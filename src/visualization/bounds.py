@@ -1,20 +1,65 @@
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
 
-def plot_bounds_with_trace(time, mean_trace, var_trace, lower_bound, upper_bound):
+def plot_bounds_with_trace(
+    time, mean_trace, var_trace, lower_bound=None, upper_bound=None, threshold=50
+):
+    std = np.sqrt(var_trace)
+
+    violate_mean = mean_trace < threshold
+    violate_1sigma = (mean_trace - std) < threshold
+
     plt.figure(figsize=(12, 6))
     plt.plot(time, mean_trace, label="Mean Height", color="blue")
     plt.fill_between(
         time,
-        mean_trace - np.sqrt(var_trace),
-        mean_trace + np.sqrt(var_trace),
+        mean_trace - std,
+        mean_trace + std,
         color="blue",
         alpha=0.2,
         label="1-sigma Interval",
     )
-    plt.axhline(50, color="red", linestyle="--", label="Threshold Height = 50m")
-    plt.title("Height Trajectory with 1-sigma Confidence Interval")
+    plt.axhline(
+        threshold, color="red", linestyle="--", label=f"Threshold Height = {threshold}m"
+    )
+
+    plt.fill_between(
+        time,
+        0,
+        threshold,
+        where=violate_mean,
+        color="red",
+        alpha=0.1,
+        label="Mean < 50",
+    )
+    plt.fill_between(
+        time,
+        0,
+        threshold,
+        where=violate_1sigma,
+        color="orange",
+        alpha=0.1,
+        label="Lower Bound < 50",
+    )
+
+    plt.scatter(
+        time[violate_mean],
+        mean_trace[violate_mean],
+        color="red",
+        s=30,
+        label="Mean Violation",
+    )
+    plt.scatter(
+        time[violate_1sigma],
+        mean_trace[violate_1sigma],
+        facecolors="none",
+        edgecolors="orange",
+        s=40,
+        label="Partial Violation",
+    )
+
+    plt.title("Height Trajectory with STL Specification Violations")
     plt.xlabel("Time [s]")
     plt.ylabel("Height [m]")
     plt.legend()
