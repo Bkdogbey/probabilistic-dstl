@@ -1,7 +1,6 @@
 import numpy as np
-import yaml
 
-from models.dynamics import first_order_system, control_input, sinusoidial_input
+from models.dynamics import control_input, first_order_system, sinusoidial_input
 from stl.propagate import compute_bounds
 from utils import skip_run
 from visualization.bounds import plot_bounds_with_trace
@@ -10,7 +9,7 @@ from visualization.bounds import plot_bounds_with_trace
 config_path = "configs/config.yml"
 # config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
-with skip_run("run", "Data - Constant Input") as check, check():
+with skip_run("skip", "Data - Constant Input") as check, check():
     # --------- System Dynamics ------------#
     a = 0.1  # state
     b = 1.0  # input
@@ -37,4 +36,10 @@ with skip_run("run", "Data - Sinusoidal Input") as check, check():
     t = np.linspace(0, 10, 50)
     mean_trace, var_trace = first_order_system(a, b, g, q, mu, P, t, sinusoidial_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
+
+    # NOTE:
+    # 1. In the plot function why are you not using lower_bound and upper_bound?
+    # 2. In the plot, the band of violations (light orange) doesn't seem correct.
+    # The band should start exactly when the lower sigma crosses the 50 mark. But it doesn't happen so.
+
     plot_bounds_with_trace(t, mean_trace, var_trace, lower_bound, upper_bound)

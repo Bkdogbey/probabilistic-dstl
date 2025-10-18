@@ -1,5 +1,5 @@
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def plot_bounds_with_trace(
@@ -24,25 +24,10 @@ def plot_bounds_with_trace(
         threshold, color="red", linestyle="--", label=f"Threshold Height = {threshold}m"
     )
 
+    plt.fill_between(time, 0, threshold, where=violate_mean, color="red", alpha=0.1)
     plt.fill_between(
-        time,
-        0,
-        threshold,
-        where=violate_mean,
-        color="red",
-        alpha=0.1,
-        label="Mean < 50",
+        time, 0, threshold, where=violate_1sigma, color="orange", alpha=0.1
     )
-    plt.fill_between(
-        time,
-        0,
-        threshold,
-        where=violate_1sigma,
-        color="orange",
-        alpha=0.1,
-        label="Lower Bound < 50",
-    )
-
     plt.scatter(
         time[violate_mean],
         mean_trace[violate_mean],
@@ -59,9 +44,8 @@ def plot_bounds_with_trace(
         label="Partial Violation",
     )
 
-    plt.title("Height Trajectory with STL Specification Violations")
-    plt.xlabel("Time [s]")
-    plt.ylabel("Height [m]")
+    plt.xlabel("Time")
+    plt.ylabel("Output")
     plt.legend()
     plt.grid()
     plt.show()
