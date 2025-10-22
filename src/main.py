@@ -4,6 +4,7 @@ from models.dynamics import control_input, first_order_system, sinusoidial_input
 from stl.propagate import compute_bounds
 from utils import skip_run
 from visualization.bounds import plot_bounds_with_trace
+from visualization.new_bounds import plot_bounds
 
 # The configuration file
 config_path = "configs/config.yml"
@@ -23,6 +24,7 @@ with skip_run("run", "Data - Constant Input") as check, check():
     mean_trace, var_trace = first_order_system(a, b, g, q, mu, P, t, control_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_bounds_with_trace(t, mean_trace, var_trace)
+    plot_bounds(t, mean_trace, var_trace)
 
 with skip_run("run", "Data - Sinusoidal Input") as check, check():
     a = 0.0  # zero drift
@@ -37,3 +39,8 @@ with skip_run("run", "Data - Sinusoidal Input") as check, check():
     mean_trace, var_trace = first_order_system(a, b, g, q, mu, P, t, sinusoidial_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_bounds_with_trace(t, mean_trace, var_trace)
+    plot_bounds(t, mean_trace, var_trace)     
+    
+    # I added a new plot function here, kind os imilar but indicates along the sigma lines the safe, risky and violation regions
+    
+
