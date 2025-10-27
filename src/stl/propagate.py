@@ -6,7 +6,7 @@ def compute_bounds(
     mean_trace,
     var_trace,
     time,
-    min_height=50,
+    threshold=50,
     start_time=0,
     end_time=10,
 ):
@@ -15,16 +15,16 @@ def compute_bounds(
     if np.sum(mask) == 0:
         return 0.0, 1.0  # no time in the interval
 
-    probs = []  # P(z(time) >= min_height) at each time in [start_time, end_time]
+    probs = []  # P(z(time) >= threshold) at each time in [start_time, end_time]
     for i in idxs:
         m = mean_trace[i]
         v = var_trace[i]
         if v <= 0:
-            p = 1.0 if m >= min_height else 0.0
+            p = 1.0 if m >= threshold else 0.0
         else:
             std = np.sqrt(v)
             # P(Z >= h) = 1 - Phi((h - m)/std)
-            p = 1.0 - norm.cdf((min_height - m) / std)
+            p = 1.0 - norm.cdf((threshold - m) / std)
         probs.append(p)
 
     min_prob = float(

@@ -3,15 +3,15 @@ import numpy as np
 
 def control_input(t):
     """Control input function u(t)."""
-    return -0.5  # constant downward velocity
+    return -0.5
 
 
 def sinusoidial_input(t):
     """A sinusoidal control input function u(t)."""
-    return 15 * np.sin(2 * np.pi * t / 5) # Sinusoidal input with period 5s and amplitude 15
+    return 15 * np.sin(2 * np.pi * t / 5)
 
 
-def first_order_system(a, b, g, q, mu, P, t, control_func=control_input):
+def linear_system(a, b, g, q, mu, P, t, control_func=control_input):
     """Propagate the belief state (mu, P) through one time step."""
     mean_trace = np.zeros(len(t))
     var_trace = np.zeros(len(t))

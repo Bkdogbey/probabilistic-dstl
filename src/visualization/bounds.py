@@ -2,68 +2,88 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_bounds_with_trace(
-    time, mean_trace, var_trace, lower_bound, upper_bound, threshold=50
-):
-    std = np.sqrt(var_trace)
+def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
+    """
+    Plot a trace with ±1σ bounds and highlight where the trace
+    violates a given threshold.
 
-    lower_bound = mean_trace - std
-    upper_bound = mean_trace + std
+    Parameters
+    ----------
+    time : array_like
+        Array of time values.
+    mean_trace : array_like
+        Mean trace over time.
+    var_trace : array_like
+        Variance trace over time.
+    threshold : float, optional
+        Threshold value for violation detection (default is 50).
+    """
+    sigma = np.sqrt(var_trace)
+    lower_sigma = mean_trace - sigma
+    upper_sigma = mean_trace + sigma
 
-    violate_full = (lower_bound < threshold) & (upper_bound < threshold)
+    # Identify violations
+    full_violation = upper_sigma < threshold
+    partial_violation = (lower_sigma < threshold) & ~full_violation
 
-    violate_partial = (lower_bound < threshold) & ~violate_full
+    # Plot setup
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    plt.figure(figsize=(12, 6))
-
-    plt.plot(time, mean_trace, label="Mean Height", color="blue", linewidth=2)
-    plt.fill_between(
+    # Main trace and uncertainty
+    ax.plot(time, mean_trace, color="blue", linewidth=2, label="Mean Height")
+    ax.fill_between(
         time,
-        mean_trace - std,
-        mean_trace + std,
+        lower_sigma,
+        upper_sigma,
         color="blue",
         alpha=0.2,
-        label="±1 Sigma Interval",
+        label="±1σ Interval",
     )
 
-    plt.axhline(
-        threshold, color="red", linestyle="--", label=f"Threshold Height = {threshold}m"
+    # Threshold line
+    ax.axhline(
+        threshold,
+        color="red",
+        linestyle="--",
+        label=f"Threshold = {threshold} m",
     )
 
-    y_max = np.max(mean_trace + std) * 1.1
-    y_min = np.min(mean_trace - std) * 0.9
+    # Vertical range for shading violations
+    y_min = np.min(lower_sigma) * 0.9
+    y_max = np.max(upper_sigma) * 1.1
 
-    plt.fill_between(
+    # Shaded violation regions
+    ax.fill_between(
         time,
         y_min,
         y_max,
-        where=violate_full,
+        where=full_violation,
         color="red",
         alpha=0.1,
         label="Full violation (both bounds < threshold)",
     )
-
-    plt.fill_between(
+    ax.fill_between(
         time,
         y_min,
         y_max,
-        where=violate_partial,
+        where=partial_violation,
         color="orange",
         alpha=0.1,
         label="Partial violation (lower bound < threshold)",
     )
 
-    plt.scatter(
-        time[violate_full],
-        mean_trace[violate_full],
+    # Violation markers
+    ax.scatter(
+        time[full_violation],
+        mean_trace[full_violation],
         color="red",
         s=30,
         label="Full Violation Points",
         zorder=5,
     )
-    plt.scatter(
-        time[violate_partial],
-        mean_trace[violate_partial],
+    ax.scatter(
+        time[partial_violation],
+        mean_trace[partial_violation],
         facecolors="none",
         edgecolors="orange",
         s=40,
@@ -71,9 +91,10 @@ def plot_bounds_with_trace(
         zorder=5,
     )
 
-    plt.xlabel("Time [s]")
-    plt.ylabel("Height [m]")
-    plt.legend(loc="best")
-    plt.grid(True, alpha=0.3)
+    # Aesthetics
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Output")
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
