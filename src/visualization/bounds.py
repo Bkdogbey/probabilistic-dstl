@@ -27,7 +27,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[2, 1])
 
-    # ========== TRACE PLOT ==========
+    # TRACE PLOT 
     # Main trace and uncertainty
     ax1.plot(time, mean_trace, color="blue", linewidth=2, label="Mean Height")
     ax1.fill_between(
@@ -92,7 +92,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
     ax1.grid(True, alpha=0.3)
     ax1.set_title("Trajectory with Violation Regions")
 
-    # ROBUSTNESS PLOT 
+    # ROBUSTNESS PLOT
     # Compute pointwise robustness: ρ(t) = Lower sigma bound - threshold
     robustness = lower_sigma - threshold
 
@@ -120,6 +120,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         label="Satisfied (ρ>0)",
         interpolate=True,
     )
+    # Violation region
     ax2.fill_between(
         time,
         robustness,
@@ -130,41 +131,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         label="Violated (ρ<0)",
         interpolate=True,
     )
-
-    # Compute STL robustness (minimum over all time)
-    rho_stl = float(np.min(robustness))
-    t_critical = float(time[np.argmin(robustness)])
-
-    # Mark critical point
-    ax2.axvline(t_critical, color="darkred", linestyle=":", linewidth=2)
-    ax2.scatter(
-        [t_critical],
-        [rho_stl],
-        color="darkred",
-        s=150,
-        zorder=10,
-        marker="o",
-        edgecolors="black",
-        linewidths=2,
-    )
-
-    # Status text
-    status = "SATISFIED" if rho_stl >= 0 else "VIOLATED"
-    status_color = "green" if rho_stl >= 0 else "red"
-    ax2.text(
-        0.02,
-        0.98,
-        f"STL Robustness: ρ = {rho_stl:.3f}\nStatus: {status}",
-        transform=ax2.transAxes,
-        fontsize=11,
-        fontweight="bold",
-        verticalalignment="top",
-        color=status_color,
-        bbox=dict(
-            boxstyle="round", facecolor="white", edgecolor=status_color, linewidth=2
-        ),
-    )
-
+    # Aesthetics
     ax2.set_xlabel("Time")
     ax2.set_ylabel("Robustness ρ(t)")
     ax2.legend(loc="best")

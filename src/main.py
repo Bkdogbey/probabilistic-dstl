@@ -8,7 +8,7 @@ from visualization.bounds import plot_mean_with_sigma_bounds
 
 # The configuration file
 config_path = "configs/config.yml"
-#config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
+config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
 with skip_run("run", "Data - Constant Input") as check, check():
     a = 0.1  # state
