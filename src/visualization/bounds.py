@@ -38,6 +38,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         alpha=0.2,
         label="±1σ Interval",
     )
+   
     # Threshold line
     ax1.axhline(
         threshold,
@@ -99,7 +100,6 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
     ax2.plot(
         time, robustness, label="Robustness ρ(t) = x(t) - h", color="blue", linewidth=2
     )
-
     # Zero line (satisfaction boundary)
     ax2.axhline(
         0,

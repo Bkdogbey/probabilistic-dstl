@@ -19,7 +19,7 @@ with skip_run("run", "Data - Constant Input") as check, check():
     mu = 45  # mean height
     P = 5  # initial height variance
 
-    t = np.linspace(0, 5, 300)  # time from 0 to 30 seconds as given by stl
+    t = np.linspace(0, 10, 300)  # time from 0 to 10 seconds as given by stl
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, control_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
