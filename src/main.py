@@ -1,12 +1,11 @@
 import numpy as np
 import yaml
-import torch
+
 
 from models.dynamics import control_input, linear_system, sinusoidial_input
 from stl.propagate import compute_bounds
 from utils import skip_run
 from visualization.bounds import plot_mean_with_sigma_bounds
-
 
 
 # The configuration file
@@ -27,8 +26,6 @@ with skip_run("run", "Data - Constant Input") as check, check():
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
 
-    
-
 
 with skip_run("run", "Data - Sinusoidal Input") as check, check():
     a = 0.0  # zero drift
@@ -43,5 +40,3 @@ with skip_run("run", "Data - Sinusoidal Input") as check, check():
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
-
-    

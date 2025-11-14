@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 
+
 def normal_cdf(z):
     """Cumulative distribution function for standard normal distribution"""
     return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
@@ -35,6 +36,7 @@ class STL_Formula(torch.nn.Module):
 
 class Minish(torch.nn.Module):
     """Compute minimum (exact or smooth) over specified dimension"""
+
     def forward(self, x, scale, dim=1, keepdim=True):
         if scale > 0:
             # Smooth minimum using LogSumExp
@@ -54,15 +56,14 @@ class GreaterThan(STL_Formula):
     def __init__(self, threshold):
         super(GreaterThan, self).__init__()
         self.threshold = threshold
-        
 
     def robustness_trace(self, belief, **kwargs):
         mean, var = belief
-        
+
         # Compute probability
         std = torch.sqrt(var)
         z = (mean - self.threshold) / std
         prob = normal_cdf(z)
-    
+
     def __str__(self):
         return f"x >= {self.threshold}"
