@@ -63,7 +63,10 @@ class GreaterThan(STL_Formula):
         std = torch.sqrt(var)
         z = (mean - self.threshold) / std
         prob = normal_cdf(z)
-        # NOTE: Where are we returning the robustness measure?
+
+        return torch.stack(
+            [prob, prob], dim=-1
+        )  # returns upper and lower bounds (same for this predicate)
 
     def __str__(self):
         return f"x >= {self.threshold}"

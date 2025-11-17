@@ -2,107 +2,122 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_rnn_robustness(time, rob_lower_rnn, rob_upper_rnn, formula, threshold):
+def plot_predicate_robustness(
+    time, mean_trace, var_trace, robustness, formula, threshold
+):
     """
-    Plot RNN temporal STL robustness bounds.
+    Plot belief trajectory and its robustness trace together.
 
     Parameters
     ----------
     time : array_like
         Array of time values.
-    rob_lower_rnn : array_like
-        Lower bound of RNN temporal robustness (from Always operator).
-    rob_upper_rnn : array_like
-        Upper bound of RNN temporal robustness (from Always operator).
+    mean_trace : array_like
+        Mean trajectory over time.
+    var_trace : array_like
+        Variance trajectory over time.
+    robustness : array_like
+        Robustness values at each timestep (probability in [0, 1]).
     formula : STL_Formula
-        The STL formula object.
+        The STL formula object (for title).
     threshold : float
-        Threshold value for the STL predicate .
+        Threshold value for the predicate.
     """
+    sigma = np.sqrt(var_trace)
+    lower_sigma = mean_trace - sigma
+    upper_sigma = mean_trace + sigma
 
-    formula_str = str(formula)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[2, 1])
 
-    # Create figure with single plot
-    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    # TOP PLOT: TRAJECTORY WITH UNCERTAINTY
 
-    # RNN TEMPORAL ROBUSTNESS =
-    ax.plot(
+    # Main trajectory
+    ax1.plot(time, mean_trace, color="blue", linewidth=2, label="Mean Height")
+    ax1.fill_between(
         time,
-        rob_lower_rnn,
-        label="Lower Robustness (pessimistic)",
-        color="darkred",
-        linewidth=2.5,
-        linestyle="-",
-    )
-    ax.plot(
-        time,
-        rob_upper_rnn,
-        label="Upper Robustness (optimistic)",
-        color="darkgreen",
-        linewidth=2.5,
-        linestyle="-",
-    )
-
-    # Fill uncertainty band
-    ax.fill_between(
-        time,
-        rob_lower_rnn,
-        rob_upper_rnn,
-        color="purple",
-        alpha=0.3,
-        label="Robustness Uncertainty",
-    )
-
-    # Zero line (satisfaction boundary)
-    ax.axhline(
-        0,
-        color="black",
-        linestyle="-",
-        linewidth=2,
-        label="Satisfaction Boundary (ρ=0)",
-    )
-
-    # Fill satisfaction/violation regions
-    ax.fill_between(
-        time,
-        0,
-        rob_lower_rnn,
-        where=(rob_lower_rnn >= 0),
-        color="green",
+        lower_sigma,
+        upper_sigma,
+        color="blue",
         alpha=0.2,
-        label="Definitely Satisfied",
-        interpolate=True,
+        label="±1σ Interval",
     )
-    ax.fill_between(
-        time,
-        rob_upper_rnn,
-        0,
-        where=(rob_upper_rnn < 0),
+
+    # Threshold line
+    ax1.axhline(
+        threshold,
         color="red",
-        alpha=0.2,
-        label="Definitely Violated",
-        interpolate=True,
+        linestyle="--",
+        linewidth=2,
+        label=f"Threshold = {threshold} m",
     )
-    ax.fill_between(
+
+    # Identify violation regions
+    full_violation = upper_sigma < threshold
+    partial_violation = (lower_sigma < threshold) & ~full_violation
+
+    # Vertical range for shading
+    y_min = np.min(lower_sigma) * 0.9
+    y_max = np.max(upper_sigma) * 1.1
+
+    # Shaded violation regions
+    ax1.fill_between(
         time,
-        rob_lower_rnn,
-        rob_upper_rnn,
-        where=((rob_lower_rnn < 0) & (rob_upper_rnn >= 0)),
-        color="yellow",
-        alpha=0.3,
-        label="Uncertain Region",
-        interpolate=True,
+        y_min,
+        y_max,
+        where=full_violation,
+        color="red",
+        alpha=0.1,
+        label="Definitely below threshold",
+    )
+    ax1.fill_between(
+        time,
+        y_min,
+        y_max,
+        where=partial_violation,
+        color="orange",
+        alpha=0.1,
+        label="Uncertainty crosses threshold",
     )
 
-    ax.set_xlabel("Time (s)", fontsize=11)
-    ax.set_ylabel("STL Robustness ρ(t)", fontsize=11)
-    ax.legend(loc="best", fontsize=9)
-    ax.grid(True, alpha=0.3)
+    # Aesthetics
+    ax1.set_xlabel("Time (s)", fontsize=12)
+    ax1.set_ylabel("Height (m)", fontsize=12)
+    ax1.legend(loc="best", fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_title("Belief Trajectory with Uncertainty", fontsize=13, fontweight="bold")
 
-    title = "RNN Temporal STL Robustness"
-    if formula_str:
-        title += f"\n{formula_str}"
-    ax.set_title(title, fontsize=12, fontweight="bold")
+    # STOCHASTIC ROBUSTNESS
+
+    # Main robustness curve
+    ax2.plot(time, robustness, "b-", linewidth=2.5, label="Stochastic Robustness")
+
+    # Reference lines
+    ax2.axhline(
+        0.5,
+        color="orange",
+        linestyle="--",
+        linewidth=1.5,
+        label="50% Confidence",
+        alpha=0.7,
+    )
+    ax2.axhline(
+        0.9,
+        color="green",
+        linestyle="--",
+        linewidth=1.5,
+        label="90% Confidence",
+        alpha=0.7,
+    )
+
+    # Aesthetics
+    ax2.set_xlabel("Time (s)", fontsize=12)
+    ax2.set_ylabel("Robustness\n(Probability)", fontsize=12)
+    ax2.set_ylim([0, 1.05])
+    ax2.legend(loc="best", fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    title = f"Stochastic Robustness: {formula}"
+    ax2.set_title(title, fontsize=13, fontweight="bold")
 
     plt.tight_layout()
     plt.show()
