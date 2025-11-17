@@ -1,18 +1,15 @@
 import numpy as np
 import yaml
-
-
 from models.dynamics import control_input, linear_system, sinusoidial_input
 from stl.propagate import compute_bounds
 from utils import skip_run
 from visualization.bounds import plot_mean_with_sigma_bounds
 
-
 # The configuration file
 config_path = "configs/config.yml"
 config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
-with skip_run("run", "Data - Constant Input") as check, check():
+with skip_run("skip", "Data - Constant Input") as check, check():
     a = 0.1  # state
     b = 1.0  # input
     g = 0.5  # Stochastic noise
@@ -27,7 +24,7 @@ with skip_run("run", "Data - Constant Input") as check, check():
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
 
 
-with skip_run("run", "Data - Sinusoidal Input") as check, check():
+with skip_run("skip", "Data - Sinusoidal Input") as check, check():
     a = 0.0  # zero drift
     b = 1.0  # input gain
     g = 10.5  # stochastic noise
@@ -40,3 +37,8 @@ with skip_run("run", "Data - Sinusoidal Input") as check, check():
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
+
+
+with skip_run("skip", "Greater Verification") as check, check():
+    # TODO: Implement verification of greater than
+    pass
