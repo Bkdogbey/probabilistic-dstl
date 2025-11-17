@@ -12,7 +12,7 @@ from visualization.stlcg_robs import plot_predicate_robustness
 config_path = "configs/config.yml"
 config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
-with skip_run("skip", "Data - Constant Input") as check, check():
+with skip_run("run", "Data - Constant Input") as check, check():
     a = 0.1  # state
     b = 1.0  # input
     g = 0.5  # Stochastic noise
