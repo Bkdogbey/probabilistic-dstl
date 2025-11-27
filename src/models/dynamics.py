@@ -1,4 +1,11 @@
 import numpy as np
+import torch
+from pdstl.base import Belief
+
+
+def normal_cdf(z):
+    """Cumulative distribution function for standard normal distribution"""
+    return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
 
 
 def control_input(t):
@@ -30,3 +37,17 @@ def linear_system(a, b, g, q, mu, P, t, control_func=control_input):
         # Variance update
         var_trace[i] = (Phi**2) * var_trace[i - 1] + Q * dt
     return mean_trace, var_trace
+
+
+class GaussianBelief(Belief):
+    def __init__(self, mean, var):
+        self.mean = mean
+        self.var = var
+
+    def value(self):
+        return self.mean
+
+    def probability_of(self, residual):
+        std = torch.sqrt(self.var)
+        z = residual / std
+        return normal_cdf(z)

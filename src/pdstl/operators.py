@@ -1,11 +1,6 @@
 import torch
 
 
-def normal_cdf(z):
-    """Cumulative distribution function for standard normal distribution"""
-    return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
-
-
 class STL_Formula(torch.nn.Module):
     """
     Base class for Probabilistic STL formulas.
@@ -56,13 +51,15 @@ class GreaterThan(STL_Formula):
         super(GreaterThan, self).__init__()
         self.threshold = threshold
 
-    def robustness_trace(self, belief, **kwargs):
-        mean, var = belief
+    def robustness_trace(self, belief_trajectory, **kwargs):
+        probs = []
 
-        # Compute probability
-        std = torch.sqrt(var)
-        z = (mean - self.threshold) / std
-        prob = normal_cdf(z)
+        for t in range(len(belief_trajectory)):
+            belief = belief_trajectory[t]  # get the belief at time t
+            residual = belief.value() - self.threshold
+            prob = belief.probability_of(residual)
+
+            probs.append(prob)
 
         return torch.stack(
             [prob, prob], dim=-1

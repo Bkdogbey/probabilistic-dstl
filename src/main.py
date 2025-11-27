@@ -1,18 +1,24 @@
 import numpy as np
-import yaml
 import torch
-from models.dynamics import control_input, linear_system, sinusoidial_input
-from stl.propagate import compute_bounds
-from stl.pdstl import GreaterThan
+import yaml
+from models.dynamics import (
+    GaussianBelief,
+    control_input,
+    linear_system,
+    sinusoidial_input,
+)
+from pdstl.base import BeliefTrajectory
+from pdstl.operators import GreaterThan
+from pdstl.propagate import compute_bounds
 from utils import skip_run
 from visualization.bounds import plot_mean_with_sigma_bounds
-from visualization.stlcg_robs import plot_predicate_robustness
+from visualization.robustness import plot_predicate_robustness
 
 # The configuration file
 config_path = "configs/config.yml"
 config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
-with skip_run("run", "Data - Constant Input") as check, check():
+with skip_run("skip", "Data - Constant Input") as check, check():
     a = 0.1  # state
     b = 1.0  # input
     g = 0.5  # Stochastic noise
@@ -25,7 +31,6 @@ with skip_run("run", "Data - Constant Input") as check, check():
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, control_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
-
 
 with skip_run("skip", "Data - Sinusoidal Input") as check, check():
     a = 0.0  # zero drift
@@ -41,7 +46,6 @@ with skip_run("skip", "Data - Sinusoidal Input") as check, check():
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
 
-
 with skip_run("run", "Greater Verification") as check, check():
     # System setup
     a, b, g, q = 0.1, 1.0, 1.5, 0.1
@@ -55,11 +59,17 @@ with skip_run("run", "Greater Verification") as check, check():
     # Convert to PyTorch tensors
     mean_torch = torch.tensor(mean_trace, dtype=torch.float32).reshape(1, -1, 1)
     var_torch = torch.tensor(var_trace, dtype=torch.float32).reshape(1, -1, 1)
-    belief = (mean_torch, var_torch)
+
+    # Convert them to belief trajectory.
+    beliefs = []
+    for mean, var in zip(mean_torch, var_torch):
+        beliefs.append(GaussianBelief(mean, var))
+
+    belief_trajectory = BeliefTrajectory(beliefs)
 
     # Compute robustness using GreaterThan predicate
     predicate = GreaterThan(threshold)
-    robustness_trace = predicate(belief)
+    robustness_trace = predicate(belief_trajectory)
     robustness = robustness_trace[..., 0].squeeze().detach().numpy()
 
     # Visualize trajectory AND robustness together
