@@ -73,9 +73,9 @@ def plot_stl_formula_bounds(
     upper = rt[:, 1]
 
     # Debug print so you SEE the numbers in the terminal
-    print(f"[DEBUG] Formula: {formula}")
-    print(f"[DEBUG] Lower bounds: min={lower.min():.4f}, max={lower.max():.4f}")
-    print(f"[DEBUG] Upper bounds: min={upper.min():.4f}, max={upper.max():.4f}")
+    print(f"[Formula: {formula}")
+    print(f"[Lower bounds: min={lower.min():.4f}, max={lower.max():.4f}")
+    print(f" Upper bounds: min={upper.min():.4f}, max={upper.max():.4f}")
 
     # ------------------------------------------------------------------
     # 3. Plot
