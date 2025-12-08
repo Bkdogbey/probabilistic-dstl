@@ -8,7 +8,7 @@ def normal_cdf(z):
     return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
 
 
-def control_input(t):
+def constant_input(t):
     """Control input function u(t)."""
     return -0.5
 
@@ -18,7 +18,7 @@ def sinusoidial_input(t):
     return 15 * np.sin(2 * np.pi * t / 5)
 
 
-def linear_system(a, b, g, q, mu, P, t, control_func=control_input):
+def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
     """Propagate the belief state (mu, P) through one time step."""
     mean_trace = np.zeros(len(t))
     var_trace = np.zeros(len(t))
@@ -50,4 +50,5 @@ class GaussianBelief(Belief):
     def probability_of(self, residual):
         std = torch.sqrt(self.var)
         z = residual / std
+
         return normal_cdf(z)

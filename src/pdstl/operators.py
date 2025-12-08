@@ -193,7 +193,7 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
-        lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
+        lower = torch.max(l1 + l2 - 1.0, min=0.0)
         upper = torch.min(u1, u2)
 
         return torch.cat([lower, upper], dim=-1)
