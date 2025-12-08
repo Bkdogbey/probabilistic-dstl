@@ -8,13 +8,12 @@ from models.dynamics import (
     sinusoidial_input,
 )
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import GreaterThan
+from pdstl.operators import GreaterThan, LessThan, Always, Eventually, Until, And, Or
 from pdstl.propagate import compute_bounds
 from utils import skip_run
 from visualization.bounds import plot_mean_with_sigma_bounds
-from visualization.robustness import plot_predicate_robustness
+from visualization.robustness import plot_stl_formula_bounds
 
-# The configuration file
 config_path = "configs/config.yml"
 config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
@@ -46,33 +45,36 @@ with skip_run("skip", "Data - Sinusoidal Input") as check, check():
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
 
-with skip_run("run", "Greater Verification") as check, check():
-    # System setup
-    a, b, g, q = 0.1, 1.0, 1.5, 0.1
-    mu, P = 35, 10
-    threshold = 50.0
 
-    # Generate belief trajectory
-    t = np.linspace(0, 10, 300)
+with skip_run("run", "STL Operators Verification") as check, check():
+    a, b, g, q = 0.1, 1.0, 1.5, 0.1
+    mu, P = 45, 10
+    t = np.linspace(0, 10, 10)
+
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, control_input)
 
-    # Convert to PyTorch tensors
     mean_torch = torch.tensor(mean_trace, dtype=torch.float32).reshape(1, -1, 1)
     var_torch = torch.tensor(var_trace, dtype=torch.float32).reshape(1, -1, 1)
 
-    # Convert them to belief trajectory.
     beliefs = []
     for mean, var in zip(mean_torch, var_torch):
         beliefs.append(GaussianBelief(mean, var))
 
     belief_trajectory = BeliefTrajectory(beliefs)
 
-    # Compute robustness using GreaterThan predicate
-    predicate = GreaterThan(threshold)
-    robustness_trace = predicate(belief_trajectory)
-    robustness = robustness_trace[..., 0].squeeze().detach().numpy()
+    threshold1 = 50.0
 
-    # Visualize trajectory AND robustness together
-    plot_predicate_robustness(
-        t, mean_trace, var_trace, robustness, predicate, threshold
+    phi1 = GreaterThan(threshold1)  # x >= 50
+    spec = Eventually(phi1, interval=[0, 10])
+
+    robustness_trace = spec(belief_trajectory)  # [1,T,1,2]
+    #print(robustness_trace)
+
+    plot_stl_formula_bounds(
+        t,
+        robustness_trace,
+        spec,
+        mean_trace=mean_trace,
+        var_trace=var_trace,
+        signal_label="Height",
     )
