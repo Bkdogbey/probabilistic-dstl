@@ -269,6 +269,7 @@ class Implies(STL_Formula):
 class Temporal_Operator(STL_Formula):
     """
     Base class for temporal operators.
+    It uses an RNN-like structure to maintain a sliding window over time. 
 
     """
 
