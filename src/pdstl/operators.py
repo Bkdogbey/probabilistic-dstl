@@ -193,15 +193,10 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
-<<<<<<< HEAD
-       
+        
         lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
-     
+       
         upper = torch.minimum(u1, u2)
-=======
-        lower = torch.max(l1 + l2 - 1.0, min=0.0)
-        upper = torch.min(u1, u2)
->>>>>>> 6d4853b0aa2b0e8c0e929cb6ea7dedc9bc2db3e7
 
         return torch.cat([lower, upper], dim=-1)
 
@@ -502,7 +497,7 @@ class Eventually(Temporal_Operator):
 
 class Until(STL_Formula):
     """
-    ϕ U_I ψ: Until operator 
+    ϕ U_I ψ : Until operator 
     """
 
     def __init__(self, left, right, interval=None):
