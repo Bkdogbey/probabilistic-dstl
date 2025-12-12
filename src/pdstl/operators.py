@@ -193,8 +193,10 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
+       
         lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
-        upper = torch.min(u1, u2)
+     
+        upper = torch.minimum(u1, u2)
 
         return torch.cat([lower, upper], dim=-1)
 
@@ -227,7 +229,8 @@ class Or(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
-        lower = torch.max(l1, l2)
+       
+        lower = torch.maximum(l1, l2)
         upper = torch.clamp(u1 + u2, max=1.0)
 
         return torch.cat([lower, upper], dim=-1)
@@ -494,7 +497,7 @@ class Eventually(Temporal_Operator):
 
 class Until(STL_Formula):
     """
-    ϕ U_I ψ : Until operator with StoRI-style probability intervals.
+    ϕ U_I ψ: Until operator 
     """
 
     def __init__(self, left, right, interval=None):
