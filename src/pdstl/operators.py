@@ -173,11 +173,20 @@ class And(STL_Formula):
         # Both: [B,T,D,2]
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
+<<<<<<< HEAD
         
         
         lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
         upper = torch.minimum(u1, u2)
         
+=======
+
+        
+        lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
+       
+        upper = torch.minimum(u1, u2)
+
+>>>>>>> 75c5d7d024c6daa5ed73fc79bbd4ecb942915c64
         return torch.cat([lower, upper], dim=-1)
     
     def __str__(self):
@@ -206,8 +215,13 @@ class Or(STL_Formula):
         
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
+<<<<<<< HEAD
         
         
+=======
+
+       
+>>>>>>> 75c5d7d024c6daa5ed73fc79bbd4ecb942915c64
         lower = torch.maximum(l1, l2)
         upper = torch.clamp(u1 + u2, max=1.0)
         
@@ -455,10 +469,13 @@ class Eventually(Temporal_Operator):
 class Until(STL_Formula):
     """
     ϕ U_I ψ : Until operator 
+<<<<<<< HEAD
     Computes:
       max_{τ ∈ [t+a, t+b]} min( ψ(τ), min_{k ∈ [t, τ)} ϕ(k) )
     ￼over the specified interval I = [a,b].
     ￼If b = inf, then the interval is unbounded above.
+=======
+>>>>>>> 75c5d7d024c6daa5ed73fc79bbd4ecb942915c64
     """
     
     def __init__(self, left, right, interval=None):

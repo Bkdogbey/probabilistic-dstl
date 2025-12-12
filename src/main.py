@@ -3,7 +3,7 @@ import torch
 import yaml
 from models.dynamics import (
     GaussianBelief,
-    control_input,
+    constant_input,
     linear_system,
     sinusoidial_input,
 )
@@ -27,7 +27,7 @@ with skip_run("skip", "Data - Constant Input") as check, check():
     P = 5  # initial height variance
 
     t = np.linspace(0, 10, 300)  # time from 0 to 10 seconds as given by stl
-    mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, control_input)
+    mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, constant_input)
     lower_bound, upper_bound = compute_bounds(mean_trace, var_trace, t)
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace)
 
@@ -51,7 +51,7 @@ with skip_run("run", "STL Operators Verification") as check, check():
     mu, P = 45, 10
     t = np.linspace(0, 10, 10)
 
-    mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, control_input)
+    mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
 
     mean_torch = torch.tensor(mean_trace, dtype=torch.float32).reshape(1, -1, 1)
     var_torch = torch.tensor(var_trace, dtype=torch.float32).reshape(1, -1, 1)
@@ -66,15 +66,11 @@ with skip_run("run", "STL Operators Verification") as check, check():
 
     phi1 = GreaterThan(threshold1)  # x >= 50
     spec = Eventually(phi1, interval=[0, 10])
-
-    robustness_trace = spec(belief_trajectory)  # [1,T,1,2]
-    #print(robustness_trace)
+    robustness_trace = spec(belief_trajectory)
 
     plot_stl_formula_bounds(
         t,
         robustness_trace,
-        spec,
         mean_trace=mean_trace,
         var_trace=var_trace,
-        signal_label="Height",
     )
