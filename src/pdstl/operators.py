@@ -174,9 +174,8 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
         
-        # FIXED: Use torch.clamp instead of torch.max with min parameter
+        
         lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
-        # FIXED: Use torch.minimum for element-wise operation
         upper = torch.minimum(u1, u2)
         
         return torch.cat([lower, upper], dim=-1)
@@ -208,7 +207,7 @@ class Or(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
         
-        # FIXED: Use torch.maximum for element-wise operation
+        
         lower = torch.maximum(l1, l2)
         upper = torch.clamp(u1 + u2, max=1.0)
         
@@ -402,7 +401,7 @@ class Always(Temporal_Operator):
 #=============================================================================
 class Eventually(Temporal_Operator):
     """
-    ♢_I ϕ: Eventually operator
+    Eventually operator: ♢_I ϕ
     Computes max over time interval.
     The bounds dimension is processed automatically.
     """
@@ -455,7 +454,11 @@ class Eventually(Temporal_Operator):
 #=============================================================================
 class Until(STL_Formula):
     """
-    ϕ U_I ψ : Until operator with StoRI-style probability intervals.
+    ϕ U_I ψ : Until operator 
+    Computes:
+      max_{τ ∈ [t+a, t+b]} min( ψ(τ), min_{k ∈ [t, τ)} ϕ(k) )
+    ￼over the specified interval I = [a,b].
+    ￼If b = inf, then the interval is unbounded above.
     """
     
     def __init__(self, left, right, interval=None):
