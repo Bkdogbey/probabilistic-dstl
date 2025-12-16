@@ -57,7 +57,7 @@ def create_beliefs_from_trace(mean_trace, var_trace):
 
 
 # =============================================================================
-# TEST CASE 1: Constant Input (Stable System)
+# TEST CASE 1: Constant Input 
 # =============================================================================
 
 with skip_run("skip", "Test 1: Constant Input") as check, check():
@@ -108,19 +108,19 @@ with skip_run("run", "Test 2: Sinusoidal Input") as check, check():
 # TEST CASE 1: Always Operator
 # =============================================================================
 
-with skip_run("skip", "Test: Always Operator") as check, check():
+with skip_run("run", "Test: Always Operator") as check, check():
     """
-    Test Always: □[0,10](x >= 48)
+    Test Always: □[0,10](x >= 50)
     Shows probability that constraint holds at ALL future times
     """
-    a, b, g, q = 0.0, 1.0, 2.0, 0.03
-    mu, P = 50, 5
-    t = np.linspace(0, 10, 100)
+    a, b, g, q = -0.1, 1.0, 5.0, 0.3
+    mu, P = 50, 10
+    t = np.linspace(0, 10, 300)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
 
-    threshold = 48.0
+    threshold = 50.0
     phi = GreaterThan(threshold)
     spec = Always(phi, interval=[0, 10])
     robustness_trace = spec(belief_trajectory)
@@ -141,19 +141,11 @@ with skip_run("skip", "Test: Always Operator") as check, check():
 # =============================================================================
 
 with skip_run("run", "Test: Complex Formula") as check, check():
-    """
-    Test complex formula: Eventually reach target WHILE always staying safe
-    ◇[0,5](x >= 55) ∧ □[0,10](x >= 40)
-    
-    Interpretation:
-    - Must reach x >= 55 sometime in [0,5]
-    - AND must stay x >= 40 for all times in [0,10]
-    """
     a, b, g, q = 0.0, 1.0, 2.5, 0.5
     mu, P = 50, 8
     t = np.linspace(0, 10, 100)
 
-    mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, noisy_stock_input)
+    mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
 
     # Reach target: ◇[0,5](x >= 55)
@@ -172,7 +164,7 @@ with skip_run("run", "Test: Complex Formula") as check, check():
         robustness_trace,
         mean_trace=mean_trace,
         var_trace=var_trace,
-        thresholds=[40.0, 55.0],
+        thresholds=[50.0, 55.0],
         formula_str=str(spec),
         show_upper=True,
     )

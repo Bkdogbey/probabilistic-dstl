@@ -1,3 +1,4 @@
+
 import torch
 import numpy as np
 
@@ -326,6 +327,7 @@ class Temporal_Operator(STL_Formula):
 
         # Treat (batch, bounds) as batch dimension for matmul
         h0_reshaped = h0.permute(0, 2, 1)  # [B,2,rnn_dim]
+
         h0_flat = h0_reshaped.reshape(-1, rnn_dim)  # [B*2,rnn_dim]
 
         # Shift
@@ -336,7 +338,7 @@ class Temporal_Operator(STL_Formula):
         # Add new value into last position
         b_broadcast = self.b.view(1, -1, 1)  # [1,rnn_dim,1]
         x_broadcast = x.squeeze(1).unsqueeze(1)  # [B,1,2]
-
+        
         return shifted + b_broadcast * x_broadcast
 
     def _rnn_cell(self, x, hc, scale=-1, **kwargs):
