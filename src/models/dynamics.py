@@ -15,7 +15,16 @@ def constant_input(t):
 
 def sinusoidial_input(t):
     """A sinusoidal control input function u(t)."""
-    return 15 * np.sin(2 * np.pi * t / 5)
+    return 5 * np.sin(20 * np.pi * t)
+
+
+def noisy_stock_input(t):
+    """A noisy stock price-like input function u(t)."""
+    np.random.seed(int(t * 100) % 10000)
+    drift = 0.01 * t
+    noise = 50.0 * np.random.randn()
+    jitter = 2.0 * np.random.randn()
+    return drift + noise + jitter
 
 
 def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
