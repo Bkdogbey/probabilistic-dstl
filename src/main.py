@@ -1,7 +1,4 @@
-"""
-Main STL Verification Script
-Demonstrates various STL formulas and signal inputs
-"""
+
 
 import numpy as np
 import torch
@@ -21,7 +18,7 @@ from visualization.bounds import plot_mean_with_sigma_bounds
 from visualization.robustness import plot_stl_formula_bounds
 
 config_path = "configs/config.yml"
-# config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
+config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 
 # =============================================================================
 # HELPER FUNCTIONS FOR CREATING BELIEFS
@@ -61,10 +58,6 @@ def create_beliefs_from_trace(mean_trace, var_trace):
 # =============================================================================
 
 with skip_run("skip", "Test 1: Constant Input") as check, check():
-    """
-    System with constant negative input - should drift down
-    Good for testing Always operator (stays above threshold)
-    """
     a = 0.1  # positive drift
     b = 1.0  # input gain
     g = 0.5  # low stochastic noise
@@ -84,11 +77,7 @@ with skip_run("skip", "Test 1: Constant Input") as check, check():
 # TEST CASE 2: Sinusoidal Input (Oscillating System)
 # =============================================================================
 
-with skip_run("run", "Test 2: Sinusoidal Input") as check, check():
-    """
-    System with sinusoidal input - oscillates around threshold
-    Good for testing Eventually/Always with bounded intervals
-    """
+with skip_run("skip", "Test 2: Sinusoidal Input") as check, check():
     a = 0.0  # zero drift
     b = 1.0  # input gain
     g = 2.5  # moderate stochastic noise
@@ -109,20 +98,17 @@ with skip_run("run", "Test 2: Sinusoidal Input") as check, check():
 # =============================================================================
 
 with skip_run("run", "Test: Always Operator") as check, check():
-    """
-    Test Always: □[0,10](x >= 50)
-    Shows probability that constraint holds at ALL future times
-    """
+
     a, b, g, q = -0.1, 1.0, 5.0, 0.3
-    mu, P = 50, 10
-    t = np.linspace(0, 10, 300)
+    mu, P = 10, 10
+    t = np.linspace(0, 10,1)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
 
     threshold = 50.0
     phi = GreaterThan(threshold)
-    spec = Always(phi, interval=[0, 10])
+    spec = Always(phi, interval=[0, 11])
     robustness_trace = spec(belief_trajectory)
 
     plot_stl_formula_bounds(
@@ -143,19 +129,17 @@ with skip_run("run", "Test: Always Operator") as check, check():
 with skip_run("run", "Test: Complex Formula") as check, check():
     a, b, g, q = 0.0, 1.0, 2.5, 0.5
     mu, P = 50, 8
-    t = np.linspace(0, 10, 100)
+    t = np.linspace(0, 10)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
 
-    # Reach target: ◇[0,5](x >= 55)
-    reach_target = Eventually(GreaterThan(55.0), interval=[0, 5])
+    reach_target = Eventually(LessThan(75.0), interval=[0, 10])
 
-    # Stay safe: □[0,10](x >= 40)
-    stay_safe = Always(GreaterThan(40.0), interval=[0, 10])
+    stay_safe = Always(GreaterThan(50.0), interval=[0, 10])
 
     # Combined: reach AND safe
-    spec = reach_target & stay_safe
+    spec = stay_safe & reach_target
 
     robustness_trace = spec(belief_trajectory)
 
@@ -164,8 +148,7 @@ with skip_run("run", "Test: Complex Formula") as check, check():
         robustness_trace,
         mean_trace=mean_trace,
         var_trace=var_trace,
-        thresholds=[50.0, 55.0],
+        thresholds=[20.0, 75.0],
         formula_str=str(spec),
         show_upper=True,
     )
-

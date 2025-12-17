@@ -361,6 +361,10 @@ class Temporal_Operator(STL_Formula):
         trace = self.subformula(
             belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
         )
+        # FORWARD-LOOKING
+        #trace_reversed = torch.flip(trace, dims=[1])
+        #output_reversed = self._run_cell(trace_reversed, scale=scale)
+        #return torch.flip(output_reversed, dims=[1])
         return self._run_cell(trace, scale=scale)
 
 
@@ -407,7 +411,7 @@ class Always(Temporal_Operator):
             new_h0 = self._apply_shift(h0, x)
             state = (new_h0, None)
             h0x = torch.cat([h0, x], dim=1)  # [B,rnn_dim+1,2]
-            input_ = h0x[:, : self.steps, :]  # [B,steps,2]
+            input_ = h0x[:, :-self.steps, :]  # [B,steps,2]
             output = self.operation(input_, scale, dim=1, keepdim=True)
 
         return output, state
@@ -461,7 +465,7 @@ class Eventually(Temporal_Operator):
             new_h0 = self._apply_shift(h0, x)
             state = (new_h0, None)
             h0x = torch.cat([h0, x], dim=1)
-            input_ = h0x[:, : self.steps, :]
+            input_ = h0x[:, : -self.steps, :]
             output = self.operation(input_, scale, dim=1, keepdim=True)
 
         return output, state
@@ -551,3 +555,4 @@ class Until(STL_Formula):
 
     def __str__(self):
         return f"({self.left}) U_{self._interval} ({self.right})"
+    
