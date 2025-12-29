@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 
@@ -106,7 +105,7 @@ class GreaterThan(STL_Formula):
             prob_tensor = prob_tensor.squeeze(2)  # [B, T]
 
         # Return as [lower, upper] - identical for atomic predicates
-        return torch.stack([prob_tensor, prob_tensor], dim=-1)  
+        return torch.stack([prob_tensor, prob_tensor], dim=-1)
 
     def __str__(self):
         return f"x >= {self.threshold}"
@@ -126,7 +125,7 @@ class LessThan(STL_Formula):
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
             residual = self.threshold - belief.value()
-            prob = belief.probability_of(residual)  #[B, T, D]
+            prob = belief.probability_of(residual)  # [B, T, D]
             probs.append(prob)
 
         # Stack along time dimension
@@ -278,11 +277,7 @@ class Temporal_Operator(STL_Formula):
             if np.isinf(b):
                 self.rnn_dim = int(max(1, a))
             else:
-                self.rnn_dim = int(b - a + 1)
-
-        self.steps = (
-            1 if not self.interval else int(self._interval[-1] - self._interval[0] + 1)
-        )
+                self.rnn_dim = int(b + 1)
 
         # Operation set by subclass (Minish or Maxish)
         self.operation = None
@@ -338,7 +333,7 @@ class Temporal_Operator(STL_Formula):
         # Add new value into last position
         b_broadcast = self.b.view(1, -1, 1)  # [1,rnn_dim,1]
         x_broadcast = x.squeeze(1).unsqueeze(1)  # [B,1,2]
-        
+
         return shifted + b_broadcast * x_broadcast
 
     def _rnn_cell(self, x, hc, scale=-1, **kwargs):
@@ -362,10 +357,9 @@ class Temporal_Operator(STL_Formula):
             belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
         )
         # FORWARD-LOOKING
-        #trace_reversed = torch.flip(trace, dims=[1])
-        #output_reversed = self._run_cell(trace_reversed, scale=scale)
-        #return torch.flip(output_reversed, dims=[1])
-        return self._run_cell(trace, scale=scale)
+        trace_reversed = torch.flip(trace, dims=[1])
+        output_reversed = self._run_cell(trace_reversed, scale=scale)
+        return torch.flip(output_reversed, dims=[1])
 
 
 # =============================================================================
@@ -408,12 +402,12 @@ class Always(Temporal_Operator):
 
         # CASE 3: Bounded interval [a,b]
         else:
+            a, b = int(self._interval[0]), int(self._interval[1])
+            step = b - a + 1
             new_h0 = self._apply_shift(h0, x)
+            window = new_h0[:, :step, :]
+            output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
-            h0x = torch.cat([h0, x], dim=1)  # [B,rnn_dim+1,2]
-            input_ = h0x[:, :-self.steps, :]  # [B,steps,2]
-            output = self.operation(input_, scale, dim=1, keepdim=True)
-
         return output, state
 
     def __str__(self):
@@ -462,12 +456,12 @@ class Eventually(Temporal_Operator):
 
         # Case 3: Bounded interval [a,b]
         else:
+            a, b = int(self._interval[0]), int(self._interval[1])
+            step = b - a + 1
             new_h0 = self._apply_shift(h0, x)
+            window = new_h0[:, :step, :]
+            output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
-            h0x = torch.cat([h0, x], dim=1)
-            input_ = h0x[:, : -self.steps, :]
-            output = self.operation(input_, scale, dim=1, keepdim=True)
-
         return output, state
 
     def __str__(self):
@@ -555,4 +549,3 @@ class Until(STL_Formula):
 
     def __str__(self):
         return f"({self.left}) U_{self._interval} ({self.right})"
-    

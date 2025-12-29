@@ -52,6 +52,25 @@ def create_beliefs_from_trace(mean_trace, var_trace):
 
     return BeliefTrajectory(beliefs)
 
+def interval_seconds_to_steps(interval_sec, t):
+    """
+    Convert STL interval given in seconds to discrete step offsets for your STL code.
+
+    interval_sec: [a_sec, b_sec] where b_sec can be np.inf
+    t: time vector (seconds), assumed uniform spacing
+    """
+    a_sec, b_sec = interval_sec
+    dt = float(t[1] - t[0])
+
+    a = int(round(a_sec / dt))
+
+    if np.isinf(b_sec):
+        b = np.inf
+    else:
+        b = int(round(b_sec / dt))
+
+    return [a, b]
+
 
 # =============================================================================
 # TEST CASE 1: Constant Input 
@@ -92,33 +111,47 @@ with skip_run("skip", "Test 2: Sinusoidal Input") as check, check():
     # Visualize raw signal
     plot_mean_with_sigma_bounds(t, mean_trace, var_trace, threshold=50)
 
-
 # =============================================================================
 # TEST CASE 1: Always Operator
 # =============================================================================
 
 with skip_run("run", "Test: Always Operator") as check, check():
 
-    a, b, g, q = -0.1, 1.0, 5.0, 0.3
-    mu, P = 10, 10
-    t = np.linspace(0, 10,1)
+    a, b, g, q = 0.1, 1.0, 5.0, 0.3
+    mu, P = 60, 5
+    t = np.linspace(0, 16, 100)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
 
     threshold = 50.0
     phi = GreaterThan(threshold)
-    spec = Always(phi, interval=[0, 11])
+    phi_trace = phi(belief_trajectory)
+    print("Predicate trace at t=0:", phi_trace[0, 0, :])
+    print("Predicate trace at t=20:", phi_trace[0, 20, :])
+    print("Predicate trace at t=59:", phi_trace[0, 59, :])
+    print("Shape:", phi_trace.shape)
+    interval_sec = [2, 5]
+    interval_steps = interval_seconds_to_steps(interval_sec, t)
+
+    spec = Always(phi, interval=interval_steps)
     robustness_trace = spec(belief_trajectory)
 
+    # Create custom formula string with original time interval
+    formula_str = f"Always[{interval_sec[0]},{interval_sec[1]}](x >= {threshold})"
+
+    # Plot with temporal windows
     plot_stl_formula_bounds(
         t,
         robustness_trace,
         mean_trace=mean_trace,
         var_trace=var_trace,
         thresholds=threshold,
-        formula_str=str(spec),
+        formula_str=formula_str, 
         show_upper=True,
+        interval=interval_steps,  
+        show_windows=True,
+        n_example_windows=4,
     )
 
 
@@ -126,7 +159,7 @@ with skip_run("run", "Test: Always Operator") as check, check():
 # TEST CASE 2: Complex Formula - Reach While Staying Safe
 # =============================================================================
 
-with skip_run("run", "Test: Complex Formula") as check, check():
+with skip_run("skip", "Test: Complex Formula") as check, check():
     a, b, g, q = 0.0, 1.0, 2.5, 0.5
     mu, P = 50, 8
     t = np.linspace(0, 10)
