@@ -191,7 +191,8 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
-        lower = torch.maximum(l1 + l2 - 1.0, torch.tensor(0.0))
+        
+        lower = torch.maximum(l1 + l2 - 1.0, torch.zeros_like(l1))
         upper = torch.minimum(u1, u2)
 
         return torch.cat([lower, upper], dim=-1)
@@ -225,7 +226,8 @@ class Or(STL_Formula):
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
         lower = torch.maximum(l1, l2)
-        upper = torch.minimum(u1 + u2, torch.tensor(1.0))
+        # FIX: Use ones_like for device compatibility
+        upper = torch.minimum(u1 + u2, torch.ones_like(u1))
 
         return torch.cat([lower, upper], dim=-1)
 
@@ -403,11 +405,11 @@ class Always(Temporal_Operator):
         # CASE 3: Bounded interval [a,b]
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
-            step = b - a + 1
             new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, :step, :]
+            window = new_h0[:, a:b+1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
+
         return output, state
 
     def __str__(self):
@@ -457,11 +459,11 @@ class Eventually(Temporal_Operator):
         # Case 3: Bounded interval [a,b]
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
-            step = b - a + 1
             new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, :step, :]
+            window = new_h0[:, a:b+1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
+
         return output, state
 
     def __str__(self):

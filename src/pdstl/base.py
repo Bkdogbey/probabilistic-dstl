@@ -5,14 +5,14 @@ class Belief(ABC):
     """
     Abstract base class for any belief representation.
     Users must implement:
-        - value() -> representative state (tensor)
+        - value() -> representative range of state (tensor)
         - prob_from_residual(residual) -> probability (tensor)
     """
 
     @abstractmethod
     def value(self):
         """
-        Return a representative state x(t)
+        Return a representative range of state x(t)
         """
         raise NotImplementedError
 
