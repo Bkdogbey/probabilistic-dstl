@@ -84,9 +84,9 @@ class GreaterThan(STL_Formula):
     """
     Predicate: x >= threshold
     Returns conservative probability intervals [lower, upper].
-    
-    Lower bound: Pessimistic 
-    Upper bound: Optimistic 
+
+    Lower bound: Pessimistic
+    Upper bound: Optimistic
     """
 
     def __init__(self, threshold):
@@ -96,22 +96,22 @@ class GreaterThan(STL_Formula):
     def robustness_trace(self, belief_trajectory, **kwargs):
         probs_lower = []
         probs_upper = []
-        
+
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
-            
-            # LOWER BOUND: 
-            
+
+            # LOWER BOUND:
+
             lower_bound = belief.lower_bound()  # μ - k*σ
             residual_lower = lower_bound - self.threshold
             prob_lower = belief.probability_of(residual_lower)
-            
+
             # UPPER BOUND: Optimistic assumption
-            
+
             upper_bound = belief.upper_bound()  # μ + k*σ
             residual_upper = upper_bound - self.threshold
             prob_upper = belief.probability_of(residual_upper)
-            
+
             probs_lower.append(prob_lower)
             probs_upper.append(prob_upper)
 
@@ -131,7 +131,6 @@ class GreaterThan(STL_Formula):
         return f"x >= {self.threshold}"
 
 
-
 class LessThan(STL_Formula):
     """
     Predicate: x <= threshold
@@ -145,20 +144,20 @@ class LessThan(STL_Formula):
     def robustness_trace(self, belief_trajectory, **kwargs):
         probs_lower = []
         probs_upper = []
-        
+
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
-            
+
             # LOWER BOUND: Pessimistic assumption
             upper_bound = belief.upper_bound()  # μ + k*σ
             residual_lower = self.threshold - upper_bound
             prob_lower = belief.probability_of(residual_lower)
-            
+
             # UPPER BOUND: Optimistic assumption
             lower_bound = belief.lower_bound()  # μ - k*σ
             residual_upper = self.threshold - lower_bound
             prob_upper = belief.probability_of(residual_upper)
-            
+
             probs_lower.append(prob_lower)
             probs_upper.append(prob_upper)
 
@@ -174,7 +173,6 @@ class LessThan(STL_Formula):
 
     def __str__(self):
         return f"x <= {self.threshold}"
-    
 
 
 # =============================================================================
@@ -228,7 +226,6 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
-        
         lower = torch.maximum(l1 + l2 - 1.0, torch.zeros_like(l1))
         upper = torch.minimum(u1, u2)
 
@@ -442,7 +439,7 @@ class Always(Temporal_Operator):
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, a:b+1, :]
+            window = new_h0[:, a : b + 1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
 
@@ -496,7 +493,7 @@ class Eventually(Temporal_Operator):
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, a:b+1, :]
+            window = new_h0[:, a : b + 1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
 

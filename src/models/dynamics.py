@@ -52,17 +52,17 @@ class GaussianBelief(Belief):
     def __init__(self, mean, var, confidence_level=2.0):
         self.mean = mean
         self.var = var
-        self.confidence_level = confidence_level  
+        self.confidence_level = confidence_level
 
     def value(self):
         """Return mean (representative state)"""
         return self.mean
-    
+
     def lower_bound(self):
         """Conservative lower bound: μ - k*σ"""
         std = torch.sqrt(self.var)
         return self.mean - self.confidence_level * std
-    
+
     def upper_bound(self):
         """Conservative upper bound: μ + k*σ"""
         std = torch.sqrt(self.var)
@@ -71,6 +71,5 @@ class GaussianBelief(Belief):
     def probability_of(self, residual):
         """Probability that residual >= 0"""
         std = torch.sqrt(self.var)
-        z = residual / (std)  
-        return 1- normal_cdf(z)
-
+        z = residual / (std)
+        return 1 - normal_cdf(z)

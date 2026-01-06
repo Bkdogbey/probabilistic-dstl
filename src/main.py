@@ -23,10 +23,11 @@ config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 # HELPER FUNCTIONS
 # =============================================================================
 
+
 def create_beliefs_from_trace(mean_trace, var_trace, confidence_level=2.0):
     """
     Create per-timestep beliefs from mean and variance traces.
-    
+
     Parameters
     ----------
     mean_trace : array_like
@@ -34,8 +35,8 @@ def create_beliefs_from_trace(mean_trace, var_trace, confidence_level=2.0):
     var_trace : array_like
         Variance values over time
     confidence_level : float
-        Number of standard deviations for confidence bounds 
-    
+        Number of standard deviations for confidence bounds
+
     Returns
     -------
     belief_trajectory : BeliefTrajectory
@@ -69,13 +70,13 @@ def interval_seconds_to_steps(interval_sec, t):
 # =============================================================================
 
 with skip_run("skip", "Test 1: Constant Input") as check, check():
-    a = 0.1   # positive drift
-    b = 1.0   # input gain
-    g = 0.5   # low stochastic noise
-    q = 0.1   # low process noise
+    a = 0.1  # positive drift
+    b = 1.0  # input gain
+    g = 0.5  # low stochastic noise
+    q = 0.1  # low process noise
 
-    mu = 45   # start below threshold
-    P = 5     # low initial variance
+    mu = 45  # start below threshold
+    P = 5  # low initial variance
 
     t = np.linspace(0, 10, 100)
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, constant_input)
@@ -88,13 +89,13 @@ with skip_run("skip", "Test 1: Constant Input") as check, check():
 # =============================================================================
 
 with skip_run("skip", "Test 2: Sinusoidal Input") as check, check():
-    a = 0.0   # zero drift
-    b = 1.0   # input gain
-    g = 2.5   # moderate stochastic noise
-    q = 0.5   # moderate process noise
+    a = 0.0  # zero drift
+    b = 1.0  # input gain
+    g = 2.5  # moderate stochastic noise
+    q = 0.5  # moderate process noise
 
-    mu = 50   # start at threshold
-    P = 5     # initial variance
+    mu = 50  # start at threshold
+    P = 5  # initial variance
 
     t = np.linspace(0, 10, 100)
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, noisy_stock_input)
@@ -107,19 +108,18 @@ with skip_run("skip", "Test 2: Sinusoidal Input") as check, check():
 # =============================================================================
 
 with skip_run("run", "Test 3: Always Operator") as check, check():
-
     a, b, g, q = 0.01, 1.0, 2.0, 2.5
     mu, P = 50, 0.388**2
     t = np.linspace(0, 10, 100)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
-    belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace,1)
+    belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace, 1)
 
     # Specification: Always[2,5](x >= 50)
     threshold = 50.0
     phi = GreaterThan(threshold)
-    
-    interval_sec = [1,2]
+
+    interval_sec = [1, 2]
     interval_steps = interval_seconds_to_steps(interval_sec, t)
 
     spec = Always(phi, interval=interval_steps)
@@ -132,7 +132,7 @@ with skip_run("run", "Test 3: Always Operator") as check, check():
         mean_trace=mean_trace,
         var_trace=var_trace,
         thresholds=threshold,
-        formula_str=formula_str, 
+        formula_str=formula_str,
         interval=interval_steps,
         show_windows=True,
         n_example_windows=5,
@@ -140,11 +140,10 @@ with skip_run("run", "Test 3: Always Operator") as check, check():
 
 
 # =============================================================================
-# TEST 4: Boolean AND 
+# TEST 4: Boolean AND
 # =============================================================================
 
 with skip_run("run", "Test 4: Boolean AND") as check, check():
-
     a, b, g, q = 0.01, 2.0, 4.0, 0.5
     mu, P = 50, 5
     t = np.linspace(0, 10, 100)
@@ -155,7 +154,7 @@ with skip_run("run", "Test 4: Boolean AND") as check, check():
     # Specification: (x >= 40) ∧ (x <= 55)
     phi_and = And(GreaterThan(40.0), LessThan(55.0))
     robustness_trace = phi_and(belief_trajectory)
- 
+
     plot_stl_formula_bounds(
         t,
         robustness_trace,
@@ -163,7 +162,7 @@ with skip_run("run", "Test 4: Boolean AND") as check, check():
         var_trace=var_trace,
         thresholds=[40.0, 55.0],
         formula_str="(x ≥ 40) ∧ (x ≤ 55)",
-        interval=None,  
+        interval=None,
         show_windows=True,
     )
 
@@ -173,7 +172,6 @@ with skip_run("run", "Test 4: Boolean AND") as check, check():
 # =============================================================================
 
 with skip_run("run", "Test 5: Complex Formula") as check, check():
-
     a, b, g, q = 0.1, 1.0, 0.5, 0.5
     mu, P = 40, 2
     t = np.linspace(0, 20, 100)
@@ -199,4 +197,3 @@ with skip_run("run", "Test 5: Complex Formula") as check, check():
         show_windows=True,
         n_example_windows=5,
     )
-
