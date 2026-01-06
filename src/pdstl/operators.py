@@ -80,8 +80,6 @@ class Maxish(torch.nn.Module):
 # =============================================================================
 # PREDICATES
 # =============================================================================
-# src/pdstl/operators.py
-
 class GreaterThan(STL_Formula):
     """
     Predicate: x >= threshold
@@ -104,14 +102,14 @@ class GreaterThan(STL_Formula):
             
             # LOWER BOUND: 
             
-            lower_state = belief.lower_bound()  # μ - k*σ
-            residual_lower = lower_state - self.threshold
+            lower_bound = belief.lower_bound()  # μ - k*σ
+            residual_lower = lower_bound - self.threshold
             prob_lower = belief.probability_of(residual_lower)
             
             # UPPER BOUND: Optimistic assumption
-            # "What if the true state is at the upper confidence bound?"
-            upper_state = belief.upper_bound()  # μ + k*σ
-            residual_upper = upper_state - self.threshold
+            
+            upper_bound = belief.upper_bound()  # μ + k*σ
+            residual_upper = upper_bound - self.threshold
             prob_upper = belief.probability_of(residual_upper)
             
             probs_lower.append(prob_lower)
@@ -133,7 +131,6 @@ class GreaterThan(STL_Formula):
         return f"x >= {self.threshold}"
 
 
-# src/pdstl/operators.py
 
 class LessThan(STL_Formula):
     """
@@ -153,13 +150,13 @@ class LessThan(STL_Formula):
             belief = belief_trajectory[t]
             
             # LOWER BOUND: Pessimistic assumption
-            upper_state = belief.upper_bound()  # μ + k*σ
-            residual_lower = self.threshold - upper_state
+            upper_bound = belief.upper_bound()  # μ + k*σ
+            residual_lower = self.threshold - upper_bound
             prob_lower = belief.probability_of(residual_lower)
             
             # UPPER BOUND: Optimistic assumption
-            lower_state = belief.lower_bound()  # μ - k*σ
-            residual_upper = self.threshold - lower_state
+            lower_bound = belief.lower_bound()  # μ - k*σ
+            residual_upper = self.threshold - lower_bound
             prob_upper = belief.probability_of(residual_upper)
             
             probs_lower.append(prob_lower)

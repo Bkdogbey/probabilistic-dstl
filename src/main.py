@@ -109,17 +109,17 @@ with skip_run("skip", "Test 2: Sinusoidal Input") as check, check():
 with skip_run("run", "Test 3: Always Operator") as check, check():
 
     a, b, g, q = 0.01, 1.0, 2.0, 2.5
-    mu, P = 50, 2
+    mu, P = 50, 0.388**2
     t = np.linspace(0, 10, 100)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
-    belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
+    belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace,1)
 
     # Specification: Always[2,5](x >= 50)
-    threshold = 45.0
+    threshold = 50.0
     phi = GreaterThan(threshold)
     
-    interval_sec = [0, 10]
+    interval_sec = [1,2]
     interval_steps = interval_seconds_to_steps(interval_sec, t)
 
     spec = Always(phi, interval=interval_steps)
@@ -135,7 +135,7 @@ with skip_run("run", "Test 3: Always Operator") as check, check():
         formula_str=formula_str, 
         interval=interval_steps,
         show_windows=True,
-        n_example_windows=3,
+        n_example_windows=5,
     )
 
 

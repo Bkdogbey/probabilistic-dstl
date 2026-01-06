@@ -71,6 +71,6 @@ class GaussianBelief(Belief):
     def probability_of(self, residual):
         """Probability that residual >= 0"""
         std = torch.sqrt(self.var)
-        z = residual / (std + 1e-8)  
-        return normal_cdf(z)
+        z = residual / (std)  
+        return 1- normal_cdf(z)
 
