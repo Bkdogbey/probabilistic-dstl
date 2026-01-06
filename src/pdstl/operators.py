@@ -80,10 +80,15 @@ class Maxish(torch.nn.Module):
 # =============================================================================
 # PREDICATES
 # =============================================================================
+# src/pdstl/operators.py
+
 class GreaterThan(STL_Formula):
     """
     Predicate: x >= threshold
-    Returns probability intervals [lower, upper].
+    Returns conservative probability intervals [lower, upper].
+    
+    Lower bound: Pessimistic 
+    Upper bound: Optimistic 
     """
 
     def __init__(self, threshold):
@@ -91,29 +96,49 @@ class GreaterThan(STL_Formula):
         self.threshold = threshold
 
     def robustness_trace(self, belief_trajectory, **kwargs):
-        probs = []
+        probs_lower = []
+        probs_upper = []
+        
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
-            residual = belief.value() - self.threshold
-            prob = belief.probability_of(residual)  # [B, T, D]
-            probs.append(prob)
+            
+            # LOWER BOUND: 
+            
+            lower_state = belief.lower_bound()  # μ - k*σ
+            residual_lower = lower_state - self.threshold
+            prob_lower = belief.probability_of(residual_lower)
+            
+            # UPPER BOUND: Optimistic assumption
+            # "What if the true state is at the upper confidence bound?"
+            upper_state = belief.upper_bound()  # μ + k*σ
+            residual_upper = upper_state - self.threshold
+            prob_upper = belief.probability_of(residual_upper)
+            
+            probs_lower.append(prob_lower)
+            probs_upper.append(prob_upper)
 
-        prob_tensor = torch.cat(probs, dim=1)  # [B, T, D]
+        # Stack along time dimension
+        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
+        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
 
         # Remove the D dimension (assuming D=1 for scalar signals)
-        if prob_tensor.shape[2] == 1:
-            prob_tensor = prob_tensor.squeeze(2)  # [B, T]
+        if lower_tensor.shape[2] == 1:
+            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
+            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
 
-        # Return as [lower, upper] - identical for atomic predicates
-        return torch.stack([prob_tensor, prob_tensor], dim=-1)
+        # Return as [lower, upper] bounds
+        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
 
     def __str__(self):
         return f"x >= {self.threshold}"
 
 
+# src/pdstl/operators.py
+
 class LessThan(STL_Formula):
     """
     Predicate: x <= threshold
+    Returns conservative probability intervals [lower, upper].
     """
 
     def __init__(self, threshold):
@@ -121,23 +146,38 @@ class LessThan(STL_Formula):
         self.threshold = threshold
 
     def robustness_trace(self, belief_trajectory, **kwargs):
-        probs = []
+        probs_lower = []
+        probs_upper = []
+        
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
-            residual = self.threshold - belief.value()
-            prob = belief.probability_of(residual)  # [B, T, D]
-            probs.append(prob)
+            
+            # LOWER BOUND: Pessimistic assumption
+            upper_state = belief.upper_bound()  # μ + k*σ
+            residual_lower = self.threshold - upper_state
+            prob_lower = belief.probability_of(residual_lower)
+            
+            # UPPER BOUND: Optimistic assumption
+            lower_state = belief.lower_bound()  # μ - k*σ
+            residual_upper = self.threshold - lower_state
+            prob_upper = belief.probability_of(residual_upper)
+            
+            probs_lower.append(prob_lower)
+            probs_upper.append(prob_upper)
 
         # Stack along time dimension
-        prob_tensor = torch.cat(probs, dim=1)  # [B, T, D]
+        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
+        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
 
-        if prob_tensor.shape[2] == 1:
-            prob_tensor = prob_tensor.squeeze(2)  # [B, T]
+        if lower_tensor.shape[2] == 1:
+            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
+            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
 
-        return torch.stack([prob_tensor, prob_tensor], dim=-1)  # [B, T, 2]
+        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
 
     def __str__(self):
         return f"x <= {self.threshold}"
+    
 
 
 # =============================================================================
@@ -226,7 +266,6 @@ class Or(STL_Formula):
         l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
 
         lower = torch.maximum(l1, l2)
-        # FIX: Use ones_like for device compatibility
         upper = torch.minimum(u1 + u2, torch.ones_like(u1))
 
         return torch.cat([lower, upper], dim=-1)

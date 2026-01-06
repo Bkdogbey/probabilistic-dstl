@@ -13,7 +13,7 @@ from pdstl.operators import GreaterThan, LessThan, Always, Eventually, Until, An
 from visualization.bounds import plot_mean_with_sigma_bounds
 from visualization.robustness import plot_stl_formula_bounds
 from utils import skip_run
-import matplotlib.pyplot as plt
+
 
 config_path = "configs/config.yml"
 config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
@@ -23,8 +23,24 @@ config = yaml.load(open(str(config_path)), Loader=yaml.SafeLoader)
 # HELPER FUNCTIONS
 # =============================================================================
 
-def create_beliefs_from_trace(mean_trace, var_trace):
-    """Create per-timestep beliefs from mean and variance traces."""
+def create_beliefs_from_trace(mean_trace, var_trace, confidence_level=2.0):
+    """
+    Create per-timestep beliefs from mean and variance traces.
+    
+    Parameters
+    ----------
+    mean_trace : array_like
+        Mean values over time
+    var_trace : array_like
+        Variance values over time
+    confidence_level : float
+        Number of standard deviations for confidence bounds 
+    
+    Returns
+    -------
+    belief_trajectory : BeliefTrajectory
+        Trajectory of Gaussian beliefs with conservative bounds
+    """
     mean_torch = torch.tensor(mean_trace, dtype=torch.float32).reshape(1, -1, 1)
     var_torch = torch.tensor(var_trace, dtype=torch.float32).reshape(1, -1, 1)
 
@@ -32,7 +48,7 @@ def create_beliefs_from_trace(mean_trace, var_trace):
     for i in range(len(mean_trace)):
         mean_i = mean_torch[:, i : i + 1, :]
         var_i = var_torch[:, i : i + 1, :]
-        beliefs.append(GaussianBelief(mean_i, var_i))
+        beliefs.append(GaussianBelief(mean_i, var_i, confidence_level=confidence_level))
 
     return BeliefTrajectory(beliefs)
 
@@ -92,18 +108,18 @@ with skip_run("skip", "Test 2: Sinusoidal Input") as check, check():
 
 with skip_run("run", "Test 3: Always Operator") as check, check():
 
-    a, b, g, q = 0.1, 1.0, 10.0, 0.3
-    mu, P = 50, 5
+    a, b, g, q = 0.01, 1.0, 2.0, 2.5
+    mu, P = 50, 2
     t = np.linspace(0, 10, 100)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
     belief_trajectory = create_beliefs_from_trace(mean_trace, var_trace)
 
     # Specification: Always[2,5](x >= 50)
-    threshold = 50.0
+    threshold = 45.0
     phi = GreaterThan(threshold)
     
-    interval_sec = [2, 5]
+    interval_sec = [0, 10]
     interval_steps = interval_seconds_to_steps(interval_sec, t)
 
     spec = Always(phi, interval=interval_steps)
@@ -129,7 +145,7 @@ with skip_run("run", "Test 3: Always Operator") as check, check():
 
 with skip_run("run", "Test 4: Boolean AND") as check, check():
 
-    a, b, g, q = 0.0, 1.0, 2.0, 0.5
+    a, b, g, q = 0.01, 2.0, 4.0, 0.5
     mu, P = 50, 5
     t = np.linspace(0, 10, 100)
 
@@ -148,7 +164,7 @@ with skip_run("run", "Test 4: Boolean AND") as check, check():
         thresholds=[40.0, 55.0],
         formula_str="(x ≥ 40) ∧ (x ≤ 55)",
         interval=None,  
-        show_windows=False,
+        show_windows=True,
     )
 
 
@@ -158,8 +174,8 @@ with skip_run("run", "Test 4: Boolean AND") as check, check():
 
 with skip_run("run", "Test 5: Complex Formula") as check, check():
 
-    a, b, g, q = 0.1, 1.0, 12.5, 0.5
-    mu, P = 45, 8
+    a, b, g, q = 0.1, 1.0, 0.5, 0.5
+    mu, P = 40, 2
     t = np.linspace(0, 20, 100)
 
     mean_trace, var_trace = linear_system(a, b, g, q, mu, P, t, sinusoidial_input)
@@ -167,7 +183,7 @@ with skip_run("run", "Test 5: Complex Formula") as check, check():
 
     interval_steps = [0, 20]
     reach_target = Eventually(GreaterThan(70.0), interval=interval_steps)
-    stay_safe = Always(GreaterThan(40.0), interval=interval_steps)
+    stay_safe = Always(GreaterThan(50.0), interval=interval_steps)
 
     spec = reach_target & stay_safe
     robustness_trace = spec(belief_trajectory)
@@ -181,7 +197,6 @@ with skip_run("run", "Test 5: Complex Formula") as check, check():
         formula_str="◇[0,20](x ≥ 70) ∧ □[0,20](x ≥ 40)",
         interval=interval_steps,
         show_windows=True,
-        n_example_windows=3,
+        n_example_windows=5,
     )
 
-plt(belief_trajectory, title="Belief Trajectory", save_path=None)
