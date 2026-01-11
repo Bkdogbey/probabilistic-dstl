@@ -26,6 +26,33 @@ def noisy_stock_input(t):
     jitter = 0.2 * np.random.randn()
     return drift + noise + jitter
 
+def step_sequence_input(t):
+    """Discrete step sequence mimicking paper-style signals."""
+    if t < 2:
+        return 10.0
+    elif t < 4:
+        return -5.0
+    elif t < 6:
+        return -15.0
+    elif t < 8:
+        return 20.0
+    else:
+        return 5.0
+    
+def piecewise_input(t):
+    """
+    Piecewise constant input for STL verification.
+    """
+    if t < 2:
+        return 0.0       
+    elif t < 4:
+        return 20.0      
+    elif t < 6:
+        return -25.0     
+    elif t < 8:
+        return 30.0      
+    else:
+        return -5.0      
 
 def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
     """Propagate the belief state (mu, P) through one time step."""
@@ -72,4 +99,4 @@ class GaussianBelief(Belief):
         """Probability that residual >= 0"""
         std = torch.sqrt(self.var)
         z = residual / (std)
-        return 1 - normal_cdf(z)
+        return normal_cdf(z)

@@ -1,6 +1,30 @@
+"""
+STL Robustness Visualization
+
+3-panel layout:
+  (a) Signal trajectory
+  (b) Predicate satisfaction probability  
+  (c) Temporal operator output
+"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+
+def _to_numpy(trace, T):
+    """Convert trace to numpy [T, 2]."""
+    if isinstance(trace, torch.Tensor):
+        trace = trace.detach().cpu().numpy()
+    trace = np.asarray(trace)
+    
+    if trace.ndim == 3:
+        trace = trace[0]
+    elif trace.ndim == 1:
+        trace = np.stack([trace, trace], axis=-1)
+    
+    assert trace.shape == (T, 2), f"Expected ({T}, 2), got {trace.shape}"
+    return trace
 
 
 def plot_stl_formula_bounds(
@@ -8,311 +32,204 @@ def plot_stl_formula_bounds(
     robustness_trace,
     mean_trace=None,
     var_trace=None,
+    predicate_trace=None,
     thresholds=None,
     formula_str=None,
-    show_upper=True,
-    interval=None,  # [a,b] in STEPS (not seconds)
-    show_windows=True,
-    n_example_windows=3,
+    interval=None,
+    operator_type='always',
+    figsize=(10, 8),
+    save_path=None,
 ):
     """
-    General STL verification plot with optional temporal-window visualization.
-
+    STL verification plot with signal, predicate, and operator output.
+    
     Parameters
     ----------
     time : array_like
-        Time vector (seconds or arbitrary units), length T
-    robustness_trace : torch.Tensor or np.ndarray
-        Output from formula(belief_trajectory), shape [B, T, 2] or [T,2]
-    mean_trace : array_like, optional
-        Mean signal trajectory, length T
-    var_trace : array_like, optional
-        Variance trajectory, length T
-    thresholds : float or list[float], optional
-        Threshold line(s) to display on signal plot
+        Time vector, length T
+    robustness_trace : array_like
+        Output of temporal operator, shape [B,T,2] or [T,2]
+    mean_trace, var_trace : array_like, optional
+        Signal mean and variance for top panel
+    predicate_trace : array_like, optional
+        Output of predicate φ, shape [B,T,2] or [T,2]
+    thresholds : float or list, optional
+        Threshold line(s) for signal plot
     formula_str : str, optional
-        String representation of the STL formula
-    show_upper : bool
-        Plot both lower/upper bounds if True, else only lower
-    interval : (a,b), optional
-        Temporal interval [a,b] IN STEPS (indices). Used only for visualization.
-    show_windows : bool
-        If True and interval provided, visualize windows [t+a, t+b]
-    n_example_windows : int
-        Number of example windows to visualize
-
+        Formula string for suptitle
+    interval : [a, b], optional
+        Temporal interval in STEPS (auto windows if provided)
+    operator_type : str
+        'always' or 'eventually'
+    save_path : str, optional
+        Path to save figure
+    
     Returns
     -------
-    fig, (ax1, ax2)
+    fig, axes
     """
     time = np.asarray(time)
     T = len(time)
-
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    def _pick_example_indices(n_points: int, n_examples: int) -> np.ndarray:
-        if n_points <= 1:
-            return np.array([0], dtype=int)
-        idx = np.linspace(0, n_points - 1, num=min(n_examples, n_points))
-        return np.unique(np.round(idx).astype(int))
-
-    def _as_np_trace(rt):
-        if isinstance(rt, torch.Tensor):
-            rt = rt.detach().cpu().numpy()
-        rt = np.asarray(rt)
-
-        # Accept [B,T,2], [T,2], [B,T] (rare), [T]
-        if rt.ndim == 3:
-            rt = rt[0]  # take batch 0 -> [T,2]
-        elif rt.ndim == 2:
-            # [T,2] ok
-            pass
-        elif rt.ndim == 1:
-            # [T] -> treat as lower=upper
-            rt = np.stack([rt, rt], axis=-1)
-        else:
-            raise ValueError(f"Unexpected robustness_trace shape: {rt.shape}")
-
-        if rt.shape[0] != T:
-            raise ValueError(
-                f"Time length T={T} but robustness_trace has length {rt.shape[0]}."
-            )
-        if rt.shape[1] != 2:
-            raise ValueError(
-                f"robustness_trace must have last dim 2 (lower/upper). Got {rt.shape}."
-            )
-        return rt
-
-    rt = _as_np_trace(robustness_trace)
-    prob_lower = rt[:, 0]
-    prob_upper = rt[:, 1]
-
-    # Robust dt for inclusive-looking shading
-    dt = np.median(np.diff(time)) if T > 1 else 1.0
-
-    # -----------------------------
-    # Figure
-    # -----------------------------
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-
+    
+    oper = _to_numpy(robustness_trace, T)
+    pred = _to_numpy(predicate_trace, T) if predicate_trace is not None else None
+    
+    # Operator symbol
+    op_symbol = '□' if operator_type == 'always' else '◇'
+    
+    # Figure setup
+    if pred is not None:
+        fig, axes = plt.subplots(3, 1, figsize=figsize, sharex=True)
+        ax_signal, ax_pred, ax_oper = axes
+    else:
+        fig, axes = plt.subplots(2, 1, figsize=(figsize[0], figsize[1]*0.7), sharex=True)
+        ax_signal, ax_oper = axes
+        ax_pred = None
+    
     # =========================================================================
-    # TOP PANEL: Signal
+    # Panel (a): Signal
     # =========================================================================
     if mean_trace is not None and var_trace is not None:
         mean_trace = np.asarray(mean_trace)
         var_trace = np.asarray(var_trace)
-
-        if len(mean_trace) != T or len(var_trace) != T:
-            raise ValueError("mean_trace and var_trace must have same length as time.")
-
         sigma = np.sqrt(np.maximum(var_trace, 0.0))
-        lower_sigma = mean_trace - sigma
-        upper_sigma = mean_trace + sigma
-
-        ax1.plot(time, mean_trace, linewidth=2.5, label="Mean μ(t)", zorder=5)
-        ax1.fill_between(
-            time,
-            lower_sigma,
-            upper_sigma,
-            alpha=0.25,
-            label="μ(t) ± σ(t)",
-            zorder=3,
-        )
-
-        # Threshold(s)
+        
+        ax_signal.fill_between(time, mean_trace - sigma, mean_trace + sigma,
+                                alpha=0.25, color='steelblue')
+        ax_signal.plot(time, mean_trace, 'b-', lw=1.5, label='μ(t)')
+        ax_signal.plot(time, mean_trace + sigma, 'b--', lw=1, alpha=0.7, label='μ ± σ')
+        ax_signal.plot(time, mean_trace - sigma, 'b--', lw=1, alpha=0.7)
+        
         if thresholds is not None:
-            if not isinstance(thresholds, (list, tuple)):
-                thresholds = [thresholds]
-            for thresh in thresholds:
-                ax1.axhline(
-                    thresh,
-                    linestyle="--",
-                    linewidth=2.0,
-                    alpha=0.8,
-                    label=f"Threshold = {thresh}",
-                    zorder=4,
-                )
-
-        ax1.set_ylabel("Signal x(t)", fontsize=13, fontweight="bold")
-        ax1.set_title("Signal Trajectory", fontsize=14, fontweight="bold")
-        ax1.grid(True, alpha=0.3, zorder=0)
-
-        # Add interval annotation
+            thresholds = [thresholds] if not isinstance(thresholds, (list, tuple)) else thresholds
+            for th in thresholds:
+                ax_signal.axhline(th, color='red', ls='--', lw=1.5, label=f'h = {th}')
+    
+    ax_signal.set_ylabel('x(t)')
+    ax_signal.set_title('(a) Signal Trajectory', loc='left', fontweight='bold')
+    ax_signal.legend(loc='upper right', fontsize=8)
+    ax_signal.grid(True, alpha=0.3)
+    
+    # =========================================================================
+    # Panel (b): Predicate with sliding windows
+    # =========================================================================
+    if ax_pred is not None:
+        # Light green fill between bounds
+        ax_pred.fill_between(time, pred[:, 0], pred[:, 1], alpha=0.3, color='lightgreen')
+        ax_pred.plot(time, pred[:, 0], 'b-', lw=1.5, label='Lower bound')
+        ax_pred.plot(time, pred[:, 1], 'r-', lw=1.5, label='Upper bound')
+        
+        # Auto sliding windows
         if interval is not None:
-            a, b = int(interval[0]), int(interval[1])
-            ax1.text(
-                0.01,
-                0.98,
-                f"Interval (steps): [{a},{b}]",
-                transform=ax1.transAxes,
-                va="top",
-                fontsize=10,
-                bbox=dict(boxstyle="round", alpha=0.12),
-            )
-
-    else:
-        # Still label the axis
-        ax1.set_ylabel("Signal x(t)", fontsize=13, fontweight="bold")
-        ax1.set_title("Signal Trajectory", fontsize=14, fontweight="bold")
-        ax1.grid(True, alpha=0.3, zorder=0)
-
-    # After signal is drawn, get limits for arrow placement
-    ymin, ymax = ax1.get_ylim()
-    y_arrow = ymin + 0.85 * (ymax - ymin)
-
+            _draw_sliding_windows(ax_pred, time, T, interval)
+        
+        ax_pred.set_ylabel('P(φ)')
+        ax_pred.set_ylim(-0.05, 1.05)
+        ax_pred.set_title('(b) Predicate Satisfaction Probability', loc='left', fontweight='bold')
+        ax_pred.legend(loc='upper right', fontsize=8)
+        ax_pred.grid(True, alpha=0.3)
+    
     # =========================================================================
-    # Window visualization on TOP
+    # Panel (c): Operator output
     # =========================================================================
-    if show_windows and interval is not None and T > 0:
-        a, b = int(interval[0]), int(interval[1])
-
-        example_indices = _pick_example_indices(T, n_example_windows)
-        colors_window = ["orange", "purple", "brown", "cyan", "magenta"]
-
-        for i, t_idx in enumerate(example_indices):
-            color = colors_window[i % len(colors_window)]
-
-            # window indices in step-space; clip only for visualization
-            ws = int(np.clip(t_idx + a, 0, T - 1))
-            we = int(np.clip(t_idx + b, 0, T - 1))
-
-            t_current = time[t_idx]
-            t_start = time[ws]
-            t_end = time[we]
-
-            # shaded region (inclusive-looking)
-            ax1.axvspan(
-                t_start,
-                t_end + 0.5 * dt,
-                alpha=0.12,
-                color=color,
-                zorder=1,
-            )
-
-            # line at current time
-            ax1.axvline(
-                t_current,
-                color=color,
-                linestyle=":",
-                linewidth=2.0,
-                alpha=0.65,
-                zorder=4,
-            )
-
-            # arrow from t to start of window
-            ax1.annotate(
-                "",
-                xy=(t_start, y_arrow),
-                xytext=(t_current, y_arrow),
-                arrowprops=dict(arrowstyle="->", color=color, lw=2.0, alpha=0.7),
-                zorder=6,
-            )
-
-            ax1.text(
-                t_current,
-                y_arrow,
-                f" t={t_current:.2f}",
-                fontsize=9,
-                color=color,
-                fontweight="bold",
-                va="bottom",
-                ha="left",
-                zorder=7,
-            )
-
-    # Legend for top (after windows so labels don’t get duplicated)
-    ax1.legend(loc="best", fontsize=10, framealpha=0.95, ncol=2)
-
-    # =========================================================================
-    # BOTTOM PANEL: Probability bounds
-    # =========================================================================
-    if show_upper:
-        ax2.plot(
-            time,
-            prob_lower,
-            linewidth=2.5,
-            label="P_lower (guaranteed)",
-            marker="o",
-            markersize=4,
-            markevery=max(1, T // 25),
-            zorder=5,
-        )
-        ax2.plot(
-            time,
-            prob_upper,
-            linewidth=2.5,
-            label="P_upper (best-case)",
-            marker="s",
-            markersize=4,
-            markevery=max(1, T // 25),
-            zorder=5,
-        )
-        ax2.fill_between(
-            time,
-            prob_lower,
-            prob_upper,
-            alpha=0.25,
-            label="Uncertainty interval",
-            zorder=3,
-        )
-    else:
-        ax2.plot(
-            time,
-            prob_lower,
-            linewidth=3.0,
-            label="P(φ satisfied)",
-            marker="o",
-            markersize=4,
-            markevery=max(1, T // 25),
-            zorder=5,
-        )
-        ax2.fill_between(time, 0, prob_lower, alpha=0.25, zorder=3)
-
-    # Window visualization on BOTTOM
-    if show_windows and interval is not None and T > 0:
-        a, b = int(interval[0]), int(interval[1])
-        example_indices = _pick_example_indices(T, n_example_windows)
-        colors_window = ["orange", "purple", "brown", "cyan", "magenta"]
-
-        for i, t_idx in enumerate(example_indices):
-            color = colors_window[i % len(colors_window)]
-            ws = int(np.clip(t_idx + a, 0, T - 1))
-            we = int(np.clip(t_idx + b, 0, T - 1))
-
-            ax2.axvspan(
-                time[ws],
-                time[we] + 0.5 * dt,
-                alpha=0.08,
-                color=color,
-                zorder=1,
-            )
-            ax2.axvline(
-                time[t_idx],
-                color=color,
-                linestyle=":",
-                linewidth=1.8,
-                alpha=0.5,
-                zorder=4,
-            )
-
-    # Reference lines
-    ax2.axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.35, zorder=2)
-    ax2.axhline(0.5, color="gray", linestyle=":", linewidth=1.5, alpha=0.55, zorder=2)
-    ax2.axhline(0.0, color="black", linestyle="--", linewidth=1, alpha=0.35, zorder=2)
-
-    ax2.set_xlabel("Time t (s)", fontsize=13, fontweight="bold")
-    ax2.set_ylabel("Satisfaction Probability", fontsize=13, fontweight="bold")
-    ax2.set_ylim([-0.05, 1.05])
-
+    # Light green fill between bounds
+    ax_oper.fill_between(time, oper[:, 0], oper[:, 1], alpha=0.3, color='lightgreen')
+    ax_oper.plot(time, oper[:, 0], 'b-', lw=1.5, label='Lower bound')
+    ax_oper.plot(time, oper[:, 1], 'r-', lw=1.5, label='Upper bound')
+    
+    # Auto sliding windows with output markers
+    if interval is not None and pred is not None:
+        _draw_output_markers(ax_oper, time, T, interval, oper)
+    
+    ax_oper.set_xlabel('Time (s)')
+    ax_oper.set_ylabel(f'P({op_symbol}φ)')
+    ax_oper.set_ylim(-0.05, 1.05)
+    ax_oper.set_title(f'(c) Temporal Operator Output', loc='left', fontweight='bold')
+    ax_oper.legend(loc='upper right', fontsize=8)
+    ax_oper.grid(True, alpha=0.3)
+    
+    # Suptitle with formula
     if formula_str:
-        ax2.set_title(f"STL Formula: {formula_str}", fontsize=14, fontweight="bold")
-    else:
-        ax2.set_title("STL Satisfaction Probability", fontsize=14, fontweight="bold")
-
-    ax2.legend(loc="best", fontsize=10, framealpha=0.95)
-    ax2.grid(True, alpha=0.3, zorder=0)
-
+        fig.suptitle(formula_str, fontsize=12, fontweight='bold')
+    
     plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    
     plt.show()
-    return fig, (ax1, ax2)
+    
+    return fig, axes
+
+
+def _draw_sliding_windows(ax, time, T, interval):
+    """Draw automatic sliding windows based on interval."""
+    a = int(interval[0])
+    b_inf = np.isinf(interval[1])
+    b = T - 1 if b_inf else int(interval[1])
+    
+    # Window width in steps
+    window_width = b - a + 1
+    
+    # Auto-select number of windows: show ~4 non-overlapping if possible
+    if window_width >= T:
+        # Window covers entire trace, just show one
+        n_windows = 1
+    else:
+        # Aim for 4 windows, spaced so they don't overlap too much
+        n_windows = min(4, max(1, T // window_width))
+    
+    # Pick evenly spaced starting points
+    max_start = max(0, T - 1 - b)
+    if max_start <= 0:
+        t_indices = np.array([0])
+    else:
+        t_indices = np.linspace(0, max_start, n_windows).astype(int)
+    
+    # Colors - varying orange intensity
+    colors = plt.cm.Oranges(np.linspace(0.25, 0.65, len(t_indices)))
+    
+    for i, t_idx in enumerate(t_indices):
+        w_start = t_idx + a
+        w_end = t_idx + b
+        
+        # Clip to valid range
+        w_start = min(w_start, T - 1)
+        w_end = min(w_end, T - 1)
+        
+        if w_start > w_end:
+            continue
+        
+        # Shaded window
+        ax.axvspan(time[w_start], time[w_end], alpha=0.15, color=colors[i])
+        
+        # Small marker at evaluation point t_idx
+        ax.plot(time[t_idx], -0.03, marker='v', color=colors[i], 
+                markersize=5, clip_on=False)
+
+
+def _draw_output_markers(ax, time, T, interval, oper):
+    """Draw markers on output corresponding to window positions."""
+    a = int(interval[0])
+    b_inf = np.isinf(interval[1])
+    b = T - 1 if b_inf else int(interval[1])
+    
+    window_width = b - a + 1
+    
+    if window_width >= T:
+        n_windows = 1
+    else:
+        n_windows = min(4, max(1, T // window_width))
+    
+    max_start = max(0, T - 1 - b)
+    if max_start <= 0:
+        t_indices = np.array([0])
+    else:
+        t_indices = np.linspace(0, max_start, n_windows).astype(int)
+    
+    colors = plt.cm.Oranges(np.linspace(0.25, 0.65, len(t_indices)))
+    
+    for i, t_idx in enumerate(t_indices):
+        if t_idx >= T:
+            continue
+        ax.plot(time[t_idx], oper[t_idx, 0], 'o', color=colors[i], markersize=5)
