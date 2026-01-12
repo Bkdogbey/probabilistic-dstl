@@ -439,7 +439,7 @@ class Always(Temporal_Operator):
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, a : b + 1, :]
+            window = new_h0[:, : b - a + 1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
 
@@ -493,7 +493,7 @@ class Eventually(Temporal_Operator):
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, a : b + 1, :]
+            window = new_h0[:, : b - a + 1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
 

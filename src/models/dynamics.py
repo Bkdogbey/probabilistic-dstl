@@ -27,20 +27,6 @@ def noisy_stock_input(t):
     return drift + noise + jitter
 
 
-def step_sequence_input(t):
-    """Discrete step sequence mimicking paper-style signals."""
-    if t < 2:
-        return 10.0
-    elif t < 4:
-        return -5.0
-    elif t < 6:
-        return -15.0
-    elif t < 8:
-        return 20.0
-    else:
-        return 5.0
-
-
 def piecewise_input(t):
     """
     Piecewise constant input for STL verification.
@@ -76,6 +62,28 @@ def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
         # Variance update
         var_trace[i] = (Phi**2) * var_trace[i - 1] + Q * dt
     return mean_trace, var_trace
+
+
+def piecewise_signal(n_steps=7):
+    """
+    Discrete piecewise constant signal for STL verification.
+    """
+    t = np.arange(n_steps, dtype=float)
+
+    default_values = [
+        (45, 4),
+        (55, 4),
+        (60, 4),
+        (48, 4),
+        (42, 9),
+        (58, 4),
+        (52, 4),
+    ]
+
+    mean_trace = np.array([s[0] for s in default_values], dtype=float)
+    var_trace = np.array([s[1] for s in default_values], dtype=float)
+
+    return t, mean_trace, var_trace
 
 
 class GaussianBelief(Belief):
