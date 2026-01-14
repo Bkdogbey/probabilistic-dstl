@@ -100,7 +100,7 @@ with skip_run("run", "Example 3: Piecewise") as check, check():
     t, mean, var = piecewise_signal()
 
     print(f"\n{'=' * 50}")
-    print(f"Example 3: Discrete Piecewise Signal")
+    print("Example 3: Discrete Piecewise Signal")
     print(f"{'=' * 50}")
     print("\nSignal values:")
     print(f"{'t':<4} {'μ(t)':<8} {'σ²(t)':<8} {'σ(t)':<8}")
