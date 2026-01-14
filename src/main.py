@@ -7,16 +7,12 @@ from models.dynamics import (
     sinusoidial_input,
 )
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import GreaterThan, Always, Eventually
+from pdstl.operators import GreaterThan, Always
 from visualization.robustness import plot_stl_formula_bounds, plot_piecewise_stl
 from utils import skip_run
 
 
-# =============================================================================
 # HELPERS
-# =============================================================================
-
-
 def create_belief_trajectory(mean_trace, var_trace, confidence_level=1.0):
     """Create belief trajectory from mean and variance traces."""
     mean = torch.tensor(mean_trace, dtype=torch.float32).reshape(1, -1, 1)
@@ -96,42 +92,8 @@ with skip_run("run", "Example 1: Always") as check, check():
         operator_type="always",
     )
 
-
 # =============================================================================
-# EXAMPLE 2: Eventually Operator (continuous)
-# =============================================================================
-
-with skip_run("run", "Example 2: Eventually") as check, check():
-    t = np.linspace(0, 20, 100)
-    mean, var = linear_system(
-        a=0.1, b=1.0, g=0.5, q=0.5, mu=40, P=2.0, t=t, control_func=sinusoidial_input
-    )
-
-    beliefs = create_belief_trajectory(mean, var, confidence_level=1.0)
-
-    threshold = 70.0
-    interval_sec = [0, 5]
-    interval_steps = to_steps(interval_sec, t)
-
-    phi = GreaterThan(threshold)
-    spec = Eventually(phi, interval=interval_steps)
-
-    pred_trace = phi(beliefs)
-    oper_trace = spec(beliefs)
-    plot_stl_formula_bounds(
-        t,
-        oper_trace,
-        mean_trace=mean,
-        var_trace=var,
-        predicate_trace=pred_trace,
-        thresholds=threshold,
-        formula_str=f"◇[{interval_sec[0]}, {interval_sec[1]}](x ≥ {threshold})",
-        interval=interval_steps,
-        operator_type="eventually",
-    )
-
-# =============================================================================
-# EXAMPLE 3: Discrete Piecewise Signal
+# EXAMPLE 2: Discrete Piecewise Signal
 # =============================================================================
 
 with skip_run("run", "Example 3: Piecewise") as check, check():
