@@ -102,7 +102,7 @@ def plot_stl_formula_bounds(
     ax_oper.set_xlabel("Time (s)")
     ax_oper.set_ylabel(f"P({op_symbol}φ)")
     ax_oper.set_ylim(-0.05, 1.05)
-    ax_oper.set_title(f"(c) Temporal Operator Output", loc="left", fontweight="bold")
+    ax_oper.set_title("(c) Temporal Operator Output", loc="left", fontweight="bold")
     ax_oper.legend(loc="upper right", fontsize=8)
     ax_oper.grid(True, alpha=0.3)
 
