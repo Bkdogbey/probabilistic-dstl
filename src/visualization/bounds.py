@@ -6,7 +6,6 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
     """
     Plot a trace with ±1σ bounds and highlight where the trace
     violates a given threshold.
-
     Parameters
     ----------
     time : array_like
@@ -21,17 +20,17 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
     sigma = np.sqrt(var_trace)
     lower_sigma = mean_trace - sigma
     upper_sigma = mean_trace + sigma
-
     # Identify violations
     full_violation = upper_sigma < threshold
     partial_violation = (lower_sigma < threshold) & ~full_violation
 
-    # Plot setup
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[2, 1])
 
+    # TRACE PLOT 
     # Main trace and uncertainty
-    ax.plot(time, mean_trace, color="blue", linewidth=2, label="Mean Height")
-    ax.fill_between(
+    ax1.plot(time, mean_trace, color="blue", linewidth=2, label="Mean Height")
+    ax1.fill_between(
         time,
         lower_sigma,
         upper_sigma,
@@ -39,21 +38,19 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         alpha=0.2,
         label="±1σ Interval",
     )
-
+   
     # Threshold line
-    ax.axhline(
+    ax1.axhline(
         threshold,
         color="red",
         linestyle="--",
         label=f"Threshold = {threshold} m",
     )
-
     # Vertical range for shading violations
     y_min = np.min(lower_sigma) * 0.9
     y_max = np.max(upper_sigma) * 1.1
-
     # Shaded violation regions
-    ax.fill_between(
+    ax1.fill_between(
         time,
         y_min,
         y_max,
@@ -62,7 +59,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         alpha=0.1,
         label="Full violation (both bounds < threshold)",
     )
-    ax.fill_between(
+    ax1.fill_between(
         time,
         y_min,
         y_max,
@@ -71,9 +68,8 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         alpha=0.1,
         label="Partial violation (lower bound < threshold)",
     )
-
     # Violation markers
-    ax.scatter(
+    ax1.scatter(
         time[full_violation],
         mean_trace[full_violation],
         color="red",
@@ -81,7 +77,7 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         label="Full Violation Points",
         zorder=5,
     )
-    ax.scatter(
+    ax1.scatter(
         time[partial_violation],
         mean_trace[partial_violation],
         facecolors="none",
@@ -90,11 +86,57 @@ def plot_mean_with_sigma_bounds(time, mean_trace, var_trace, threshold=50):
         label="Partial Violation Points",
         zorder=5,
     )
-
     # Aesthetics
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Output")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    ax1.set_xlabel("Time")
+    ax1.set_ylabel("Output")
+    ax1.legend(loc="best")
+    ax1.grid(True, alpha=0.3)
+    ax1.set_title("Trajectory with Violation Regions")
+
+    # ROBUSTNESS PLOT
+    # Compute pointwise robustness: ρ(t) = Lower sigma bound - threshold
+    robustness = lower_sigma - threshold
+
+    ax2.plot(
+        time, robustness, label="Robustness ρ(t) = x(t) - h", color="blue", linewidth=2
+    )
+    # Zero line (satisfaction boundary)
+    ax2.axhline(
+        0,
+        color="black",
+        linestyle="-",
+        linewidth=2,
+        label="Satisfaction Boundary (ρ=0)",
+    )
+
+    # Fill regions
+    ax2.fill_between(
+        time,
+        0,
+        robustness,
+        where=(robustness >= 0),
+        color="green",
+        alpha=0.2,
+        label="Satisfied (ρ>0)",
+        interpolate=True,
+    )
+    # Violation region
+    ax2.fill_between(
+        time,
+        robustness,
+        0,
+        where=(robustness < 0),
+        color="red",
+        alpha=0.2,
+        label="Violated (ρ<0)",
+        interpolate=True,
+    )
+    # Aesthetics
+    ax2.set_xlabel("Time")
+    ax2.set_ylabel("Robustness ρ(t)")
+    ax2.legend(loc="best")
+    ax2.grid(True, alpha=0.3)
+    ax2.set_title("STL Robustness")
+
     plt.tight_layout()
     plt.show()
