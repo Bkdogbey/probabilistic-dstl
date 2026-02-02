@@ -159,9 +159,9 @@ with skip_run("run", "Example 3: Motion Planning") as check, check():
     print(f"{'=' * 50}")
 
     # Problem setup
-    initial_state = np.array([0.0, 0.0])
+    initial_state = np.array([3.0, 0.0])
     goal_state = np.array([6.0, 6.0])
-    obstacle = {"x": [1.0, 7.0], "y": [3.0, 6.0]}
+    obstacle = {"x": [1.0, 5.0], "y": [3.0, 5.0]}
 
     print("\nSetup:")
     print(f"  Start: {initial_state}")
@@ -192,7 +192,7 @@ with skip_run("run", "Example 3: Motion Planning") as check, check():
         spec_goal=spec_goal,
         horizon=100,
         dt=0.15,
-        num_iterations=300,
+        num_iterations=400,
         lr=0.02,
         verbose=True,
     )
