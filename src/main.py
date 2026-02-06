@@ -1,6 +1,10 @@
-
-
 import numpy as np
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For MacOS to avoid libomp error
+import sys
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+sys.path.append(os.path.join(os.getcwd(), 'src'))
 import torch
 from models.dynamics import (
     GaussianBelief,
@@ -9,13 +13,10 @@ from models.dynamics import (
     sinusoidial_input,
 )
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import GreaterThan, Always, Eventually, LessThan
+from pdstl.operators import GreaterThan, Always
 from visualization.robustness import plot_stl_formula_bounds, plot_piecewise_stl
-from visualization.motion_planning import plot_trajectory_2d
-from motion_planning.predicates import ObstacleAvoidance, GoalReaching
-from motion_planning.dynamics import SingleIntegrator2D
-from motion_planning.planning_2d import optimize_trajectory
 from utils import skip_run
+from planning.runners import run_single_shot, run_mpc
 
 
 # HELPERS
@@ -102,11 +103,11 @@ with skip_run("skip", "Example 1: Always") as check, check():
 # EXAMPLE 2: Discrete Piecewise Signal
 # =============================================================================
 
-with skip_run("skip", "Example 2: Piecewise") as check, check():
+with skip_run("skip", "Example 3: Piecewise") as check, check():
     t, mean, var = piecewise_signal()
 
     print(f"\n{'=' * 50}")
-    print("Example 2: Discrete Piecewise Signal")
+    print("Example 3: Discrete Piecewise Signal")
     print(f"{'=' * 50}")
     print("\nSignal values:")
     print(f"{'t':<4} {'μ(t)':<8} {'σ²(t)':<8} {'σ(t)':<8}")
@@ -139,79 +140,14 @@ with skip_run("skip", "Example 2: Piecewise") as check, check():
         interval=interval_steps,
         operator_type="always",
     )
-
 # =============================================================================
-# EXAMPLE 3: 2D Motion Planning
+# EXAMPLE 3: Single Shot Motion Planning
 # =============================================================================
 
+with skip_run("skip", "Example 3: Single Shot Motion Planning") as check, check():
+    if __name__ == "__main__":
+        run_single_shot(max_iterations=2000)
 
-with skip_run("run", "Example 3: Motion Planning") as check, check():
-    from motion_planning import (
-        ObstacleAvoidance,
-        GoalReaching,
-        SingleIntegrator2D,
-        optimize_trajectory,
-    )
-    from visualization.motion_planning import plot_trajectory_2d
-
-    print(f"\n{'=' * 50}")
-    print("Example 3: 2D Motion Planning")
-    print(f"{'=' * 50}")
-
-    # Problem setup
-    initial_state = np.array([3.0, 0.0])
-    goal_state = np.array([6.0, 6.0])
-    obstacle = {"x": [1.0, 5.0], "y": [3.0, 5.0]}
-
-    print("\nSetup:")
-    print(f"  Start: {initial_state}")
-    print(f"  Goal:  {goal_state}")
-    print(f"  Obstacle: x∈{obstacle['x']}, y∈{obstacle['y']}")
-
-    # STL specification
-    avoid_pred = ObstacleAvoidance(
-        obstacle["x"][0], obstacle["x"][1], obstacle["y"][0], obstacle["y"][1]
-    )
-    spec_safe = Always(avoid_pred, interval=[0, 50])
-
-    goal_pred = GoalReaching(goal_state[0], goal_state[1], radius=0.5)
-    spec_goal = Eventually(goal_pred, interval=[0, 100])
-
-    print(f"\nSTL: φ = (□ {avoid_pred}) ∧ (◇ {goal_pred})")
-
-    # Dynamics
-    dynamics = SingleIntegrator2D(dt=0.15, sigma=0.1)
-
-    # Optimize trajectory
-    means, vars, metrics, history = optimize_trajectory(
-        initial_state=initial_state,
-        goal_state=goal_state,
-        obstacle=obstacle,
-        dynamics=dynamics,
-        spec_safe=spec_safe,
-        spec_goal=spec_goal,
-        horizon=100,
-        dt=0.15,
-        num_iterations=400,
-        lr=0.02,
-        verbose=True,
-    )
-
-    # Results
-    dist_to_goal = np.linalg.norm(means[-1] - goal_state)
-    print("\nResults:")
-    print(f"  Final: ({means[-1, 0]:.2f}, {means[-1, 1]:.2f})")
-    print(f"  Distance: {dist_to_goal:.3f} m")
-    print(f"  P_safe: {metrics['p_safe']:.4f}")
-    print(f"  P_goal: {metrics['p_goal']:.4f}")
-
-    # Visualization (with metrics)
-    plot_trajectory_2d(
-        means,
-        vars,
-        obstacle,
-        goal_state,
-        initial_state,
-        history=history,
-        title="Example 3: 2D Motion Planning with pdSTL",
-    )
+with skip_run("run", "Example 4: MPC Receding Horizon") as check, check():
+    if __name__ == "__main__":
+        run_mpc()
