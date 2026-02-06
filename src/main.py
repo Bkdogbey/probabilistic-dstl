@@ -1,10 +1,12 @@
 import numpy as np
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For MacOS to avoid libomp error
 import sys
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-sys.path.append(os.path.join(os.getcwd(), 'src'))
+
+sys.path.append(os.path.join(os.getcwd(), "src"))
 import torch
 from models.dynamics import (
     GaussianBelief,
@@ -144,10 +146,12 @@ with skip_run("skip", "Example 3: Piecewise") as check, check():
 # EXAMPLE 3: Single Shot Motion Planning
 # =============================================================================
 
-with skip_run("skip", "Example 3: Single Shot Motion Planning") as check, check():
+with skip_run("run", "Example 3: Single Shot Motion Planning") as check, check():
     if __name__ == "__main__":
         run_single_shot(max_iterations=2000)
-
-with skip_run("run", "Example 4: MPC Receding Horizon") as check, check():
+# =============================================================================
+# EXAMPLE 4: MPC Receding Horizon Motion Planning
+# =============================================================================
+with skip_run("skip", "Example 4: MPC Receding Horizon") as check, check():
     if __name__ == "__main__":
         run_mpc()

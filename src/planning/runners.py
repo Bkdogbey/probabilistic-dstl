@@ -29,7 +29,7 @@ def run_single_shot(max_iterations=500):
     env.add_obstacle(x_range=[2.0, 5.0], y_range=[4.0, 6.0])
     
     # 2. Circle obstacle
-    #env.add_circle_obstacle(center=[8.0, 4.0], radius=0.5)
+    env.add_circle_obstacle(center=[8.0, 4.0], radius=0.5)
 
     # --- 3. Setup Dynamics ---
     # Using SingleIntegrator (Velocity Control) as per PDF
