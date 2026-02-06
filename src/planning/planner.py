@@ -114,7 +114,7 @@ class ProbabilisticSTLPlanner:
             (line,) = ax.plot([], [], "b.-", alpha=0.5)
             title = ax.set_title("Iteration 0")
 
-        for k in range(self.cfg["max_iters"]):  #
+        for k in range(self.cfg["max_iters"]):
             optimizer.zero_grad()
 
             # --- A. Rollout Belief Trajectory ---
@@ -136,7 +136,7 @@ class ProbabilisticSTLPlanner:
             # robustness_trace returns [Batch, Time, 2]
             # We want P_lower at t=0
             stl_trace = phi(traj)
-            p_all = stl_trace[0, 0, 0]  #
+            p_all = stl_trace[0, 0, 0]
 
             # --- D. Compute Objective ---
             # 1. Control Effort: sum ||u_t||^2

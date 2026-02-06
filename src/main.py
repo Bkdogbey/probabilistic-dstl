@@ -3,8 +3,6 @@ import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For MacOS to avoid libomp error
 import sys
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 
 sys.path.append(os.path.join(os.getcwd(), "src"))
 import torch
