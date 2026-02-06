@@ -1,11 +1,4 @@
 import numpy as np
-import os
-import sys
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # For MacOS to avoid libomp error
-
-
-sys.path.append(os.path.join(os.getcwd(), "src"))
 import torch
 from models.dynamics import (
     GaussianBelief,
