@@ -1,14 +1,21 @@
+import copy
+import csv
 import os
 
 import numpy as np
 import torch
 
 from utils import get_device, load_config
+from baselines.det_stl import det_get_specification
+from evaluation.monte_carlo import rollout_controls
+from evaluation.metrics import evaluate_rollouts
+from pdstl.base import BeliefTrajectory
 from planning import log_utils
 from planning.dynamics import DoubleIntegrator, SingleIntegrator
 from planning.environment import Environment
-from planning.planner import Planner
+from planning.planner import Planner, TorchGaussianBelief
 from visualization.animation import animate_results
+from visualization.comparison import plot_two_gap_comparison
 from visualization.live_plots import make_mpc_live_callback, make_lane_change_live_callback
 from visualization.planning import visualize_lane_change, visualize_results
 
@@ -46,6 +53,12 @@ def build_environment(cfg, device):
         env.set_bounds(**cfg["bounds"])
     for vr in cfg.get("visit_regions", []):
         env.add_visit_region(**vr)
+    for group in cfg.get("choice_region_groups", []):
+        env.add_choice_region_group(
+            regions=group["regions"],
+            interval=group.get("interval", None),
+            label=group.get("label", None),
+        )
     for obs in cfg.get("obstacles", []):
         if obs["type"] == "circle":
             env.add_circle_obstacle(center=obs["center"], radius=obs["radius"])
@@ -156,22 +169,30 @@ def _clip_env_to_result(env, result):
         env.clip_moving_obstacles(result["mean_trace"].shape[1])
 
 
-
-def run_single_shot(max_iterations=1000, load_from=None, force_run=False):
+def run_planning_scenario(cfg_path, max_iterations=None, load_from=None, force_run=False):
     device = get_device()
     log_utils.log_device(device)
 
-    cfg, planner_cfg = load_scenario_config("configs/scenarios/single_shot.yaml")
+    cfg, planner_cfg = load_scenario_config(cfg_path)
 
     T = cfg["T"]
-
     env = build_environment(cfg, device)
-    planner_cfg["max_iters"] = max_iterations
 
-    log_utils._log.info("Starting single-shot optimisation...")
+    if max_iterations is not None:
+        planner_cfg["max_iters"] = max_iterations
+
+    label = cfg.get("label", cfg_path)
+    log_utils._log.info(f"Starting optimisation: {label}")
+
     result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=T, load_from=load_from, force_run=force_run
+        cfg,
+        planner_cfg,
+        env,
+        horizon=T,
+        load_from=load_from,
+        force_run=force_run,
     )
+
     log_utils._log.info(f"Done. Final P(Sat): {result['best_p']:.4f}")
 
     visualize_results(
@@ -182,16 +203,275 @@ def run_single_shot(max_iterations=1000, load_from=None, force_run=False):
         result["loss_trace"],
     )
 
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        env,
-        filename=anim["filename"],
-        step=anim["step"],
-        title=anim["title"],
-        bounds=anim["bounds"],
+    anim = cfg.get("animation", None)
+    if anim is not None:
+        animate_results(
+            result["mean_trace"],
+            result["cov_trace"],
+            env,
+            filename=anim["filename"],
+            step=anim["step"],
+            title=anim["title"],
+            bounds=anim.get("bounds"),
+        )
+
+    return result
+
+
+def run_single_shot(max_iterations=1000, load_from=None, force_run=False):
+    return run_planning_scenario(
+        "configs/scenarios/single_shot.yaml",
+        max_iterations=max_iterations,
+        load_from=load_from,
+        force_run=force_run,
     )
+
+
+def run_two_gap_reach_avoid(max_iterations=700, load_from=None, force_run=False):
+    return run_planning_scenario(
+        "configs/scenarios/two_gap_reach_avoid.yaml",
+        max_iterations=max_iterations,
+        load_from=load_from,
+        force_run=force_run,
+    )
+
+
+def run_two_gap_reach_avoid_visit(max_iterations=800, load_from=None, force_run=False):
+    return run_planning_scenario(
+        "configs/scenarios/two_gap_reach_avoid_visit.yaml",
+        max_iterations=max_iterations,
+        load_from=load_from,
+        force_run=force_run,
+    )
+
+
+def _make_deterministic_baseline_cfg(cfg):
+    """
+    Create a nominal deterministic-planning version of the scenario.
+    """
+    det_cfg = copy.deepcopy(cfg)
+
+    det_cfg["label"] = cfg.get("label", "scenario") + " Deterministic Baseline"
+    det_cfg["q_std"] = 1.0e-6
+    det_cfg["x0_cov_scale"] = 1.0e-6
+
+    if "save_file" in det_cfg:
+        det_cfg["save_file"] = det_cfg["save_file"].replace(".pt", "_deterministic.pt")
+
+    return det_cfg
+
+
+def _solve_cfg_direct(cfg, planner_cfg, *, force_run=True):
+    """
+    Solve a scenario from an already-loaded config dictionary.
+    """
+    device = get_device()
+    log_utils.log_device(device)
+
+    env = build_environment(cfg, device)
+    T = cfg["T"]
+
+    result = _load_or_solve(
+        cfg,
+        planner_cfg,
+        env,
+        horizon=T,
+        force_run=force_run,
+    )
+
+    dynamics = build_dynamics(cfg, device)
+    x0_mean, x0_cov = build_initial_belief(cfg, device)
+
+    return result, env, dynamics, x0_mean, x0_cov
+
+
+def _planned_det_robustness(result, env):
+    """
+    Signed deterministic STL robustness of the planned mean trajectory.
+    """
+    mean_trace = result["mean_trace"].detach()
+    cov_trace = result.get("cov_trace", None)
+    if cov_trace is None:
+        state_dim = mean_trace.shape[-1]
+        cov_trace = torch.zeros(
+            mean_trace.shape[0],
+            mean_trace.shape[1],
+            state_dim,
+            state_dim,
+            device=mean_trace.device,
+            dtype=mean_trace.dtype,
+        )
+    else:
+        cov_trace = cov_trace.detach()
+
+    horizon = mean_trace.shape[1] - 1
+    spec = det_get_specification(env, horizon).to(mean_trace.device)
+    beliefs = [
+        TorchGaussianBelief(mean_trace[:, t, :], cov_trace[:, t])
+        for t in range(horizon + 1)
+    ]
+    traj = BeliefTrajectory(beliefs)
+    return spec(traj)[0, 0, 0].item()
+
+
+def _metrics_row(planner, metrics, planned_best_p, planned_det_robustness):
+    return {
+        "planner": planner,
+        "num_rollouts": metrics["num_rollouts"],
+        "safety_rate": metrics["safety_rate"],
+        "goal_rate": metrics["goal_rate"],
+        "satisfaction_rate": metrics["satisfaction_rate"],
+        "mean_min_clearance": metrics["mean_min_clearance"],
+        "min_clearance": metrics["min_clearance"],
+        "planned_best_p": planned_best_p,
+        "planned_det_robustness": planned_det_robustness,
+    }
+
+
+def run_two_gap_comparison(force_run=True):
+    """
+    Run nominal deterministic baseline and pdSTL planner on the two-gap scenario,
+    then evaluate both under the same stochastic execution noise.
+    """
+    eval_cfg = load_config("configs/evaluation/two_gap_eval.yaml")
+
+    scenario_path = eval_cfg["scenario"]
+    cfg, planner_cfg = load_scenario_config(scenario_path)
+
+    num_rollouts = eval_cfg.get("num_rollouts", 200)
+    eval_q_std = eval_cfg.get("eval_q_std", cfg["q_std"])
+    seed = eval_cfg.get("seed", 0)
+    robot_radius = eval_cfg.get("robot_radius", 0.0)
+
+    det_cfg = _make_deterministic_baseline_cfg(cfg)
+
+    log_utils._log.info("Solving deterministic nominal baseline...")
+    det_result, det_env, det_dyn, det_x0_mean, det_x0_cov = _solve_cfg_direct(
+        det_cfg,
+        planner_cfg,
+        force_run=force_run,
+    )
+
+    log_utils._log.info("Solving pdSTL uncertainty-aware planner...")
+    pdstl_result, pdstl_env, pdstl_dyn, pdstl_x0_mean, pdstl_x0_cov = _solve_cfg_direct(
+        cfg,
+        planner_cfg,
+        force_run=force_run,
+    )
+
+    log_utils._log.info("Running Monte Carlo evaluation...")
+
+    det_rollouts = rollout_controls(
+        det_dyn,
+        det_x0_mean,
+        det_x0_cov,
+        det_result["u_trace"],
+        num_rollouts=num_rollouts,
+        q_std=eval_q_std,
+        seed=seed,
+    )
+
+    pdstl_rollouts = rollout_controls(
+        pdstl_dyn,
+        pdstl_x0_mean,
+        pdstl_x0_cov,
+        pdstl_result["u_trace"],
+        num_rollouts=num_rollouts,
+        q_std=eval_q_std,
+        seed=seed,
+    )
+
+    det_metrics = evaluate_rollouts(
+        det_rollouts,
+        det_env,
+        robot_radius=robot_radius,
+    )
+
+    pdstl_metrics = evaluate_rollouts(
+        pdstl_rollouts,
+        pdstl_env,
+        robot_radius=robot_radius,
+    )
+
+    det_row = _metrics_row(
+        "deterministic",
+        det_metrics,
+        det_result.get("best_p", None),
+        _planned_det_robustness(det_result, det_env),
+    )
+    pdstl_row = _metrics_row(
+        "pdstl",
+        pdstl_metrics,
+        pdstl_result.get("best_p", None),
+        _planned_det_robustness(pdstl_result, pdstl_env),
+    )
+
+    output = eval_cfg.get("output", {})
+    results_dir = output.get("results_dir", "results")
+    figures_dir = output.get("figures_dir", "figures")
+    summary_csv = output.get("summary_csv", "two_gap_mc_summary.csv")
+
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+
+    csv_path = os.path.join(results_dir, summary_csv)
+    rows = [det_row, pdstl_row]
+    fieldnames = [
+        "planner",
+        "num_rollouts",
+        "safety_rate",
+        "goal_rate",
+        "satisfaction_rate",
+        "mean_min_clearance",
+        "min_clearance",
+        "planned_best_p",
+        "planned_det_robustness",
+    ]
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    log_utils._log.info(f"Saved Monte Carlo summary to {csv_path}")
+
+    comparison_png = os.path.join(
+        figures_dir,
+        output.get("comparison_png", "two_gap_compare_mc.png"),
+    )
+
+    comparison_pdf = os.path.join(
+        figures_dir,
+        output.get("comparison_pdf", "two_gap_compare_mc.pdf"),
+    )
+
+    plot_two_gap_comparison(
+        pdstl_env,
+        det_result,
+        pdstl_result,
+        det_rollouts,
+        pdstl_rollouts,
+        save_png=comparison_png,
+        save_pdf=comparison_pdf,
+    )
+
+    log_utils._log.info(f"Saved comparison plot to {comparison_png}")
+    log_utils._log.info(f"Saved comparison plot to {comparison_pdf}")
+
+    print("\nMonte Carlo Summary")
+    print("-------------------")
+    print("Deterministic:", det_row)
+    print("pdSTL:", pdstl_row)
+
+    return {
+        "det_result": det_result,
+        "pdstl_result": pdstl_result,
+        "det_rollouts": det_rollouts,
+        "pdstl_rollouts": pdstl_rollouts,
+        "det_metrics": det_row,
+        "pdstl_metrics": pdstl_row,
+    }
 
 
 def run_mpc(load_from=None, force_run=False):

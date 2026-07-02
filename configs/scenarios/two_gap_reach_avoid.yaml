@@ -1,0 +1,60 @@
+# Two-gap reach-avoid scenario.
+# Robot must move from start to goal while avoiding obstacle blocks that form two gaps.
+
+label: "Two-Gap Reach-Avoid"
+
+# --- Dynamics ---
+dynamics: single_integrator
+T: 120
+dt: 0.2
+u_max: 1.0
+q_std: 0.03
+
+# --- Initial condition ---
+x0_mean: [0.0, 5.0]
+x0_cov_scale: 0.01
+
+# --- Environment bounds ---
+bounds:
+  x_range: [0.0, 14.0]
+  y_range: [0.0, 10.0]
+
+# --- Goal region ---
+goal:
+  x_range: [12.0, 14.0]
+  y_range: [4.0, 6.0]
+
+# --- Obstacles forming two passage gaps ---
+obstacles:
+  - type: rectangle
+    x_range: [4.5, 7.0]
+    y_range: [0.0, 3.2]
+
+  - type: rectangle
+    x_range: [4.5, 7.0]
+    y_range: [4.2, 5.8]
+
+  - type: rectangle
+    x_range: [4.5, 7.0]
+    y_range: [6.8, 10.0]
+
+# --- Planner overrides ---
+planner:
+  w_u: 0.5
+  w_du: 0.01
+  w_phi: 100.0
+  w_dist: 50.0
+  w_obs: 5.0
+  w_visit: 0.0
+  max_iters: 700
+  alpha: 0.95
+  loss_tol: 1.0e-5
+
+# --- Output ---
+save_file: two_gap_reach_avoid.pt
+
+animation:
+  filename: two_gap_reach_avoid.gif
+  step: 2
+  title: "Two-Gap Reach-Avoid"
+  bounds: [[-1, 15], [-1, 11]]

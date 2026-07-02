@@ -7,6 +7,9 @@ from planning.runners import (
     run_lane_change_aggressive,
     run_mpc,
     run_single_shot,
+    run_two_gap_comparison,
+    run_two_gap_reach_avoid,
+    run_two_gap_reach_avoid_visit,
 )
 from utils import create_belief_trajectory, load_config, skip_run, to_steps
 from visualization.robustness import plot_piecewise_stl, plot_stl_formula_bounds
@@ -74,6 +77,27 @@ with skip_run("skip", "Example 3: Single Shot Motion Planning") as check, check(
     run_single_shot(max_iterations=500, force_run=True)
 
 # =============================================================================
+# EXAMPLE 3A: Two-Gap Reach-Avoid
+# =============================================================================
+
+with skip_run("skip", "Example 3A: Two-Gap Reach-Avoid") as check, check():
+    run_two_gap_reach_avoid(max_iterations=700, force_run=True)
+
+# =============================================================================
+# EXAMPLE 3B: Two-Gap Reach-Avoid with Visit Choice
+# =============================================================================
+
+with skip_run("skip", "Example 3B: Two-Gap Reach-Avoid with Visit Choice") as check, check():
+    run_two_gap_reach_avoid_visit(max_iterations=800, force_run=True)
+
+# =============================================================================
+# EXAMPLE 3C: Two-Gap Deterministic vs pdSTL Monte Carlo Comparison
+# =============================================================================
+
+with skip_run("run", "Example 3C: Two-Gap Comparison") as check, check():
+    run_two_gap_comparison(force_run=True)
+
+# =============================================================================
 # EXAMPLE 4: MPC Receding Horizon Motion Planning
 # =============================================================================
 
@@ -84,12 +108,12 @@ with skip_run("skip", "Example 4: MPC Receding Horizon") as check, check():
 # EXAMPLE 5: Lane Change with Moving Obstacle
 # =============================================================================
 
-with skip_run("run", "Example 5: Lane Change") as check, check():
+with skip_run("skip", "Example 5: Lane Change") as check, check():
     run_lane_change()
 
 # =============================================================================
 # EXAMPLE 6: Aggressive Lane Change
 # =============================================================================
 
-with skip_run("run", "Example 6: Aggressive Lane Change") as check, check():
+with skip_run("skip", "Example 6: Aggressive Lane Change") as check, check():
     run_lane_change_aggressive()

@@ -4,7 +4,7 @@ import numpy as np
 
 import torch
 
-from pdstl.operators import Always, And, Eventually, STL_Formula
+from pdstl.operators import Always, And, Or, Eventually, STL_Formula
 
 
 def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
@@ -45,6 +45,7 @@ class Environment:
         self.circle_obstacles = []
         self.moving_obstacles = []
         self.visit_regions = []
+        self.choice_region_groups = []
         self.lane_markings = []
         self.goal = None
         self.bounds = None
@@ -95,6 +96,28 @@ class Environment:
         Adds a rectangular region that must be visited at some point.
         """
         self.visit_regions.append({"x": x_range, "y": y_range})
+
+    def add_choice_region_group(self, regions, interval=None, label=None):
+        """
+        Adds a group of visit regions where at least one region must be visited.
+        """
+        normalized_regions = []
+        for region in regions:
+            normalized = {
+                "x": region.get("x", region.get("x_range")),
+                "y": region.get("y", region.get("y_range")),
+            }
+            if "label" in region:
+                normalized["label"] = region["label"]
+            normalized_regions.append(normalized)
+
+        self.choice_region_groups.append(
+            {
+                "regions": normalized_regions,
+                "interval": interval,
+                "label": label,
+            }
+        )
 
     def set_goal(self, x_range, y_range):
         """
@@ -227,13 +250,31 @@ class Environment:
 
     def get_predicates(self):
         """ """
-        preds = {"obstacles": [], "visit": [], "goal": None}
+        preds = {
+            "obstacles": [],
+            "visit": [],
+            "choice_region_groups": [],
+            "goal": None,
+        }
 
         if self.goal:
             preds["goal"] = RectangularGoalPredicate(self.goal)
 
         for region in self.visit_regions:
             preds["visit"].append(RectangularGoalPredicate(region))
+
+        for group in self.choice_region_groups:
+            group_preds = []
+            for region in group["regions"]:
+                group_preds.append(RectangularGoalPredicate(region))
+
+            preds["choice_region_groups"].append(
+                {
+                    "predicates": group_preds,
+                    "interval": group.get("interval", None),
+                    "label": group.get("label", None),
+                }
+            )
 
         if self.obstacles or self.circle_obstacles or self.moving_obstacles:
             obs_preds = [RectangularObstaclePredicate(obs) for obs in self.obstacles]
@@ -268,6 +309,22 @@ class Environment:
         # 2. Visit Regions (Liveness)
         for visit_pred in preds["visit"]:
             specs.append(Eventually(visit_pred, interval=[0, T]))
+
+        # 2B. Choice Visit Regions
+        for group in preds["choice_region_groups"]:
+            group_preds = group["predicates"]
+            if not group_preds:
+                continue
+
+            interval = group.get("interval", None)
+            if interval is None:
+                interval = [0, T]
+
+            choice_spec = Eventually(group_preds[0], interval=interval)
+            for pred in group_preds[1:]:
+                choice_spec = Or(choice_spec, Eventually(pred, interval=interval))
+
+            specs.append(choice_spec)
 
         # 3. Obstacle Specification (Safety)
         if preds["obstacles"]:
