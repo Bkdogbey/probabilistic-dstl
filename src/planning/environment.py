@@ -45,9 +45,11 @@ class Environment:
         self.circle_obstacles = []
         self.moving_obstacles = []
         self.visit_regions = []
+        self.timed_visit_regions = []
         self.choice_region_groups = []
         self.lane_markings = []
         self.goal = None
+        self.goal_interval = None
         self.bounds = None
         self.device = device
         self.road = None
@@ -97,6 +99,15 @@ class Environment:
         """
         self.visit_regions.append({"x": x_range, "y": y_range})
 
+    def add_timed_visit_region(self, x_range, y_range, interval, label=None):
+        """
+        Adds a rectangular region that must be visited inside a time window.
+        """
+        region = {"x": x_range, "y": y_range, "interval": interval}
+        if label is not None:
+            region["label"] = label
+        self.timed_visit_regions.append(region)
+
     def add_choice_region_group(self, regions, interval=None, label=None):
         """
         Adds a group of visit regions where at least one region must be visited.
@@ -119,11 +130,12 @@ class Environment:
             }
         )
 
-    def set_goal(self, x_range, y_range):
+    def set_goal(self, x_range, y_range, interval=None):
         """
         Sets the goal region G = [x_g_min, x_g_max] x [y_g_min, y_g_max].
         """
         self.goal = {"x": x_range, "y": y_range}
+        self.goal_interval = interval
 
     def set_bounds(self, x_range, y_range):
         """
@@ -253,6 +265,7 @@ class Environment:
         preds = {
             "obstacles": [],
             "visit": [],
+            "timed_visit": [],
             "choice_region_groups": [],
             "goal": None,
         }
@@ -262,6 +275,15 @@ class Environment:
 
         for region in self.visit_regions:
             preds["visit"].append(RectangularGoalPredicate(region))
+
+        for region in self.timed_visit_regions:
+            preds["timed_visit"].append(
+                {
+                    "predicate": RectangularGoalPredicate(region),
+                    "interval": region["interval"],
+                    "label": region.get("label", None),
+                }
+            )
 
         for group in self.choice_region_groups:
             group_preds = []
@@ -304,11 +326,18 @@ class Environment:
 
         # 1. Goal Specification (Liveness)
         if preds["goal"]:
-            specs.append(Eventually(preds["goal"], interval=[t_goal_start, T]))
+            goal_interval = self.goal_interval
+            if goal_interval is None:
+                goal_interval = [t_goal_start, T]
+            specs.append(Eventually(preds["goal"], interval=goal_interval))
 
         # 2. Visit Regions (Liveness)
         for visit_pred in preds["visit"]:
             specs.append(Eventually(visit_pred, interval=[0, T]))
+
+        # 2A. Timed Visit Regions
+        for item in preds["timed_visit"]:
+            specs.append(Eventually(item["predicate"], interval=item["interval"]))
 
         # 2B. Choice Visit Regions
         for group in preds["choice_region_groups"]:

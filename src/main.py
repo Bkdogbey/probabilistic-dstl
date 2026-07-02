@@ -3,6 +3,7 @@ import numpy as np
 from models.dynamics import linear_system, piecewise_signal, sinusoidial_input
 from pdstl.operators import Always, GreaterThan
 from planning.runners import (
+    run_hazardous_object_retrieval,
     run_lane_change,
     run_lane_change_aggressive,
     run_mpc,
@@ -94,7 +95,7 @@ with skip_run("skip", "Example 3B: Two-Gap Reach-Avoid with Visit Choice") as ch
 # EXAMPLE 3C: Two-Gap Deterministic vs pdSTL Monte Carlo Comparison
 # =============================================================================
 
-with skip_run("run", "Example 3C: Two-Gap Comparison") as check, check():
+with skip_run("skip", "Example 3C: Two-Gap Comparison") as check, check():
     run_two_gap_comparison(force_run=True)
 
 # =============================================================================
@@ -117,3 +118,10 @@ with skip_run("skip", "Example 5: Lane Change") as check, check():
 
 with skip_run("skip", "Example 6: Aggressive Lane Change") as check, check():
     run_lane_change_aggressive()
+
+# =============================================================================
+# EXAMPLE 7: Hazardous Object Retrieval
+# =============================================================================
+
+with skip_run("run", "Example 7: Hazardous Object Retrieval") as check, check():
+    run_hazardous_object_retrieval(max_iterations=1200, force_run=True)

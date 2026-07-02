@@ -53,6 +53,13 @@ def build_environment(cfg, device):
         env.set_bounds(**cfg["bounds"])
     for vr in cfg.get("visit_regions", []):
         env.add_visit_region(**vr)
+    for vr in cfg.get("timed_visit_regions", []):
+        env.add_timed_visit_region(
+            x_range=vr["x_range"],
+            y_range=vr["y_range"],
+            interval=vr["interval"],
+            label=vr.get("label", None),
+        )
     for group in cfg.get("choice_region_groups", []):
         env.add_choice_region_group(
             regions=group["regions"],
@@ -239,6 +246,15 @@ def run_two_gap_reach_avoid(max_iterations=700, load_from=None, force_run=False)
 def run_two_gap_reach_avoid_visit(max_iterations=800, load_from=None, force_run=False):
     return run_planning_scenario(
         "configs/scenarios/two_gap_reach_avoid_visit.yaml",
+        max_iterations=max_iterations,
+        load_from=load_from,
+        force_run=force_run,
+    )
+
+
+def run_hazardous_object_retrieval(max_iterations=1200, load_from=None, force_run=False):
+    return run_planning_scenario(
+        "configs/scenarios/hazardous_object_retrieval.yaml",
         max_iterations=max_iterations,
         load_from=load_from,
         force_run=force_run,

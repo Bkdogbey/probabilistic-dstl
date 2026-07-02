@@ -82,16 +82,46 @@ class Planner:
 
         return loss
 
+    def _region_visit_loss(self, mean_trace, region, time_slice=slice(None)):
+        vx = (region["x"][0] + region["x"][1]) / 2.0
+        vy = (region["y"][0] + region["y"][1]) / 2.0
+        v_center = torch.tensor([[vx, vy]], device=self.device)
+        trace = mean_trace[:, time_slice, :2]
+        dists_sq = torch.sum((trace - v_center) ** 2, dim=2)
+        min_dist_sq, _ = torch.min(dists_sq, dim=1)
+        return torch.sum(min_dist_sq)
+
+    def _interval_slice(self, interval, trace_len):
+        if interval is None:
+            return slice(None)
+        start = max(0, int(interval[0]))
+        end = min(trace_len - 1, int(interval[1]))
+        if end < start:
+            return slice(start, start + 1)
+        return slice(start, end + 1)
+
     def _visit_loss(self, mean_trace):
-        """Pull trajectory towards visit regions (Eventually semantics)."""
+        """Pull trajectory towards visit, timed visit, and choice regions."""
         loss = torch.tensor(0.0, device=self.device)
+        trace_len = mean_trace.shape[1]
+
         for region in self.env.visit_regions:
-            vx = (region["x"][0] + region["x"][1]) / 2.0
-            vy = (region["y"][0] + region["y"][1]) / 2.0
-            v_center = torch.tensor([[vx, vy]], device=self.device)
-            dists_sq = torch.sum((mean_trace[:, :, :2] - v_center) ** 2, dim=2)
-            min_dist_sq, _ = torch.min(dists_sq, dim=1)
-            loss = loss + torch.sum(min_dist_sq)
+            loss = loss + self._region_visit_loss(mean_trace, region)
+
+        for region in getattr(self.env, "timed_visit_regions", []):
+            time_slice = self._interval_slice(region["interval"], trace_len)
+            loss = loss + self._region_visit_loss(mean_trace, region, time_slice)
+
+        for group in getattr(self.env, "choice_region_groups", []):
+            region_losses = []
+            time_slice = self._interval_slice(group.get("interval", None), trace_len)
+            for region in group["regions"]:
+                region_losses.append(
+                    self._region_visit_loss(mean_trace, region, time_slice)
+                )
+            if region_losses:
+                loss = loss + torch.min(torch.stack(region_losses))
+
         return loss
 
     def _compute_loss(self, mean_trace, u_seq, p_all, loss_fn):

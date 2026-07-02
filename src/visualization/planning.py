@@ -135,6 +135,60 @@ def draw_env_on_ax(
             )
         )
 
+    for region in getattr(env, "timed_visit_regions", []):
+        vx, vy = region["x"], region["y"]
+        ax.add_patch(
+            patches.Rectangle(
+                (vx[0], vy[0]),
+                vx[1] - vx[0],
+                vy[1] - vy[0],
+                facecolor=PALETTE["visit"]["fill"],
+                edgecolor=PALETTE["visit"]["stroke"],
+                alpha=0.32,
+                zorder=3,
+                label=region.get("label", visit_label),
+            )
+        )
+        if region.get("label"):
+            ax.text(
+                (vx[0] + vx[1]) / 2,
+                (vy[0] + vy[1]) / 2,
+                region["label"],
+                fontsize=8,
+                ha="center",
+                va="center",
+                color=PALETTE["visit"]["stroke"],
+                zorder=30,
+            )
+
+    for group in getattr(env, "choice_region_groups", []):
+        for region in group["regions"]:
+            vx, vy = region["x"], region["y"]
+            ax.add_patch(
+                patches.Rectangle(
+                    (vx[0], vy[0]),
+                    vx[1] - vx[0],
+                    vy[1] - vy[0],
+                    facecolor=PALETTE["visit"]["fill"],
+                    edgecolor=PALETTE["visit"]["stroke"],
+                    linestyle="--",
+                    alpha=0.28,
+                    zorder=3,
+                    label=region.get("label", visit_label),
+                )
+            )
+            if region.get("label"):
+                ax.text(
+                    (vx[0] + vx[1]) / 2,
+                    (vy[0] + vy[1]) / 2,
+                    region["label"],
+                    fontsize=8,
+                    ha="center",
+                    va="center",
+                    color=PALETTE["visit"]["stroke"],
+                    zorder=30,
+                )
+
     for obs in env.obstacles:
         ox, oy = obs["x"], obs["y"]
         ax.add_patch(
@@ -234,6 +288,17 @@ def _compute_env_bounds(mean_np, env):
         x_max = max(x_max, region["x"][1])
         y_min = min(y_min, region["y"][0])
         y_max = max(y_max, region["y"][1])
+    for region in getattr(env, "timed_visit_regions", []):
+        x_min = min(x_min, region["x"][0])
+        x_max = max(x_max, region["x"][1])
+        y_min = min(y_min, region["y"][0])
+        y_max = max(y_max, region["y"][1])
+    for group in getattr(env, "choice_region_groups", []):
+        for region in group["regions"]:
+            x_min = min(x_min, region["x"][0])
+            x_max = max(x_max, region["x"][1])
+            y_min = min(y_min, region["y"][0])
+            y_max = max(y_max, region["y"][1])
     return x_min, x_max, y_min, y_max
 
 
@@ -349,12 +414,14 @@ def plot_trajectory(mean_np, cov_np, env):
         ax.legend(
             by_label.values(),
             by_label.keys(),
-            loc="upper left",
-            ncol=1,
-            fontsize=17,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.10),
+            ncol=min(4, len(by_label)),
+            fontsize=11,
             framealpha=0.95,
             edgecolor="#cccccc",
         )
+        fig.subplots_adjust(bottom=0.22)
 
     plt.show()
     plt.close(fig)
