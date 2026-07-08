@@ -37,17 +37,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
+from components.environment_config import OBSTACLES as _ENV_OBSTACLES
+
 # ── Valid condition labels ──────────────────────────────────────────────────
 CONDITIONS = (
     'deterministic',
     'pdstl',
 )
 
-# ── Obstacles (x_min, x_max, y_min, y_max) — must match generate_waypoints.py ─
+# ── Obstacles (x_min, x_max, y_min, y_max), sourced from the single arena
+#    geometry config in environment_config.py — nothing hardcoded here ───────
 _OBSTACLES: list[tuple[float, float, float, float]] = [
-    (-0.165,  0.165, -1.144, -0.941),  # OBS-1 (red)
-    (-0.432, -0.102, -0.179,  0.049),  # OBS-2 (blue)
-    ( 0.114,  0.343, -0.611, -0.421),  # OBS-3 (green)
+    (obs['x'][0], obs['x'][1], obs['y'][0], obs['y'][1]) for obs in _ENV_OBSTACLES
 ]
 
 # ── Log directory: next to this file ────────────────────────────────────────

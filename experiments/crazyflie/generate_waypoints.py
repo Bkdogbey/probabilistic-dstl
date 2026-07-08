@@ -12,10 +12,6 @@ Output:
 from __future__ import annotations
 
 import pathlib
-import sys
-
-# Use the pdSTL library from this repo's src/ (no vendored copies).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'src'))
 
 import argparse
 import datetime
@@ -24,31 +20,23 @@ import math
 import numpy as np
 import torch
 
-from pdstl.base import BeliefTrajectory
-from planning.dynamics import SingleIntegrator
-from planning.environment import Environment
-from planning.planner import Planner, TorchGaussianBelief
+from components.environment_config import (
+    DT,
+    BeliefTrajectory,
+    Environment,
+    FLIGHT_X_BOUNDS,
+    FLIGHT_Y_BOUNDS,
+    PLANNER_ALPHA,
+    T,
+    TorchGaussianBelief,
+    Z_HEIGHT,
+    build_planner,
+    x0_belief,
+)
 
 HERE = pathlib.Path(__file__).resolve().parent
 
-# Measured constants.
-T = 10  # planning horizon (number of control steps)
-DT = 0.693  # mean inter-waypoint time [s]
-U_MAX = 0.44  # max inter-waypoint speed [m/s]
-Z_HEIGHT = 0.2  # flight height [m]
-FLIGHT_X_BOUNDS = [-0.5, 1.0]
-FLIGHT_Y_BOUNDS = [-2.0, 0.5]
-
-Q_STD_PER_FAN: dict[int, float] = {
-    2: 0.001,
-    6: 0.006,
-    12: 0.020,
-    16: 0.050,
-}
-
-# Initial belief measured from the experiment setup.
-X0_MEAN = torch.tensor([0.0, -1.5], dtype=torch.float32)
-X0_COV = torch.diag(torch.tensor([1e-2, 1e-2], dtype=torch.float32))
+X0_MEAN, X0_COV = x0_belief()
 
 
 def z_profile(xy_waypoints: np.ndarray) -> list[float]:
@@ -66,16 +54,6 @@ def _sine_waypoints() -> list[tuple[float, float, float]]:
     y_pos = np.linspace(-start_0, FLIGHT_Y_BOUNDS[1], 10)
     x_pos = 0.5 * np.sin(np.pi * y_pos / start_0)
     return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
-
-
-def _build_environment() -> Environment:
-    env = Environment()
-    env.set_bounds(x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS)
-    env.add_obstacle(x_range=[-0.165, 0.165], y_range=[-1.144, -0.941])  # OBS-1 (red)
-    env.add_obstacle(x_range=[-0.432, -0.102], y_range=[-0.179, 0.049])  # OBS-2 (blue)
-    env.add_obstacle(x_range=[0.114, 0.343], y_range=[-0.611, -0.421])  # OBS-3 (green)
-    env.set_goal(x_range=[-0.30, 0.30], y_range=[0.10, 0.30])
-    return env
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
@@ -102,7 +80,7 @@ def _sine_init_guess() -> torch.Tensor:
     return torch.tensor(vels, dtype=torch.float32)
 
 
-def _evaluate_rho(planner: Planner, init_u: torch.Tensor) -> float:
+def _evaluate_rho(planner, init_u: torch.Tensor) -> float:
     """Evaluate STL P(sat) for a given control sequence without optimising."""
     u_norm = torch.clamp(init_u / planner.dyn.u_max, -0.99, 0.99)
     v = 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
@@ -243,23 +221,7 @@ def main() -> None:
     parser.add_argument('--plot', action='store_true', help='Show before/after path plot')
     args = parser.parse_args()
 
-    alpha = 0.90
-
-    dynamics = SingleIntegrator(dt=DT, u_max=U_MAX, q_std=Q_STD_PER_FAN[args.fan])
-    env = _build_environment()
-    planner = Planner(
-        dynamics,
-        env,
-        T,
-        config={
-            'w_phi': 20.0,
-            'w_dist': 5.0,
-            'w_obs': 5.0,
-            'alpha': alpha,
-            'max_iters': 1000,
-            'lr': 0.02,
-        },
-    )
+    planner, _dynamics, env = build_planner(args.fan)
 
     init_u = _sine_init_guess()
 
@@ -280,7 +242,7 @@ def main() -> None:
     _validate_waypoints_inside_flight_area(waypoints)
 
     out_path = HERE / 'components' / 'opt_waypoints.py'
-    _write_waypoints(out_path, waypoints, rho_before, best_p, alpha, args.fan)
+    _write_waypoints(out_path, waypoints, rho_before, best_p, PLANNER_ALPHA, args.fan)
     print(f'Written {len(waypoints)} waypoints to {out_path}')
 
     if args.plot:
