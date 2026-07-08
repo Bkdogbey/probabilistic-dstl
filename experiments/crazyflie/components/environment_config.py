@@ -14,7 +14,12 @@ import sys
 # Use the pdSTL library from this repo's src/ (no vendored copies). Every
 # other file gets Environment/SingleIntegrator/Planner/etc. through this
 # module's re-exports below, so nothing else needs to touch sys.path.
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'src'))
+# This file lives at experiments/crazyflie/components/environment_config.py,
+# three levels below the repo root -- parents[3], not parents[2] (that was a
+# latent bug: pointed at a nonexistent experiments/src, silently masked
+# whenever nothing else registered a conflicting `planning`/`pdstl` package).
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / 'src'))
 
 import numpy as np
 import torch
@@ -46,7 +51,7 @@ OBSTACLES: list[dict] = [
 GOAL: dict = {'x': (0.85, 1.15), 'y': (-0.15, 0.15)}  # ±0.15 m box around END_XY
 
 START_XY: tuple[float, float] = (1.0, -2.0)
-END_XY: tuple[float, float] = (1.0, 0.0)  # sine warm-start target; goal box center
+END_XY: tuple[float, float] = (1.0, 0.0)  # safe-path target; goal box center
 # Abort the flight if the measured hover position at start differs from
 # START_XY by more than this (m) — see components/calibration.py.
 START_TOLERANCE: float = 0.08
@@ -84,26 +89,78 @@ MEASURED_COV_DIAG: tuple[float, float] = (1e-3, 1e-3)
 # mid-flight replans.
 REPLAN_CHECKPOINTS: list[int] = [5]
 
-# Amplitude of the deterministic sine path's swing toward obs_1 (see
-# sine_warm_start_waypoints below) — tuned so it threads through obs_1's
-# interior while keeping a near-graze on obs_3 and a safe berth around obs_2.
-SINE_AMPLITUDE: float = 0.32
+# Via-points (x, y) the deterministic safe path passes through between
+# START_XY and END_XY, computed without any disturbance/wind — the risk in
+# the experiment comes from *flying* this nominally-safe path under real fan
+# noise, not from the path itself being unsafe. (0.25, -1.0) clears obs_1 on
+# its left side; (0.617, -0.58) is the midpoint of the gap between obs_2 and
+# obs_3, which share the same y-band and so can't both be given a wide berth
+# by a single via-point.
+SAFE_PATH_VIA_POINTS: list[tuple[float, float]] = [
+    (0.25, -1.0),
+    (0.617, -0.58),
+]
 
 
-def sine_warm_start_waypoints() -> list[tuple[float, float, float]]:
-    """10-waypoint deterministic path from START_XY to END_XY.
+def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Fritsch-Carlson monotone cubic Hermite slopes.
 
-    Threads through obstacle 1's interior while keeping a near-graze on
-    obstacle 3 and a safe berth around obstacle 2 — obs_2 and obs_3 share
-    the same y-band, so no smooth start-anchored path can threaten both at
-    once. This is the 'naive' baseline flown by the deterministic condition,
-    and the warm start the pdSTL optimizer improves on. Defined once here
-    (not duplicated in generate_waypoints.py/crazyflie.py) so the two never
-    drift out of sync with each other or with START_XY/END_XY again.
+    Unlike a natural cubic spline, this doesn't overshoot past the via
+    points' x-range between nodes — important here since overshoot would
+    eat into the obstacle clearances the via points were chosen to give.
     """
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    n = len(x)
+    m = np.zeros(n)
+    m[0] = delta[0]
+    m[-1] = delta[-1]
+    for i in range(1, n - 1):
+        if delta[i - 1] * delta[i] <= 0:
+            m[i] = 0.0
+        else:
+            w1 = 2 * h[i] + h[i - 1]
+            w2 = h[i] + 2 * h[i - 1]
+            m[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i])
+    return m
+
+
+def _pchip_eval(xq: np.ndarray, x: np.ndarray, y: np.ndarray, m: np.ndarray) -> np.ndarray:
+    xq = np.atleast_1d(xq)
+    out = np.zeros_like(xq, dtype=float)
+    for j, xv in enumerate(xq):
+        i = np.searchsorted(x, xv) - 1
+        i = min(max(i, 0), len(x) - 2)
+        h = x[i + 1] - x[i]
+        t = (xv - x[i]) / h
+        h00 = 2 * t**3 - 3 * t**2 + 1
+        h10 = t**3 - 2 * t**2 + t
+        h01 = -2 * t**3 + 3 * t**2
+        h11 = t**3 - t**2
+        out[j] = h00 * y[i] + h10 * h * m[i] + h01 * y[i + 1] + h11 * h * m[i + 1]
+    return out
+
+
+def nominal_safe_waypoints() -> list[tuple[float, float, float]]:
+    """10-waypoint deterministic path from START_XY through SAFE_PATH_VIA_POINTS to END_XY.
+
+    Computed to safely clear all three obstacles with no disturbance/wind
+    modelled — the experiment's risk comes from flying this nominally-safe
+    path under real fan noise, not from the path itself cutting close to
+    anything. A monotone (PCHIP) cubic Hermite spline through the via
+    points, self-contained in numpy (no new dependency). This is the
+    baseline flown by the deterministic condition, and the warm start the
+    pdSTL optimizer improves on. Defined once here (not duplicated in
+    generate_waypoints.py/crazyflie.py) so the two never drift out of sync
+    with each other or with START_XY/END_XY again.
+    """
+    nodes = [START_XY, *SAFE_PATH_VIA_POINTS, END_XY]
+    x_nodes = np.array([p[0] for p in nodes], dtype=float)
+    y_nodes = np.array([p[1] for p in nodes], dtype=float)
+
+    slopes = _pchip_slopes(y_nodes, x_nodes)
     y_pos = np.linspace(START_XY[1], END_XY[1], 10)
-    t = (y_pos - START_XY[1]) / (END_XY[1] - START_XY[1])
-    x_pos = START_XY[0] - SINE_AMPLITUDE * np.sin(np.pi * t)
+    x_pos = _pchip_eval(y_pos, y_nodes, x_nodes, slopes)
     return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
 
 

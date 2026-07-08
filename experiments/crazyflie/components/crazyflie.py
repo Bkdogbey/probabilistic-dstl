@@ -15,19 +15,14 @@ from components.environment_config import (
     Z_HEIGHT,
     build_planner,
     measured_belief,
-    sine_warm_start_waypoints,
+    nominal_safe_waypoints,
 )
 from components.flight_logger import FlightLogger
 from components.opt_waypoints import WAYPOINTS
 from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 
-# Trial configuration: edit these values before each run.
-# Path selector: True for the pDSTL-optimised path, False for the original sine path.
-USE_OPTIMISED = False
-# Condition label: 'deterministic' or 'pdstl'.
-CONDITION = 'pdstl'
-# Fan speed integer: 2, 6, 12, or 16.
-FAN_SPEED = 12
+# Trial settings (condition, fan speed) live in CrazyflieConfig, set from
+# main.py's CLI args -- no need to edit this file before a run.
 
 TAKEOFF_Z = Z_HEIGHT
 RETURN_Z = 0.65
@@ -35,7 +30,7 @@ LAND_Z = 0.1
 WAYPOINT_DELAY_SECONDS = 0.1
 CALIBRATION_HOVER_SECONDS = 2.0
 
-_sine_waypoints = sine_warm_start_waypoints
+_nominal_waypoints = nominal_safe_waypoints
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
@@ -90,7 +85,7 @@ class CrazyfliePlanning(BaseComponent):
         """
         measured = self._measured_xy()
         horizon = max(1, len(remaining_waypoints))
-        planner, _dynamics, _env = build_planner(FAN_SPEED, T_horizon=horizon)
+        planner, _dynamics, _env = build_planner(self.config.fan_speed, T_horizon=horizon)
         x0_mean, x0_cov = measured_belief(measured)
 
         best_mean, _best_cov, _best_u, best_p, _history = planner._optimize_window(
@@ -138,13 +133,17 @@ class CrazyfliePlanning(BaseComponent):
         time.sleep(1.0)
 
     def _execute_once(self):
-        logger = FlightLogger(CONDITION, fan_speed=FAN_SPEED)
+        condition = self.config.condition
+        fan_speed = self.config.fan_speed
+        use_optimised = condition == 'pdstl'
+
+        logger = FlightLogger(condition, fan_speed=fan_speed)
 
         logger.start()
         logger.start_actual_logging(
             lambda: (self.crazyflie.current_x, self.crazyflie.current_y, self.crazyflie.current_z)
         )
-        nominal_waypoints = WAYPOINTS if USE_OPTIMISED else _sine_waypoints()
+        nominal_waypoints = WAYPOINTS if use_optimised else _nominal_waypoints()
         _validate_waypoints_inside_flight_area(nominal_waypoints)
         _validate_waypoints_inside_flight_area(
             [

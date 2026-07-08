@@ -1,9 +1,9 @@
 """
 Flight data logger for Crazyflie experiment trials.
 
-Two conditions:
-    deterministic  — original sine path (USE_OPTIMISED = False)
-    pdstl          — pDSTL-optimised path (USE_OPTIMISED = True)
+Two conditions (set via `python main.py --condition ...`):
+    deterministic  — nominal safe path, no optimisation
+    pdstl          — pDSTL-optimised path
 
 Usage (from crazyflie.py):
     logger = FlightLogger("pdstl", fan_speed=12)

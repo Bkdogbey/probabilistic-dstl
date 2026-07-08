@@ -31,7 +31,7 @@ from components.environment_config import (
     TorchGaussianBelief,
     Z_HEIGHT,
     build_planner,
-    sine_warm_start_waypoints,
+    nominal_safe_waypoints,
     x0_belief,
 )
 
@@ -49,7 +49,7 @@ def z_profile(xy_waypoints: np.ndarray) -> list[float]:
     return [Z_HEIGHT] * len(xy_waypoints)
 
 
-_sine_waypoints = sine_warm_start_waypoints
+_nominal_waypoints = nominal_safe_waypoints
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
@@ -68,9 +68,9 @@ def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, f
         )
 
 
-def _sine_init_guess() -> torch.Tensor:
-    """Convert sine waypoints to T=10 velocity controls for warm-starting."""
-    wps = np.array(_sine_waypoints())
+def _nominal_init_guess() -> torch.Tensor:
+    """Convert the deterministic safe path to T=10 velocity controls for warm-starting."""
+    wps = np.array(_nominal_waypoints())
     vels = np.diff(wps[:, :2], axis=0) / DT  # (9, 2)
     vels = np.vstack([vels, [[0.0, 0.0]]])
     return torch.tensor(vels, dtype=torch.float32)
@@ -110,7 +110,7 @@ def _write_waypoints(
 
 def _plot(
     env: Environment,
-    sine_wps: np.ndarray,
+    nominal_wps: np.ndarray,
     opt_xy: np.ndarray,
     opt_cov: np.ndarray,
 ) -> None:
@@ -122,7 +122,7 @@ def _plot(
     for ax, (path_xy, title, draw_ellipses) in zip(
         axes,
         [
-            (sine_wps[:, :2], 'Before (Sine Path)', False),
+            (nominal_wps[:, :2], 'Before (Deterministic Safe Path)', False),
             (opt_xy, 'After (pdSTL Optimised)', True),
         ],
     ):
@@ -219,10 +219,10 @@ def main() -> None:
 
     planner, _dynamics, env = build_planner(args.fan)
 
-    init_u = _sine_init_guess()
+    init_u = _nominal_init_guess()
 
     rho_before = _evaluate_rho(planner, init_u)
-    print(f'rho_before (sine path): {rho_before:.4f}')
+    print(f'rho_before (deterministic safe path): {rho_before:.4f}')
 
     best_mean, best_cov, _best_u, best_p, _history = planner._optimize_window(
         X0_MEAN,
@@ -242,8 +242,8 @@ def main() -> None:
     print(f'Written {len(waypoints)} waypoints to {out_path}')
 
     if args.plot:
-        sine_wps = np.array(_sine_waypoints())
-        _plot(env, sine_wps, positions_xy, best_cov.squeeze(0).cpu().numpy())
+        nominal_wps = np.array(_nominal_waypoints())
+        _plot(env, nominal_wps, positions_xy, best_cov.squeeze(0).cpu().numpy())
 
 
 if __name__ == '__main__':
