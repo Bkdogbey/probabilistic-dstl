@@ -10,6 +10,7 @@ from components.environment_config import (
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
     REPLAN_CHECKPOINTS,
+    SAFE_PATH_FLIGHT_POINTS,
     START_TOLERANCE,
     START_XY,
     Z_HEIGHT,
@@ -96,8 +97,17 @@ class CrazyfliePlanning(BaseComponent):
         print(f'[Replan] from measured={measured} -> P(sat)={best_p:.3f}, {len(new_tail)} new waypoints')
         return new_tail
 
-    def _fly_forward_mission(self, logger, waypoints: list[tuple[float, float, float]]) -> tuple[float, float, float]:
-        """Calibrate, fly start->goal (with mid-flight replanning), return the last waypoint flown."""
+    def _fly_forward_mission(
+        self, logger, waypoints: list[tuple[float, float, float]], *, replan_enabled: bool,
+    ) -> tuple[float, float, float]:
+        """Calibrate, fly start->goal (optionally with mid-flight replanning), return the last waypoint flown.
+
+        replan_enabled gates REPLAN_CHECKPOINTS to the pdstl condition only:
+        replanning re-optimises via the same pdSTL planner the pdstl condition
+        uses, which doesn't belong in the deterministic condition -- its whole
+        point is to be an unoptimised baseline flown as-is under real fan
+        noise, not one that secretly self-corrects mid-flight.
+        """
         waypoints = self._calibrate_and_offset(waypoints)
         logger.log_waypoint(*START_XY, TAKEOFF_Z)
 
@@ -108,7 +118,7 @@ class CrazyfliePlanning(BaseComponent):
             logger.log_waypoint(x, y, z)
             time.sleep(WAYPOINT_DELAY_SECONDS)
 
-            if i in REPLAN_CHECKPOINTS and i < len(waypoints) - 1:
+            if replan_enabled and i in REPLAN_CHECKPOINTS and i < len(waypoints) - 1:
                 new_tail = self._replan_from_here(waypoints[i + 1:])
                 _validate_waypoints_inside_flight_area(new_tail)
                 waypoints = waypoints[: i + 1] + new_tail
@@ -143,7 +153,7 @@ class CrazyfliePlanning(BaseComponent):
         logger.start_actual_logging(
             lambda: (self.crazyflie.current_x, self.crazyflie.current_y, self.crazyflie.current_z)
         )
-        nominal_waypoints = WAYPOINTS if use_optimised else _nominal_waypoints()
+        nominal_waypoints = WAYPOINTS if use_optimised else _nominal_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
         _validate_waypoints_inside_flight_area(nominal_waypoints)
         _validate_waypoints_inside_flight_area(
             [
@@ -153,7 +163,7 @@ class CrazyfliePlanning(BaseComponent):
         )
 
         try:
-            last_xyz = self._fly_forward_mission(logger, nominal_waypoints)
+            last_xyz = self._fly_forward_mission(logger, nominal_waypoints, replan_enabled=use_optimised)
         except Exception:
             logger.mark_crashed()
             logger.stop_actual_logging()

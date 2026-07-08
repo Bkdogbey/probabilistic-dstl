@@ -101,6 +101,12 @@ SAFE_PATH_VIA_POINTS: list[tuple[float, float]] = [
     (0.617, -0.58),
 ]
 
+# Waypoint count actually flown for the deterministic condition (denser than
+# the T=10 planning horizon, purely for a smoother real flight path — the
+# T-point warm-start fed to the optimizer is unaffected, see
+# nominal_safe_waypoints(n_points=T) in generate_waypoints.py).
+SAFE_PATH_FLIGHT_POINTS: int = 30
+
 
 def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Fritsch-Carlson monotone cubic Hermite slopes.
@@ -141,27 +147,47 @@ def _pchip_eval(xq: np.ndarray, x: np.ndarray, y: np.ndarray, m: np.ndarray) -> 
     return out
 
 
-def nominal_safe_waypoints() -> list[tuple[float, float, float]]:
-    """10-waypoint deterministic path from START_XY through SAFE_PATH_VIA_POINTS to END_XY.
+def nominal_safe_waypoints(n_points: int = T) -> list[tuple[float, float, float]]:
+    """Deterministic path from START_XY through SAFE_PATH_VIA_POINTS to END_XY.
 
     Computed to safely clear all three obstacles with no disturbance/wind
     modelled — the experiment's risk comes from flying this nominally-safe
     path under real fan noise, not from the path itself cutting close to
     anything. A monotone (PCHIP) cubic Hermite spline through the via
     points, self-contained in numpy (no new dependency). This is the
-    baseline flown by the deterministic condition, and the warm start the
-    pdSTL optimizer improves on. Defined once here (not duplicated in
-    generate_waypoints.py/crazyflie.py) so the two never drift out of sync
-    with each other or with START_XY/END_XY again.
+    baseline flown by the deterministic condition, and (at n_points=T,
+    the default) the warm start the pdSTL optimizer improves on. Defined
+    once here (not duplicated in generate_waypoints.py/crazyflie.py) so
+    nothing drifts out of sync with START_XY/END_XY again.
+
+    n_points defaults to T because generate_waypoints.py's warm-start needs
+    exactly T points to produce T velocity controls for the T-step
+    optimizer — pass SAFE_PATH_FLIGHT_POINTS for the denser path actually
+    flown by the deterministic condition, or a larger value for plotting
+    the smooth underlying curve.
     """
     nodes = [START_XY, *SAFE_PATH_VIA_POINTS, END_XY]
     x_nodes = np.array([p[0] for p in nodes], dtype=float)
     y_nodes = np.array([p[1] for p in nodes], dtype=float)
 
     slopes = _pchip_slopes(y_nodes, x_nodes)
-    y_pos = np.linspace(START_XY[1], END_XY[1], 10)
+    y_pos = np.linspace(START_XY[1], END_XY[1], n_points)
     x_pos = _pchip_eval(y_pos, y_nodes, x_nodes, slopes)
     return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
+
+
+def reference_direct_path(n_points: int = 200) -> list[tuple[float, float]]:
+    """The 'obstacles are not there' path: straight line START_XY -> END_XY.
+
+    Plotting-only reference so via-points can be chosen by comparing this
+    against the obstacle layout — never flown, not used for planning.
+    """
+    x_nodes = np.array([START_XY[0], END_XY[0]], dtype=float)
+    y_nodes = np.array([START_XY[1], END_XY[1]], dtype=float)
+    slopes = _pchip_slopes(y_nodes, x_nodes)
+    y_pos = np.linspace(START_XY[1], END_XY[1], n_points)
+    x_pos = _pchip_eval(y_pos, y_nodes, x_nodes, slopes)
+    return [(float(x), float(y)) for x, y in zip(x_pos, y_pos)]
 
 
 def build_environment() -> Environment:

@@ -26,12 +26,15 @@ from components.environment_config import (
     Environment,
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
+    OBSTACLES,
     PLANNER_ALPHA,
+    SAFE_PATH_FLIGHT_POINTS,
     T,
     TorchGaussianBelief,
     Z_HEIGHT,
     build_planner,
     nominal_safe_waypoints,
+    reference_direct_path,
     x0_belief,
 )
 
@@ -70,7 +73,7 @@ def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, f
 
 def _nominal_init_guess() -> torch.Tensor:
     """Convert the deterministic safe path to T=10 velocity controls for warm-starting."""
-    wps = np.array(_nominal_waypoints())
+    wps = np.array(_nominal_waypoints(n_points=T))
     vels = np.diff(wps[:, :2], axis=0) / DT  # (9, 2)
     vels = np.vstack([vels, [[0.0, 0.0]]])
     return torch.tensor(vels, dtype=torch.float32)
@@ -108,92 +111,116 @@ def _write_waypoints(
     path.write_text('\n'.join(lines), encoding='utf-8')
 
 
-def _plot(
-    env: Environment,
-    nominal_wps: np.ndarray,
-    opt_xy: np.ndarray,
-    opt_cov: np.ndarray,
-) -> None:
+def _obstacle_clearance(curve_xy: np.ndarray, obs: dict) -> float:
+    """Min distance from any point on curve_xy [N,2] to an {'x','y'} obstacle box (0 = inside)."""
+    x0, x1 = obs['x']
+    y0, y1 = obs['y']
+    dx = np.maximum(np.maximum(x0 - curve_xy[:, 0], 0.0), curve_xy[:, 0] - x1)
+    dy = np.maximum(np.maximum(y0 - curve_xy[:, 1], 0.0), curve_xy[:, 1] - y1)
+    return float(np.min(np.sqrt(dx**2 + dy**2)))
+
+
+def _draw_env(ax, env: Environment) -> None:
     import matplotlib.patches as patches
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Ellipse
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-    for ax, (path_xy, title, draw_ellipses) in zip(
-        axes,
-        [
-            (nominal_wps[:, :2], 'Before (Deterministic Safe Path)', False),
-            (opt_xy, 'After (pdSTL Optimised)', True),
-        ],
-    ):
-        ax.set_title(title)
-        ax.set_aspect('equal')
-        ax.set_xlim(FLIGHT_X_BOUNDS[0] - 0.1, FLIGHT_X_BOUNDS[1] + 0.1)
-        ax.set_ylim(FLIGHT_Y_BOUNDS[0] - 0.1, FLIGHT_Y_BOUNDS[1] + 0.1)
-        ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    ax.set_xlim(FLIGHT_X_BOUNDS[0] - 0.1, FLIGHT_X_BOUNDS[1] + 0.1)
+    ax.set_ylim(FLIGHT_Y_BOUNDS[0] - 0.1, FLIGHT_Y_BOUNDS[1] + 0.1)
+    ax.grid(True, alpha=0.3)
 
+    ax.add_patch(
+        patches.Rectangle(
+            (FLIGHT_X_BOUNDS[0], FLIGHT_Y_BOUNDS[0]),
+            FLIGHT_X_BOUNDS[1] - FLIGHT_X_BOUNDS[0],
+            FLIGHT_Y_BOUNDS[1] - FLIGHT_Y_BOUNDS[0],
+            facecolor='none',
+            edgecolor='black',
+            linestyle='--',
+            linewidth=1.2,
+            label='flight area',
+        )
+    )
+
+    for obs in env.obstacles:
+        ox, oy = obs['x'], obs['y']
         ax.add_patch(
             patches.Rectangle(
-                (FLIGHT_X_BOUNDS[0], FLIGHT_Y_BOUNDS[0]),
-                FLIGHT_X_BOUNDS[1] - FLIGHT_X_BOUNDS[0],
-                FLIGHT_Y_BOUNDS[1] - FLIGHT_Y_BOUNDS[0],
-                facecolor='none',
-                edgecolor='black',
-                linestyle='--',
-                linewidth=1.2,
-                label='flight area',
+                (ox[0], oy[0]),
+                ox[1] - ox[0],
+                oy[1] - oy[0],
+                facecolor='red',
+                alpha=0.4,
+                edgecolor='darkred',
             )
         )
 
-        for obs in env.obstacles:
-            ox, oy = obs['x'], obs['y']
-            ax.add_patch(
-                patches.Rectangle(
-                    (ox[0], oy[0]),
-                    ox[1] - ox[0],
-                    oy[1] - oy[0],
-                    facecolor='red',
-                    alpha=0.4,
-                    edgecolor='darkred',
-                )
+    if env.goal:
+        gx, gy = env.goal['x'], env.goal['y']
+        ax.add_patch(
+            patches.Rectangle(
+                (gx[0], gy[0]),
+                gx[1] - gx[0],
+                gy[1] - gy[0],
+                facecolor='green',
+                alpha=0.3,
+                edgecolor='darkgreen',
             )
+        )
 
-        if env.goal:
-            gx, gy = env.goal['x'], env.goal['y']
-            ax.add_patch(
-                patches.Rectangle(
-                    (gx[0], gy[0]),
-                    gx[1] - gx[0],
-                    gy[1] - gy[0],
-                    facecolor='green',
-                    alpha=0.3,
-                    edgecolor='darkgreen',
-                )
-            )
 
-        ax.plot(path_xy[:, 0], path_xy[:, 1], 'b.-', lw=2, ms=8)
-        ax.plot(path_xy[0, 0], path_xy[0, 1], 'go', ms=10, label='start')
-        ax.plot(path_xy[-1, 0], path_xy[-1, 1], 'rs', ms=10, label='end')
+def _plot(
+    env: Environment,
+    nominal_wps: np.ndarray,
+    nominal_curve: np.ndarray,
+    reference_curve: np.ndarray,
+    opt_xy: np.ndarray,
+    opt_cov: np.ndarray,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
 
-        if draw_ellipses:
-            for t in range(len(opt_xy)):
-                cov_t = opt_cov[t]
-                vals, vecs = np.linalg.eigh(cov_t)
-                angle = math.degrees(math.atan2(*vecs[:, -1][::-1]))
-                w, h = 2 * 2 * np.sqrt(np.maximum(vals, 0))
-                el = Ellipse(
-                    xy=opt_xy[t],
-                    width=w,
-                    height=h,
-                    angle=angle,
-                    edgecolor='blue',
-                    facecolor='none',
-                    alpha=0.5,
-                    lw=0.8,
-                )
-                ax.add_patch(el)
+    fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(14, 7))
 
-        ax.legend()
+    # ── Before: deterministic safe path, with an obstacle-free reference
+    # curve and per-obstacle clearance so via-points can be tuned by eye ──
+    _draw_env(ax_before, env)
+    ax_before.set_title('Before (Deterministic Safe Path)')
+    ax_before.plot(
+        reference_curve[:, 0], reference_curve[:, 1],
+        'k--', lw=1.2, alpha=0.6, label='reference (no obstacles)',
+    )
+    ax_before.plot(nominal_curve[:, 0], nominal_curve[:, 1], 'b-', lw=1.5, alpha=0.8)
+    ax_before.plot(nominal_wps[:, 0], nominal_wps[:, 1], 'bo', ms=5, label='flown waypoints')
+    ax_before.plot(nominal_wps[0, 0], nominal_wps[0, 1], 'go', ms=10, label='start')
+    ax_before.plot(nominal_wps[-1, 0], nominal_wps[-1, 1], 'rs', ms=10, label='end')
+    for obs in OBSTACLES:
+        clearance = _obstacle_clearance(nominal_curve, obs)
+        cx = (obs['x'][0] + obs['x'][1]) / 2
+        cy = (obs['y'][0] + obs['y'][1]) / 2
+        ax_before.annotate(
+            f"{obs['name']}\n{clearance * 100:.1f} cm",
+            (cx, cy), ha='center', va='center', fontsize=8, color='darkred',
+        )
+    ax_before.legend(fontsize=8)
+
+    # ── After: pdSTL-optimised plan, with belief-covariance ellipses ──────
+    _draw_env(ax_after, env)
+    ax_after.set_title('After (pdSTL Optimised)')
+    ax_after.plot(reference_curve[:, 0], reference_curve[:, 1], 'k--', lw=1.2, alpha=0.6)
+    ax_after.plot(opt_xy[:, 0], opt_xy[:, 1], 'b.-', lw=2, ms=8)
+    ax_after.plot(opt_xy[0, 0], opt_xy[0, 1], 'go', ms=10, label='start')
+    ax_after.plot(opt_xy[-1, 0], opt_xy[-1, 1], 'rs', ms=10, label='end')
+    for t in range(len(opt_xy)):
+        cov_t = opt_cov[t]
+        vals, vecs = np.linalg.eigh(cov_t)
+        angle = math.degrees(math.atan2(*vecs[:, -1][::-1]))
+        w, h = 2 * 2 * np.sqrt(np.maximum(vals, 0))
+        el = Ellipse(
+            xy=opt_xy[t], width=w, height=h, angle=angle,
+            edgecolor='blue', facecolor='none', alpha=0.5, lw=0.8,
+        )
+        ax_after.add_patch(el)
+    ax_after.legend(fontsize=8)
 
     plt.tight_layout()
     out = HERE / 'waypoints_comparison.png'
@@ -242,8 +269,12 @@ def main() -> None:
     print(f'Written {len(waypoints)} waypoints to {out_path}')
 
     if args.plot:
-        nominal_wps = np.array(_nominal_waypoints())
-        _plot(env, nominal_wps, positions_xy, best_cov.squeeze(0).cpu().numpy())
+        # SAFE_PATH_FLIGHT_POINTS -- matches what crazyflie.py actually flies
+        # for the deterministic condition, not the T-point optimizer warm-start.
+        nominal_wps = np.array(_nominal_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS))[:, :2]
+        nominal_curve = np.array(_nominal_waypoints(n_points=200))[:, :2]
+        reference_curve = np.array(reference_direct_path(n_points=200))
+        _plot(env, nominal_wps, nominal_curve, reference_curve, positions_xy, best_cov.squeeze(0).cpu().numpy())
 
 
 if __name__ == '__main__':
