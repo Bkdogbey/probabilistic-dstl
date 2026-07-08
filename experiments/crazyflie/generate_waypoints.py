@@ -31,6 +31,7 @@ from components.environment_config import (
     TorchGaussianBelief,
     Z_HEIGHT,
     build_planner,
+    sine_warm_start_waypoints,
     x0_belief,
 )
 
@@ -48,12 +49,7 @@ def z_profile(xy_waypoints: np.ndarray) -> list[float]:
     return [Z_HEIGHT] * len(xy_waypoints)
 
 
-def _sine_waypoints() -> list[tuple[float, float, float]]:
-    """10-waypoint sine path in unscaled commanded coordinates."""
-    start_0 = 1.5
-    y_pos = np.linspace(-start_0, FLIGHT_Y_BOUNDS[1], 10)
-    x_pos = 0.5 * np.sin(np.pi * y_pos / start_0)
-    return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
+_sine_waypoints = sine_warm_start_waypoints
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:

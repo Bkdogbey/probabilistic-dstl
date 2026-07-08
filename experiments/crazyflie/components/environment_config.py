@@ -16,6 +16,7 @@ import sys
 # module's re-exports below, so nothing else needs to touch sys.path.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'src'))
 
+import numpy as np
 import torch
 
 from pdstl.base import BeliefTrajectory as BeliefTrajectory
@@ -24,23 +25,28 @@ from planning.environment import Environment as Environment
 from planning.planner import Planner as Planner
 from planning.planner import TorchGaussianBelief as TorchGaussianBelief
 
-# ── Arena geometry — TODO: replace with the newly measured arena numbers ────
-FLIGHT_X_BOUNDS: list[float] = [-0.5, 1.0]
+# ── Arena geometry (measured; arena extended 0.5 m past the raw x=1.0 wall so
+# ── that start/end/obstacle_3 — all of which sit exactly at x=1.0 — don't sit
+# ── flush on a hard planning boundary) ───────────────────────────────────────
+FLIGHT_X_BOUNDS: list[float] = [-0.5, 1.5]
 FLIGHT_Y_BOUNDS: list[float] = [-2.0, 0.5]
 Z_HEIGHT: float = 0.2  # flight height [m], fixed altitude (2D planning)
 
-# TODO: replace with newly measured obstacle boxes. Single list consumed by
-# both the planner (generate_waypoints.py) and the safety flags in the
-# flight logger — no more duplicating obstacle boxes across files.
+# Measured obstacle boxes (converted from inches at 0.0254 m/in) — single
+# list consumed by both the planner (generate_waypoints.py) and the safety
+# flags in the flight logger — no more duplicating obstacle boxes across
+# files. 'height' is metadata for the future-3D seam (z_profile()); the
+# current 2D collision logic ignores it.
 OBSTACLES: list[dict] = [
-    {'name': 'obs_1', 'x': (-0.165, 0.165), 'y': (-1.144, -0.941)},  # red
-    {'name': 'obs_2', 'x': (-0.432, -0.102), 'y': (-0.179, 0.049)},  # blue
-    {'name': 'obs_3', 'x': (0.114, 0.343), 'y': (-0.611, -0.421)},  # green
+    {'name': 'obs_1', 'x': (0.5, 0.8175), 'y': (-1.2667, -1.0), 'height': 0.4064},
+    {'name': 'obs_2', 'x': (0.25, 0.4405), 'y': (-0.6651, -0.5), 'height': 0.5143},
+    {'name': 'obs_3', 'x': (0.7936, 1.0), 'y': (-0.6651, -0.5), 'height': 0.3302},
 ]
 
-GOAL: dict = {'x': (-0.30, 0.30), 'y': (0.10, 0.30)}
+GOAL: dict = {'x': (0.85, 1.15), 'y': (-0.15, 0.15)}  # ±0.15 m box around END_XY
 
-START_XY: tuple[float, float] = (0.0, -1.5)
+START_XY: tuple[float, float] = (1.0, -2.0)
+END_XY: tuple[float, float] = (1.0, 0.0)  # sine warm-start target; goal box center
 # Abort the flight if the measured hover position at start differs from
 # START_XY by more than this (m) — see components/calibration.py.
 START_TOLERANCE: float = 0.08
@@ -77,6 +83,28 @@ MEASURED_COV_DIAG: tuple[float, float] = (1e-3, 1e-3)
 # of blindly continuing the offline plan. Append a second index for two
 # mid-flight replans.
 REPLAN_CHECKPOINTS: list[int] = [5]
+
+# Amplitude of the deterministic sine path's swing toward obs_1 (see
+# sine_warm_start_waypoints below) — tuned so it threads through obs_1's
+# interior while keeping a near-graze on obs_3 and a safe berth around obs_2.
+SINE_AMPLITUDE: float = 0.32
+
+
+def sine_warm_start_waypoints() -> list[tuple[float, float, float]]:
+    """10-waypoint deterministic path from START_XY to END_XY.
+
+    Threads through obstacle 1's interior while keeping a near-graze on
+    obstacle 3 and a safe berth around obstacle 2 — obs_2 and obs_3 share
+    the same y-band, so no smooth start-anchored path can threaten both at
+    once. This is the 'naive' baseline flown by the deterministic condition,
+    and the warm start the pdSTL optimizer improves on. Defined once here
+    (not duplicated in generate_waypoints.py/crazyflie.py) so the two never
+    drift out of sync with each other or with START_XY/END_XY again.
+    """
+    y_pos = np.linspace(START_XY[1], END_XY[1], 10)
+    t = (y_pos - START_XY[1]) / (END_XY[1] - START_XY[1])
+    x_pos = START_XY[0] - SINE_AMPLITUDE * np.sin(np.pi * t)
+    return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
 
 
 def build_environment() -> Environment:

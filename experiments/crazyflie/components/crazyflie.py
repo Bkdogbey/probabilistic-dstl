@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
 from cflib.positioning.position_hl_commander import PositionHlCommander
 from ros_sugar.core import BaseComponent
 
@@ -16,6 +15,7 @@ from components.environment_config import (
     Z_HEIGHT,
     build_planner,
     measured_belief,
+    sine_warm_start_waypoints,
 )
 from components.flight_logger import FlightLogger
 from components.opt_waypoints import WAYPOINTS
@@ -29,20 +29,13 @@ CONDITION = 'pdstl'
 # Fan speed integer: 2, 6, 12, or 16.
 FAN_SPEED = 12
 
-START_Y = START_XY[1]
-END_Y = FLIGHT_Y_BOUNDS[1]
 TAKEOFF_Z = Z_HEIGHT
 RETURN_Z = 0.65
 LAND_Z = 0.1
 WAYPOINT_DELAY_SECONDS = 0.1
 CALIBRATION_HOVER_SECONDS = 2.0
 
-
-def _sine_waypoints() -> list[tuple[float, float, float]]:
-    start_0 = abs(START_Y)
-    y_pos = np.linspace(START_Y, END_Y, 10)
-    x_pos = 0.5 * np.sin(np.pi * y_pos / start_0)
-    return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
+_sine_waypoints = sine_warm_start_waypoints
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
@@ -108,6 +101,42 @@ class CrazyfliePlanning(BaseComponent):
         print(f'[Replan] from measured={measured} -> P(sat)={best_p:.3f}, {len(new_tail)} new waypoints')
         return new_tail
 
+    def _fly_forward_mission(self, logger, waypoints: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+        """Calibrate, fly start->goal (with mid-flight replanning), return the last waypoint flown."""
+        waypoints = self._calibrate_and_offset(waypoints)
+        logger.log_waypoint(*START_XY, TAKEOFF_Z)
+
+        i = 0
+        while i < len(waypoints):
+            x, y, z = waypoints[i]
+            self.position_commander.go_to(x, y, z)
+            logger.log_waypoint(x, y, z)
+            time.sleep(WAYPOINT_DELAY_SECONDS)
+
+            if i in REPLAN_CHECKPOINTS and i < len(waypoints) - 1:
+                new_tail = self._replan_from_here(waypoints[i + 1:])
+                _validate_waypoints_inside_flight_area(new_tail)
+                waypoints = waypoints[: i + 1] + new_tail
+            i += 1
+
+        return waypoints[-1]
+
+    def _return_to_start(self, last_xyz: tuple[float, float, float]) -> None:
+        """Fly back to the start and land — not part of the recorded trial.
+
+        Run after the trial's data is already saved, so it makes back-to-back
+        runs easier without polluting the logged mission with the return leg.
+        """
+        x, y, _z = last_xyz
+        self.position_commander.go_to(x, y, RETURN_Z)
+        time.sleep(1.0)
+        self.position_commander.go_to(*START_XY, RETURN_Z)
+        time.sleep(1.0)
+        self.position_commander.go_to(*START_XY, LAND_Z)
+        time.sleep(1.0)
+        self.position_commander._hl_commander.stop()
+        time.sleep(1.0)
+
     def _execute_once(self):
         logger = FlightLogger(CONDITION, fan_speed=FAN_SPEED)
 
@@ -119,42 +148,28 @@ class CrazyfliePlanning(BaseComponent):
         _validate_waypoints_inside_flight_area(nominal_waypoints)
         _validate_waypoints_inside_flight_area(
             [
-                (0.0, START_Y, RETURN_Z),
-                (0.0, START_Y, LAND_Z),
+                (*START_XY, RETURN_Z),
+                (*START_XY, LAND_Z),
             ]
         )
+
         try:
-            waypoints = self._calibrate_and_offset(nominal_waypoints)
-            logger.log_waypoint(*START_XY, TAKEOFF_Z)
-
-            i = 0
-            while i < len(waypoints):
-                x, y, z = waypoints[i]
-                self.position_commander.go_to(x, y, z)
-                logger.log_waypoint(x, y, z)
-                time.sleep(WAYPOINT_DELAY_SECONDS)
-
-                if i in REPLAN_CHECKPOINTS and i < len(waypoints) - 1:
-                    new_tail = self._replan_from_here(waypoints[i + 1:])
-                    _validate_waypoints_inside_flight_area(new_tail)
-                    waypoints = waypoints[: i + 1] + new_tail
-                i += 1
-
-            self.position_commander.go_to(x, y, RETURN_Z)
-            time.sleep(1.0)
-            self.position_commander.go_to(0, START_Y, RETURN_Z)
-            time.sleep(1.0)
-            self.position_commander.go_to(0, START_Y, LAND_Z)
-            time.sleep(1.0)
-            self.position_commander._hl_commander.stop()
-            time.sleep(1.0)
-
+            last_xyz = self._fly_forward_mission(logger, nominal_waypoints)
         except Exception:
             logger.mark_crashed()
-            raise
-        finally:
             logger.stop_actual_logging()
             logger.save()
+            self.position_commander.land()
+            raise
+
+        # Forward mission (the recorded trial) is done -- stop logging and save
+        # before the return-to-start leg, which is deliberately not recorded.
+        logger.stop_actual_logging()
+        logger.save()
+
+        try:
+            self._return_to_start(last_xyz)
+        finally:
             self.position_commander.land()
 
     def _execution_step(self):
