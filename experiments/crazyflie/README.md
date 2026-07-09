@@ -1,136 +1,147 @@
 # Crazyflie reach-avoid experiment
 
-Real-world pdSTL experiment (paper Experiment 3), laid out like the original
-`irobot-crazyflie` codebase — but the pdSTL planner comes from this repo's
-`src/` (no vendored copies) and the drone hardware comes from the lab's
-`irobot` package.
+Real-world pdSTL experiment (paper Experiment 3). A Crazyflie flies from a start
+to a goal through three obstacles under fan-induced disturbance. Two conditions
+are compared: a **deterministic** nominal safe path, and a **pdSTL**-optimised
+plan that maximises the probabilistic satisfaction lower bound for a given fan
+level.
+
+The pdSTL planner comes from this repo's `src/` (no vendored copies); the drone
+hardware comes from the lab's `irobot` package.
+
+## Layout
 
 ```
-generate_waypoints.py    offline: pdSTL planner -> components/opt_waypoints.py
-main.py                  flight:  CLI entry point, launches CrazyfliePlanning
+run.py                 SINGLE entry point:  plan (offline) | fly (hardware)
+waypoint_planning.py   offline optimiser + before/after plotting
 components/
-    environment_config.py  single source of truth: arena geometry (bounds,
-                            obstacles, goal, start), the deterministic safe
-                            path's via-points, planner config, and
-                            build_environment()/build_planner() — everything
-                            else imports from here instead of duplicating or
-                            reaching into src/ directly
-    calibration.py        hover-and-measure start offset, abort-if-too-large,
-                           shift a plan to match the drone's real position
-    config.py              CrazyflieConfig — trial settings (condition, fan
-                            speed) live here, set from main.py's CLI args
-    crazyflie.py            flight component: calibrates at the start, flies
-                             the (offset-corrected) plan, and replans from the
-                             actual measured position at REPLAN_CHECKPOINTS
-    flight_logger.py       commanded/actual CSV logging, auto-incremented runs
-    opt_waypoints.py       generated pdSTL-optimised WAYPOINTS list
-                            (do not edit by hand — regenerate with
-                            generate_waypoints.py)
-    logs/                  flight CSVs (gitignored)
+    config.py          SINGLE config: arena geometry, per-fan uncertainty,
+                        planner hyperparameters, flight params, factories.
+                        Edit this one file to change anything. No hardware/ROS
+                        import, so the offline `plan` path stays lightweight.
+    crazyflie.py        flight component (ros_sugar): calibrate at start, fly the
+                        plan start->finish, return, land. Also defines the
+                        CrazyflieConfig trial dataclass.
+    calibration.py      hover-and-measure start offset, abort-if-too-large, shift
+    flight_logger.py    commanded/actual CSV logging, auto-incremented runs
+    logs/               flight CSVs (gitignored)
+waypoints/              generated pdstl_fan<L>.json (one per fan level)
+plots/                  generated fan<L>_comparison.png (one per fan level)
 ```
 
-## Setup (works on any machine — no hardware needed for this part)
+Everything you configure lives in **`components/config.py`**. Trial choices
+(condition, fan) are CLI args to `run.py` — no file editing per run.
 
-**Prerequisites**: Python 3.10+, and this repo's `src/` importable (that's
-handled automatically — `environment_config.py` adds `<repo>/src` to
-`sys.path`, no install step needed for `pdstl`/`planning` themselves).
+## Run flow
 
-Install the planning dependencies (not fully covered by the repo's
-`requirements.txt`, which is missing `torch`/`numpy`):
+```bash
+cd experiments/crazyflie
+
+# 1. Plan (offline, no hardware). Fan level selects the initial belief
+#    covariance Σ0; --plot writes plots/fan<L>_comparison.png.
+python run.py plan --fan 12 --plot
+
+# 2. Fly (needs hardware + ROS). No replanning — the plan is flown as given.
+python run.py fly --condition pdstl --fan 12           # fly the optimised plan
+python run.py fly --condition deterministic --fan 6    # fly the nominal safe path
+```
+
+`fly --condition pdstl --fan L` flies `waypoints/pdstl_fan<L>.json`, which records
+the fan it was generated for and is checked on load — so you can't accidentally
+fly a plan optimised for a different fan. Generate each fan's plan once; fly any
+of them later without re-planning.
+
+Logs land in `components/logs/` as
+`<condition>_fan<XX>_run<NN>_<ts>_{commanded,actual}.csv`; crashed trials
+(including calibration aborts) are tagged `_CRASH`. The return-to-start leg after
+each trial is flown but not logged, so back-to-back runs need no manual reset.
+
+## Setup
+
+**Planning only** (works on any machine — no hardware):
 ```bash
 pip install torch numpy matplotlib
 ```
-
-**Smoke test** — confirms the install works, no drone or ROS needed:
+Smoke test:
 ```bash
-cd experiments/crazyflie
-python generate_waypoints.py --fan 2 --plot
+python run.py plan --fan 2 --plot
 ```
-This should converge and write `components/opt_waypoints.py` plus
-`waypoints_comparison.png` (before/after path figure). If it errors on
-`import torch`/`numpy`, the pip install above didn't take; if it errors on
-`import pdstl`/`planning`, you're not running from inside
-`experiments/crazyflie` (the path resolution is relative to this file).
+This converges, writes `waypoints/pdstl_fan2.json` and `plots/fan2_comparison.png`.
+If `import pdstl`/`planning` fails, you're not running from inside
+`experiments/crazyflie` (path resolution is relative to `components/config.py`).
 
-### Hardware setup (only needed to actually fly)
-
-On top of the above, install:
+**Flying** additionally needs the hardware stack (`fly` lazy-imports these, so
+`plan` never requires them):
 ```bash
 pip install cflib
 pip install -e <path-to-irobot-clone>   # e.g. pip install -e ~/Research/irobot
 ```
-Plus `ros_sugar` and a working ROS2 install (not pip-installable; follow your
-lab's ROS2 setup). `components/crazyflie.py` imports the pdSTL planner
-(`torch`) at flight time too, for mid-flight replanning — it's no longer
-decoupled through the generated `opt_waypoints.py` alone, so the flight
-machine needs the full set above (`torch`, `cflib`, `ros_sugar`, `irobot`).
+plus `ros_sugar` and a working ROS2 install (follow your lab's ROS2 setup). Note
+the flight machine **no longer needs torch** — replanning was removed, so the
+flight path only loads pre-generated JSON waypoints.
 
-## Why calibration + mid-flight replanning
+## Per-fan uncertainty (the covariance model)
 
-An offline single-shot plan assumes the drone starts exactly where the plan
-says and never drifts — real flights don't work that way (we saw a real
-offset between the tracked position and the planned/simulated one). So at
-flight time:
+Each fan level has its own **initial belief covariance Σ0** (`SIGMA0_PER_FAN` in
+`config.py`), so every fan's optimisation and plot reflect that fan's real
+uncertainty:
 
-1. **Calibrate**: hover at the planned start, measure the real position for
-   ~2s, and either abort (offset too large to trust) or shift the whole plan
-   by the measured (dx, dy) so it's anchored to where the drone actually is.
-2. **Replan mid-flight**: at each waypoint index in `REPLAN_CHECKPOINTS`
-   (`environment_config.py`), read the live measured position and re-run the
-   pdSTL optimizer (`Planner._optimize_window`) from there over the
-   remaining horizon, splicing in a corrected tail. A full replan takes a
-   few seconds on real hardware (measured: ~2.4s/300 iters, up to ~8s for a
-   full 1000-iter convergence) — too slow to do before every waypoint
-   (~0.7s apart), so this defaults to one checkpoint near the midpoint.
-   Add a second index to `REPLAN_CHECKPOINTS` for two replans.
+| Fan | Σ0 (m²) | Source |
+|----:|--------:|--------|
+| 2   | 0.001   | paper Setting 1 |
+| 6   | 0.006   | paper Setting 2 |
+| 12  | 0.020   | paper Setting 3 |
+| 16  | 0.050   | uncalibrated extrapolation (no paper source) |
 
-## The deterministic condition
+The belief grows along the path as `Σ_t = Σ0 + t·Q_STD²`, where `Q_STD` is a small
+shared per-step process noise (modest vs Σ0, so the per-fan Σ0 differences
+dominate the plots). Bump `Q_STD` for more visible growth, or calibrate both from
+tracking residuals.
 
-`nominal_safe_waypoints()` in `environment_config.py` is a path computed to
-safely clear all three obstacles **with no disturbance/wind modelled** —
-via-points (`SAFE_PATH_VIA_POINTS`) chosen by hand to route around each
-obstacle, connected by a monotone (PCHIP) spline. The risk this condition is
-meant to surface comes from *flying* that nominally-safe path under real fan
-noise, not from the path itself cutting through anything. It also serves as
-the pdSTL optimizer's warm start.
+This replaces the previous behaviour, where every fan used a single hardcoded
+Σ0 = 0.01 and all plots looked identical.
 
-Old flight logs are not reused by any of this — this is a fresh experiment;
-the logger's schema/behavior is unchanged, only its obstacle list comes from
-`environment_config.py` instead of being duplicated.
+## Optimiser knobs
+
+Every planner hyperparameter is in one place — `PLANNER_CONFIG` in `config.py` —
+with each value labelled paper-faithful (`w_phi`, `w_u`=λ, `alpha`), heuristic
+shaping (`w_dist`, `w_obs`, `w_visit`, `obs_margin` — potential fields that speed
+convergence but aren't in the paper's objective; set to 0 for the clean paper
+objective), or numerical (`lr`, `max_iters`, …). The `scale` knob controls β
+log-sum-exp smoothing of the STL min/max: `-1` = exact (default, current
+behaviour), `>0` = smooth (the paper's differentiable form).
+
+## Why calibration (but not replanning)
+
+An offline plan assumes the drone starts exactly where the plan says. Real flights
+drift, so at flight time the drone hovers at the planned start, measures its real
+position for ~2 s, and either aborts (offset too large to trust) or shifts the
+whole plan by the measured (dx, dy). This is a **one-time pre-flight** step.
+
+There is **no mid-flight replanning** — the plan is flown start-to-finish as
+given, so the drone moves continuously without pausing mid-arena to re-optimise.
+Flight speed is set to the planned `U_MAX` so actual flight matches the belief
+model's timing.
 
 ## Updating for a re-measured arena
 
-Edit the geometry constants at the top of `components/environment_config.py`
-(`FLIGHT_X_BOUNDS`, `FLIGHT_Y_BOUNDS`, `OBSTACLES`, `GOAL`, `START_XY`,
-`END_XY`, `SAFE_PATH_VIA_POINTS`) — one file, used by planning, flight, and
-logging alike.
+Edit the geometry constants at the top of `components/config.py`
+(`FLIGHT_*_BOUNDS`, `OBSTACLES`, `GOAL`, `START_XY`, `END_XY`,
+`SAFE_PATH_VIA_POINTS`) — one file, used by planning, flight, and logging alike.
 
-## Run flow (from this folder)
+## Scaling to 3D (future)
 
-```bash
-# 1. Plan (fan speed selects the process noise; --plot saves the before/after figure)
-python generate_waypoints.py --fan 12 --plot
+Planning is 2D at a fixed altitude (`Z_HEIGHT`); per-waypoint altitudes go in
+`z_profile()` in `waypoint_planning.py`, and `OBSTACLES` already carry a `height`
+field. A full 3D experiment is a localised change: `SingleIntegrator`
+(`eye(2)`→`eye(3)`) in `src/planning/dynamics.py`, the `Rectangular{Goal,Obstacle}`
+predicates in `src/planning/environment.py`, and the planner's `[:2]` slices in
+`src/planning/planner.py`. The pdSTL operators (`src/pdstl/`) are already
+dimension-agnostic.
 
-# 2. Fly — trial settings are CLI args, no file editing required:
-python main.py --condition pdstl --fan 12            # fly the pdSTL-optimised plan
-python main.py --condition deterministic --fan 6      # fly the nominal safe path
-```
+## Troubleshooting
 
-Logs land in `components/logs/` as `<condition>_fan<XX>_run<NN>_<ts>_{commanded,actual}.csv`;
-crashed trials (including calibration aborts) are tagged `_CRASH`. The
-return-to-start leg after each trial is flown but not logged, so back-to-back
-runs don't need any manual reset between them.
-
-Planning is 2D at a fixed altitude (`Z_HEIGHT` in `environment_config.py`);
-per-waypoint altitudes for future 3D flights go in `z_profile()` in
-`generate_waypoints.py`.
-
-## Noise calibration
-
-`Q_STD_PER_FAN` in `environment_config.py` maps fan settings to process
-noise. Three of its four values (`2, 6, 12`) are verified against the paper's
-documented calibration; the fourth (`16`) has no paper source. A separate,
-more rigorous calibration effort exists in `~/Research/crazyflie-stl-experiments`
-(`cfstl/calibrate_noise.py`, real tracking-residual data for fan levels
-`00/06/12/18`) but uses a different fan-level scheme that hasn't been
-reconciled with this experiment's — not wired in here.
+- **matplotlib `CXXABI_... not found`** on `--plot`: a conda libstdc++ mismatch.
+  Run with the env's own lib: `LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" python run.py plan --fan 2 --plot`.
+- **`No optimised waypoints for fan L`** on `fly --condition pdstl`: generate that
+  fan's plan first with `python run.py plan --fan L`.

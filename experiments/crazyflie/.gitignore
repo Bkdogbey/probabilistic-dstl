@@ -1,0 +1,6 @@
+# Generated artifacts (regenerate with run.py)
+logs/
+plots/
+
+# Flight-input waypoints (waypoints/pdstl_fan<L>.json) ARE tracked — they are
+# what `run.py fly` loads. Only the generated figures/logs above are ignored.

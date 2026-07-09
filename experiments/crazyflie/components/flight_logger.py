@@ -1,7 +1,7 @@
 """
 Flight data logger for Crazyflie experiment trials.
 
-Two conditions (set via `python main.py --condition ...`):
+Two conditions (set via `python run.py fly --condition ...`):
     deterministic  — nominal safe path, no optimisation
     pdstl          — pDSTL-optimised path
 
@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-from components.environment_config import OBSTACLES as _ENV_OBSTACLES
+from components.config import OBSTACLES as _ENV_OBSTACLES
 
 # ── Valid condition labels ──────────────────────────────────────────────────
 CONDITIONS = (
@@ -46,7 +46,7 @@ CONDITIONS = (
 )
 
 # ── Obstacles (x_min, x_max, y_min, y_max), sourced from the single arena
-#    geometry config in environment_config.py — nothing hardcoded here ───────
+#    geometry config in components/config.py — nothing hardcoded here ────────
 _OBSTACLES: list[tuple[float, float, float, float]] = [
     (obs['x'][0], obs['x'][1], obs['y'][0], obs['y'][1]) for obs in _ENV_OBSTACLES
 ]

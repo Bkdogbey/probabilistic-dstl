@@ -2,36 +2,42 @@ from __future__ import annotations
 
 import time
 
+from attrs import define
 from cflib.positioning.position_hl_commander import PositionHlCommander
+from ros_sugar.config import BaseComponentConfig
 from ros_sugar.core import BaseComponent
 
 from components import calibration
-from components.environment_config import (
+from components.config import (
+    CALIBRATION_HOVER_SECONDS,
+    FLIGHT_VELOCITY,
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
-    REPLAN_CHECKPOINTS,
+    LAND_Z,
+    RETURN_Z,
     SAFE_PATH_FLIGHT_POINTS,
     START_TOLERANCE,
     START_XY,
-    Z_HEIGHT,
-    build_planner,
-    measured_belief,
+    TAKEOFF_Z,
+    load_pdstl_waypoints,
     nominal_safe_waypoints,
 )
 from components.flight_logger import FlightLogger
-from components.opt_waypoints import WAYPOINTS
 from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 
-# Trial settings (condition, fan speed) live in CrazyflieConfig, set from
-# main.py's CLI args -- no need to edit this file before a run.
 
-TAKEOFF_Z = Z_HEIGHT
-RETURN_Z = 0.65
-LAND_Z = 0.1
-WAYPOINT_DELAY_SECONDS = 0.1
-CALIBRATION_HOVER_SECONDS = 2.0
+@define(kw_only=True)
+class CrazyflieConfig(BaseComponentConfig):
+    """Trial settings for one flight, set from run.py's CLI args.
 
-_nominal_waypoints = nominal_safe_waypoints
+    `condition` selects which plan to fly ('pdstl' = the optimised waypoints for
+    `fan_speed`, 'deterministic' = the nominal safe path). `fan_speed` also tags
+    the logs. No file editing is needed before a run.
+    """
+
+    z_hold: float = 0.3
+    condition: str = 'pdstl'  # 'pdstl' or 'deterministic'
+    fan_speed: int = 12  # 2, 6, 12, or 16
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
@@ -59,17 +65,24 @@ class CrazyfliePlanning(BaseComponent):
             config=config,
             **kwargs,
         )
-        self.position_commander = PositionHlCommander(self.crazyflie.cf)
+        # Fly at the planned speed so actual flight matches the belief model's
+        # DT/U_MAX timing instead of the commander's arbitrary default.
+        self.position_commander = PositionHlCommander(
+            self.crazyflie.cf, default_velocity=FLIGHT_VELOCITY,
+        )
 
     def _measured_xy(self) -> tuple[float, float]:
         return self.crazyflie.current_x, self.crazyflie.current_y
 
-    def _calibrate_and_offset(self, waypoints: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    def _calibrate_and_offset(
+        self, waypoints: list[tuple[float, float, float]]
+    ) -> list[tuple[float, float, float]]:
         """Hover at the assumed start, measure the real offset, and shift the plan to match.
 
         Real position rarely matches the offline plan's assumed start exactly
-        (tracking drift, imprecise placement). Aborts (raises) if the offset
-        is too large to trust rather than silently flying a bad plan.
+        (tracking drift, imprecise placement). Aborts (raises) if the offset is
+        too large to trust rather than silently flying a bad plan. This is a
+        one-time pre-flight step — not a mid-flight pause.
         """
         self.position_commander.go_to(*START_XY, TAKEOFF_Z)
         measured = calibration.hover_and_measure(self._measured_xy, duration_s=CALIBRATION_HOVER_SECONDS)
@@ -78,59 +91,29 @@ class CrazyfliePlanning(BaseComponent):
         calibration.check_offset_or_abort(offset, START_TOLERANCE)
         return calibration.shift_waypoints(waypoints, offset)
 
-    def _replan_from_here(self, remaining_waypoints: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
-        """Re-optimise the remaining trajectory from the actual measured position.
-
-        Called at each REPLAN_CHECKPOINTS index instead of blindly continuing
-        the offline plan — corrects for drift/disturbance accumulated in flight.
-        """
-        measured = self._measured_xy()
-        horizon = max(1, len(remaining_waypoints))
-        planner, _dynamics, _env = build_planner(self.config.fan_speed, T_horizon=horizon)
-        x0_mean, x0_cov = measured_belief(measured)
-
-        best_mean, _best_cov, _best_u, best_p, _history = planner._optimize_window(
-            x0_mean, x0_cov, verbose=False,
-        )
-        positions_xy = best_mean.squeeze(0).cpu().numpy()[1:]  # drop t=0 (== measured)
-        new_tail = [(float(x), float(y), Z_HEIGHT) for x, y in positions_xy]
-        print(f'[Replan] from measured={measured} -> P(sat)={best_p:.3f}, {len(new_tail)} new waypoints')
-        return new_tail
-
     def _fly_forward_mission(
-        self, logger, waypoints: list[tuple[float, float, float]], *, replan_enabled: bool,
+        self, logger, waypoints: list[tuple[float, float, float]],
     ) -> tuple[float, float, float]:
-        """Calibrate, fly start->goal (optionally with mid-flight replanning), return the last waypoint flown.
+        """Calibrate once, then fly the given waypoints start->finish; return the last one.
 
-        replan_enabled gates REPLAN_CHECKPOINTS to the pdstl condition only:
-        replanning re-optimises via the same pdSTL planner the pdstl condition
-        uses, which doesn't belong in the deterministic condition -- its whole
-        point is to be an unoptimised baseline flown as-is under real fan
-        noise, not one that secretly self-corrects mid-flight.
+        No mid-flight replanning: the plan is flown exactly as given (offset-
+        corrected at the start), so the drone moves continuously from start to
+        goal without pausing to re-optimise.
         """
         waypoints = self._calibrate_and_offset(waypoints)
         logger.log_waypoint(*START_XY, TAKEOFF_Z)
 
-        i = 0
-        while i < len(waypoints):
-            x, y, z = waypoints[i]
+        for x, y, z in waypoints:
             self.position_commander.go_to(x, y, z)
             logger.log_waypoint(x, y, z)
-            time.sleep(WAYPOINT_DELAY_SECONDS)
-
-            if replan_enabled and i in REPLAN_CHECKPOINTS and i < len(waypoints) - 1:
-                new_tail = self._replan_from_here(waypoints[i + 1:])
-                _validate_waypoints_inside_flight_area(new_tail)
-                waypoints = waypoints[: i + 1] + new_tail
-            i += 1
 
         return waypoints[-1]
 
     def _return_to_start(self, last_xyz: tuple[float, float, float]) -> None:
         """Fly back to the start and land — not part of the recorded trial.
 
-        Run after the trial's data is already saved, so it makes back-to-back
-        runs easier without polluting the logged mission with the return leg.
+        Run after the trial's data is already saved, so back-to-back runs don't
+        need a manual reset and the return leg doesn't pollute the logged mission.
         """
         x, y, _z = last_xyz
         self.position_commander.go_to(x, y, RETURN_Z)
@@ -148,22 +131,20 @@ class CrazyfliePlanning(BaseComponent):
         use_optimised = condition == 'pdstl'
 
         logger = FlightLogger(condition, fan_speed=fan_speed)
-
         logger.start()
         logger.start_actual_logging(
             lambda: (self.crazyflie.current_x, self.crazyflie.current_y, self.crazyflie.current_z)
         )
-        nominal_waypoints = WAYPOINTS if use_optimised else _nominal_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
-        _validate_waypoints_inside_flight_area(nominal_waypoints)
-        _validate_waypoints_inside_flight_area(
-            [
-                (*START_XY, RETURN_Z),
-                (*START_XY, LAND_Z),
-            ]
-        )
+
+        if use_optimised:
+            waypoints = load_pdstl_waypoints(fan_speed)
+        else:
+            waypoints = nominal_safe_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
+        _validate_waypoints_inside_flight_area(waypoints)
+        _validate_waypoints_inside_flight_area([(*START_XY, RETURN_Z), (*START_XY, LAND_Z)])
 
         try:
-            last_xyz = self._fly_forward_mission(logger, nominal_waypoints, replan_enabled=use_optimised)
+            last_xyz = self._fly_forward_mission(logger, waypoints)
         except Exception:
             logger.mark_crashed()
             logger.stop_actual_logging()
