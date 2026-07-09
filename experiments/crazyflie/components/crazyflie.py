@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from attrs import define
+from attrs import define, field
 from cflib.positioning.position_hl_commander import PositionHlCommander
 from ros_sugar.config import BaseComponentConfig
 from ros_sugar.core import BaseComponent
@@ -23,6 +23,7 @@ from components.config import (
     nominal_safe_waypoints,
 )
 from components.flight_logger import FlightLogger
+from irobot.src.robots.crazyflie.config import CrazyflieConfig as CrazyflieHwConfig
 from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 
 
@@ -32,12 +33,15 @@ class CrazyflieConfig(BaseComponentConfig):
 
     `condition` selects which plan to fly ('pdstl' = the optimised waypoints for
     `fan_speed`, 'deterministic' = the nominal safe path). `fan_speed` also tags
-    the logs. No file editing is needed before a run.
+    the logs. `hw_config` is the irobot-side radio/connection config (uri,
+    timeout, ...); override it to fly a Crazyflie other than the default URI.
+    No file editing is needed before a run.
     """
 
     z_hold: float = 0.3
     condition: str = 'pdstl'  # 'pdstl' or 'deterministic'
     fan_speed: int = 12  # 2, 6, 12, or 16
+    hw_config: CrazyflieHwConfig = field(factory=CrazyflieHwConfig)
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
@@ -58,7 +62,7 @@ def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, f
 
 class CrazyfliePlanning(BaseComponent):
     def __init__(self, *, component_name, config, **kwargs):
-        self.crazyflie = CrazyflieBase(config)
+        self.crazyflie = CrazyflieBase(config.hw_config)
 
         super().__init__(
             component_name=component_name,

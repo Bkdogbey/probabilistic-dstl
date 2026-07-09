@@ -168,6 +168,7 @@ def _plot(env, fan, sigma0, nominal_wps, nominal_curve, reference_curve,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150)
     print(f'Plot saved to {out_path}')
+    plt.show()
     plt.close(fig)
 
 

@@ -11,9 +11,13 @@ Two subcommands:
     python run.py fly --condition pdstl --fan 12          # optimised plan
     python run.py fly --condition deterministic --fan 6   # nominal safe path
 
-All configuration lives in components/config.py. `plan` needs only
+    # 3. Analyze (offline, no hardware): plot a logged flight against its plan
+    python run.py analyze --condition pdstl --fan 12      # latest run
+    python run.py analyze --all                           # every condition/fan pair
+
+All configuration lives in components/config.py. `plan`/`analyze` need only
 torch/numpy/matplotlib; `fly` additionally needs cflib, ros_sugar and the
-irobot package (imported lazily, so `plan` works without them).
+irobot package (imported lazily, so `plan`/`analyze` work without them).
 """
 
 from __future__ import annotations
@@ -28,6 +32,13 @@ def _plan(args: argparse.Namespace) -> None:
     from waypoint_planning import run_plan
 
     run_plan(fan=args.fan, plot=args.plot)
+
+
+def _analyze(args: argparse.Namespace) -> None:
+    # Lazy import: keeps torch/matplotlib off the `fly` path.
+    from analyze_logs import run_analyze
+
+    run_analyze(condition=args.condition, fan=args.fan, run=args.run, all_=args.all)
 
 
 def _fly(args: argparse.Namespace) -> None:
@@ -63,6 +74,19 @@ def main() -> None:
     p_fly.add_argument('--fan', type=int, default=12, choices=VALID_FANS,
                        help='Fan level; selects which optimised plan to fly and tags the logs')
     p_fly.set_defaults(func=_fly)
+
+    p_analyze = sub.add_parser(
+        'analyze', help='Plot a logged flight against its planned path (offline)'
+    )
+    p_analyze.add_argument('--condition', choices=['pdstl', 'deterministic'],
+                           help='Required unless --all is given')
+    p_analyze.add_argument('--fan', type=int, choices=VALID_FANS,
+                           help='Required unless --all is given')
+    p_analyze.add_argument('--run', type=int, default=None,
+                           help='Run number; defaults to the latest logged run')
+    p_analyze.add_argument('--all', action='store_true',
+                           help='Plot the latest run of every condition/fan pair with logs')
+    p_analyze.set_defaults(func=_analyze)
 
     args = parser.parse_args()
     args.func(args)
