@@ -40,6 +40,10 @@ from planning.environment import Environment as Environment
 from planning.planner import Planner as Planner
 from planning.planner import TorchGaussianBelief as TorchGaussianBelief
 
+# 3D dynamics/environment/planner, isolated to this experiment (see
+# components/env3d.py) rather than generalizing the shared library above.
+from components.env3d import Environment3D, Planner3D, SingleIntegrator3D
+
 # Experiment root (where run.py, waypoints/ and plots/ live).
 EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parents[1]
 
@@ -52,22 +56,27 @@ VALID_FANS: tuple[int, ...] = (2, 6, 12, 16)
 # ═════════════════════════════════════════════════════════════════════════════
 FLIGHT_X_BOUNDS: list[float] = [-0.5, 1.5]
 FLIGHT_Y_BOUNDS: list[float] = [-2.0, 0.5]
-Z_HEIGHT: float = 0.2  # flight height [m], fixed altitude (2D planning)
+FLIGHT_Z_BOUNDS: list[float] = [0.1, 1.7]  # floor (= LAND_Z) to measured ceiling/tracking-volume top
+Z_HEIGHT: float = 0.2  # flight height [m], the fixed altitude used by 2D planning/plots
 
 # Measured obstacle boxes (converted from inches at 0.0254 m/in), consumed by
-# both the planner and the safety flags in the flight logger. 'height' is
-# metadata for the future-3D seam (z_profile()); the current 2D collision
-# logic ignores it.
+# the planner, the 3D safety predicates (components/env3d.py), and the safety
+# flags in the flight logger. 'height' is each obstacle's vertical extent,
+# assumed floor-mounted (z spans 0..height) -- this is what lets the 3D
+# planner route over the top of an obstacle instead of only around it.
 OBSTACLES: list[dict] = [
     {'name': 'obs_1', 'x': (0.5, 0.8175), 'y': (-1.2667, -1.0), 'height': 0.4064},
     {'name': 'obs_2', 'x': (0.25, 0.4405), 'y': (-0.6651, -0.5), 'height': 0.5143},
     {'name': 'obs_3', 'x': (0.7936, 1.0), 'y': (-0.6651, -0.5), 'height': 0.3302},
 ]
 
-GOAL: dict = {'x': (0.85, 1.15), 'y': (-0.15, 0.15)}  # ±0.15 m box around END_XY
+# ±0.15 m box around END_XY/END_Z (same margin convention on all three axes)
+GOAL: dict = {'x': (0.85, 1.15), 'y': (-0.15, 0.15), 'z': (0.05, 0.35)}
 
 START_XY: tuple[float, float] = (1.0, -2.0)
 END_XY: tuple[float, float] = (1.0, 0.0)  # safe-path target; goal box center
+START_Z: float = Z_HEIGHT  # cruise altitude at the start of the optimized trajectory
+END_Z: float = Z_HEIGHT    # cruise altitude the goal box is centered on
 # Abort the flight if the measured hover position at start differs from
 # START_XY by more than this (m) — see components/calibration.py.
 START_TOLERANCE: float = 0.08
@@ -161,6 +170,11 @@ TAKEOFF_Z: float = Z_HEIGHT
 RETURN_Z: float = 0.65
 LAND_Z: float = 0.1
 
+# Drone radio address, e.g. 'radio://0/80/2M/E7E7E7E780'. Set this once for
+# your drone; leave as None to use irobot's own CrazyflieConfig.uri default.
+# Picked up automatically by components/crazyflie.py -- no per-run flag needed.
+DRONE_URI: str | None = 'radio://0/84/2M/E7E7E7E784'
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. Factories & helpers
@@ -236,37 +250,44 @@ def reference_direct_path(n_points: int = 200) -> list[tuple[float, float]]:
     return [(float(x), float(y)) for x, y in zip(x_pos, y_pos)]
 
 
-def build_environment() -> Environment:
-    """Build the pdSTL Environment (bounds, obstacles, goal) from the geometry above."""
-    env = Environment()
-    env.set_bounds(x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS)
+def build_environment() -> Environment3D:
+    """Build the pdSTL Environment3D (bounds, obstacles, goal) from the geometry above.
+
+    Obstacles are floor-mounted: z spans (0.0, obs['height']) -- this is what
+    lets the 3D planner satisfy safety by flying over an obstacle's top.
+    """
+    env = Environment3D()
+    env.set_bounds(x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS, z_range=FLIGHT_Z_BOUNDS)
     for obs in OBSTACLES:
-        env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']))
-    env.set_goal(x_range=list(GOAL['x']), y_range=list(GOAL['y']))
+        env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=(0.0, obs['height']))
+    env.set_goal(x_range=list(GOAL['x']), y_range=list(GOAL['y']), z_range=list(GOAL['z']))
     return env
 
 
-def build_planner(fan_speed: int) -> tuple[Planner, SingleIntegrator, Environment]:
+def build_planner(fan_speed: int) -> tuple[Planner3D, SingleIntegrator3D, Environment3D]:
     """Build a (Planner, dynamics, environment) for the given fan level.
 
     Fan level selects the *initial* belief covariance Σ0 (see x0_belief); the
     per-step process noise Q_STD is shared across fans (belief growth term).
     """
-    dynamics = SingleIntegrator(dt=DT, u_max=U_MAX, q_std=Q_STD)
+    dynamics = SingleIntegrator3D(dt=DT, u_max=U_MAX, q_std=Q_STD)
     env = build_environment()
-    planner = Planner(dynamics, env, T, config=dict(PLANNER_CONFIG))
+    planner = Planner3D(dynamics, env, T, config=dict(PLANNER_CONFIG))
     return planner, dynamics, env
 
 
 def x0_belief(fan_speed: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Initial (mean, cov) belief for the given fan level.
 
-    The covariance is SIGMA0_PER_FAN[fan_speed] on each axis — this is what
-    makes each fan's optimisation and plot reflect its own uncertainty.
+    The covariance is SIGMA0_PER_FAN[fan_speed] on each axis (x, y, and z share
+    the same sigma0) — this is what makes each fan's optimisation and plot
+    reflect its own uncertainty.
     """
     sigma0 = SIGMA0_PER_FAN[fan_speed]
-    mean = torch.tensor(START_XY, dtype=torch.float32)
-    cov = torch.diag(torch.tensor([sigma0, sigma0], dtype=torch.float32))
+    mean = torch.tensor([*START_XY, START_Z], dtype=torch.float32)
+    cov = torch.diag(torch.tensor([sigma0, sigma0, sigma0], dtype=torch.float32))
+    assert mean.shape == (3,), f'x0 mean must be 3D, got {tuple(mean.shape)}'
+    assert cov.shape == (3, 3), f'x0 cov must be 3x3, got {tuple(cov.shape)}'
     return mean, cov
 
 

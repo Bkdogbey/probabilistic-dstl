@@ -47,6 +47,9 @@ def _fly(args: argparse.Namespace) -> None:
 
     from components.crazyflie import CrazyflieConfig, CrazyfliePlanning
 
+    # Drone radio address comes from components/config.py's DRONE_URI (set it
+    # there once for your drone); CrazyflieConfig's hw_config default factory
+    # picks it up automatically, falling back to irobot's own default if unset.
     component = CrazyfliePlanning(
         component_name='crazyflie_planning',
         config=CrazyflieConfig(z_hold=0.3, condition=args.condition, fan_speed=args.fan),

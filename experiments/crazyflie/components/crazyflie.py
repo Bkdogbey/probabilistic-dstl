@@ -10,9 +10,11 @@ from ros_sugar.core import BaseComponent
 from components import calibration
 from components.config import (
     CALIBRATION_HOVER_SECONDS,
+    DRONE_URI,
     FLIGHT_VELOCITY,
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
+    FLIGHT_Z_BOUNDS,
     LAND_Z,
     RETURN_Z,
     SAFE_PATH_FLIGHT_POINTS,
@@ -27,6 +29,11 @@ from irobot.src.robots.crazyflie.config import CrazyflieConfig as CrazyflieHwCon
 from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 
 
+def _default_hw_config() -> CrazyflieHwConfig:
+    """CrazyflieHwConfig seeded from config.py's DRONE_URI, if set."""
+    return CrazyflieHwConfig(uri=DRONE_URI) if DRONE_URI else CrazyflieHwConfig()
+
+
 @define(kw_only=True)
 class CrazyflieConfig(BaseComponentConfig):
     """Trial settings for one flight, set from run.py's CLI args.
@@ -34,29 +41,30 @@ class CrazyflieConfig(BaseComponentConfig):
     `condition` selects which plan to fly ('pdstl' = the optimised waypoints for
     `fan_speed`, 'deterministic' = the nominal safe path). `fan_speed` also tags
     the logs. `hw_config` is the irobot-side radio/connection config (uri,
-    timeout, ...); override it to fly a Crazyflie other than the default URI.
-    No file editing is needed before a run.
+    timeout, ...); its default picks up components/config.py's DRONE_URI, so
+    set that once instead of overriding hw_config per run.
     """
 
     z_hold: float = 0.3
     condition: str = 'pdstl'  # 'pdstl' or 'deterministic'
     fan_speed: int = 12  # 2, 6, 12, or 16
-    hw_config: CrazyflieHwConfig = field(factory=CrazyflieHwConfig)
+    hw_config: CrazyflieHwConfig = field(factory=_default_hw_config)
 
 
 def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
     x_min, x_max = FLIGHT_X_BOUNDS
     y_min, y_max = FLIGHT_Y_BOUNDS
+    z_min, z_max = FLIGHT_Z_BOUNDS
     outside = [
-        (idx, x, y)
-        for idx, (x, y, _z) in enumerate(waypoints)
-        if not (x_min <= x <= x_max and y_min <= y <= y_max)
+        (idx, x, y, z)
+        for idx, (x, y, z) in enumerate(waypoints)
+        if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max)
     ]
     if outside:
-        details = ', '.join(f'#{idx}=({x:.3f}, {y:.3f})' for idx, x, y in outside)
+        details = ', '.join(f'#{idx}=({x:.3f}, {y:.3f}, {z:.3f})' for idx, x, y, z in outside)
         raise ValueError(
             'Waypoint(s) outside flight area '
-            f'x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]: {details}'
+            f'x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]: {details}'
         )
 
 
