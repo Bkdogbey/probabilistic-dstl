@@ -12,19 +12,19 @@ from components.config import (
     CALIBRATION_HOVER_SECONDS,
     DRONE_URI,
     FLIGHT_VELOCITY,
-    FLIGHT_X_BOUNDS,
-    FLIGHT_Y_BOUNDS,
-    FLIGHT_Z_BOUNDS,
     LAND_Z,
+    POST_GATE_Z,
     RETURN_Z,
     SAFE_PATH_FLIGHT_POINTS,
     START_TOLERANCE,
     START_XY,
     TAKEOFF_Z,
     load_pdstl_waypoints,
-    nominal_safe_waypoints,
+    validate_waypoints_in_bounds,
 )
 from components.flight_logger import FlightLogger
+from components.planning_2d import nominal_safe_waypoints
+from components.planning_3d import nominal_gate_waypoints
 from irobot.src.robots.crazyflie.config import CrazyflieConfig as CrazyflieHwConfig
 from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 
@@ -45,27 +45,11 @@ class CrazyflieConfig(BaseComponentConfig):
     set that once instead of overriding hw_config per run.
     """
 
-    z_hold: float = 0.3
+    z_hold: float = POST_GATE_Z  # shared with the gate scenario's post-gate descent altitude
     condition: str = 'pdstl'  # 'pdstl' or 'deterministic'
     fan_speed: int = 12  # 2, 6, 12, or 16
+    scenario: str = 'baseline'  # 'baseline' or 'gate'
     hw_config: CrazyflieHwConfig = field(factory=_default_hw_config)
-
-
-def _validate_waypoints_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
-    x_min, x_max = FLIGHT_X_BOUNDS
-    y_min, y_max = FLIGHT_Y_BOUNDS
-    z_min, z_max = FLIGHT_Z_BOUNDS
-    outside = [
-        (idx, x, y, z)
-        for idx, (x, y, z) in enumerate(waypoints)
-        if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max)
-    ]
-    if outside:
-        details = ', '.join(f'#{idx}=({x:.3f}, {y:.3f}, {z:.3f})' for idx, x, y, z in outside)
-        raise ValueError(
-            'Waypoint(s) outside flight area '
-            f'x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]: {details}'
-        )
 
 
 class CrazyfliePlanning(BaseComponent):
@@ -140,6 +124,7 @@ class CrazyfliePlanning(BaseComponent):
     def _execute_once(self):
         condition = self.config.condition
         fan_speed = self.config.fan_speed
+        scenario = self.config.scenario
         use_optimised = condition == 'pdstl'
 
         logger = FlightLogger(condition, fan_speed=fan_speed)
@@ -149,11 +134,13 @@ class CrazyfliePlanning(BaseComponent):
         )
 
         if use_optimised:
-            waypoints = load_pdstl_waypoints(fan_speed)
+            waypoints = load_pdstl_waypoints(fan_speed, scenario=scenario)
+        elif scenario == 'gate':
+            waypoints = nominal_gate_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
         else:
             waypoints = nominal_safe_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
-        _validate_waypoints_inside_flight_area(waypoints)
-        _validate_waypoints_inside_flight_area([(*START_XY, RETURN_Z), (*START_XY, LAND_Z)])
+        validate_waypoints_in_bounds(waypoints)
+        validate_waypoints_in_bounds([(*START_XY, RETURN_Z), (*START_XY, LAND_Z)])
 
         try:
             last_xyz = self._fly_forward_mission(logger, waypoints)

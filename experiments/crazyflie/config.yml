@@ -1,0 +1,226 @@
+# Crazyflie reach-avoid experiment — all measured/tunable input values.
+#
+# This is the file to edit when the arena geometry changes (new obstacle
+# measurements, a moved goal, ...), when the per-fan uncertainty model
+# changes, or when planner/flight parameters need retuning. Code that
+# CONSTRUCTS things from these values (environments, planners, dynamics,
+# the deterministic-path optimizer) lives in components/config.py (loader +
+# shared helpers), components/planning_2d.py (2D baseline), and
+# components/planning_3d.py (3D gate scenario) — none of that should need to
+# change just because a number here changes.
+#
+# components/config.py loads this file and exposes every key below as a
+# module-level constant (same names used throughout the experiment before
+# this file existed).
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1. Arena geometry (measured; arena extended 0.5 m past the raw x=1.0
+#    wall so start/end (both at x=1.0) and obstacle_3 don't sit flush on
+#    a hard boundary)
+# ═══════════════════════════════════════════════════════════════════════
+arena:
+  flight_x_bounds: [-0.5, 1.5]
+  flight_y_bounds: [-2.0, 0.5]
+  flight_z_bounds: [0.1, 1.7]   # floor (= flight.land_z) to measured ceiling/tracking-volume top
+  z_height: 0.2                 # flight height [m] -- the 2D baseline's constant cruise altitude
+
+  # Measured obstacle boxes (converted from inches at 0.0254 m/in). 'height'
+  # is each obstacle's vertical extent, assumed floor-mounted (z spans
+  # 0..height) -- read only by planning_3d.py's gate scenario (the 2D
+  # baseline planner has no altitude axis to place it on) and by the
+  # flight logger's safety flags (x,y footprint only, height-independent).
+  obstacles:
+    # obs_1 recentered: same size (0.3175m x 0.2667m) as before, shifted so
+    # its y-center sits at -1.25 (was -1.1334) -- opens up more room along
+    # the corridor's tightest stretch for the deterministic-path optimizer.
+    - name: obs_1
+      x: [0.5, 0.8175]
+      y: [-1.38335, -1.11665]
+      height: 0.4064
+    # obs_2 re-measured: same width as before (0.1905m), x-midpoint moved to
+    # exactly 0.25m.
+    - name: obs_2
+      x: [0.1547, 0.3453]
+      y: [-0.6651, -0.5]
+      height: 0.5143
+    # obs_3 = real-world box measured L11.5in x W8in x H16.5in (L on x, W on
+    # y). Re-measured: y moved -- now spans 2ft to 32in (24in-32in, i.e.
+    # exactly the measured 8in width) from the goal wall (y=0), further from
+    # the goal / closer to obs_1 than before.
+    - name: obs_3
+      x: [0.7508, 1.0429]
+      y: [-0.8128, -0.6096]
+      height: 0.4191
+
+  # +/-0.15 m box around end_xy/end_z (same margin convention on all three
+  # axes). 'z' is read only by planning_3d.py, same reasoning as obstacles.
+  goal:
+    x: [0.85, 1.15]
+    y: [-0.15, 0.15]
+    z: [0.05, 0.35]
+
+  start_xy: [1.0, -2.0]
+  end_xy: [1.0, 0.0]           # safe-path target; goal box center
+
+  # Abort the flight if the measured hover position at start differs from
+  # start_xy by more than this (m) -- see components/calibration.py.
+  start_tolerance: 0.08
+
+  # Via-points (x, y) the GATE scenario's deterministic path passes through
+  # (planning_3d.py's nominal_gate_waypoints) -- the 2D baseline no longer
+  # uses hand-picked via-points; its deterministic path's sine amplitude is
+  # calculated instead (planning_2d.py's _calculate_sine_amplitude).
+  # (0.25, -1.0) clears obs_1 on its left side; (0.617, -0.58) clears obs_2.
+  # Re-check with `python run.py plan --fan 2 --scenario gate --plot` if
+  # geometry moves.
+  safe_path_via_points:
+    - [0.25, -1.0]
+    - [0.617, -0.58]
+
+  # Waypoint count actually flown for both deterministic conditions (denser
+  # than the planning horizon, purely for a smoother flight path -- the
+  # T-point warm-start fed to the optimizer is unaffected).
+  safe_path_flight_points: 30
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2. 2D baseline deterministic-path calculation. The deterministic path
+#    IS the single left/right-bending sine curve x(s) = x_linear(s) -
+#    A*sin(pi*s) -- not a gradient-descent-optimized path warm-started from
+#    one. A is calculated in closed form (planning_2d.py's
+#    _calculate_sine_amplitude) to clear every obstacle in section 1 by the
+#    margin below, choosing each obstacle's passing side (left/right) by
+#    exhaustive search over the small number of combinations -- no
+#    optimizer loop, no iterations, just geometry.
+# ═══════════════════════════════════════════════════════════════════════
+deterministic_path:
+  # Required clearance (m) from every obstacle's box, on whichever side the
+  # calculated curve passes it. With the current geometry the feasible
+  # amplitude range for a single-hump sine is narrow (~0.667-0.699) --
+  # margins much above ~0.05 make the calculation infeasible (raises
+  # ValueError) and need hand-picked via-points instead, like the gate
+  # scenario's nominal_gate_waypoints.
+  margin: 0.05
+
+# ═══════════════════════════════════════════════════════════════════════
+# 3. Per-fan uncertainty model (paper Experiment 3)
+#    Sigma_t(fan) = uncertainty.sigma0_per_fan[fan] + t * uncertainty.q_std^2
+# ═══════════════════════════════════════════════════════════════════════
+uncertainty:
+  # Initial belief variance (m^2 per axis), empirically characterized from
+  # tracking-error residuals at each fan setting. Values are variances, not
+  # standard deviations and not process-noise magnitudes.
+  sigma0_per_fan:
+    2: 0.001
+    6: 0.006
+    12: 0.020
+    16: 0.050          # uncalibrated extrapolation --
+
+  # Shared propagation noise. The paper reports the fan-dependent sigma0
+  # values above but does not report fan-dependent Crazyflie q_std values.
+  q_std: 0.01
+
+# ═══════════════════════════════════════════════════════════════════════
+# 4. Planner (2D baseline horizon/dynamics + hyperparameters, shared by
+#    planning_2d.py's Planner and planning_3d.py's Planner3D)
+# ═══════════════════════════════════════════════════════════════════════
+planner:
+  T: 10                  # 2D baseline planning horizon (gate scenario uses its own gate.T)
+  dt: 0.693               # mean inter-waypoint time [s]
+  u_max: 0.44              # max inter-waypoint speed [m/s]
+  alpha: 0.90              # P(sat) early-stop threshold (also recorded in outputs)
+
+  config:
+    # -- Paper-faithful objective (J = w_phi*(-log(P_sat+eps)) + w_u*|u|^2) --
+    w_phi: 20.0    # weight on the STL satisfaction objective
+    w_u: 0.1       # lambda on control effort |u|^2
+
+    # -- Heuristic shaping (NOT in the paper -- potential fields that speed
+    #    up convergence; set to 0.0 for the clean paper objective) --
+    w_dist: 5.0       # pull final position toward goal centre
+    w_obs: 5.0        # repel trajectory from obstacle centres
+    w_visit: 5.0      # pull toward visit regions (none defined here -> inert)
+    obs_margin: 0.75  # safety margin (m) added to obstacle radius in repulsion
+
+    # -- Numerical / optimizer internals --
+    w_du: 0.1                # smoothness (penalise input rate of change)
+    lr: 0.02                 # Adam learning rate
+    max_iters: 1500          # max optimisation iterations (bumped for the longer,
+                              # multi-phase 'gate' scenario's T=16 horizon; still
+                              # fine for the 2D baseline's T=10)
+    min_iters: 10             # min iters before the loss-tolerance check activates
+    converge_patience: 50     # consecutive iters at P>=alpha before early stop
+    loss_tol: 1.0e-4          # loss convergence tolerance
+
+    # -- Robustness smoothing --
+    # Beta log-sum-exp smoothing of min/max in the STL robustness. scale > 0 =
+    # smooth (paper's differentiable form); scale <= 0 = exact min/max. Kept
+    # exact by default to preserve current behaviour; raise to e.g. 10-50 to
+    # enable smoothing.
+    scale: -1
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. Trial selection -- which fan/condition/scenario `run.py plan|fly|
+#    analyze|calibrate-uncertainty` act on when you don't pass --fan/
+#    --condition/--scenario. Edit this before a run instead of typing the
+#    same flags every time; the flags still exist and override this for
+#    one-off invocations (e.g. batch-planning every fan level in a loop).
+# ═══════════════════════════════════════════════════════════════════════
+trial:
+  fan: 12               # 2, 6, 12, or 16
+  condition: pdstl       # 'pdstl' or 'deterministic' (fly/analyze only)
+  scenario: baseline     # 'baseline' or 'gate' (plan/fly only)
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. Flight parameters (used only at flight time by components/crazyflie.py)
+# ═══════════════════════════════════════════════════════════════════════
+flight:
+  calibration_hover_seconds: 2.0
+  return_z: 0.65
+  land_z: 0.1
+  z_hold: 0.3   # shared with gate.post_gate_z below -- both describe the same descent altitude
+
+  # Drone radio address, e.g. 'radio://0/80/2M/E7E7E7E780'. Set this once for
+  # your drone; leave null to use irobot's own CrazyflieConfig.uri default.
+  # Picked up automatically by components/crazyflie.py -- no per-run flag needed.
+  drone_uri: 'radio://0/85/2M/E7E7E7E85'
+
+# ═══════════════════════════════════════════════════════════════════════
+# 7. Gate scenario geometry (3D-only; construction logic stays entirely in
+#    planning_3d.py -- this section is just the measured input values)
+# ═══════════════════════════════════════════════════════════════════════
+gate:
+  # A box with a square hole cut in it, mounted on a pole, at horizontal
+  # midpoint (0.5, -1.25). Overlaps obs_1's x/y footprint by design -- the
+  # opening sits well above obs_1's 0.4064m top, so the flight goes over
+  # obs_1 through the gate, not around it. The opening was described as
+  # "8 by 8" but the exact measured span (29.25in-36in off the floor) is
+  # only 6.75in tall; using the exact span for z. The pole (~3in/0.076m
+  # square) is not modeled as an obstacle -- judged negligible.
+  center_xy: [0.5, -1.25]
+  x: [0.3984, 0.6016]      # 8in opening, centered on x=0.5
+  z: [0.7430, 0.9144]      # 29.25in-36in off the floor (exact)
+  z_center: 0.8287         # cruise altitude through the gate
+
+  # Gate "depth" along the flight direction (y) was not measured --
+  # engineering default, narrower than goal's +/-0.15m since a physical
+  # opening is a stricter target than a soft goal box.
+  y_margin: 0.10
+
+  post_gate_z: 0.3         # descent altitude flown after the gate, before landing
+  # Hard altitude ceiling (Always) enforced for the rest of the flight after
+  # the gate -- without this, the obstacle-avoidance term is already
+  # satisfiable by flying above every obstacle's top for the whole mission
+  # (that's how the 2D baseline already clears obstacles), so nothing else
+  # forces a real post-gate descent. Kept loose (below obs_2's 0.5143m top,
+  # not obs_3's 0.4191m) rather than tight, to avoid an infeasible spec at
+  # higher fan levels.
+  post_gate_z_band: [0.15, 0.5]
+
+  # Planning horizon for the gate scenario (vs. the 2D baseline's planner.T=10,
+  # tuned for a single-phase mission): more steps for climb-to-gate /
+  # descend-and-avoid / reach-goal. t_start/t_end bound the Eventually(gate)
+  # window; the Always(altitude band) then runs from t_descend_start through T.
+  T: 16
+  t_start: 2
+  t_end: 6
+  t_descend_start: 7

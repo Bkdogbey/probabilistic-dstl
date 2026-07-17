@@ -20,15 +20,22 @@ Usage (from crazyflie.py):
 Output files (logs/ directory, next to this file):
     <condition>_fan<XX>_run<NN>_<ts>_commanded.csv  — one row per go_to call
     <condition>_fan<XX>_run<NN>_<ts>_actual.csv     — 10 Hz sampled Lighthouse position
-    (crashed trials get _CRASH_ between run tag and timestamp)
+    (crashed trials get _CRASH, trials with any unsafe sample get _VIOLATION,
+    both inserted between the run tag and timestamp, in that order)
+
+A trial whose actual position never moves more than START_TOLERANCE from its
+own first sample (e.g. a calibration abort that fires before any real flight)
+isn't saved at all — see save()'s early return.
 
 Columns (both files):
-    condition, t, x, y, z, outside_obs1, outside_obs2, outside_obs3, safe
+    condition, baseline_path_id, t, x, y, z,
+    outside_obs1, outside_obs2, outside_obs3, safe
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import pathlib
 import re
 import threading
@@ -37,7 +44,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
+from components.config import BASELINE_PATH_ID, LOGS_DIR
 from components.config import OBSTACLES as _ENV_OBSTACLES
+from components.config import START_TOLERANCE
 
 # ── Valid condition labels ──────────────────────────────────────────────────
 CONDITIONS = (
@@ -46,13 +55,13 @@ CONDITIONS = (
 )
 
 # ── Obstacles (x_min, x_max, y_min, y_max), sourced from the single arena
-#    geometry config in components/config.py — nothing hardcoded here ────────
+#    geometry config in config.yml — nothing hardcoded here ──────────────────
 _OBSTACLES: list[tuple[float, float, float, float]] = [
     (obs['x'][0], obs['x'][1], obs['y'][0], obs['y'][1]) for obs in _ENV_OBSTACLES
 ]
 
-# ── Log directory: next to this file ────────────────────────────────────────
-_LOGS_DIR = pathlib.Path(__file__).parent / 'logs'
+# ── Log directory (shared with uncertainty_calibration.py/analyze_logs.py) ──
+_LOGS_DIR = LOGS_DIR
 
 # Actual-position sampling rate (Hz) — CrazyflieBase updates at 20 Hz so 10 is safe
 _SAMPLE_HZ = 10
@@ -72,6 +81,7 @@ def _safety_row(condition: str, t: float, x: float, y: float, z: float,
     outside = [not _inside(x, y, obs) for obs in obstacles]
     row: dict = {
         'condition': condition,
+        'baseline_path_id': BASELINE_PATH_ID,
         't': t,
         'x': round(x, 6),
         'y': round(y, 6),
@@ -88,13 +98,14 @@ class FlightLogger:
     """
     Logs commanded waypoints and continuous Lighthouse position for one trial.
 
-    Two output files are written on save():
+    Two output files are written on save() -- unless the trial never left the
+    start region, in which case nothing is written (see _never_left_start()):
       - <condition>_fan<XX>_run<NN>_<ts>_commanded.csv  one row per go_to call
       - <condition>_fan<XX>_run<NN>_<ts>_actual.csv     10 Hz sampled real position
 
     The run number NN is auto-incremented by scanning the logs directory for
     existing files with the same (condition, fan_speed) so that successive calls
-    of main.py automatically produce run01, run02, … without any manual editing.
+    of run.py automatically produce run01, run02, … without any manual editing.
     """
 
     condition: str
@@ -170,6 +181,23 @@ class FlightLogger:
         """Call from the exception handler to flag this trial as a crash."""
         self._crashed = True
 
+    def _never_left_start(self) -> bool:
+        """True if the actual trace never moved beyond START_TOLERANCE from its own first sample.
+
+        Compares against the trial's own first sample rather than the nominal
+        START_XY: a calibration-abort trial's hover position can itself differ
+        from START_XY by more than START_TOLERANCE (that's why calibration
+        aborted) without the drone having flown anywhere afterward -- what
+        matters here is whether it moved *during the trial*, not where it
+        happened to start.
+        """
+        if not self._actual:
+            return True
+        x0, y0 = self._actual[0]['x'], self._actual[0]['y']
+        return all(
+            math.hypot(r['x'] - x0, r['y'] - y0) <= START_TOLERANCE for r in self._actual
+        )
+
     def _next_run_number(self) -> int:
         """Scan logs dir and return the next available run number for this cell."""
         _LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -182,8 +210,21 @@ class FlightLogger:
         ]
         return max(run_nums, default=0) + 1
 
-    def save(self) -> tuple[pathlib.Path, pathlib.Path]:
-        """Write both CSVs and return (commanded_path, actual_path)."""
+    def save(self) -> tuple[pathlib.Path, pathlib.Path] | None:
+        """Write both CSVs and return (commanded_path, actual_path).
+
+        Returns None (writing nothing, consuming no run number) if the trial
+        never left the start region -- see _never_left_start(). Checked before
+        _next_run_number() is even called, so the next real trial still gets
+        the correct next run number.
+        """
+        if self._never_left_start():
+            print(
+                f'[FlightLogger] Discarded: never moved beyond {START_TOLERANCE} m '
+                f'from start -- not saved, run number not consumed.'
+            )
+            return None
+
         _LOGS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')
         run_num = self._next_run_number()
@@ -191,7 +232,9 @@ class FlightLogger:
         fan_tag = f'fan{self.fan_speed:02d}'
         run_tag = f'run{run_num:02d}'
         crash_tag = '_CRASH' if self._crashed else ''
-        stem = f'{self.condition}_{fan_tag}_{run_tag}{crash_tag}_{ts}'
+        violated = any(not r['safe'] for r in self._actual)
+        violation_tag = '_VIOLATION' if violated else ''
+        stem = f'{self.condition}_{fan_tag}_{run_tag}{crash_tag}{violation_tag}_{ts}'
         cmd_path = _LOGS_DIR / f'{stem}_commanded.csv'
         act_path = _LOGS_DIR / f'{stem}_actual.csv'
 
@@ -201,6 +244,8 @@ class FlightLogger:
         print(f'[FlightLogger] Run {run_num:02d} | condition={self.condition} | fan={self.fan_speed}')
         if self._crashed:
             print('[FlightLogger] *** CRASH flagged — partial data saved ***')
+        if violated:
+            print('[FlightLogger] *** VIOLATION flagged — an actual sample entered an obstacle ***')
 
         if self._actual:
             xs = [r['x'] for r in self._actual]

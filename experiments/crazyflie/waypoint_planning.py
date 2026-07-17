@@ -1,15 +1,21 @@
 """Offline pdSTL planning for the Crazyflie experiment.
 
-Optimises a waypoint plan for one fan level and writes it to
-waypoints/pdstl_fan<L>.json. Called by `run.py plan`; has no hardware/ROS
-dependency (only torch/numpy, plus matplotlib for --plot).
+Optimises a waypoint plan for one fan level/scenario and writes it to
+waypoints/pdstl[_<scenario>]_fan<L>.json. Called by `run.py plan`; has no
+hardware/ROS dependency (only torch/numpy, plus matplotlib for --plot).
 
-Each fan level uses its own initial covariance Σ0 (config.SIGMA0_PER_FAN), so
-both the optimisation and the saved plot reflect that fan's real uncertainty.
+Each fan uses the paper's empirically characterized initial covariance, while
+shared process noise accumulates along the trajectory.
 
-Planning is 3D: the optimizer jointly places (x, y, z) for every waypoint
-(components/env3d.py), so there is no post-hoc altitude profile to apply here
--- waypoints come straight out of the optimized mean trajectory.
+This file is the shared CLI runner + plotting code for *both* scenarios --
+the actual environment/planner/dynamics construction is dimension-specific
+and lives in components/planning_2d.py (genuinely 2D: x, y only) and
+components/planning_3d.py (genuinely 3D: x, y, z). `run_plan` dispatches to
+`_run_plan_2d`/`_run_plan_3d`, which share `_optimize_and_report` (a single
+`planner._optimize_window` call, evaluate + print) but plot with
+dimension-specific code: `_plot_2d`/`_draw_env_2d` (flat 2D axes, Ellipse
+patches -- the 2D optimizer's state has no z to plot) for the baseline,
+`_plot`/`_draw_env` (3D axes, ellipsoids) for the gate scenario.
 """
 
 from __future__ import annotations
@@ -19,60 +25,41 @@ import datetime
 import numpy as np
 import torch
 
+# Imported first: components.config does the one sys.path.insert(src/) every
+# planning.*/pdstl.* import below relies on -- importing it before them
+# guarantees that regardless of which module gets imported first at runtime.
 from components.config import (
-    DT,
     EXPERIMENT_DIR,
     FLIGHT_Z_BOUNDS,
     OBSTACLES,
     PLANNER_ALPHA,
     SAFE_PATH_FLIGHT_POINTS,
+    Q_STD,
     SIGMA0_PER_FAN,
-    T,
     Z_HEIGHT,
-    BeliefTrajectory,
-    Environment,
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
-    TorchGaussianBelief,
-    build_planner,
-    nominal_safe_waypoints,
+    obstacle_clearance_2d,
     reference_direct_path,
     save_pdstl_waypoints,
-    x0_belief,
+    validate_waypoints_in_bounds,
 )
+from pdstl.base import BeliefTrajectory
+from planning.planner import TorchGaussianBelief
 
-
-def _validate_inside_flight_area(waypoints: list[tuple[float, float, float]]) -> None:
-    x_min, x_max = FLIGHT_X_BOUNDS
-    y_min, y_max = FLIGHT_Y_BOUNDS
-    z_min, z_max = FLIGHT_Z_BOUNDS
-    outside = [
-        (idx, x, y, z)
-        for idx, (x, y, z) in enumerate(waypoints)
-        if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max)
-    ]
-    if outside:
-        details = ', '.join(f'#{idx}=({x:.3f}, {y:.3f}, {z:.3f})' for idx, x, y, z in outside)
-        raise ValueError(
-            'Generated waypoint(s) outside flight area '
-            f'x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]: {details}'
-        )
-
-
-def _nominal_init_guess() -> torch.Tensor:
-    """Convert the deterministic safe path to T velocity controls for warm-starting.
-
-    The nominal path flies at constant Z_HEIGHT, so its z-velocity column is
-    all zeros -- the optimizer is free to move away from that in z.
-    """
-    wps = np.array(nominal_safe_waypoints(n_points=T))
-    vels_xy = np.diff(wps[:, :2], axis=0) / DT
-    vels_xy = np.vstack([vels_xy, [[0.0, 0.0]]])
-    vels_z = np.zeros((vels_xy.shape[0], 1))
-    vels = np.hstack([vels_xy, vels_z])
-    init_u = torch.tensor(vels, dtype=torch.float32)
-    assert init_u.shape[-1] == 3, f'init_u must be [T, 3], got {tuple(init_u.shape)}'
-    return init_u
+from components.planning_2d import (
+    build_planner_2d,
+    nominal_safe_waypoints,
+    x0_belief_2d,
+    _nominal_init_guess_2d,
+)
+from components.planning_3d import (
+    build_planner_3d,
+    nominal_gate_waypoints,
+    x0_belief_3d,
+    _nominal_init_guess_3d,
+)
+from uncertainty_calibration import uncertainty_signature
 
 
 def _evaluate_rho(planner, init_u: torch.Tensor,
@@ -82,12 +69,155 @@ def _evaluate_rho(planner, init_u: torch.Tensor,
     v = 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
     with torch.no_grad():
         mean_trace, cov_trace = planner.dyn(v, x0_mean, x0_cov)
-        beliefs = [TorchGaussianBelief(mean_trace[:, t, :], cov_trace[:, t]) for t in range(T + 1)]
-        phi = planner.env.get_specification(T)
+        beliefs = [TorchGaussianBelief(mean_trace[:, t, :], cov_trace[:, t]) for t in range(planner.T + 1)]
+        phi = planner.env.get_specification(planner.T)
         return phi(BeliefTrajectory(beliefs))[0, 0, 0].item()
 
 
-# ── Plotting ─────────────────────────────────────────────────────────────────
+def _print_rho(label: str, value: float) -> None:
+    print(f'{label + ":":<48} {value:.4f}')
+
+
+def _optimize_and_report(planner, x0_mean: torch.Tensor, x0_cov: torch.Tensor,
+                         init_u: torch.Tensor):
+    """Evaluate rho_before, run a single optimisation, print both. Shared by
+    _run_plan_2d/_run_plan_3d -- this part is dimension-generic; only
+    construction and waypoint conversion differ between them.
+
+    Single-shot: one planner._optimize_window() call from init_u (the
+    deterministic nominal path's warm start) -- no multi-start.
+
+    Returns (rho_before, best_mean, best_cov, best_u, best_p).
+    """
+    rho_before = _evaluate_rho(planner, init_u, x0_mean, x0_cov)
+    _print_rho('rho_before (deterministic nominal path)', rho_before)
+
+    best_mean, best_cov, best_u, best_p, _history = planner._optimize_window(
+        x0_mean, x0_cov, init_guess=init_u, verbose=True,
+    )
+    _print_rho('rho_after (optimised)', best_p)
+
+    return rho_before, best_mean, best_cov, best_u, best_p
+
+
+def _axis_clearance(pos: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Per-point distance outside [lo, hi] along one axis (0 where pos is inside).
+
+    Shared building block for both the 2D and 3D obstacle-clearance
+    functions below -- they differ only in how many axes they combine.
+    """
+    return np.maximum(np.maximum(lo - pos, 0.0), pos - hi)
+
+
+# ── 2D plotting (baseline scenario only) ────────────────────────────────────
+# obstacle_clearance_2d (min x,y-only distance from a curve to an obstacle
+# box) is imported from components.config -- shared with the closed-form
+# sine-amplitude calculation in planning_2d.py, not redefined here.
+
+
+def _draw_env_2d(ax, env) -> None:
+    """Draw the arena (bounds, obstacle boxes, goal box) as flat 2D rectangles.
+
+    Used only for the baseline scenario -- planning_2d.Environment carries no
+    z on any region, so there's no altitude axis to draw at all, unlike the
+    gate scenario's 3D _draw_env below.
+    """
+    import matplotlib.patches as patches
+
+    ax.set_xlim(FLIGHT_X_BOUNDS[0] - 0.1, FLIGHT_X_BOUNDS[1] + 0.1)
+    ax.set_ylim(FLIGHT_Y_BOUNDS[0] - 0.1, FLIGHT_Y_BOUNDS[1] + 0.1)
+    ax.set_aspect('equal')
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.grid(True, alpha=0.3)
+
+    ax.add_patch(patches.Rectangle(
+        (FLIGHT_X_BOUNDS[0], FLIGHT_Y_BOUNDS[0]),
+        FLIGHT_X_BOUNDS[1] - FLIGHT_X_BOUNDS[0], FLIGHT_Y_BOUNDS[1] - FLIGHT_Y_BOUNDS[0],
+        facecolor='none', edgecolor='black', linestyle='dashed', alpha=0.4,
+    ))
+    for obs in env.obstacles:
+        ox, oy = obs['x'], obs['y']
+        ax.add_patch(patches.Rectangle(
+            (ox[0], oy[0]), ox[1] - ox[0], oy[1] - oy[0],
+            facecolor='red', edgecolor='darkred', alpha=0.35,
+        ))
+    if env.goal:
+        gx, gy = env.goal['x'], env.goal['y']
+        ax.add_patch(patches.Rectangle(
+            (gx[0], gy[0]), gx[1] - gx[0], gy[1] - gy[0],
+            facecolor='green', edgecolor='darkgreen', alpha=0.25,
+        ))
+
+
+def _plot_2d(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
+             opt_xy, opt_cov, out_path) -> None:
+    """2D before/after comparison plot for the baseline mission.
+
+    Flat axes and Ellipse covariance patches -- matches the arena's actual
+    planning dimensionality (no z), unlike _plot's 3D-axes/ellipsoid version
+    below (gate scenario only).
+    """
+    import math
+
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
+
+    fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(14, 7))
+    fig.suptitle(
+        f'Fan {fan}  (2D baseline, Σ0 = {sigma0} m², q_std = {q_std} m/step)',
+        fontsize=13,
+    )
+
+    # ── Before: deterministic safe path, obstacle-free reference + clearances ──
+    _draw_env_2d(ax_before, env)
+    ax_before.set_title('Before (Deterministic Safe Path)')
+    ax_before.plot(reference_curve[:, 0], reference_curve[:, 1],
+                   'k--', lw=1.2, alpha=0.6, label='reference (no obstacles)')
+    ax_before.plot(nominal_curve[:, 0], nominal_curve[:, 1], 'b-', lw=1.5, alpha=0.8)
+    ax_before.scatter(nominal_wps[:, 0], nominal_wps[:, 1], c='blue', s=25, label='flown waypoints')
+    ax_before.scatter(*nominal_wps[0], c='green', s=80, label='start')
+    ax_before.scatter(*nominal_wps[-1], c='red', s=80, marker='s', label='end')
+    for obs in OBSTACLES:
+        clearance = obstacle_clearance_2d(nominal_curve, obs)
+        cx = (obs['x'][0] + obs['x'][1]) / 2
+        cy = (obs['y'][0] + obs['y'][1]) / 2
+        ax_before.text(cx, cy, f"{obs['name']}\n{clearance * 100:.1f} cm",
+                       ha='center', va='center', fontsize=7, color='darkred')
+    ax_before.legend(fontsize=8)
+
+    # ── After: pdSTL-optimised plan, with this fan's belief-covariance ellipses ──
+    _draw_env_2d(ax_after, env)
+    ax_after.set_title('After (pdSTL Optimised)')
+    ax_after.plot(reference_curve[:, 0], reference_curve[:, 1], 'k--', lw=1.2, alpha=0.6)
+    ax_after.plot(opt_xy[:, 0], opt_xy[:, 1], 'b.-', lw=2, ms=8)
+    ax_after.scatter(*opt_xy[0], c='green', s=80, label='start')
+    ax_after.scatter(*opt_xy[-1], c='red', s=80, marker='s', label='end')
+    for obs in OBSTACLES:
+        clearance = obstacle_clearance_2d(opt_xy, obs)
+        cx = (obs['x'][0] + obs['x'][1]) / 2
+        cy = (obs['y'][0] + obs['y'][1]) / 2
+        ax_after.text(cx, cy, f"{obs['name']}\n{clearance * 100:.1f} cm",
+                      ha='center', va='center', fontsize=7, color='darkred')
+    for t in range(len(opt_xy)):
+        vals, vecs = np.linalg.eigh(opt_cov[t])
+        angle = math.degrees(math.atan2(*vecs[:, -1][::-1]))
+        w, h = 2 * 2 * np.sqrt(np.maximum(vals, 0.0))
+        ax_after.add_patch(Ellipse(
+            xy=opt_xy[t], width=w, height=h, angle=angle,
+            edgecolor='blue', facecolor='none', alpha=0.5, lw=0.8,
+        ))
+    ax_after.legend(fontsize=8)
+
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    print(f'Plot saved to {out_path}')
+    plt.show()
+    plt.close(fig)
+
+
+# ── 3D plotting (gate scenario only) ────────────────────────────────────────
 def _obstacle_clearance(curve_xyz: np.ndarray, obs: dict) -> float:
     """Min distance from any point on curve_xyz [N,3] to an {'x','y','z'} obstacle box (0 = inside).
 
@@ -95,12 +225,10 @@ def _obstacle_clearance(curve_xyz: np.ndarray, obs: dict) -> float:
     dz > 0) even with zero lateral (x,y) clearance, not just when routed
     around it.
     """
-    x0, x1 = obs['x']
-    y0, y1 = obs['y']
     z0, z1 = obs.get('z', (curve_xyz[:, 2].min(), curve_xyz[:, 2].max()))
-    dx = np.maximum(np.maximum(x0 - curve_xyz[:, 0], 0.0), curve_xyz[:, 0] - x1)
-    dy = np.maximum(np.maximum(y0 - curve_xyz[:, 1], 0.0), curve_xyz[:, 1] - y1)
-    dz = np.maximum(np.maximum(z0 - curve_xyz[:, 2], 0.0), curve_xyz[:, 2] - z1)
+    dx = _axis_clearance(curve_xyz[:, 0], *obs['x'])
+    dy = _axis_clearance(curve_xyz[:, 1], *obs['y'])
+    dz = _axis_clearance(curve_xyz[:, 2], z0, z1)
     return float(np.min(np.sqrt(dx**2 + dy**2 + dz**2)))
 
 
@@ -130,8 +258,15 @@ def _draw_box(ax, x_range, y_range, z_range, *, facecolor, edgecolor, alpha, lin
     ))
 
 
-def _draw_env(ax, env: Environment) -> None:
-    """Draw the arena (workspace bounds wireframe, obstacle boxes, goal box) in 3D."""
+def _draw_env(ax, env) -> None:
+    """Draw the arena (workspace bounds wireframe, obstacle boxes, goal box) in 3D.
+
+    `env` is duck-typed -- works for both the 2D planning_2d.Environment (via
+    build_environment_2d, no z on any region) and the 3D planning_3d.Environment3D
+    (via build_environment_3d, z on every region) -- .get('z', ...) covers the
+    former, getattr(..., 'time_windowed_bounds', []) covers the fact that only
+    Environment3D defines that attribute at all.
+    """
     ax.set_xlim(FLIGHT_X_BOUNDS[0] - 0.1, FLIGHT_X_BOUNDS[1] + 0.1)
     ax.set_ylim(FLIGHT_Y_BOUNDS[0] - 0.1, FLIGHT_Y_BOUNDS[1] + 0.1)
     ax.set_zlim(FLIGHT_Z_BOUNDS[0] - 0.1, FLIGHT_Z_BOUNDS[1] + 0.1)
@@ -153,6 +288,19 @@ def _draw_env(ax, env: Environment) -> None:
             ax, env.goal['x'], env.goal['y'], env.goal.get('z', FLIGHT_Z_BOUNDS),
             facecolor='green', edgecolor='darkgreen', alpha=0.25,
         )
+    # Gate scenario only: the 2D env's timed_visit_regions is always empty and
+    # it has no time_windowed_bounds attribute at all, so these loops draw
+    # nothing for the 2D baseline.
+    for region in env.timed_visit_regions:
+        _draw_box(
+            ax, region['x'], region['y'], region.get('z', FLIGHT_Z_BOUNDS),
+            facecolor='blue', edgecolor='darkblue', alpha=0.35,
+        )
+    for region in getattr(env, 'time_windowed_bounds', []):
+        _draw_box(
+            ax, region['x'], region['y'], region['z'],
+            facecolor='none', edgecolor='purple', alpha=0.5, linestyle='dashed',
+        )
 
 
 def _cov_ellipsoid_surface(center: np.ndarray, cov: np.ndarray, n_std: float = 2.0, resolution: int = 8):
@@ -172,14 +320,16 @@ def _cov_ellipsoid_surface(center: np.ndarray, cov: np.ndarray, n_std: float = 2
     return ellipsoid[..., 0], ellipsoid[..., 1], ellipsoid[..., 2]
 
 
-def _plot(env, fan, sigma0, nominal_wps, nominal_curve, reference_curve,
+def _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
           opt_xyz, opt_cov, out_path) -> None:
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(15, 7.5))
     ax_before = fig.add_subplot(1, 2, 1, projection='3d')
     ax_after = fig.add_subplot(1, 2, 2, projection='3d')
-    fig.suptitle(f'Fan {fan}  (Σ0 = {sigma0} m²)', fontsize=13)
+    fig.suptitle(
+        f'Fan {fan}  (Σ0 = {sigma0} m², q_std = {q_std} m/step)', fontsize=13,
+    )
 
     # ── Before: deterministic safe path, obstacle-free reference + clearances ──
     _draw_env(ax_before, env)
@@ -230,45 +380,103 @@ def _plot(env, fan, sigma0, nominal_wps, nominal_curve, reference_curve,
 
 
 # ── Entry ────────────────────────────────────────────────────────────────────
-def run_plan(fan: int, plot: bool = False) -> None:
-    """Optimise and save waypoints for one fan level (optionally plot)."""
-    sigma0 = SIGMA0_PER_FAN[fan]
-    print(f'Planning for fan {fan}  (Σ0 = {sigma0} m², T = {T})')
-
-    planner, _dynamics, env = build_planner(fan)
-    x0_mean, x0_cov = x0_belief(fan)
-    init_u = _nominal_init_guess()
-
-    rho_before = _evaluate_rho(planner, init_u, x0_mean, x0_cov)
-    print(f'rho_before (deterministic safe path): {rho_before:.4f}')
-
-    best_mean, best_cov, _best_u, best_p, _history = planner._optimize_window(
-        x0_mean, x0_cov, init_guess=init_u, verbose=True,
+def _save_plan(
+    fan: int, scenario: str, sigma0: float, q_std: float,
+    rho_before: float, best_p: float,
+    waypoints: list[tuple[float, float, float]],
+) -> None:
+    """Validate + write the optimised plan JSON. Shared by both _run_plan_2d/_3d."""
+    validate_waypoints_in_bounds(waypoints, label='Generated waypoint')
+    signature = (
+        uncertainty_signature(fan)
+        if scenario == 'baseline'
+        else {'uncertainty_model': 'paper_sigma0_shared_process_noise_3d',
+              'calibration_generated': None}
     )
-    print(f'rho_after  (optimised):               {best_p:.4f}')
-
-    positions_xyz = best_mean.squeeze(0).cpu().numpy()
-    assert positions_xyz.shape[-1] == 3, f'planned positions must be 3D, got {positions_xyz.shape}'
-    waypoints = [(float(x), float(y), float(z)) for x, y, z in positions_xyz]
-    _validate_inside_flight_area(waypoints)
-
     meta = {
         'sigma0': sigma0,
+        'q_std': q_std,
+        **signature,
         'rho_before': round(rho_before, 4),
         'rho_after': round(float(best_p), 4),
         'alpha': PLANNER_ALPHA,
         'generated': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
     }
-    out = save_pdstl_waypoints(fan, waypoints, meta)
+    out = save_pdstl_waypoints(fan, waypoints, meta, scenario=scenario)
     print(f'Wrote {len(waypoints)} waypoints to {out}')
 
+
+def _run_plan_2d(fan: int, plot: bool) -> None:
+    """Optimise and save a 2D baseline plan. Optimizer state is strictly (x, y)."""
+    sigma0 = SIGMA0_PER_FAN[fan]
+    q_std = Q_STD
+    planner, _dynamics, env = build_planner_2d(fan)
+    print(f'Planning for fan {fan}  (Σ0 = {sigma0} m², q_std = {q_std} m/step, '
+          f'T = {planner.T}, scenario = baseline [2D])')
+
+    x0_mean, x0_cov = x0_belief_2d(fan)
+    init_u = _nominal_init_guess_2d()
+    rho_before, best_mean, best_cov, _best_u, best_p = _optimize_and_report(
+        planner, x0_mean, x0_cov, init_u,
+    )
+
+    positions_xy = best_mean.squeeze(0).cpu().numpy()
+    assert positions_xy.shape[-1] == 2, f'2D planned positions must be 2D, got {positions_xy.shape}'
+    waypoints = [(float(x), float(y), Z_HEIGHT) for x, y in positions_xy]
+    _save_plan(fan, 'baseline', sigma0, q_std, rho_before, best_p, waypoints)
+
     if plot:
-        nominal_wps = np.array(nominal_safe_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS))
-        nominal_curve = np.array(nominal_safe_waypoints(n_points=200))
-        reference_xy = np.array(reference_direct_path(n_points=200))
-        reference_curve = np.column_stack([reference_xy, np.full(len(reference_xy), Z_HEIGHT)])
+        nominal_wps = np.array(nominal_safe_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS))[:, :2]
+        nominal_curve = np.array(nominal_safe_waypoints(n_points=200))[:, :2]
+        reference_curve = np.array(reference_direct_path(n_points=200))
         plot_path = EXPERIMENT_DIR / 'plots' / f'fan{fan}_comparison.png'
         opt_cov = best_cov.squeeze(0).cpu().numpy()
+        assert opt_cov.shape[-2:] == (2, 2), f'2D planned covariance must be 2x2, got {opt_cov.shape}'
+
+        _plot_2d(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
+                 positions_xy, opt_cov, plot_path)
+
+
+def _run_plan_3d(fan: int, plot: bool) -> None:
+    """Optimise and save a 3D gate plan. Optimizer state is (x, y, z)."""
+    sigma0 = SIGMA0_PER_FAN[fan]
+    q_std = Q_STD
+    planner, _dynamics, env = build_planner_3d()
+    print(f'Planning for fan {fan}  (Σ0 = {sigma0} m², q_std = {q_std} m/step, '
+          f'T = {planner.T}, scenario = gate [3D])')
+
+    x0_mean, x0_cov = x0_belief_3d(fan)
+    init_u = _nominal_init_guess_3d()
+    rho_before, best_mean, best_cov, _best_u, best_p = _optimize_and_report(
+        planner, x0_mean, x0_cov, init_u,
+    )
+
+    positions_xyz = best_mean.squeeze(0).cpu().numpy()
+    assert positions_xyz.shape[-1] == 3, f'3D planned positions must be 3D, got {positions_xyz.shape}'
+    waypoints = [(float(x), float(y), float(z)) for x, y, z in positions_xyz]
+    _save_plan(fan, 'gate', sigma0, q_std, rho_before, best_p, waypoints)
+
+    if plot:
+        nominal_wps = np.array(nominal_gate_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS))
+        nominal_curve = np.array(nominal_gate_waypoints(n_points=200))
+        reference_xy = np.array(reference_direct_path(n_points=200))
+        reference_curve = np.column_stack([reference_xy, np.full(len(reference_xy), Z_HEIGHT)])
+        plot_path = EXPERIMENT_DIR / 'plots' / f'fan{fan}_gate_comparison.png'
+        opt_cov = best_cov.squeeze(0).cpu().numpy()
         assert opt_cov.shape[-2:] == (3, 3), f'planned covariance must be 3x3, got {opt_cov.shape}'
-        _plot(env, fan, sigma0, nominal_wps, nominal_curve, reference_curve,
+        _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
               positions_xyz, opt_cov, plot_path)
+
+
+def run_plan(fan: int, scenario: str = 'baseline', plot: bool = False) -> None:
+    """Optimise and save waypoints for one fan level/scenario (optionally plot).
+
+    One-line dispatch to _run_plan_2d/_run_plan_3d -- everything scenario-
+    specific (construction, optimizer state shape, waypoint conversion) lives
+    in those two functions and the planning_2d/planning_3d modules they call
+    into; nothing here branches beyond this.
+    """
+    if scenario == 'gate':
+        _run_plan_3d(fan, plot)
+    else:
+        _run_plan_2d(fan, plot)

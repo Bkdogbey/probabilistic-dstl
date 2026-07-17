@@ -1,183 +1,187 @@
-"""Single source of truth for the Crazyflie experiment.
+"""Load config.yml and expose it as module-level constants, plus the
+genuinely-logic helpers that are shared between the 2D baseline and 3D
+gate scenarios (spline math, waypoint validation, waypoint JSON I/O,
+obstacle-clearance distance, and the geometry signature used to derive
+BASELINE_PATH_ID).
 
-Everything you edit to run the experiment lives here: arena geometry, the
-per-fan uncertainty model, planner hyperparameters, and flight parameters.
-Every other file imports from this module instead of duplicating constants or
-reaching into src/ directly.
+This file is a thin loader now -- arena/uncertainty/planner/flight/gate
+INPUT VALUES live in config.yml (edit that file, not this one, to change
+geometry, obstacle positions, planner hyperparameters, etc.). Nothing
+scenario-specific is *constructed* here (that's still planning_2d.py /
+planning_3d.py); gate-only geometry VALUES do live in config.yml (section
+6 below), but the gate scenario's construction logic (Environment3D,
+Planner3D, nominal_gate_waypoints, ...) is entirely in planning_3d.py,
+unchanged.
 
-This module is import-safe with NO hardware/ROS dependencies, so the offline
-planning path (`run.py plan`) needs only torch/numpy/matplotlib. The ros_sugar
-trial config (CrazyflieConfig) lives in components/crazyflie.py, next to the
-flight component that uses it, so importing this file never pulls in ros_sugar.
+This module is import-safe with NO torch/hardware/ROS dependencies (pure
+Python + numpy + PyYAML) -- deliberately NOT using src/utils.py's
+load_config() helper, since that module imports torch. Keeping this file
+torch-free matters: flight_logger.py and run.py's top-level
+`from components.config import VALID_FANS` must never pull in torch.
 
 Sections:
     1. Arena geometry          — bounds, obstacles, goal, start/end, safe path
-    2. Per-fan uncertainty     — SIGMA0_PER_FAN, Q_STD  (drives planning + plots)
-    3. Planner hyperparameters — PLANNER_CONFIG (every optimizer knob, labeled)
-    4. Flight parameters       — velocities, heights, calibration
-    5. Factories & helpers     — build_environment/build_planner, waypoint I/O
+    2. Deterministic-path calc — required obstacle-clearance margin
+    3. Per-fan uncertainty     — SIGMA0_PER_FAN, Q_STD (planning + plots)
+    4. Planner hyperparameters — PLANNER_CONFIG (every optimizer knob, labeled)
+    5. Trial selection         — TRIAL_FAN/TRIAL_CONDITION/TRIAL_SCENARIO, the
+                                  run.py CLI's --fan/--condition/--scenario defaults
+    6. Flight parameters       — velocities, heights, calibration, log paths
+    7. Gate geometry           — 3D-only; consumed solely by planning_3d.py
+    8. Shared helpers          — spline math, waypoint validation/I/O,
+                                  obstacle clearance, geometry signature
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sys
 
-# Use the pdSTL library from this repo's src/ (no vendored copies). Every other
-# file gets Environment/SingleIntegrator/Planner/etc. through this module's
-# re-exports below, so nothing else needs to touch sys.path. This file lives at
-# experiments/crazyflie/components/config.py, three levels below the repo root.
+# Use the pdSTL library from this repo's src/ (no vendored copies). This file
+# lives at experiments/crazyflie/components/config.py, three levels below
+# the repo root. planning_2d.py/planning_3d.py both import this module
+# before their own planning.*/pdstl.* imports specifically so this insert
+# always runs first -- see the comment at the top of their import blocks.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / 'src'))
 
 import numpy as np
-import torch
+import yaml
 
-from pdstl.base import BeliefTrajectory as BeliefTrajectory
-from planning.dynamics import SingleIntegrator as SingleIntegrator
-from planning.environment import Environment as Environment
-from planning.planner import Planner as Planner
-from planning.planner import TorchGaussianBelief as TorchGaussianBelief
-
-# 3D dynamics/environment/planner, isolated to this experiment (see
-# components/env3d.py) rather than generalizing the shared library above.
-from components.env3d import Environment3D, Planner3D, SingleIntegrator3D
-
-# Experiment root (where run.py, waypoints/ and plots/ live).
+# Experiment root (where run.py, config.yml, waypoints/ and plots/ live).
 EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 VALID_FANS: tuple[int, ...] = (2, 6, 12, 16)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 1. Arena geometry (measured; arena extended 0.5 m past the raw x=1.0 wall so
-#    start/end/obstacle_3 — all at x=1.0 — don't sit flush on a hard boundary)
-# ═════════════════════════════════════════════════════════════════════════════
-FLIGHT_X_BOUNDS: list[float] = [-0.5, 1.5]
-FLIGHT_Y_BOUNDS: list[float] = [-2.0, 0.5]
-FLIGHT_Z_BOUNDS: list[float] = [0.1, 1.7]  # floor (= LAND_Z) to measured ceiling/tracking-volume top
-Z_HEIGHT: float = 0.2  # flight height [m], the fixed altitude used by 2D planning/plots
+def _t2(v) -> tuple[float, float]:
+    """2-tuple-of-float cast for YAML lists that must behave like the old
+    Python tuple literals (e.g. unpacked with `*obs['x']`)."""
+    return (float(v[0]), float(v[1]))
 
-# Measured obstacle boxes (converted from inches at 0.0254 m/in), consumed by
-# the planner, the 3D safety predicates (components/env3d.py), and the safety
-# flags in the flight logger. 'height' is each obstacle's vertical extent,
-# assumed floor-mounted (z spans 0..height) -- this is what lets the 3D
-# planner route over the top of an obstacle instead of only around it.
+
+_CONFIG_PATH = EXPERIMENT_DIR / 'config.yml'
+_cfg = yaml.safe_load(_CONFIG_PATH.read_text(encoding='utf-8'))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. Arena geometry — see config.yml for values + measurement rationale
+# ═════════════════════════════════════════════════════════════════════════════
+_arena = _cfg['arena']
+FLIGHT_X_BOUNDS: list[float] = list(_arena['flight_x_bounds'])
+FLIGHT_Y_BOUNDS: list[float] = list(_arena['flight_y_bounds'])
+FLIGHT_Z_BOUNDS: list[float] = list(_arena['flight_z_bounds'])
+Z_HEIGHT: float = float(_arena['z_height'])
+
 OBSTACLES: list[dict] = [
-    {'name': 'obs_1', 'x': (0.5, 0.8175), 'y': (-1.2667, -1.0), 'height': 0.4064},
-    {'name': 'obs_2', 'x': (0.25, 0.4405), 'y': (-0.6651, -0.5), 'height': 0.5143},
-    {'name': 'obs_3', 'x': (0.7936, 1.0), 'y': (-0.6651, -0.5), 'height': 0.3302},
+    {'name': o['name'], 'x': _t2(o['x']), 'y': _t2(o['y']), 'height': float(o['height'])}
+    for o in _arena['obstacles']
 ]
-
-# ±0.15 m box around END_XY/END_Z (same margin convention on all three axes)
-GOAL: dict = {'x': (0.85, 1.15), 'y': (-0.15, 0.15), 'z': (0.05, 0.35)}
-
-START_XY: tuple[float, float] = (1.0, -2.0)
-END_XY: tuple[float, float] = (1.0, 0.0)  # safe-path target; goal box center
-START_Z: float = Z_HEIGHT  # cruise altitude at the start of the optimized trajectory
-END_Z: float = Z_HEIGHT    # cruise altitude the goal box is centered on
-# Abort the flight if the measured hover position at start differs from
-# START_XY by more than this (m) — see components/calibration.py.
-START_TOLERANCE: float = 0.08
-
-# Via-points (x, y) the deterministic safe path passes through between START_XY
-# and END_XY, computed with no disturbance/wind — the risk in the experiment
-# comes from *flying* this nominally-safe path under real fan noise, not from
-# the path itself being unsafe. (0.25, -1.0) clears obs_1 on its left side;
-# (0.617, -0.58) is the midpoint of the gap between obs_2 and obs_3.
-SAFE_PATH_VIA_POINTS: list[tuple[float, float]] = [
-    (0.25, -1.0),
-    (0.617, -0.58),
-]
-
-# Waypoint count actually flown for the deterministic condition (denser than
-# the T-step planning horizon, purely for a smoother flight path — the T-point
-# warm-start fed to the optimizer is unaffected).
-SAFE_PATH_FLIGHT_POINTS: int = 30
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 2. Per-fan uncertainty model
-#    Σ_t(fan) = SIGMA0_PER_FAN[fan] + t · Q_STD²   (open-loop growth)
-# ═════════════════════════════════════════════════════════════════════════════
-# Initial belief *variance* (m², per axis) for each fan setting — used directly
-# as Σ0 (NOT squared). Fans 2/6/12 are the paper's Settings 1–3; fan 16 has no
-# paper calibration and is a flagged extrapolation. This is the one knob that
-# distinguishes the fan levels, so each fan's plot shows its own uncertainty.
-SIGMA0_PER_FAN: dict[int, float] = {
-    2: 0.001,
-    6: 0.006,
-    12: 0.020,
-    16: 0.050,  # uncalibrated extrapolation — no paper source
+GOAL: dict = {
+    'x': _t2(_arena['goal']['x']), 'y': _t2(_arena['goal']['y']), 'z': _t2(_arena['goal']['z']),
 }
 
-# Shared per-step process-noise std (m). Modest vs Σ0 so the per-fan Σ0
-# differences dominate the plots, while ellipses still grow along the path.
-# Ideally calibrate from tracking residuals; a single value keeps it simple.
-Q_STD: float = 0.01
+START_XY: tuple[float, float] = _t2(_arena['start_xy'])
+END_XY: tuple[float, float] = _t2(_arena['end_xy'])
+START_Z: float = Z_HEIGHT   # cruise altitude at the start of the gate trajectory (derived, not stored)
+END_Z: float = Z_HEIGHT     # cruise altitude the goal box is centered on (derived, not stored)
+START_TOLERANCE: float = float(_arena['start_tolerance'])
 
-# Planning horizon (number of control steps → T+1 waypoints), inter-waypoint
-# time and max inter-waypoint speed (measured from the experiment setup).
-T: int = 10
-DT: float = 0.693   # mean inter-waypoint time [s]
-U_MAX: float = 0.44  # max inter-waypoint speed [m/s]
+SAFE_PATH_VIA_POINTS: list[tuple[float, float]] = [_t2(p) for p in _arena['safe_path_via_points']]
+SAFE_PATH_FLIGHT_POINTS: int = int(_arena['safe_path_flight_points'])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3. Planner hyperparameters — every knob in one place (was split between
-#    configs/planning.yaml and an override dict). Each value below shadows the
-#    repo-level YAML so the Crazyflie run is fully described here.
+# 2. Deterministic-path calculation input (2D baseline only — consumed by
+#    planning_2d.py's _calculate_sine_amplitude()). The required per-obstacle
+#    clearance margin for the closed-form sine-amplitude calculation; see
+#    that function's docstring for how it's used.
 # ═════════════════════════════════════════════════════════════════════════════
-PLANNER_ALPHA: float = 0.90  # P(sat) early-stop threshold (also recorded in outputs)
-
-PLANNER_CONFIG: dict = {
-    # ── Paper-faithful objective (J = w_phi·(−log(P_sat+ε)) + w_u·|u|²) ──
-    'w_phi': 20.0,   # weight on the STL satisfaction objective
-    'w_u': 0.1,      # λ on control effort |u|²
-    'alpha': PLANNER_ALPHA,
-
-    # ── Heuristic shaping (NOT in the paper — potential fields that speed up
-    #    convergence; set to 0.0 for the clean paper objective) ──
-    'w_dist': 5.0,      # pull final position toward goal centre
-    'w_obs': 5.0,       # repel trajectory from obstacle centres
-    'w_visit': 5.0,     # pull toward visit regions (none defined here → inert)
-    'obs_margin': 0.75,  # safety margin (m) added to obstacle radius in repulsion
-
-    # ── Numerical / optimizer internals ──
-    'w_du': 0.1,             # smoothness (penalise input rate of change)
-    'lr': 0.02,              # Adam learning rate
-    'max_iters': 1000,       # max optimisation iterations
-    'min_iters': 10,         # min iters before the loss-tolerance check activates
-    'converge_patience': 50,  # consecutive iters at P≥alpha before early stop
-    'loss_tol': 1.0e-4,      # loss convergence tolerance
-
-    # ── Robustness smoothing ──
-    # β log-sum-exp smoothing of min/max in the STL robustness. scale > 0 =
-    # smooth (paper's differentiable form); scale <= 0 = exact min/max. Kept
-    # exact by default to preserve current behaviour; raise to e.g. 10–50 to
-    # enable smoothing.
-    'scale': -1,
-}
+_det = _cfg['deterministic_path']
+DETERMINISTIC_PATH_MARGIN: float = float(_det['margin'])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4. Flight parameters (used only at flight time by components/crazyflie.py)
+# 3. Per-fan uncertainty model (paper Experiment 3)
+#    Σ_t(fan) = SIGMA0_PER_FAN[fan] + t · Q_STD²
 # ═════════════════════════════════════════════════════════════════════════════
+_unc = _cfg['uncertainty']
+SIGMA0_PER_FAN: dict[int, float] = {int(k): float(v) for k, v in _unc['sigma0_per_fan'].items()}
+Q_STD: float = float(_unc['q_std'])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. Planner hyperparameters — every knob in one place, labeled
+#    paper-faithful/heuristic/numerical. Shared by both planning_2d.py's
+#    Planner and planning_3d.py's Planner3D.
+# ═════════════════════════════════════════════════════════════════════════════
+_planner = _cfg['planner']
+T: int = int(_planner['T'])
+DT: float = float(_planner['dt'])
+U_MAX: float = float(_planner['u_max'])
+PLANNER_ALPHA: float = float(_planner['alpha'])
+PLANNER_CONFIG: dict = {**_planner['config'], 'alpha': PLANNER_ALPHA}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. Trial selection — which fan/condition/scenario `run.py` acts on when
+#    --fan/--condition/--scenario aren't passed on the command line. Edit
+#    config.yml's trial: section instead of typing the same flags every run;
+#    CLI flags still exist and override these for one-off invocations.
+# ═════════════════════════════════════════════════════════════════════════════
+_trial = _cfg['trial']
+TRIAL_FAN: int = int(_trial['fan'])
+TRIAL_CONDITION: str = str(_trial['condition'])
+TRIAL_SCENARIO: str = str(_trial['scenario'])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. Flight parameters (used only at flight time by components/crazyflie.py)
+#    + log/calibration directories (shared by uncertainty_calibration.py,
+#    analyze_logs.py, and components/flight_logger.py).
+# ═════════════════════════════════════════════════════════════════════════════
+_flight = _cfg['flight']
 FLIGHT_VELOCITY: float = U_MAX  # PositionHlCommander default velocity [m/s]
-CALIBRATION_HOVER_SECONDS: float = 2.0
+CALIBRATION_HOVER_SECONDS: float = float(_flight['calibration_hover_seconds'])
 TAKEOFF_Z: float = Z_HEIGHT
-RETURN_Z: float = 0.65
-LAND_Z: float = 0.1
+RETURN_Z: float = float(_flight['return_z'])
+LAND_Z: float = float(_flight['land_z'])
+Z_HOLD: float = float(_flight['z_hold'])
 
 # Drone radio address, e.g. 'radio://0/80/2M/E7E7E7E780'. Set this once for
-# your drone; leave as None to use irobot's own CrazyflieConfig.uri default.
-# Picked up automatically by components/crazyflie.py -- no per-run flag needed.
-DRONE_URI: str | None = 'radio://0/84/2M/E7E7E7E784'
+# your drone in config.yml; leave null there to use irobot's own
+# CrazyflieConfig.uri default. Picked up automatically by
+# components/crazyflie.py -- no per-run flag needed.
+DRONE_URI: str | None = _flight.get('drone_uri')
+
+LOGS_DIR: pathlib.Path = EXPERIMENT_DIR / 'components' / 'logs'
+CALIBRATION_DIR: pathlib.Path = EXPERIMENT_DIR / 'calibration'
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. Factories & helpers
+# 7. Gate scenario geometry (3D-only; construction logic lives entirely in
+#    planning_3d.py, which imports these names)
+# ═════════════════════════════════════════════════════════════════════════════
+_gate = _cfg['gate']
+GATE_CENTER_XY: tuple[float, float] = _t2(_gate['center_xy'])
+GATE_X: tuple[float, float] = _t2(_gate['x'])
+GATE_Z: tuple[float, float] = _t2(_gate['z'])
+GATE_Z_CENTER: float = float(_gate['z_center'])
+GATE_Y_MARGIN: float = float(_gate['y_margin'])
+GATE_Y: tuple[float, float] = (GATE_CENTER_XY[1] - GATE_Y_MARGIN, GATE_CENTER_XY[1] + GATE_Y_MARGIN)
+POST_GATE_Z: float = float(_gate['post_gate_z'])
+POST_GATE_Z_BAND: tuple[float, float] = _t2(_gate['post_gate_z_band'])
+GATE_T: int = int(_gate['T'])
+GATE_T_START: int = int(_gate['t_start'])
+GATE_T_END: int = int(_gate['t_end'])
+GATE_T_DESCEND_START: int = int(_gate['t_descend_start'])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. Shared helpers — spline math, waypoint validation, waypoint JSON I/O,
+#    geometry signature. Used by both planning_2d.py and planning_3d.py.
 # ═════════════════════════════════════════════════════════════════════════════
 def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Fritsch-Carlson monotone cubic Hermite slopes.
@@ -218,24 +222,6 @@ def _pchip_eval(xq: np.ndarray, x: np.ndarray, y: np.ndarray, m: np.ndarray) -> 
     return out
 
 
-def nominal_safe_waypoints(n_points: int = T) -> list[tuple[float, float, float]]:
-    """Deterministic path from START_XY through SAFE_PATH_VIA_POINTS to END_XY.
-
-    A monotone (PCHIP) cubic Hermite spline through the via points, computed to
-    clear all three obstacles with no disturbance modelled. This is the baseline
-    flown by the deterministic condition, and (at n_points=T, the default) the
-    warm start the pdSTL optimizer improves on.
-    """
-    nodes = [START_XY, *SAFE_PATH_VIA_POINTS, END_XY]
-    x_nodes = np.array([p[0] for p in nodes], dtype=float)
-    y_nodes = np.array([p[1] for p in nodes], dtype=float)
-
-    slopes = _pchip_slopes(y_nodes, x_nodes)
-    y_pos = np.linspace(START_XY[1], END_XY[1], n_points)
-    x_pos = _pchip_eval(y_pos, y_nodes, x_nodes, slopes)
-    return [(float(x), float(y), Z_HEIGHT) for x, y in zip(x_pos, y_pos)]
-
-
 def reference_direct_path(n_points: int = 200) -> list[tuple[float, float]]:
     """The 'obstacles are not there' straight line START_XY -> END_XY.
 
@@ -250,78 +236,116 @@ def reference_direct_path(n_points: int = 200) -> list[tuple[float, float]]:
     return [(float(x), float(y)) for x, y in zip(x_pos, y_pos)]
 
 
-def build_environment() -> Environment3D:
-    """Build the pdSTL Environment3D (bounds, obstacles, goal) from the geometry above.
+def obstacle_clearance_2d(curve_xy: np.ndarray, obs: dict) -> float:
+    """Min x,y-only distance from any point on curve_xy [N,2] to an obstacle's box (0 = inside).
 
-    Obstacles are floor-mounted: z spans (0.0, obs['height']) -- this is what
-    lets the 3D planner satisfy safety by flying over an obstacle's top.
+    No altitude term -- callers with a 2D-only view of the arena (the sine-
+    amplitude calculation in planning_2d.py, the before/after comparison
+    plots in waypoint_planning.py) share this single implementation.
     """
-    env = Environment3D()
-    env.set_bounds(x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS, z_range=FLIGHT_Z_BOUNDS)
-    for obs in OBSTACLES:
-        env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=(0.0, obs['height']))
-    env.set_goal(x_range=list(GOAL['x']), y_range=list(GOAL['y']), z_range=list(GOAL['z']))
-    return env
+    dx = np.maximum(np.maximum(obs['x'][0] - curve_xy[:, 0], 0.0), curve_xy[:, 0] - obs['x'][1])
+    dy = np.maximum(np.maximum(obs['y'][0] - curve_xy[:, 1], 0.0), curve_xy[:, 1] - obs['y'][1])
+    return float(np.min(np.sqrt(dx**2 + dy**2)))
 
 
-def build_planner(fan_speed: int) -> tuple[Planner3D, SingleIntegrator3D, Environment3D]:
-    """Build a (Planner, dynamics, environment) for the given fan level.
+def validate_waypoints_in_bounds(
+    waypoints: list[tuple[float, float, float]], *, label: str = 'Waypoint',
+) -> None:
+    """Raise ValueError if any (x, y, z) waypoint falls outside FLIGHT_*_BOUNDS.
 
-    Fan level selects the *initial* belief covariance Σ0 (see x0_belief); the
-    per-step process noise Q_STD is shared across fans (belief growth term).
+    Shared by the planner (checking optimizer output, before saving a plan)
+    and the flight component (checking what's about to be commanded, before
+    takeoff) so both paths use the same bounds check.
     """
-    dynamics = SingleIntegrator3D(dt=DT, u_max=U_MAX, q_std=Q_STD)
-    env = build_environment()
-    planner = Planner3D(dynamics, env, T, config=dict(PLANNER_CONFIG))
-    return planner, dynamics, env
+    x_min, x_max = FLIGHT_X_BOUNDS
+    y_min, y_max = FLIGHT_Y_BOUNDS
+    z_min, z_max = FLIGHT_Z_BOUNDS
+    outside = [
+        (idx, x, y, z)
+        for idx, (x, y, z) in enumerate(waypoints)
+        if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max)
+    ]
+    if outside:
+        details = ', '.join(f'#{idx}=({x:.3f}, {y:.3f}, {z:.3f})' for idx, x, y, z in outside)
+        raise ValueError(
+            f'{label}(s) outside flight area '
+            f'x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]: {details}'
+        )
 
 
-def x0_belief(fan_speed: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Initial (mean, cov) belief for the given fan level.
-
-    The covariance is SIGMA0_PER_FAN[fan_speed] on each axis (x, y, and z share
-    the same sigma0) — this is what makes each fan's optimisation and plot
-    reflect its own uncertainty.
+def geometry_signature_2d() -> str:
+    """sha256-based signature of everything that determines
+    nominal_safe_waypoints()'s calculated sine amplitude: obstacle geometry,
+    start/end points, and the required clearance margin (see
+    planning_2d.py's _calculate_sine_amplitude). Deliberately torch-free
+    (pure Python + numpy) so it can be computed here and imported by
+    flight_logger.py (via BASELINE_PATH_ID below) without pulling in torch.
+    Used, via BASELINE_PATH_ID, to auto-invalidate stale calibration/flight
+    logs whenever a change to this file would actually change the
+    deterministic path's shape -- replacing the old convention of
+    hand-bumping a version string.
     """
-    sigma0 = SIGMA0_PER_FAN[fan_speed]
-    mean = torch.tensor([*START_XY, START_Z], dtype=torch.float32)
-    cov = torch.diag(torch.tensor([sigma0, sigma0, sigma0], dtype=torch.float32))
-    assert mean.shape == (3,), f'x0 mean must be 3D, got {tuple(mean.shape)}'
-    assert cov.shape == (3, 3), f'x0 cov must be 3x3, got {tuple(cov.shape)}'
-    return mean, cov
+    payload = {
+        'obstacles': OBSTACLES, 'start_xy': START_XY, 'end_xy': END_XY,
+        'margin': DETERMINISTIC_PATH_MARGIN,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
 
 
-# ── Per-fan optimised waypoint files (waypoints/pdstl_fan<L>.json) ────────────
-def _waypoints_path(fan_speed: int) -> pathlib.Path:
-    return EXPERIMENT_DIR / 'waypoints' / f'pdstl_fan{fan_speed}.json'
+BASELINE_PATH_ID: str = f'sine_calc_v1_{geometry_signature_2d()}'
+
+
+# ── Per-fan optimised waypoint files (waypoints/pdstl[_<scenario>]_fan<L>.json) ─
+def _waypoints_path(fan_speed: int, scenario: str = 'baseline') -> pathlib.Path:
+    suffix = '' if scenario == 'baseline' else f'_{scenario}'
+    return EXPERIMENT_DIR / 'waypoints' / f'pdstl{suffix}_fan{fan_speed}.json'
 
 
 def save_pdstl_waypoints(fan_speed: int, waypoints: list[tuple[float, float, float]],
-                         meta: dict) -> pathlib.Path:
-    """Write optimised waypoints for one fan level as JSON (with metadata)."""
-    path = _waypoints_path(fan_speed)
+                         meta: dict, scenario: str = 'baseline') -> pathlib.Path:
+    """Write optimised waypoints for one fan level/scenario as JSON (with metadata)."""
+    path = _waypoints_path(fan_speed, scenario)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {'fan': fan_speed, **meta,
+    payload = {'fan': fan_speed, 'scenario': scenario, **meta,
                'waypoints': [[float(x), float(y), float(z)] for x, y, z in waypoints]}
     path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
     return path
 
 
-def load_pdstl_waypoints(fan_speed: int) -> list[tuple[float, float, float]]:
-    """Load the optimised waypoints for one fan level, checking the fan matches.
+def pdstl_plan_meta(fan_speed: int, scenario: str = 'baseline') -> dict:
+    """Read the full waypoints JSON payload (rho_before, rho_after, ...) for one fan/scenario.
+
+    Unlike load_pdstl_waypoints, this doesn't fail on a non-converged plan --
+    it's used to *decide* whether a plan is flyable (see run.py's --condition
+    pdstl guard) before committing to loading/flying it.
+    """
+    path = _waypoints_path(fan_speed, scenario)
+    if not path.exists():
+        scenario_flag = '' if scenario == 'baseline' else f' --scenario {scenario}'
+        raise FileNotFoundError(
+            f'No optimised waypoints for fan {fan_speed} (scenario={scenario}) at {path}. '
+            f'Generate them first:  python run.py plan --fan {fan_speed}{scenario_flag}'
+        )
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def load_pdstl_waypoints(fan_speed: int, scenario: str = 'baseline') -> list[tuple[float, float, float]]:
+    """Load the optimised waypoints for one fan level/scenario, checking fan/scenario match.
 
     Raises FileNotFoundError with a clear hint if the file hasn't been generated
-    (run `python run.py plan --fan <L>` first).
+    (run `python run.py plan --fan <L>` first) -- reuses pdstl_plan_meta for that
+    check instead of re-reading the file. Files predating the 'scenario' field
+    default to 'baseline' so they still load under the new signature.
     """
-    path = _waypoints_path(fan_speed)
-    if not path.exists():
-        raise FileNotFoundError(
-            f'No optimised waypoints for fan {fan_speed} at {path}. '
-            f'Generate them first:  python run.py plan --fan {fan_speed}'
+    data = pdstl_plan_meta(fan_speed, scenario)
+    if data.get('scenario', 'baseline') != scenario:
+        raise ValueError(
+            f'Waypoints for fan {fan_speed} were generated for scenario '
+            f'{data.get("scenario", "baseline")!r}, not {scenario!r}.'
         )
-    data = json.loads(path.read_text(encoding='utf-8'))
     if data.get('fan') != fan_speed:
         raise ValueError(
-            f'{path} was generated for fan {data.get("fan")}, not {fan_speed}.'
+            f'Waypoints file was generated for fan {data.get("fan")}, not {fan_speed}.'
         )
     return [tuple(wp) for wp in data['waypoints']]

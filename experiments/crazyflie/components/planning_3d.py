@@ -1,19 +1,68 @@
-"""Crazyflie-only 3D extension of the shared pdSTL planning library.
+"""Everything 3D: the 'gate' scenario, and only the 'gate' scenario.
 
-Subclasses src/planning/{dynamics,environment,planner}.py rather than
-modifying them: that shared library also backs ~6 other 2D scenario configs
-under configs/scenarios/, so 3D support is kept isolated to this experiment.
-Only the genuinely 2D-hardcoded pieces (process-noise covariance shape,
+The 2D baseline mission (components/planning_2d.py) is planned with the
+plain, unmodified 2D Environment/Planner/SingleIntegrator from src/planning/
+-- it never imports anything from this file. This module exists solely
+because the gate scenario needs a real third (z) dimension: climb through a
+gate, descend, avoid, land.
+
+Section 1 (3D dynamics/environment/planner classes) subclasses
+src/planning/{dynamics,environment,planner}.py rather than modifying it:
+that shared library also backs ~6 other 2D scenario configs under
+configs/scenarios/, so 3D support is kept isolated to this experiment. Only
+the genuinely 2D-hardcoded pieces (process-noise covariance shape,
 rectangular-predicate axis slicing, heuristic-loss centers) are overridden;
 the STL operator chaining (Eventually/Or/And/Always) and the optimization
 loop (Planner._optimize_window) are dimension-general already and reused
 unchanged.
+
+Section 2 (build_environment_3d/build_planner_3d/nominal_gate_waypoints/
+x0_belief_3d/_nominal_init_guess_3d) is the gate scenario's construction
+logic, which lives exclusively in this file. The gate geometry *values* it
+builds from (GATE_*, POST_GATE_Z*) live in config.yml, imported below --
+components/config.py is the single source of truth for those numbers, this
+file is the single source of truth for what to build from them.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
+# Imported first: components.config does the one sys.path.insert(src/) every
+# planning.*/pdstl.* import in this file relies on -- importing it before
+# them guarantees that regardless of which module gets imported first.
+from components.config import (
+    DT,
+    END_XY,
+    END_Z,
+    FLIGHT_X_BOUNDS,
+    FLIGHT_Y_BOUNDS,
+    FLIGHT_Z_BOUNDS,
+    GATE_CENTER_XY,
+    GATE_T,
+    GATE_T_DESCEND_START,
+    GATE_T_END,
+    GATE_T_START,
+    GATE_X,
+    GATE_Y,
+    GATE_Z,
+    GATE_Z_CENTER,
+    GOAL,
+    OBSTACLES,
+    PLANNER_CONFIG,
+    POST_GATE_Z,
+    POST_GATE_Z_BAND,
+    Q_STD,
+    SAFE_PATH_VIA_POINTS,
+    SIGMA0_PER_FAN,
+    START_XY,
+    START_Z,
+    U_MAX,
+    Z_HEIGHT,
+    _pchip_eval,
+    _pchip_slopes,
+)
 from pdstl.operators import Always, And, Eventually, Or, STL_Formula
 from planning.dynamics import SingleIntegrator
 from planning.environment import (
@@ -134,11 +183,38 @@ class Environment3D(Environment):
     exposed as an independently overridable seam there.
     """
 
+    def __init__(self, device="cpu"):
+        super().__init__(device=device)
+        self.time_windowed_bounds = []
+
     def add_obstacle(self, x_range, y_range, z_range=None):
         obstacle = {"x": x_range, "y": y_range}
         if z_range is not None:
             obstacle["z"] = z_range
         self.obstacles.append(obstacle)
+
+    def add_visit_region(self, x_range, y_range, z_range=None):
+        region = {"x": x_range, "y": y_range}
+        if z_range is not None:
+            region["z"] = z_range
+        self.visit_regions.append(region)
+
+    def add_timed_visit_region(self, x_range, y_range, interval, z_range=None, label=None):
+        region = {"x": x_range, "y": y_range, "interval": interval, "label": label}
+        if z_range is not None:
+            region["z"] = z_range
+        self.timed_visit_regions.append(region)
+
+    def add_time_windowed_bounds(self, x_range, y_range, z_range, interval, label=None):
+        """A rectangular region the trajectory must stay inside for an entire
+        sub-interval (Always), unlike visit_regions/timed_visit_regions which
+        only require being inside at some point (Eventually). Reuses the same
+        containment predicate as goal/visit regions -- only the temporal
+        operator wrapping it in get_specification() differs.
+        """
+        self.time_windowed_bounds.append(
+            {"x": x_range, "y": y_range, "z": z_range, "interval": interval, "label": label}
+        )
 
     def set_goal(self, x_range, y_range, z_range=None, interval=None):
         self.goal = {"x": x_range, "y": y_range}
@@ -157,6 +233,7 @@ class Environment3D(Environment):
             "visit": [],
             "timed_visit": [],
             "choice_region_groups": [],
+            "time_windowed_bounds": [],
             "goal": None,
         }
 
@@ -182,6 +259,15 @@ class Environment3D(Environment):
                     "predicates": group_preds,
                     "interval": group.get("interval", None),
                     "label": group.get("label", None),
+                }
+            )
+
+        for region in self.time_windowed_bounds:
+            preds["time_windowed_bounds"].append(
+                {
+                    "predicate": RectangularGoalPredicate3D(region),
+                    "interval": region["interval"],
+                    "label": region.get("label", None),
                 }
             )
 
@@ -226,6 +312,9 @@ class Environment3D(Environment):
             for pred in group_preds[1:]:
                 choice_spec = Or(choice_spec, Eventually(pred, interval=interval))
             specs.append(choice_spec)
+
+        for item in preds["time_windowed_bounds"]:
+            specs.append(Always(item["predicate"], interval=item["interval"]))
 
         if preds["obstacles"]:
             obs_preds = preds["obstacles"]
@@ -312,3 +401,111 @@ class Planner3D(Planner):
             loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
 
         return loss
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. Gate scenario construction (3D-only). Geometry values (GATE_*,
+#    POST_GATE_Z*) are imported from components/config.py -- see config.yml's
+#    'gate:' section for the measurements and rationale behind each one.
+# ═════════════════════════════════════════════════════════════════════════════
+def nominal_gate_waypoints(n_points: int = GATE_T) -> list[tuple[float, float, float]]:
+    """Deterministic climb-to-gate / pass-through / descend-and-avoid / land path.
+
+    x(y) and z(y) are two independent PCHIP splines over the shared y-parameter
+    (y increases monotonically along the whole route: START_XY -> gate -> via
+    points -> END_XY). This is a warm start for the optimizer and (for the
+    deterministic condition) a flyable path in its own right -- the z-profile
+    nodes are shaped only to force a climb before the gate and a descent after
+    it, not chosen to be obstacle-clear on their own.
+    """
+    xy_nodes = [START_XY, GATE_CENTER_XY, *SAFE_PATH_VIA_POINTS, END_XY]
+    x_nodes = np.array([p[0] for p in xy_nodes], dtype=float)
+    y_nodes = np.array([p[1] for p in xy_nodes], dtype=float)
+    x_slopes = _pchip_slopes(y_nodes, x_nodes)
+
+    # The z-profile must already be under POST_GATE_Z_BAND's ceiling by the y
+    # the Always(altitude band) window starts (GATE_T_DESCEND_START, in planning-
+    # horizon steps, independent of n_points) -- otherwise the warm start itself
+    # violates that hard constraint right at the boundary, which (combined with
+    # the other AND'd terms via the STL And operator's Frechet lower bound) can
+    # crash the whole specification's P(sat) to 0 and stall the optimizer.
+    y_descend = START_XY[1] + (END_XY[1] - START_XY[1]) * GATE_T_DESCEND_START / (GATE_T - 1)
+    z_at_descend = 0.4  # comfortably under POST_GATE_Z_BAND[1]=0.5, on the way to POST_GATE_Z
+    z_y_nodes = np.array([START_XY[1], -1.5, GATE_CENTER_XY[1], y_descend, -0.58, END_XY[1]])
+    z_nodes = np.array([Z_HEIGHT, 0.75, GATE_Z_CENTER, z_at_descend, POST_GATE_Z, END_Z])
+    z_slopes = _pchip_slopes(z_y_nodes, z_nodes)
+
+    y_pos = np.linspace(START_XY[1], END_XY[1], n_points)
+    x_pos = _pchip_eval(y_pos, y_nodes, x_nodes, x_slopes)
+    z_pos = _pchip_eval(y_pos, z_y_nodes, z_nodes, z_slopes)
+    return [(float(x), float(y), float(z)) for x, y, z in zip(x_pos, y_pos, z_pos)]
+
+
+def build_environment_3d() -> Environment3D:
+    """Build the pdSTL Environment for the 3D gate mission.
+
+    Extends the same bounds/obstacles/goal as the 2D baseline (obstacles are
+    floor-mounted: z spans (0.0, obs['height']), letting the optimizer clear
+    one by flying over its top) with the timed gate visit region and a hard
+    post-gate altitude ceiling (Always, not just a soft preference) --
+    without that ceiling, the obstacle-avoidance term alone is already
+    satisfiable by flying above every obstacle's top for the whole mission,
+    so nothing else would force a real post-gate descent.
+    """
+    env = Environment3D()
+    env.set_bounds(x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS, z_range=FLIGHT_Z_BOUNDS)
+    for obs in OBSTACLES:
+        env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=(0.0, obs['height']))
+    env.set_goal(x_range=list(GOAL['x']), y_range=list(GOAL['y']), z_range=list(GOAL['z']))
+    env.add_timed_visit_region(
+        x_range=list(GATE_X), y_range=list(GATE_Y),
+        interval=[GATE_T_START, GATE_T_END], z_range=list(GATE_Z), label='gate',
+    )
+    env.add_time_windowed_bounds(
+        x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS, z_range=list(POST_GATE_Z_BAND),
+        interval=[GATE_T_DESCEND_START, GATE_T], label='post_gate_low',
+    )
+    return env
+
+
+def build_planner_3d() -> tuple[Planner3D, SingleIntegrator3D, Environment3D]:
+    """Build a (Planner, dynamics, environment) for the 3D gate mission.
+
+    Uses GATE_T (16) as the planning horizon instead of the 2D baseline's T
+    (10) -- climb / gate / descend-and-avoid needs more steps than the
+    baseline's single-phase mission.
+    """
+    dynamics = SingleIntegrator3D(dt=DT, u_max=U_MAX, q_std=Q_STD)
+    env = build_environment_3d()
+    planner = Planner3D(dynamics, env, GATE_T, config=dict(PLANNER_CONFIG))
+    return planner, dynamics, env
+
+
+def x0_belief_3d(fan_speed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Initial (mean, cov) belief for the gate mission at the given fan level.
+
+    The paper's empirically characterized variance for this fan setting is
+    placed on all three axes for this 3D extension.
+    """
+    sigma0 = SIGMA0_PER_FAN[fan_speed]
+    mean = torch.tensor([*START_XY, START_Z], dtype=torch.float32)
+    cov = torch.diag(torch.tensor(
+        [sigma0, sigma0, sigma0], dtype=torch.float32,
+    ))
+    assert mean.shape == (3,), f'x0 mean must be 3D, got {tuple(mean.shape)}'
+    assert cov.shape == (3, 3), f'x0 cov must be 3x3, got {tuple(cov.shape)}'
+    return mean, cov
+
+
+def _nominal_init_guess_3d() -> torch.Tensor:
+    """Gate warm start: velocities from nominal_gate_waypoints (real z-velocity, not zeroed).
+
+    Unlike the 2D baseline, the gate nominal path already climbs/descends, so
+    its z-velocity is meaningful and kept as-is.
+    """
+    wps = np.array(nominal_gate_waypoints())
+    vels_xyz = np.diff(wps, axis=0) / DT
+    vels_xyz = np.vstack([vels_xyz, [[0.0, 0.0, 0.0]]])
+    init_u = torch.tensor(vels_xyz, dtype=torch.float32)
+    assert init_u.shape[-1] == 3, f'init_u must be [T, 3], got {tuple(init_u.shape)}'
+    return init_u

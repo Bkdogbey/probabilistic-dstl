@@ -6,7 +6,10 @@ nominal safe path) on the same arena drawing used by waypoint_planning.py, so
 a flight can be visually compared to the offline plan it was supposed to fly.
 
 Called by `run.py analyze`; has no hardware/ROS dependency (only torch/numpy,
-via components.config, plus matplotlib) -- same weight class as `plan`.
+via components.planning_2d, plus matplotlib) -- same weight class as `plan`.
+Only ever plots against the 2D baseline plan/environment -- there's no
+--scenario flag here yet, so a gate-scenario run's plot would currently (and
+already, before this file was split) draw the wrong arena.
 """
 
 from __future__ import annotations
@@ -20,15 +23,19 @@ import numpy as np
 
 from components.config import (
     EXPERIMENT_DIR,
+    LOGS_DIR,
     VALID_FANS,
-    build_environment,
     load_pdstl_waypoints,
-    nominal_safe_waypoints,
+    pdstl_plan_meta,
 )
 from components.flight_logger import CONDITIONS
+from components.planning_2d import build_environment_2d, nominal_safe_waypoints
 
-_LOGS_DIR = EXPERIMENT_DIR / 'components' / 'logs'
+_LOGS_DIR = LOGS_DIR
 _RUN_RE = re.compile(r'_run(\d+)_')
+_LOG_NAME_RE = re.compile(
+    r'^(?P<condition>\w+?)_fan(?P<fan>\d+)_run(?P<run>\d+)(?P<crash>_CRASH)?(?:_VIOLATION)?_'
+)
 
 
 def _find_run(
@@ -79,7 +86,7 @@ def _planned_path(condition: str, fan: int) -> np.ndarray:
 
 def plot_run(condition: str, fan: int, run: int | None = None) -> pathlib.Path:
     """Plot one logged run against its planned path; returns the saved PNG path."""
-    from waypoint_planning import _draw_env  # reuse the same arena drawing as `plan`
+    from waypoint_planning import _draw_env_2d  # same flat arena drawing as baseline `plan`
 
     import matplotlib.pyplot as plt
 
@@ -90,7 +97,7 @@ def plot_run(condition: str, fan: int, run: int | None = None) -> pathlib.Path:
     planned_xy = _planned_path(condition, fan)
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    _draw_env(ax, build_environment())
+    _draw_env_2d(ax, build_environment_2d())
 
     title = f'{condition} fan {fan}  —  run {run_num:02d}'
     if crashed:
@@ -142,7 +149,83 @@ def plot_all() -> list[pathlib.Path]:
     return out
 
 
-def run_analyze(condition: str | None, fan: int | None, run: int | None, all_: bool) -> None:
+def _run_stats(actual_path: pathlib.Path) -> dict:
+    """Parse one run's filename + CSV into a flat stats row.
+
+    condition/fan/run/crashed come from the filename (same convention
+    flight_logger.py writes and _find_run parses); n/duration/unsafe come from
+    the actual-position CSV itself.
+    """
+    m = _LOG_NAME_RE.match(actual_path.name)
+    if not m:
+        raise ValueError(f'Unrecognised log filename: {actual_path.name}')
+    condition = m.group('condition')
+    fan = int(m.group('fan'))
+    row = {
+        'condition': condition,
+        'fan': fan,
+        'run': int(m.group('run')),
+        'crashed': m.group('crash') is not None,
+    }
+    row.update(_summarize(_read_csv(actual_path)))
+    if condition == 'pdstl':
+        try:
+            meta = pdstl_plan_meta(fan)
+        except FileNotFoundError:
+            meta = {}
+        row['rho_before'] = meta.get('rho_before')
+        row['rho_after'] = meta.get('rho_after')
+    else:
+        row['rho_before'] = None
+        row['rho_after'] = None
+    return row
+
+
+def summarize_all() -> list[dict]:
+    """Print a per-run table and a per-(condition, fan) rollup across ALL logged runs.
+
+    Unlike plot_all/plot_run (latest run per cell, one PNG each), this covers
+    every run ever logged -- the cross-run view for judging progress across a
+    batch of real flights, not just the most recent trial.
+    """
+    paths = sorted(_LOGS_DIR.glob('*_actual.csv'))
+    if not paths:
+        print(f'No logs yet in {_LOGS_DIR}.')
+        return []
+
+    rows = [_run_stats(p) for p in paths]
+    rows.sort(key=lambda r: (r['condition'], r['fan'], r['run']))
+
+    print(f'{"condition":<14}{"fan":>4}{"run":>4}{"crash":>7}{"n":>6}{"dur_s":>8}'
+          f'{"unsafe":>8}{"unsafe%":>9}{"rho_after":>11}')
+    for r in rows:
+        rho = '' if r['rho_after'] is None else f'{r["rho_after"]:.3f}'
+        print(f'{r["condition"]:<14}{r["fan"]:>4}{r["run"]:>4}{"Y" if r["crashed"] else "":>7}'
+              f'{r["n"]:>6}{r["duration_s"]:>8.1f}{r["unsafe_samples"]:>8}'
+              f'{r["unsafe_frac"] * 100:>8.1f}%{rho:>11}')
+
+    print(f'\n{"condition":<14}{"fan":>4}{"runs":>6}{"crashed":>9}{"crash%":>8}'
+          f'{"mean unsafe%":>14}{"mean dur_s":>12}')
+    cells: dict[tuple[str, int], list[dict]] = {}
+    for r in rows:
+        cells.setdefault((r['condition'], r['fan']), []).append(r)
+    for (condition, fan), cell_rows in sorted(cells.items()):
+        n = len(cell_rows)
+        n_crashed = sum(1 for r in cell_rows if r['crashed'])
+        mean_unsafe = sum(r['unsafe_frac'] for r in cell_rows) / n
+        mean_dur = sum(r['duration_s'] for r in cell_rows) / n
+        print(f'{condition:<14}{fan:>4}{n:>6}{n_crashed:>9}{n_crashed / n * 100:>7.1f}%'
+              f'{mean_unsafe * 100:>13.1f}%{mean_dur:>12.1f}')
+
+    return rows
+
+
+def run_analyze(
+    condition: str | None, fan: int | None, run: int | None, all_: bool, summary: bool = False,
+) -> None:
+    if summary:
+        summarize_all()
+        return
     if all_:
         plot_all()
         return
@@ -160,8 +243,10 @@ def main() -> None:
     parser.add_argument('--run', type=int, default=None, help='Run number; defaults to the latest')
     parser.add_argument('--all', action='store_true',
                         help='Plot the latest run of every condition/fan pair with logs')
+    parser.add_argument('--summary', action='store_true',
+                        help='Print a cross-run table + per-condition/fan rollup instead of plotting')
     args = parser.parse_args()
-    run_analyze(args.condition, args.fan, args.run, args.all)
+    run_analyze(args.condition, args.fan, args.run, args.all, args.summary)
 
 
 if __name__ == '__main__':
