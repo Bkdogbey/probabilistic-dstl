@@ -1,0 +1,113 @@
+# Hazardous object retrieval and secure delivery — MPC (receding horizon) variant.
+# Same mission as hazardous_object_retrieval.yaml (retrieve a contaminated object,
+# visit a verification checkpoint, choose one of two sterilization zones, deliver
+# to a secure containment zone), but replanned every step from the actual state
+# instead of solved once open-loop. Absolute sub-goal deadlines are windowed into
+# each MPC step's local horizon by Environment.make_local_timed_window.
+
+label: "Hazardous Object Retrieval (MPC)"
+
+# --- Dynamics ---
+dynamics: single_integrator
+H: 45            # Planning horizon per MPC window (time steps)
+T_SIM: 180       # Total simulation steps (matches the mission's real deadline horizon)
+dt: 0.2
+u_max: 1.0
+q_std: 0.025
+
+# --- Initial condition ---
+x0_mean: [1.0, 7.0]
+x0_cov_scale: 0.01
+
+# --- Environment bounds ---
+bounds:
+  x_range: [0.0, 24.0]
+  y_range: [0.0, 14.0]
+
+# --- Final secure containment zone ---
+goal:
+  x_range: [21.0, 23.0]
+  y_range: [6.0, 8.0]
+  interval: [130, 180]
+
+# --- Required timed mission regions ---
+timed_visit_regions:
+  - label: "contaminated_object_pickup"
+    interval: [0, 45]
+    x_range: [4.0, 6.0]
+    y_range: [9.0, 11.0]
+
+  - label: "verification_checkpoint"
+    interval: [40, 90]
+    x_range: [10.0, 12.0]
+    y_range: [6.0, 8.0]
+
+# --- Disjunctive sterilization choice ---
+# The robot must visit at least one sterilization zone.
+choice_region_groups:
+  - label: "sterilization_choice"
+    interval: [85, 140]
+    regions:
+      - label: "sterilization_upper"
+        x_range: [15.0, 17.0]
+        y_range: [11.0, 13.0]
+
+      - label: "sterilization_lower"
+        x_range: [15.0, 17.0]
+        y_range: [1.0, 3.0]
+
+# --- Scattered debris and unsafe areas ---
+obstacles:
+  - type: rectangle
+    label: "debris_1"
+    x_range: [3.0, 4.0]
+    y_range: [11.5, 13.5]
+
+  - type: rectangle
+    label: "debris_2"
+    x_range: [5.5, 7.0]
+    y_range: [2.0, 5.0]
+
+  - type: rectangle
+    label: "unsafe_zone_center"
+    x_range: [8.0, 9.5]
+    y_range: [8.5, 12.0]
+
+  - type: rectangle
+    label: "blocked_debris_center"
+    x_range: [12.5, 14.0]
+    y_range: [4.0, 7.5]
+
+  - type: rectangle
+    label: "debris_5"
+    x_range: [18.5, 20.0]
+    y_range: [8.0, 11.0]
+
+  - type: rectangle
+    label: "debris_6"
+    x_range: [18.0, 19.0]
+    y_range: [2.0, 4.5]
+
+# --- Planner overrides ---
+# max_iters is much lower than the single-shot scenario's 1800: this now solves
+# once per executed step (~T_SIM times), not once total, so cost scales with
+# T_SIM * max_iters. Tune alongside T_SIM during initial benchmarking.
+planner:
+  w_u: 0.4
+  w_du: 0.02
+  w_phi: 160.0
+  w_dist: 45.0
+  w_obs: 7.0
+  w_visit: 65.0
+  max_iters: 250
+  alpha: 0.90
+  loss_tol: 1.0e-5
+
+# --- Output ---
+save_file: hazardous_object_retrieval_mpc.pt
+
+animation:
+  filename: hazardous_object_retrieval_mpc.gif
+  step: 2
+  title: "Hazardous Object Retrieval (MPC)"
+  bounds: [[-1, 25], [-1, 15]]

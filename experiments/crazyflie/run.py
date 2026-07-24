@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single entry point for the Crazyflie reach-avoid experiment.
 
-Two subcommands:
+Three subcommands:
 
     # 0. Trial selection (fan/condition/scenario) defaults to config.yml's
     #    trial: section -- edit that instead of typing flags every run:
@@ -17,7 +17,7 @@ Two subcommands:
     python run.py plan --fan 12 --plot
     python run.py plan --fan 12 --scenario gate --plot     # gate/descend/avoid/land
 
-    # 2. Fly (needs hardware + ROS): fly a plan start->finish, no replanning
+    # 2. Fly (needs hardware + ROS): fly a plan start->finish
     python run.py fly --condition pdstl --fan 12          # optimised plan
     python run.py fly --condition deterministic --fan 6   # nominal safe path
     python run.py fly --condition pdstl --fan 12 --scenario gate
@@ -47,7 +47,6 @@ from components.config import (
     VALID_FANS,
     pdstl_plan_meta,
 )
-from uncertainty_calibration import DEFAULT_MIN_RUNS, calibrate_uncertainty, uncertainty_signature
 
 
 def _add_scenario_arg(parser: argparse.ArgumentParser) -> None:
@@ -59,23 +58,12 @@ def _add_scenario_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _check_pdstl_converged(fan: int, scenario: str) -> None:
-    """Refuse to fly a pdstl plan whose optimizer never found a satisfying trajectory.
-
-    rho_after <= 0 means the STL And operator's Frechet lower bound crashed the
-    whole specification's satisfaction probability to 0 -- flying that plan
-    would just be flying whatever the optimizer happened to end on, not a plan
-    that was actually optimised for safety. Caught here, before any hardware
-    connection is attempted, so the failure is immediate and actionable.
+    """Refuse to fly a pdstl plan generated under a different uncertainty
+    model, or whose optimizer never found a satisfying trajectory
+    (rho_after <= 0), before any hardware connection is attempted.
     """
     meta = pdstl_plan_meta(fan, scenario)
-    expected = (
-        uncertainty_signature(fan)
-        if scenario == 'baseline'
-        else {'uncertainty_model': 'paper_sigma0_shared_process_noise_3d',
-              'calibration_generated': None, 'sigma0': SIGMA0_PER_FAN[fan],
-              'q_std': Q_STD}
-    )
-    if any(meta.get(key) != value for key, value in expected.items()):
+    if meta.get('sigma0') != SIGMA0_PER_FAN[fan] or meta.get('q_std') != Q_STD:
         raise SystemExit(
             f'Refusing to fly stale pdstl fan {fan} waypoints (scenario={scenario}): '
             'they were generated with a different uncertainty model. '
@@ -98,10 +86,6 @@ def _plan(args: argparse.Namespace) -> None:
     from waypoint_planning import run_plan
 
     run_plan(fan=args.fan, scenario=args.scenario, plot=args.plot)
-
-
-def _calibrate_uncertainty(args: argparse.Namespace) -> None:
-    calibrate_uncertainty(args.fan, min_runs=args.min_runs)
 
 
 def _analyze(args: argparse.Namespace) -> None:
@@ -150,16 +134,6 @@ def main() -> None:
     p_plan.add_argument('--plot', action='store_true',
                         help='Also save plots/fan<L>[_<scenario>]_comparison.png')
     p_plan.set_defaults(func=_plan)
-
-    p_cal = sub.add_parser(
-        'calibrate-uncertainty',
-        help='Estimate a covariance profile from deterministic flight logs',
-    )
-    p_cal.add_argument('--fan', type=int, default=TRIAL_FAN, choices=VALID_FANS,
-                       help=f"default: config.yml's trial.fan = {TRIAL_FAN}")
-    p_cal.add_argument('--min-runs', type=int, default=DEFAULT_MIN_RUNS,
-                       help=f'Minimum usable non-crashed deterministic runs (default: {DEFAULT_MIN_RUNS})')
-    p_cal.set_defaults(func=_calibrate_uncertainty)
 
     p_fly = sub.add_parser('fly', help='Fly a plan start->finish (needs hardware)')
     p_fly.add_argument('--condition', choices=['pdstl', 'deterministic'], default=TRIAL_CONDITION,

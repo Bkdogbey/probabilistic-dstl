@@ -9,8 +9,8 @@ from planning.runners import (
     run_mpc,
     run_single_shot,
     run_two_gap_comparison,
+    run_two_gap_qstd_sweep,
     run_two_gap_reach_avoid,
-    run_two_gap_reach_avoid_visit,
 )
 from utils import create_belief_trajectory, load_config, skip_run, to_steps
 from visualization.robustness import plot_piecewise_stl, plot_stl_formula_bounds
@@ -81,15 +81,8 @@ with skip_run("skip", "Example 3: Single Shot Motion Planning") as check, check(
 # EXAMPLE 3A: Two-Gap Reach-Avoid
 # =============================================================================
 
-with skip_run("skip", "Example 3A: Two-Gap Reach-Avoid") as check, check():
+with skip_run("run", "Example 3A: Two-Gap Reach-Avoid") as check, check():
     run_two_gap_reach_avoid(max_iterations=700, force_run=True)
-
-# =============================================================================
-# EXAMPLE 3B: Two-Gap Reach-Avoid with Visit Choice
-# =============================================================================
-
-with skip_run("skip", "Example 3B: Two-Gap Reach-Avoid with Visit Choice") as check, check():
-    run_two_gap_reach_avoid_visit(max_iterations=800, force_run=True)
 
 # =============================================================================
 # EXAMPLE 3C: Two-Gap Deterministic vs pdSTL Monte Carlo Comparison
@@ -97,6 +90,13 @@ with skip_run("skip", "Example 3B: Two-Gap Reach-Avoid with Visit Choice") as ch
 
 with skip_run("skip", "Example 3C: Two-Gap Comparison") as check, check():
     run_two_gap_comparison(force_run=True)
+
+# =============================================================================
+# EXAMPLE 3D: Two-Gap Covariance Sweep
+# =============================================================================
+
+with skip_run("skip", "Example 3D: Two-Gap Covariance Sweep") as check, check():
+    run_two_gap_qstd_sweep(force_run=True)
 
 # =============================================================================
 # EXAMPLE 4: MPC Receding Horizon Motion Planning
@@ -123,5 +123,5 @@ with skip_run("skip", "Example 6: Aggressive Lane Change") as check, check():
 # EXAMPLE 7: Hazardous Object Retrieval
 # =============================================================================
 
-with skip_run("run", "Example 7: Hazardous Object Retrieval") as check, check():
+with skip_run("skip", "Example 7: Hazardous Object Retrieval") as check, check():
     run_hazardous_object_retrieval(max_iterations=1200, force_run=True)

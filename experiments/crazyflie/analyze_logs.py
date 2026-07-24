@@ -8,8 +8,8 @@ a flight can be visually compared to the offline plan it was supposed to fly.
 Called by `run.py analyze`; has no hardware/ROS dependency (only torch/numpy,
 via components.planning_2d, plus matplotlib) -- same weight class as `plan`.
 Only ever plots against the 2D baseline plan/environment -- there's no
---scenario flag here yet, so a gate-scenario run's plot would currently (and
-already, before this file was split) draw the wrong arena.
+--scenario flag here yet, so a gate-scenario run's plot would draw the wrong
+arena.
 """
 
 from __future__ import annotations
@@ -90,13 +90,15 @@ def plot_run(condition: str, fan: int, run: int | None = None) -> pathlib.Path:
 
     import matplotlib.pyplot as plt
 
+    from visualization.style import PALETTE, figsize as _figsize, save_figure
+
     actual_path, commanded_path, run_num, crashed = _find_run(condition, fan, run)
     actual_rows = _read_csv(actual_path)
     commanded_rows = _read_csv(commanded_path) if commanded_path else []
     summary = _summarize(actual_rows)
     planned_xy = _planned_path(condition, fan)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=_figsize("single", aspect=1.0))
     _draw_env_2d(ax, build_environment_2d())
 
     title = f'{condition} fan {fan}  —  run {run_num:02d}'
@@ -104,28 +106,36 @@ def plot_run(condition: str, fan: int, run: int | None = None) -> pathlib.Path:
         title += '  (CRASH)'
     ax.set_title(title)
 
-    ax.plot(planned_xy[:, 0], planned_xy[:, 1], 'k--', lw=1.5, alpha=0.7, label='planned')
+    ax.plot(
+        planned_xy[:, 0], planned_xy[:, 1],
+        color=PALETTE["plan"]["stroke"], linestyle='--', lw=1.5, alpha=0.7, label='planned',
+    )
 
     ax_x = [float(r['x']) for r in actual_rows]
     ax_y = [float(r['y']) for r in actual_rows]
     safe = [int(r['safe']) for r in actual_rows]
-    ax.plot(ax_x, ax_y, 'b-', lw=1.2, alpha=0.8, label='actual (flown)')
+    ax.plot(
+        ax_x, ax_y,
+        color=PALETTE["ego"]["stroke"], linestyle='-', lw=1.2, alpha=0.8, label='actual (flown)',
+    )
     unsafe_xy = [(x, y) for x, y, s in zip(ax_x, ax_y, safe) if not s]
     if unsafe_xy:
         ux, uy = zip(*unsafe_xy)
-        ax.scatter(ux, uy, c='red', s=20, zorder=5, label='unsafe sample')
+        ax.scatter(ux, uy, c=PALETTE["obs_static"]["stroke"], s=20, zorder=5, label='unsafe sample')
 
     if commanded_rows:
         cx = [float(r['x']) for r in commanded_rows]
         cy = [float(r['y']) for r in commanded_rows]
-        ax.plot(cx, cy, 'go', ms=4, alpha=0.6, label='commanded waypoint')
+        ax.plot(
+            cx, cy, 'o',
+            color=PALETTE["goal"]["stroke"], ms=4, alpha=0.6, label='commanded waypoint',
+        )
 
-    ax.legend(fontsize=8)
+    ax.legend()
     fig.tight_layout()
 
     out_path = EXPERIMENT_DIR / 'plots' / f'{condition}_fan{fan:02d}_run{run_num:02d}_actual.png'
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    save_figure(fig, out_path.with_suffix(""), formats=("png", "pdf"))
     plt.close(fig)
 
     print(

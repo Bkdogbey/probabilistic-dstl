@@ -1,17 +1,6 @@
 # Crazyflie reach-avoid experiment — all measured/tunable input values.
-#
-# This is the file to edit when the arena geometry changes (new obstacle
-# measurements, a moved goal, ...), when the per-fan uncertainty model
-# changes, or when planner/flight parameters need retuning. Code that
-# CONSTRUCTS things from these values (environments, planners, dynamics,
-# the deterministic-path optimizer) lives in components/config.py (loader +
-# shared helpers), components/planning_2d.py (2D baseline), and
-# components/planning_3d.py (3D gate scenario) — none of that should need to
-# change just because a number here changes.
-#
 # components/config.py loads this file and exposes every key below as a
-# module-level constant (same names used throughout the experiment before
-# this file existed).
+# module-level constant.
 
 # ═══════════════════════════════════════════════════════════════════════
 # 1. Arena geometry (measured; arena extended 0.5 m past the raw x=1.0
@@ -24,29 +13,25 @@ arena:
   flight_z_bounds: [0.1, 1.7]   # floor (= flight.land_z) to measured ceiling/tracking-volume top
   z_height: 0.2                 # flight height [m] -- the 2D baseline's constant cruise altitude
 
-  # Measured obstacle boxes (converted from inches at 0.0254 m/in). 'height'
-  # is each obstacle's vertical extent, assumed floor-mounted (z spans
-  # 0..height) -- read only by planning_3d.py's gate scenario (the 2D
-  # baseline planner has no altitude axis to place it on) and by the
-  # flight logger's safety flags (x,y footprint only, height-independent).
+  # Measured obstacle boxes (converted from inches at 0.0254 m/in). Each
+  # obstacle sets its vertical extent in EXACTLY ONE of two ways:
+  #   - height: <h>       floor-mounted shorthand, z spans 0..h
+  #   - z: [z_min, z_max]  general 3D box floating/hanging at an arbitrary
+  #                        height (must lie within flight_z_bounds)
+  # The z-extent is read only by planning_3d.py's gate scenario (the 2D
+  # baseline planner has no altitude axis to place it on); the flight
+  # logger's safety flags use the x,y footprint only (height-independent).
   obstacles:
-    # obs_1 recentered: same size (0.3175m x 0.2667m) as before, shifted so
-    # its y-center sits at -1.25 (was -1.1334) -- opens up more room along
-    # the corridor's tightest stretch for the deterministic-path optimizer.
     - name: obs_1
       x: [0.5, 0.8175]
       y: [-1.38335, -1.11665]
       height: 0.4064
-    # obs_2 re-measured: same width as before (0.1905m), x-midpoint moved to
-    # exactly 0.25m.
     - name: obs_2
       x: [0.1547, 0.3453]
       y: [-0.6651, -0.5]
       height: 0.5143
-    # obs_3 = real-world box measured L11.5in x W8in x H16.5in (L on x, W on
-    # y). Re-measured: y moved -- now spans 2ft to 32in (24in-32in, i.e.
-    # exactly the measured 8in width) from the goal wall (y=0), further from
-    # the goal / closer to obs_1 than before.
+    # Real-world box measured L11.5in x W8in x H16.5in (L on x, W on y); y
+    # spans 24in-32in from the goal wall (y=0).
     - name: obs_3
       x: [0.7508, 1.0429]
       y: [-0.8128, -0.6096]
@@ -67,12 +52,10 @@ arena:
   start_tolerance: 0.08
 
   # Via-points (x, y) the GATE scenario's deterministic path passes through
-  # (planning_3d.py's nominal_gate_waypoints) -- the 2D baseline no longer
-  # uses hand-picked via-points; its deterministic path's sine amplitude is
-  # calculated instead (planning_2d.py's _calculate_sine_amplitude).
-  # (0.25, -1.0) clears obs_1 on its left side; (0.617, -0.58) clears obs_2.
-  # Re-check with `python run.py plan --fan 2 --scenario gate --plot` if
-  # geometry moves.
+  # (planning_3d.py's nominal_gate_waypoints). Not used by the 2D baseline
+  # (see deterministic_path.via_points above). (0.25, -1.0) clears obs_1 on
+  # its left side; (0.617, -0.58) clears obs_2. Re-check with
+  # `python run.py plan --fan 2 --scenario gate --plot` if geometry moves.
   safe_path_via_points:
     - [0.25, -1.0]
     - [0.617, -0.58]
@@ -83,23 +66,15 @@ arena:
   safe_path_flight_points: 30
 
 # ═══════════════════════════════════════════════════════════════════════
-# 2. 2D baseline deterministic-path calculation. The deterministic path
-#    IS the single left/right-bending sine curve x(s) = x_linear(s) -
-#    A*sin(pi*s) -- not a gradient-descent-optimized path warm-started from
-#    one. A is calculated in closed form (planning_2d.py's
-#    _calculate_sine_amplitude) to clear every obstacle in section 1 by the
-#    margin below, choosing each obstacle's passing side (left/right) by
-#    exhaustive search over the small number of combinations -- no
-#    optimizer loop, no iterations, just geometry.
+# 2. 2D baseline deterministic path: a sine curve through start, these
+#    via-points, and end, in that y-order. Coefficients are solved in
+#    closed form (planning_2d.py's nominal_safe_waypoints) so the curve
+#    passes through every point exactly.
 # ═══════════════════════════════════════════════════════════════════════
 deterministic_path:
-  # Required clearance (m) from every obstacle's box, on whichever side the
-  # calculated curve passes it. With the current geometry the feasible
-  # amplitude range for a single-hump sine is narrow (~0.667-0.699) --
-  # margins much above ~0.05 make the calculation infeasible (raises
-  # ValueError) and need hand-picked via-points instead, like the gate
-  # scenario's nominal_gate_waypoints.
-  margin: 0.05
+  via_points:
+    - [0.0, -1.0]
+    - [0.5, -0.5]
 
 # ═══════════════════════════════════════════════════════════════════════
 # 3. Per-fan uncertainty model (paper Experiment 3)
@@ -113,7 +88,7 @@ uncertainty:
     2: 0.001
     6: 0.006
     12: 0.020
-    16: 0.050          # uncalibrated extrapolation --
+    16: 0.050          # uncalibrated extrapolation
 
   # Shared propagation noise. The paper reports the fan-dependent sigma0
   # values above but does not report fan-dependent Crazyflie q_std values.
@@ -160,8 +135,8 @@ planner:
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Trial selection -- which fan/condition/scenario `run.py plan|fly|
-#    analyze|calibrate-uncertainty` act on when you don't pass --fan/
-#    --condition/--scenario. Edit this before a run instead of typing the
+#    analyze` act on when you don't pass --fan/--condition/--scenario.
+#    Edit this before a run instead of typing the
 #    same flags every time; the flags still exist and override this for
 #    one-off invocations (e.g. batch-planning every fan level in a loop).
 # ═══════════════════════════════════════════════════════════════════════

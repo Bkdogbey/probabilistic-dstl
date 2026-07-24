@@ -24,12 +24,12 @@ waypoint_planning.py   shared CLI runner + plotting; dispatches to planning_2d/p
 analyze_logs.py        post-flight: plot a logged run against its planned path
 components/
     config.py          thin config.yml loader + shared helpers (spline math,
-                        waypoint validation/I/O, geometry signature) — edit
-                        config.yml, not this file, to change input values
+                        waypoint validation/I/O) — edit config.yml, not this
+                        file, to change input values
     planning_2d.py      2D-only: plain Environment/Planner/SingleIntegrator from
                         src/planning/ (x, y only) for the baseline mission, plus
-                        the closed-form deterministic-path sine-amplitude
-                        calculation (_calculate_sine_amplitude)
+                        the closed-form deterministic-path calculation
+                        (nominal_safe_waypoints)
     planning_3d.py      3D-only: Environment3D/Planner3D/SingleIntegrator3D
                         (Crazyflie-only (x,y,z) extension of src/planning/) +
                         gate-scenario construction (geometry values live in
@@ -44,9 +44,6 @@ waypoints/              generated pdstl[_<scenario>]_fan<L>.json (one per
                         itself is calculated on the fly, not cached to disk
 plots/                  fan<L>[_<scenario>]_comparison.png,
                         <condition>_fan<XX>_run<NN>_actual.png
-calibration/            generated empirical covariance profiles, one per fan
-uncertainty_calibration.py
-                        deterministic-log alignment + covariance estimation
 ```
 
 ## Quickstart
@@ -81,11 +78,11 @@ a window. If `import pdstl`/`planning` fails, run from inside
 **3. Measure the arena**
 
 Edit `config.yml`'s `arena:` section: `flight_x_bounds`, `flight_y_bounds`,
-`obstacles`, `goal`, `start_xy`, `end_xy`. Every stage reads geometry from
-here. Re-run step 2 — it automatically recalculates the deterministic path's
-amplitude (raising if no single-hump sine curve can clear every obstacle by
-`deterministic_path.margin`), so there's no manual "eyeball the plot" step;
-the "Before" plot panel is a sanity check, not the source of truth.
+`obstacles`, `goal`, `start_xy`, `end_xy`, and `deterministic_path.via_points`.
+Every stage reads geometry from here. Re-run step 2 and check the "Before"
+plot panel — the deterministic path is a fixed curve through your via-points,
+so it's on you to pick via-points that clear the obstacles; nothing computes
+or checks clearance for you.
 
 **4. Install the hardware stack (flight machine)**
 ```bash
@@ -113,7 +110,8 @@ python run.py fly
 or override without editing the file: `python run.py fly --condition deterministic --fan 6`.
 `--fan` only tags the logs — the path itself doesn't depend on fan level.
 Watch for the calibration offset printout; it aborts before takeoff if the
-measured start is too far from `START_XY` (see [Calibration](#calibration)).
+measured start is too far from `START_XY` (see
+[Start-position calibration](#start-position-calibration)).
 
 **6. Plan and fly pdstl**
 ```bash
@@ -146,6 +144,34 @@ commanded waypoints, and planned path on one arena drawing; unsafe samples
 (not just the latest per cell) plus a per-`(condition, fan)` rollup — run
 count, crash rate, mean unsafe fraction, mean duration — for judging progress
 across a batch of flights.
+
+## Deterministic path
+
+The 2D baseline's "deterministic" condition — and the pdSTL optimizer's warm
+start — is `nominal_safe_waypoints()` (`components/planning_2d.py`): a sine
+curve through `START_XY`, `config.yml`'s `deterministic_path.via_points`, and
+`END_XY`, in that y-order. This curve **is** the deterministic path; it is
+flown as-is, not fed into an optimizer.
+
+y is linear in normalized progress `s ∈ [0, 1]`; x is the straight line
+`START_XY → END_XY` plus one sine harmonic per via-point,
+`x(s) = x_linear(s) + Σ a_k·sin(k·pi·s)`. Every harmonic vanishes at `s=0`
+and `s=1`, so the coefficients `a_k` are solved by a single closed-form
+linear system to hit each via-point exactly without perturbing start/end.
+
+Via-points aren't checked against obstacle geometry — pick ones that clear
+the arena (compare against the "Before" plot panel) the same way the gate
+scenario's `nominal_gate_waypoints` via-points are chosen.
+
+## Start-position calibration
+
+An offline plan assumes an exact start position. Real flights drift, so at
+flight time the drone hovers at the planned start, measures its real position
+for ~2 s, and either aborts (offset too large) or shifts the whole plan by the
+measured offset — a one-time pre-flight step.
+
+There is no mid-flight replanning: the plan flies start-to-finish as given, at
+the planned `U_MAX`, so actual flight matches the belief model's timing.
 
 ## Logging
 
@@ -189,44 +215,6 @@ Fans 2/6/12 correspond to paper Settings 1–3. Fan 16 is an explicitly
 uncalibrated extrapolation. The final column uses the baseline horizon
 (`T=10`); the gate extension accumulates six additional propagation updates.
 
-### Automatic calibration from flight logs
-
-After collecting repeated deterministic baseline flights for one fan, build
-an empirical full-covariance profile with:
-
-```bash
-python run.py calibrate-uncertainty --fan 2 --min-runs 10
-```
-
-The command ignores crashed trials, interpolates the actual Lighthouse trace
-at each commanded waypoint-arrival timestamp, resamples every run to the
-planner's `T+1` steps, and writes `calibration/uncertainty_fan<L>.json`.
-The baseline planner automatically uses that profile when present; without a
-profile it falls back to `SIGMA0_PER_FAN + t·Q_STD²`. Re-running calibration
-changes its generation identifier, so flight-time validation rejects waypoint
-plans made with the previous profile until they are regenerated.
-
-Each new flight log records `BASELINE_PATH_ID`, which is now derived
-automatically from a signature over the obstacles/start/end/margin that
-determine the calculated deterministic path (see
-[Deterministic path](#deterministic-path)) rather than hand-edited.
-Calibration accepts only runs whose path identifier matches the current 2D
-baseline, preventing residuals from a since-changed deterministic path from
-silently configuring the current planner. After any change that shifts the
-signature (obstacle/start/end geometry or `deterministic_path.margin`),
-collect a fresh batch of deterministic runs before recalibrating -- any
-`calibration/uncertainty_fan<L>.json` generated under an older signature is
-automatically ignored (not deleted) until then, including the
-`baseline_path_id: "pchip_legacy"` fan-2 calibration file already in this
-repo, which predates this refactor and stays inert until fan 2 is
-recalibrated.
-
-The calibration also records mean tracking residual separately from covariance.
-The current paper-faithful planner keeps the nominal state as the belief mean
-and uses only the measured covariance profile. Inspect a large nonzero mean
-residual as evidence of systematic tracking or frame-offset bias rather than
-silently treating it as random noise.
-
 `rho_after` isn't tabulated here — it depends on the current `OBSTACLES`
 geometry (which moves as the arena gets re-measured) and isn't cached
 anywhere except the waypoints JSON files themselves; run `python run.py plan
@@ -236,46 +224,6 @@ anywhere except the waypoints JSON files themselves; run `python run.py plan
 generally fall short of `alpha=0.90`. `run.py fly --condition pdstl --fan L`
 refuses to fly a plan with `rho_after<=0`; `--condition deterministic` is
 unaffected at every fan level.
-
-## Calibration
-
-An offline plan assumes an exact start position. Real flights drift, so at
-flight time the drone hovers at the planned start, measures its real position
-for ~2 s, and either aborts (offset too large) or shifts the whole plan by the
-measured offset — a one-time pre-flight step.
-
-There is no mid-flight replanning: the plan flies start-to-finish as given, at
-the planned `U_MAX`, so actual flight matches the belief model's timing.
-
-## Deterministic path
-
-The 2D baseline's "deterministic" condition — and the pdSTL optimizer's warm
-start — is `nominal_safe_waypoints()` (`components/planning_2d.py`): a single
-left/right-bending sine curve, `x(s) = x_linear(s) - A*sin(pi*s)` for
-normalized path progress `s` in `[0, 1]`. This curve **is** the deterministic
-path; it is flown as-is, not fed into an optimizer.
-
-`A` is calculated in closed form, not hand-tuned and not gradient-descent
-optimized (`_calculate_sine_amplitude`, `components/planning_2d.py`): each
-obstacle can be passed on its left (curve stays below `x_min`) or right
-(stays above `x_max`), and for a fixed side the amplitude needed to clear it
-by `deterministic_path.margin` is a closed-form expression evaluated over the
-obstacle's y-projected range. With 3 obstacles there are only 8 possible
-left/right assignments, so the calculation just enumerates them, discards any
-assignment whose per-obstacle bounds don't intersect into a feasible
-amplitude interval, and keeps the feasible one with the largest real
-worst-case clearance (checked with the actual box-distance, not just the
-linear bound). Raises `ValueError` if no assignment is feasible at all — this
-single-hump curve family can't thread every obstacle layout; a tighter one
-would need hand-picked via-points instead, like the gate scenario's
-`nominal_gate_waypoints`.
-
-`BASELINE_PATH_ID` (used to tag flight logs and calibration files) is a
-sha256 signature (`components/config.py`'s `geometry_signature_2d()`) over
-exactly the inputs the calculation depends on — obstacles, start/end points,
-and `deterministic_path.margin` — so it changes automatically whenever the
-calculated path would actually change, and stays fixed across edits (e.g.
-planner hyperparameters) that don't affect it.
 
 ## Scenarios
 

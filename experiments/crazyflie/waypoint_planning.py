@@ -4,18 +4,12 @@ Optimises a waypoint plan for one fan level/scenario and writes it to
 waypoints/pdstl[_<scenario>]_fan<L>.json. Called by `run.py plan`; has no
 hardware/ROS dependency (only torch/numpy, plus matplotlib for --plot).
 
-Each fan uses the paper's empirically characterized initial covariance, while
-shared process noise accumulates along the trajectory.
-
-This file is the shared CLI runner + plotting code for *both* scenarios --
-the actual environment/planner/dynamics construction is dimension-specific
-and lives in components/planning_2d.py (genuinely 2D: x, y only) and
-components/planning_3d.py (genuinely 3D: x, y, z). `run_plan` dispatches to
-`_run_plan_2d`/`_run_plan_3d`, which share `_optimize_and_report` (a single
-`planner._optimize_window` call, evaluate + print) but plot with
-dimension-specific code: `_plot_2d`/`_draw_env_2d` (flat 2D axes, Ellipse
-patches -- the 2D optimizer's state has no z to plot) for the baseline,
-`_plot`/`_draw_env` (3D axes, ellipsoids) for the gate scenario.
+Shared CLI runner + plotting code for both scenarios -- environment/planner/
+dynamics construction is dimension-specific and lives in
+components/planning_2d.py / components/planning_3d.py. `run_plan` dispatches
+to `_run_plan_2d`/`_run_plan_3d`, which share `_optimize_and_report` but plot
+with dimension-specific code: `_plot_2d`/`_draw_env_2d` for the baseline,
+`_plot`/`_draw_env` for the gate scenario.
 """
 
 from __future__ import annotations
@@ -25,9 +19,8 @@ import datetime
 import numpy as np
 import torch
 
-# Imported first: components.config does the one sys.path.insert(src/) every
-# planning.*/pdstl.* import below relies on -- importing it before them
-# guarantees that regardless of which module gets imported first at runtime.
+# components.config must import before planning.*/pdstl.* below -- it does
+# the sys.path insert those packages need.
 from components.config import (
     EXPERIMENT_DIR,
     FLIGHT_Z_BOUNDS,
@@ -59,7 +52,6 @@ from components.planning_3d import (
     x0_belief_3d,
     _nominal_init_guess_3d,
 )
-from uncertainty_calibration import uncertainty_signature
 
 
 def _evaluate_rho(planner, init_u: torch.Tensor,
@@ -80,12 +72,7 @@ def _print_rho(label: str, value: float) -> None:
 
 def _optimize_and_report(planner, x0_mean: torch.Tensor, x0_cov: torch.Tensor,
                          init_u: torch.Tensor):
-    """Evaluate rho_before, run a single optimisation, print both. Shared by
-    _run_plan_2d/_run_plan_3d -- this part is dimension-generic; only
-    construction and waypoint conversion differ between them.
-
-    Single-shot: one planner._optimize_window() call from init_u (the
-    deterministic nominal path's warm start) -- no multi-start.
+    """Evaluate rho_before, run a single optimisation from init_u, print both.
 
     Returns (rho_before, best_mean, best_cov, best_u, best_p).
     """
@@ -387,16 +374,9 @@ def _save_plan(
 ) -> None:
     """Validate + write the optimised plan JSON. Shared by both _run_plan_2d/_3d."""
     validate_waypoints_in_bounds(waypoints, label='Generated waypoint')
-    signature = (
-        uncertainty_signature(fan)
-        if scenario == 'baseline'
-        else {'uncertainty_model': 'paper_sigma0_shared_process_noise_3d',
-              'calibration_generated': None}
-    )
     meta = {
         'sigma0': sigma0,
         'q_std': q_std,
-        **signature,
         'rho_before': round(rho_before, 4),
         'rho_after': round(float(best_p), 4),
         'alpha': PLANNER_ALPHA,

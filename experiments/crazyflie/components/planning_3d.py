@@ -1,27 +1,21 @@
 """Everything 3D: the 'gate' scenario, and only the 'gate' scenario.
 
-The 2D baseline mission (components/planning_2d.py) is planned with the
-plain, unmodified 2D Environment/Planner/SingleIntegrator from src/planning/
--- it never imports anything from this file. This module exists solely
-because the gate scenario needs a real third (z) dimension: climb through a
-gate, descend, avoid, land.
+The 2D baseline mission (components/planning_2d.py) never imports this file
+-- it's planned with the plain 2D Environment/Planner/SingleIntegrator from
+src/planning/. This module exists because the gate scenario needs a real
+third (z) dimension: climb through a gate, descend, avoid, land.
 
-Section 1 (3D dynamics/environment/planner classes) subclasses
-src/planning/{dynamics,environment,planner}.py rather than modifying it:
-that shared library also backs ~6 other 2D scenario configs under
-configs/scenarios/, so 3D support is kept isolated to this experiment. Only
-the genuinely 2D-hardcoded pieces (process-noise covariance shape,
-rectangular-predicate axis slicing, heuristic-loss centers) are overridden;
-the STL operator chaining (Eventually/Or/And/Always) and the optimization
-loop (Planner._optimize_window) are dimension-general already and reused
-unchanged.
+Section 1 subclasses src/planning/{dynamics,environment,planner}.py rather
+than modifying it, since that shared library also backs other 2D scenario
+configs under configs/scenarios/. Only the genuinely 2D-hardcoded pieces
+(process-noise covariance shape, rectangular-predicate axis slicing,
+heuristic-loss centers) are overridden; STL operator chaining and the
+optimization loop (Planner._optimize_window) are dimension-general already.
 
 Section 2 (build_environment_3d/build_planner_3d/nominal_gate_waypoints/
 x0_belief_3d/_nominal_init_guess_3d) is the gate scenario's construction
-logic, which lives exclusively in this file. The gate geometry *values* it
-builds from (GATE_*, POST_GATE_Z*) live in config.yml, imported below --
-components/config.py is the single source of truth for those numbers, this
-file is the single source of truth for what to build from them.
+logic. The gate geometry *values* it builds from (GATE_*, POST_GATE_Z*)
+live in config.yml.
 """
 
 from __future__ import annotations
@@ -91,20 +85,13 @@ class SingleIntegrator3D(SingleIntegrator):
 class RectangularGoalPredicate3D(STL_Formula):
     """3D rectangular goal containment via the product of per-axis probabilities.
 
-    Extends RectangularGoalPredicate's p_x*p_y with a third p_z factor. Unlike
-    the And operator's cross-predicate chaining (fixed to use the sound
-    Frechet bound in pdstl.operators.And, since sub-formulas there can be
-    correlated in ways the planner doesn't track), this per-axis product is
-    exact -- not an approximation -- given this experiment's dynamics:
-    SingleIntegrator3D's covariance is provably diagonal for all time
-    (P_next = P + Q, both diagonal, no cross-axis coupling), so x, y, z are
-    genuinely independent random variables under the belief model, and
-    P(x∈X ∩ y∈Y ∩ z∈Z) = P(x∈X)·P(y∈Y)·P(z∈Z) exactly. This also matches the
-    shared library's 2D RectangularGoalPredicate's own documented convention
-    ("Combine using Product (Independence)... more accurate for a rectangular
-    region than min()"), just extended to a third axis rather than a new
-    assumption. With no z range, reduces to p_x * p_y (identical to the 2D
-    predicate).
+    Extends RectangularGoalPredicate's p_x*p_y with a third p_z factor. This
+    per-axis product is exact -- not an approximation -- given this
+    experiment's dynamics: SingleIntegrator3D's covariance is provably
+    diagonal for all time (P_next = P + Q, both diagonal, no cross-axis
+    coupling), so x, y, z are genuinely independent under the belief model,
+    and P(x∈X ∩ y∈Y ∩ z∈Z) = P(x∈X)·P(y∈Y)·P(z∈Z) exactly. With no z range,
+    reduces to p_x * p_y (identical to the 2D predicate).
     """
 
     def __init__(self, region):
@@ -134,13 +121,16 @@ class RectangularGoalPredicate3D(STL_Formula):
 class RectangularObstaclePredicate3D(STL_Formula):
     """3D rectangular obstacle safety: safe if outside on ANY single axis (6-face max).
 
-    The union bound P(union) >= max(p_i) is sound regardless of dependence --
-    unlike the goal predicate's intersection case, no independence assumption
-    is involved here (union always dominates any single member by
-    monotonicity). Backward compatible: with no z range, behaves identically
-    to the 4-face 2D RectangularObstaclePredicate. Flying above z_max (or
-    below z_min) satisfies safety regardless of x/y -- this is what lets the
-    planner route over a floor-mounted obstacle using its known height.
+    The union bound P(union) >= max(p_i) is sound regardless of dependence
+    (union always dominates any single member by monotonicity), unlike the
+    goal predicate's intersection case. This single predicate backs both
+    floor-mounted and floating boxes uniformly -- the z-extent is just
+    (z_min, z_max), whether it sits on the floor or hangs in the air. Flying
+    above z_max (or below z_min) satisfies safety regardless of x/y, which is
+    what lets the planner route over a floor-mounted obstacle (or under a
+    floating one). The z_min is None branch remains only as a defensive
+    fallback (Crazyflie obstacles always carry an explicit z after config.py
+    canonicalisation); with no z range it reduces to the 4-face 2D predicate.
     """
 
     def __init__(self, region):
@@ -343,13 +333,11 @@ class Planner3D(Planner):
 
     _optimize_window itself is dimension-general (inherited, unchanged) --
     only the optional potential-field heuristic losses hardcode a 2D [:2]
-    slice/center in the shared Planner. No override needed for:
-      - _init_controls: its hardcoded-2 fallback only fires when init_guess
-        is None; this experiment always passes an explicit init_guess.
-      - _region_visit_loss/_visit_loss: this experiment's arena defines no
-        visit regions.
-      - _empty_u_trace: only used by the MPC loops, which this experiment's
-        single-shot _optimize_window call never runs.
+    slice/center in the shared Planner, overridden below. Not overridden:
+    _init_controls (its 2D fallback only fires with no init_guess, and this
+    experiment always passes one), _region_visit_loss/_visit_loss (no visit
+    regions in this arena), _empty_u_trace (MPC-only; unused by this
+    experiment's single-shot _optimize_window call).
     """
 
     def _goal_dist_loss(self, mean_trace):
@@ -444,18 +432,20 @@ def nominal_gate_waypoints(n_points: int = GATE_T) -> list[tuple[float, float, f
 def build_environment_3d() -> Environment3D:
     """Build the pdSTL Environment for the 3D gate mission.
 
-    Extends the same bounds/obstacles/goal as the 2D baseline (obstacles are
-    floor-mounted: z spans (0.0, obs['height']), letting the optimizer clear
-    one by flying over its top) with the timed gate visit region and a hard
-    post-gate altitude ceiling (Always, not just a soft preference) --
-    without that ceiling, the obstacle-avoidance term alone is already
-    satisfiable by flying above every obstacle's top for the whole mission,
-    so nothing else would force a real post-gate descent.
+    Extends the same bounds/obstacles/goal as the 2D baseline. Each obstacle
+    carries an explicit z-extent (obs['z'], canonicalised by config.py from
+    either a floor-mounted 'height' shorthand or an explicit [z_min, z_max]);
+    a floor-mounted box lets the optimizer clear it by flying over its top.
+    Adds the timed gate visit region and a hard post-gate altitude ceiling
+    (Always, not just a soft preference) -- without that ceiling, the
+    obstacle-avoidance term alone is already satisfiable by flying above every
+    obstacle's top for the whole mission, so nothing else would force a real
+    post-gate descent.
     """
     env = Environment3D()
     env.set_bounds(x_range=FLIGHT_X_BOUNDS, y_range=FLIGHT_Y_BOUNDS, z_range=FLIGHT_Z_BOUNDS)
     for obs in OBSTACLES:
-        env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=(0.0, obs['height']))
+        env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=list(obs['z']))
     env.set_goal(x_range=list(GOAL['x']), y_range=list(GOAL['y']), z_range=list(GOAL['z']))
     env.add_timed_visit_region(
         x_range=list(GATE_X), y_range=list(GATE_Y),

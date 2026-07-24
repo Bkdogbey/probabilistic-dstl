@@ -1,5 +1,8 @@
 # Two-gap reach-avoid scenario.
-# Robot must move from start to goal while avoiding obstacle blocks that form two gaps.
+# Robot must move from start to goal while avoiding obstacle blocks that form
+# two gaps of different sizes: lower gap 1.5m (y in 3.2-4.7), upper gap 0.7m
+# (y in 6.1-6.8) -- asymmetric on purpose, so a planner has a real reason to
+# prefer the bigger gap once uncertainty makes the narrow one risky.
 
 label: "Two-Gap Reach-Avoid"
 
@@ -21,21 +24,21 @@ bounds:
 
 # --- Goal region ---
 goal:
-  x_range: [12.0, 14.0]
-  y_range: [4.0, 6.0]
+  x_range: [12.5, 13.5]
+  y_range: [4.5, 5.5]
 
 # --- Obstacles forming two passage gaps ---
 obstacles:
   - type: rectangle
-    x_range: [4.5, 7.0]
+    x_range: [5.0, 6.5]
     y_range: [0.0, 3.2]
 
   - type: rectangle
-    x_range: [4.5, 7.0]
-    y_range: [4.2, 5.8]
+    x_range: [5.0, 6.5]
+    y_range: [4.7, 6.1]
 
   - type: rectangle
-    x_range: [4.5, 7.0]
+    x_range: [5.0, 6.5]
     y_range: [6.8, 10.0]
 
 # --- Planner overrides ---

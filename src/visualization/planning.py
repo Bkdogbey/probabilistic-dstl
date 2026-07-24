@@ -1,26 +1,15 @@
+import os
+
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import matplotlib.transforms as transforms
 import numpy as np
 import torch
 
-# Tableau 10 colors
-PALETTE = {
-    "ego": {"fill": "#1f77b4", "stroke": "#1f77b4"},  # Tableau Blue
-    "plan": {"fill": "#ff7f0e", "stroke": "#ff7f0e"},  # Tableau Orange
-    "visit": {"fill": "#c5b0d5", "stroke": "#9467bd"},  # Tableau Green (Light/Dark)
-    "obs_static": {"fill": "#ff9896", "stroke": "#d62728"},  # Tableau Red (Light/Dark)
-    "obs_moving": {
-        "fill": "#ff9896",
-        "stroke": "#d62728",
-    },  # Tableau Purple (Light/Dark)
-    "lane": {"fill": "#c7c7c7", "stroke": "#7f7f7f"},  # Tableau Gray (Light/Dark)
-    "goal": {"fill": "#98df8a", "stroke": "#2ca02c"},  # Tableau Green (Light/Dark)
-    "road": {"fill": "#F2F2F7"},  # Light Gray Background
-}
+from visualization.style import CONFIDENCE_95_K, PALETTE, figsize as _figsize, save_figure
 
 
-def cov_ellipse_params(cov, k=1.96):
+def cov_ellipse_params(cov, k=CONFIDENCE_95_K):
     vals, vecs = np.linalg.eigh(cov)
     order = vals.argsort()[::-1]
     vals = vals[order]
@@ -34,7 +23,7 @@ def plot_covariance_ellipse(
     ax,
     mean,
     cov,
-    k=1.96,
+    k=CONFIDENCE_95_K,
     facecolor="blue",
     edgecolor="blue",
     alpha=0.4,
@@ -330,17 +319,16 @@ def heading_deg(mean_np, t, T):
     return np.degrees(np.arctan2(dy, dx))
 
 
-def plot_trajectory(mean_np, cov_np, env):
+def plot_trajectory(mean_np, cov_np, env, save_path=None):
     T = mean_np.shape[0] - 1
     x_min, x_max, y_min, y_max = _compute_env_bounds(mean_np, env)
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=_figsize("single", aspect=1.0))
     ax.set_xlim(x_min - 1.0, x_max + 1.0)
     ax.set_ylim(y_min - 1.0, y_max + 1.0)
     ax.set_aspect("equal")
-    ax.set_xlabel("$x$ [m]", fontsize=20, fontweight="bold")
-    ax.set_ylabel("$y$ [m]", fontsize=20, fontweight="bold")
-    ax.tick_params(axis="both", labelsize=16)
+    ax.set_xlabel("$x$ [m]")
+    ax.set_ylabel("$y$ [m]")
     ax.set_axisbelow(True)
     ax.grid(True, alpha=0.3)
 
@@ -352,7 +340,7 @@ def plot_trajectory(mean_np, cov_np, env):
             (gx[0] + gx[1]) / 2,
             (gy[0] + gy[1]) / 2,
             "G",
-            fontsize=24,
+            fontsize="large",
             fontweight="bold",
             ha="center",
             va="center",
@@ -366,7 +354,7 @@ def plot_trajectory(mean_np, cov_np, env):
             (vx[0] + vx[1]) / 2,
             (vy[0] + vy[1]) / 2,
             "V",
-            fontsize=24,
+            fontsize="large",
             fontweight="bold",
             ha="center",
             va="center",
@@ -400,7 +388,7 @@ def plot_trajectory(mean_np, cov_np, env):
         start_pos[0] - 0.5,
         start_pos[1],
         "S",
-        fontsize=24,
+        fontsize="large",
         fontweight="bold",
         ha="center",
         va="center",
@@ -417,40 +405,41 @@ def plot_trajectory(mean_np, cov_np, env):
             loc="upper center",
             bbox_to_anchor=(0.5, -0.10),
             ncol=min(4, len(by_label)),
-            fontsize=11,
             framealpha=0.95,
             edgecolor="#cccccc",
         )
         fig.subplots_adjust(bottom=0.22)
 
+    if save_path is not None:
+        save_figure(fig, save_path)
     plt.show()
     plt.close(fig)
 
 
-def plot_controls(u_np):
+def plot_controls(u_np, save_path=None):
     T = u_np.shape[0]
     time_steps = np.arange(T)
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=_figsize("single", aspect=1.15), sharex=True)
     axes[0].plot(time_steps, u_np[:, 0], color=PALETTE["ego"]["stroke"], linewidth=1.8)
     axes[0].axhline(0, color="k", linewidth=0.5, linestyle=":")
-    axes[0].set_ylabel("$u_x$", fontsize=18, fontweight="bold")
-    axes[0].tick_params(labelsize=16)
+    axes[0].set_ylabel("$u_x$")
     axes[0].grid(True, alpha=0.35)
     axes[1].plot(time_steps, u_np[:, 1], color=PALETTE["plan"]["stroke"], linewidth=1.8)
     axes[1].axhline(0, color="k", linewidth=0.5, linestyle=":")
-    axes[1].set_ylabel("$u_y$", fontsize=18, fontweight="bold")
-    axes[1].set_xlabel("Time Step", fontsize=18, fontweight="bold")
-    axes[1].tick_params(labelsize=16)
+    axes[1].set_ylabel("$u_y$")
+    axes[1].set_xlabel("Time Step")
     axes[1].grid(True, alpha=0.35)
     plt.tight_layout()
+    if save_path is not None:
+        save_figure(fig, save_path)
     plt.show()
     plt.close(fig)
 
 
-def plot_metrics(history, p_sat_trace):
+def plot_metrics(history, p_sat_trace, save_path=None):
     if history is None and p_sat_trace is None:
         return
-    fig, ax = plt.subplots(figsize=(8, 3.2))
+    fig, ax = plt.subplots(figsize=_figsize("single", aspect=0.45))
     if p_sat_trace is not None:
         ax.plot(
             p_sat_trace,
@@ -460,22 +449,22 @@ def plot_metrics(history, p_sat_trace):
             markersize=4,
             label=r"$P_{\downarrow}(\varphi)$",
         )
-        ax.set_ylabel(r"$P_{\downarrow}(\varphi)$", fontsize=18, fontweight="bold")
+        ax.set_ylabel(r"$P_{\downarrow}(\varphi)$")
     else:
         ax.plot(history, color=PALETTE["lane"]["stroke"], linewidth=2, label="Loss")
-        ax.set_ylabel("Loss", fontsize=18, fontweight="bold")
-    ax.set_xlabel("Iteration", fontsize=18, fontweight="bold")
-    ax.tick_params(labelsize=16)
+        ax.set_ylabel("Loss")
+    ax.set_xlabel("Iteration")
     ax.grid(True, alpha=0.35)
     ax.legend(
         loc="upper center",
         bbox_to_anchor=(0.5, -0.15),
         ncol=2,
-        fontsize=16,
         framealpha=0.95,
         edgecolor="#cccccc",
     )
     fig.subplots_adjust(bottom=0.25)
+    if save_path is not None:
+        save_figure(fig, save_path)
     plt.show()
     plt.close(fig)
 
@@ -488,13 +477,19 @@ def visualize_results(
     history=None,
     p_sat_trace=None,
     robot_dims=None,
+    save_dir=None,
 ):
     mean_np = mean_trace.cpu().squeeze().numpy()
     cov_np = cov_trace.cpu().squeeze().numpy()
     u_np = u_trace.cpu().squeeze().numpy()
-    plot_trajectory(mean_np, cov_np, env)
-    plot_controls(u_np)
-    plot_metrics(history, p_sat_trace)
+    paths = (None, None, None) if save_dir is None else (
+        os.path.join(save_dir, "trajectory"),
+        os.path.join(save_dir, "controls"),
+        os.path.join(save_dir, "metrics"),
+    )
+    plot_trajectory(mean_np, cov_np, env, save_path=paths[0])
+    plot_controls(u_np, save_path=paths[1])
+    plot_metrics(history, p_sat_trace, save_path=paths[2])
 
 
 def plot_lc_trajectory(
@@ -525,14 +520,13 @@ def plot_lc_trajectory(
     else:
         ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
-    ax.set_ylabel("$y$ [m]", fontsize=24)
-    ax.tick_params(axis="y", labelsize=20)
+    ax.set_ylabel("$y$ [m]")
     ax.set_axisbelow(True)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.25)
 
     if title:
-        ax.set_title(title, fontsize=22, fontweight="bold")
+        ax.set_title(title, fontweight="bold")
 
     draw_env_on_ax(
         ax,
@@ -551,7 +545,6 @@ def plot_lc_trajectory(
             ax,
             mean_np[t, :2],
             cov_np[t, :2, :2],
-            k=2.45,
             facecolor=PALETTE["ego"]["fill"],
             edgecolor=PALETTE["ego"]["stroke"],
             alpha=0.16,
@@ -609,7 +602,6 @@ def plot_lc_trajectory(
             loc="upper center",
             bbox_to_anchor=(0.5, -0.2),
             ncol=len(by_label),
-            fontsize=18,
             framealpha=0.95,
         )
 
@@ -649,15 +641,14 @@ def plot_lc_snapshots(
         ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
     if show_xlabel:
-        ax.set_xlabel("$x$ [m]", fontsize=24)
-    ax.set_ylabel("$y$ [m]", fontsize=24)
-    ax.tick_params(axis="both", labelsize=20)
+        ax.set_xlabel("$x$ [m]")
+    ax.set_ylabel("$y$ [m]")
     ax.set_axisbelow(True)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.25)
 
     if title:
-        ax.set_title(title, fontsize=22, fontweight="bold")
+        ax.set_title(title, fontweight="bold")
 
     draw_env_on_ax(ax, env, x_mask=(x_lo, x_hi))
 
@@ -722,7 +713,6 @@ def plot_lc_snapshots(
             ax,
             mean_np[t, :2],
             cov_np[t, :2, :2],
-            k=2.45,
             facecolor=PALETTE["ego"]["fill"],
             edgecolor=PALETTE["ego"]["stroke"],
             alpha=0.06,
@@ -738,7 +728,6 @@ def plot_lc_snapshots(
             ax,
             mean_np[t, :2],
             cov_np[t, :2, :2],
-            k=2.45,
             facecolor=PALETTE["ego"]["fill"],
             edgecolor=PALETTE["ego"]["stroke"],
             alpha=0.10 + 0.15 * frac,
@@ -765,7 +754,7 @@ def plot_lc_snapshots(
         ax.annotate(
             f"$t={t_sec:.1f}\\,$s",
             xy=(ex, ey + label_y_off),
-            fontsize=12,
+            fontsize="small",
             ha="center",
             va="bottom",
             color=PALETTE["ego"]["stroke"],
@@ -809,7 +798,6 @@ def plot_lc_snapshots(
             loc="upper center",
             bbox_to_anchor=(0.5, -0.25),
             ncol=len(legend_handles),
-            fontsize=22,
             framealpha=0.95,
             edgecolor="#cccccc",
         )
@@ -826,13 +814,14 @@ def visualize_lane_change(
     dt=0.2,
     robot_dims=None,
     xlim=None,
+    save_dir=None,
 ):
     mean_np = mean_trace.cpu().squeeze().numpy()  # [T+1, ≥2]
     u_np = u_trace.cpu().squeeze().numpy()  # [T,  2]
     T = mean_np.shape[0] - 1
     time_u = np.arange(T) * dt
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 9), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=_figsize("single", aspect=1.3), sharex=True)
 
     h_traj = plot_lc_trajectory(
         ax1, mean_trace, cov_trace, env, dt, robot_dims, show_legend=False, xlim=xlim
@@ -857,32 +846,31 @@ def visualize_lane_change(
         handles=combined_handles,
         loc="lower center",
         ncol=min(len(combined_handles), 4),
-        fontsize=16,
         bbox_to_anchor=(0.5, 0.02),
     )
     fig.subplots_adjust(bottom=0.15)
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.15)
+    if save_dir is not None:
+        save_figure(fig, os.path.join(save_dir, "lane_change_trajectory"))
     plt.show()
     plt.close(fig)
 
     n_rows = 3 if p_sat_trace is not None else 2
-    fig3, axes = plt.subplots(n_rows, 1, figsize=(10, 2.6 * n_rows), sharex=True)
+    fig3, axes = plt.subplots(
+        n_rows, 1, figsize=_figsize("single", aspect=0.5 * n_rows), sharex=True
+    )
 
     axes[0].plot(time_u, u_np[:, 0], color=PALETTE["ego"]["stroke"], linewidth=1.8)
     axes[0].axhline(0, color="k", linewidth=0.5, linestyle=":")
-    axes[0].set_ylabel("$a_x$ [m/s²]", fontsize=16)
-    axes[0].set_title(
-        "Control Inputs and Satisfaction Probability", fontsize=18, fontweight="bold"
-    )
+    axes[0].set_ylabel("$a_x$ [m/s²]")
+    axes[0].set_title("Control Inputs and Satisfaction Probability", fontweight="bold")
     axes[0].grid(True, alpha=0.35)
-    axes[0].tick_params(labelsize=14)
 
     axes[1].plot(time_u, u_np[:, 1], color=PALETTE["plan"]["stroke"], linewidth=1.8)
     axes[1].axhline(0, color="k", linewidth=0.5, linestyle=":")
-    axes[1].set_ylabel("$a_y$ [m/s²]", fontsize=16)
+    axes[1].set_ylabel("$a_y$ [m/s²]")
     axes[1].grid(True, alpha=0.35)
-    axes[1].tick_params(labelsize=14)
 
     if p_sat_trace is not None:
         p_sat_arr = np.asarray(p_sat_trace)
@@ -904,12 +892,13 @@ def visualize_lane_change(
             label="Threshold ($\\alpha = 0.85$)",
         )
         axes[2].set_ylim(0, 1.05)
-        axes[2].set_ylabel(r"$P_{\downarrow}(\varphi)$", fontsize=16)
-        axes[2].legend(fontsize=14, loc="lower right", framealpha=0.9)
+        axes[2].set_ylabel(r"$P_{\downarrow}(\varphi)$")
+        axes[2].legend(loc="lower right", framealpha=0.9)
         axes[2].grid(True, alpha=0.35)
-        axes[2].tick_params(labelsize=14)
 
-    axes[-1].set_xlabel("Time [s]", fontsize=16)
+    axes[-1].set_xlabel("Time [s]")
     plt.tight_layout()
+    if save_dir is not None:
+        save_figure(fig3, os.path.join(save_dir, "lane_change_controls"))
     plt.show()
     plt.close(fig3)

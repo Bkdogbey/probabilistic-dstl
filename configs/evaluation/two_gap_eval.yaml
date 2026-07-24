@@ -11,6 +11,8 @@ robot_radius: 0.0
 output:
   results_dir: results
   figures_dir: figures
+  tables_dir: results/tables
   summary_csv: two_gap_mc_summary.csv
+  summary_tex: two_gap_mc_summary.tex
   comparison_png: two_gap_compare_mc.png
   comparison_pdf: two_gap_compare_mc.pdf

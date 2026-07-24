@@ -1,49 +1,24 @@
-"""Load config.yml and expose it as module-level constants, plus the
-genuinely-logic helpers that are shared between the 2D baseline and 3D
-gate scenarios (spline math, waypoint validation, waypoint JSON I/O,
-obstacle-clearance distance, and the geometry signature used to derive
-BASELINE_PATH_ID).
+"""Loads config.yml into module-level constants, plus helpers shared by the
+2D baseline and 3D gate scenarios (spline math, waypoint validation,
+waypoint JSON I/O, obstacle-clearance distance).
 
-This file is a thin loader now -- arena/uncertainty/planner/flight/gate
-INPUT VALUES live in config.yml (edit that file, not this one, to change
-geometry, obstacle positions, planner hyperparameters, etc.). Nothing
-scenario-specific is *constructed* here (that's still planning_2d.py /
-planning_3d.py); gate-only geometry VALUES do live in config.yml (section
-6 below), but the gate scenario's construction logic (Environment3D,
-Planner3D, nominal_gate_waypoints, ...) is entirely in planning_3d.py,
-unchanged.
+Edit config.yml, not this file, to change geometry, obstacle positions, or
+planner hyperparameters. Scenario construction logic lives in
+planning_2d.py / planning_3d.py.
 
-This module is import-safe with NO torch/hardware/ROS dependencies (pure
-Python + numpy + PyYAML) -- deliberately NOT using src/utils.py's
-load_config() helper, since that module imports torch. Keeping this file
-torch-free matters: flight_logger.py and run.py's top-level
-`from components.config import VALID_FANS` must never pull in torch.
-
-Sections:
-    1. Arena geometry          — bounds, obstacles, goal, start/end, safe path
-    2. Deterministic-path calc — required obstacle-clearance margin
-    3. Per-fan uncertainty     — SIGMA0_PER_FAN, Q_STD (planning + plots)
-    4. Planner hyperparameters — PLANNER_CONFIG (every optimizer knob, labeled)
-    5. Trial selection         — TRIAL_FAN/TRIAL_CONDITION/TRIAL_SCENARIO, the
-                                  run.py CLI's --fan/--condition/--scenario defaults
-    6. Flight parameters       — velocities, heights, calibration, log paths
-    7. Gate geometry           — 3D-only; consumed solely by planning_3d.py
-    8. Shared helpers          — spline math, waypoint validation/I/O,
-                                  obstacle clearance, geometry signature
+Import-safe with no torch/hardware/ROS dependencies (pure Python + numpy +
+PyYAML) so flight_logger.py and run.py's top-level `from components.config
+import VALID_FANS` never pull in torch.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import pathlib
 import sys
 
-# Use the pdSTL library from this repo's src/ (no vendored copies). This file
-# lives at experiments/crazyflie/components/config.py, three levels below
-# the repo root. planning_2d.py/planning_3d.py both import this module
-# before their own planning.*/pdstl.* imports specifically so this insert
-# always runs first -- see the comment at the top of their import blocks.
+# planning_2d.py/planning_3d.py both import this module before their own
+# planning.*/pdstl.* imports so this sys.path insert always runs first.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / 'src'))
 
@@ -75,8 +50,44 @@ FLIGHT_Y_BOUNDS: list[float] = list(_arena['flight_y_bounds'])
 FLIGHT_Z_BOUNDS: list[float] = list(_arena['flight_z_bounds'])
 Z_HEIGHT: float = float(_arena['z_height'])
 
+def _obstacle_z_range(o: dict) -> tuple[float, float]:
+    """Resolve an obstacle's vertical extent to a canonical (z_min, z_max) tuple.
+
+    An obstacle authors its z-extent in exactly one of two mutually exclusive
+    ways: `height: h` (floor-mounted shorthand, z spans 0..h) or explicit
+    `z: [z_min, z_max]` (a box floating/hanging at an arbitrary height).
+    Downstream code (planning_3d.py) reads only the resulting 'z' tuple.
+    """
+    has_z = 'z' in o
+    has_height = 'height' in o
+    name = o.get('name', '?')
+    if has_z == has_height:
+        raise ValueError(
+            f"Obstacle {name!r} must set exactly one of 'height' (floor-mounted) "
+            f"or 'z' (explicit [z_min, z_max]); got "
+            f"{'both' if has_z else 'neither'}."
+        )
+    z_min, z_max = _t2(o['z']) if has_z else (0.0, float(o['height']))
+    if z_min < 0.0:
+        raise ValueError(f"Obstacle {name!r} z_min={z_min} must be >= 0.")
+    if z_min >= z_max:
+        raise ValueError(f"Obstacle {name!r} needs z_min < z_max; got [{z_min}, {z_max}].")
+    if z_max > FLIGHT_Z_BOUNDS[1]:
+        raise ValueError(
+            f"Obstacle {name!r} z_max={z_max} exceeds the flight ceiling "
+            f"FLIGHT_Z_BOUNDS[1]={FLIGHT_Z_BOUNDS[1]} (likely a config typo)."
+        )
+    return z_min, z_max
+
+
 OBSTACLES: list[dict] = [
-    {'name': o['name'], 'x': _t2(o['x']), 'y': _t2(o['y']), 'height': float(o['height'])}
+    {
+        'name': o['name'], 'x': _t2(o['x']), 'y': _t2(o['y']),
+        'z': _obstacle_z_range(o),
+        # Original floor-mounted shorthand preserved when supplied (footprint-vs-height
+        # consumers may still read it); planning reads the canonical 'z' above.
+        **({'height': float(o['height'])} if 'height' in o else {}),
+    }
     for o in _arena['obstacles']
 ]
 GOAL: dict = {
@@ -94,13 +105,12 @@ SAFE_PATH_FLIGHT_POINTS: int = int(_arena['safe_path_flight_points'])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2. Deterministic-path calculation input (2D baseline only — consumed by
-#    planning_2d.py's _calculate_sine_amplitude()). The required per-obstacle
-#    clearance margin for the closed-form sine-amplitude calculation; see
-#    that function's docstring for how it's used.
+# 2. Deterministic path (2D baseline only) — via-points the sine curve in
+#    planning_2d.py's nominal_safe_waypoints() passes through, between
+#    START_XY and END_XY.
 # ═════════════════════════════════════════════════════════════════════════════
 _det = _cfg['deterministic_path']
-DETERMINISTIC_PATH_MARGIN: float = float(_det['margin'])
+DETERMINISTIC_VIA_POINTS: list[tuple[float, float]] = [_t2(p) for p in _det['via_points']]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -139,8 +149,7 @@ TRIAL_SCENARIO: str = str(_trial['scenario'])
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. Flight parameters (used only at flight time by components/crazyflie.py)
-#    + log/calibration directories (shared by uncertainty_calibration.py,
-#    analyze_logs.py, and components/flight_logger.py).
+#    + log directory (shared by analyze_logs.py and components/flight_logger.py).
 # ═════════════════════════════════════════════════════════════════════════════
 _flight = _cfg['flight']
 FLIGHT_VELOCITY: float = U_MAX  # PositionHlCommander default velocity [m/s]
@@ -157,7 +166,6 @@ Z_HOLD: float = float(_flight['z_hold'])
 DRONE_URI: str | None = _flight.get('drone_uri')
 
 LOGS_DIR: pathlib.Path = EXPERIMENT_DIR / 'components' / 'logs'
-CALIBRATION_DIR: pathlib.Path = EXPERIMENT_DIR / 'calibration'
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -180,8 +188,8 @@ GATE_T_DESCEND_START: int = int(_gate['t_descend_start'])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 8. Shared helpers — spline math, waypoint validation, waypoint JSON I/O,
-#    geometry signature. Used by both planning_2d.py and planning_3d.py.
+# 8. Shared helpers — spline math, waypoint validation, waypoint JSON I/O.
+#    Used by both planning_2d.py and planning_3d.py.
 # ═════════════════════════════════════════════════════════════════════════════
 def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Fritsch-Carlson monotone cubic Hermite slopes.
@@ -237,12 +245,7 @@ def reference_direct_path(n_points: int = 200) -> list[tuple[float, float]]:
 
 
 def obstacle_clearance_2d(curve_xy: np.ndarray, obs: dict) -> float:
-    """Min x,y-only distance from any point on curve_xy [N,2] to an obstacle's box (0 = inside).
-
-    No altitude term -- callers with a 2D-only view of the arena (the sine-
-    amplitude calculation in planning_2d.py, the before/after comparison
-    plots in waypoint_planning.py) share this single implementation.
-    """
+    """Min x,y-only distance from any point on curve_xy [N,2] to an obstacle's box (0 = inside)."""
     dx = np.maximum(np.maximum(obs['x'][0] - curve_xy[:, 0], 0.0), curve_xy[:, 0] - obs['x'][1])
     dy = np.maximum(np.maximum(obs['y'][0] - curve_xy[:, 1], 0.0), curve_xy[:, 1] - obs['y'][1])
     return float(np.min(np.sqrt(dx**2 + dy**2)))
@@ -271,29 +274,6 @@ def validate_waypoints_in_bounds(
             f'{label}(s) outside flight area '
             f'x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]: {details}'
         )
-
-
-def geometry_signature_2d() -> str:
-    """sha256-based signature of everything that determines
-    nominal_safe_waypoints()'s calculated sine amplitude: obstacle geometry,
-    start/end points, and the required clearance margin (see
-    planning_2d.py's _calculate_sine_amplitude). Deliberately torch-free
-    (pure Python + numpy) so it can be computed here and imported by
-    flight_logger.py (via BASELINE_PATH_ID below) without pulling in torch.
-    Used, via BASELINE_PATH_ID, to auto-invalidate stale calibration/flight
-    logs whenever a change to this file would actually change the
-    deterministic path's shape -- replacing the old convention of
-    hand-bumping a version string.
-    """
-    payload = {
-        'obstacles': OBSTACLES, 'start_xy': START_XY, 'end_xy': END_XY,
-        'margin': DETERMINISTIC_PATH_MARGIN,
-    }
-    blob = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:12]
-
-
-BASELINE_PATH_ID: str = f'sine_calc_v1_{geometry_signature_2d()}'
 
 
 # ── Per-fan optimised waypoint files (waypoints/pdstl[_<scenario>]_fan<L>.json) ─

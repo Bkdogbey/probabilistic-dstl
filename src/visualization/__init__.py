@@ -1,5 +1,15 @@
-from visualization.planning import (
+import os
+
+from visualization.style import (
     PALETTE as PALETTE,
+    figsize as figsize,
+    save_figure as save_figure,
+    set_ieee_style as set_ieee_style,
+)
+
+set_ieee_style(mode=os.environ.get("PDSTL_PLOT_MODE", "paper"))
+
+from visualization.planning import (
     cov_ellipse_params as cov_ellipse_params,
     plot_covariance_ellipse as plot_covariance_ellipse,
     draw_env_on_ax as draw_env_on_ax,

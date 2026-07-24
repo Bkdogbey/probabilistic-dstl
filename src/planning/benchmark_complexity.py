@@ -24,6 +24,7 @@ from planning.dynamics import SingleIntegrator
 from planning.planner import TorchGaussianBelief
 from planning.runners import build_environment, load_scenario_config
 from pdstl.base import BeliefTrajectory
+from visualization.style import PALETTE, figsize as _figsize, save_figure
 
 
 def build_spec_and_env(T, device):
@@ -119,7 +120,10 @@ def run_benchmark(T_values=None, device_str="cpu"):
 
 
 def plot_results(T_values, means_ms, stds_ms, save_path="benchmark_complexity.pdf"):
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axes = plt.subplots(1, 2, figsize=_figsize("double", aspect=0.4))
+
+    measured_color = PALETTE["ego"]["stroke"]
+    fit_color = PALETTE["obs_static"]["stroke"]
 
     # --- Linear fit ---
     coeffs = np.polyfit(T_values, means_ms, 1)
@@ -131,21 +135,21 @@ def plot_results(T_values, means_ms, stds_ms, save_path="benchmark_complexity.pd
     ax = axes[0]
     ax.errorbar(
         T_values, means_ms, yerr=stds_ms,
-        fmt="o", color="#2563EB", capsize=4, label="Measured",
+        fmt="o", color=measured_color, capsize=4, label="Measured",
     )
-    ax.plot(T_fit, y_fit, "--", color="#DC2626",
+    ax.plot(T_fit, y_fit, "--", color=fit_color,
             label=f"Linear fit  (slope={slope:.3f} ms/step)")
-    ax.set_xlabel("Planning horizon $T$ (steps)", fontsize=12)
-    ax.set_ylabel("Wall-clock time per iteration (ms)", fontsize=12)
-    ax.set_title("Computation time vs. $T$ (linear scale)", fontsize=12)
-    ax.legend(fontsize=10)
+    ax.set_xlabel("Planning horizon $T$ (steps)")
+    ax.set_ylabel("Wall-clock time per iteration (ms)")
+    ax.set_title("Computation time vs. $T$ (linear scale)")
+    ax.legend()
     ax.grid(True, alpha=0.4)
 
     # --- Right panel: log-log scale ---
     ax = axes[1]
     ax.errorbar(
         T_values, means_ms, yerr=stds_ms,
-        fmt="o", color="#2563EB", capsize=4, label="Measured",
+        fmt="o", color=measured_color, capsize=4, label="Measured",
     )
     log_T = np.log10(T_values)
     log_t = np.log10(means_ms)
@@ -153,16 +157,16 @@ def plot_results(T_values, means_ms, stds_ms, save_path="benchmark_complexity.pd
     exponent = log_coeffs[0]
     T_log_fit = np.logspace(np.log10(T_values[0]), np.log10(T_values[-1]), 200)
     y_log_fit = 10 ** np.polyval(log_coeffs, np.log10(T_log_fit))
-    ax.loglog(T_log_fit, y_log_fit, "--", color="#DC2626",
+    ax.loglog(T_log_fit, y_log_fit, "--", color=fit_color,
               label=f"Power-law fit  (exponent={exponent:.2f})")
-    ax.set_xlabel("Planning horizon $T$ (steps)", fontsize=12)
-    ax.set_ylabel("Wall-clock time per iteration (ms)", fontsize=12)
-    ax.set_title("Computation time vs. $T$ (log-log scale)", fontsize=12)
-    ax.legend(fontsize=10)
+    ax.set_xlabel("Planning horizon $T$ (steps)")
+    ax.set_ylabel("Wall-clock time per iteration (ms)")
+    ax.set_title("Computation time vs. $T$ (log-log scale)")
+    ax.legend()
     ax.grid(True, which="both", alpha=0.4)
 
     fig.tight_layout()
-    fig.savefig(save_path, bbox_inches="tight")
+    save_figure(fig, save_path)
     print(f"\nFigure saved to: {save_path}")
     if os.environ.get("DISPLAY"):
         plt.show()

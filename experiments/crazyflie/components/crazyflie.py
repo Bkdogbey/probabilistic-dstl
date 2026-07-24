@@ -77,8 +77,7 @@ class CrazyfliePlanning(BaseComponent):
 
         Real position rarely matches the offline plan's assumed start exactly
         (tracking drift, imprecise placement). Aborts (raises) if the offset is
-        too large to trust rather than silently flying a bad plan. This is a
-        one-time pre-flight step — not a mid-flight pause.
+        too large to trust rather than silently flying a bad plan.
         """
         self.position_commander.go_to(*START_XY, TAKEOFF_Z)
         measured = calibration.hover_and_measure(self._measured_xy, duration_s=CALIBRATION_HOVER_SECONDS)
@@ -90,12 +89,6 @@ class CrazyfliePlanning(BaseComponent):
     def _fly_forward_mission(
         self, logger, waypoints: list[tuple[float, float, float]],
     ) -> tuple[float, float, float]:
-        """Calibrate once, then fly the given waypoints start->finish; return the last one.
-
-        No mid-flight replanning: the plan is flown exactly as given (offset-
-        corrected at the start), so the drone moves continuously from start to
-        goal without pausing to re-optimise.
-        """
         waypoints = self._calibrate_and_offset(waypoints)
         logger.log_waypoint(*START_XY, TAKEOFF_Z)
 

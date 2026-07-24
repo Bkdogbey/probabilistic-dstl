@@ -2,11 +2,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-# Tableau 10
-_BLUE  = "#1f77b4"
-_RED   = "#d62728"
-_GREEN = "#2ca02c"
-_GRAY  = "#7f7f7f"
+from visualization.style import PALETTE, figsize as _figsize, save_figure
+
+_BLUE  = PALETTE["ego"]["stroke"]
+_RED   = PALETTE["obs_static"]["stroke"]
+_GREEN = PALETTE["goal"]["stroke"]
+_GRAY  = PALETTE["lane"]["stroke"]
 
 
 def _to_numpy(trace, T):
@@ -34,7 +35,8 @@ def plot_stl_formula_bounds(
     formula_str=None,
     interval=None,
     operator_type="always",
-    figsize=(10, 8),
+    figsize=None,
+    save_path=None,
 ):
     time = np.asarray(time)
     T = len(time)
@@ -45,12 +47,11 @@ def plot_stl_formula_bounds(
     op_symbol = "□" if operator_type == "always" else "◇"
 
     if pred is not None:
-        fig, axes = plt.subplots(3, 1, figsize=figsize, sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=figsize or _figsize("single", aspect=1.3), sharex=True)
         ax_signal, ax_pred, ax_oper = axes
     else:
-        fig, axes = plt.subplots(
-            2, 1, figsize=(figsize[0], figsize[1] * 0.7), sharex=True
-        )
+        base = figsize or _figsize("single", aspect=1.3)
+        fig, axes = plt.subplots(2, 1, figsize=(base[0], base[1] * 0.7), sharex=True)
         ax_signal, ax_oper = axes
         ax_pred = None
 
@@ -71,35 +72,37 @@ def plot_stl_formula_bounds(
             for th in thresholds:
                 ax_signal.axhline(th, color=_RED, ls="--", lw=1.5, label=f"$h = {th}$")
 
-    ax_signal.set_ylabel("$x(t)$", fontsize=11)
+    ax_signal.set_ylabel("$x(t)$")
     ax_signal.set_title("(a) Signal Trajectory", loc="left", fontweight="bold")
-    ax_signal.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=9, framealpha=0.95)
+    ax_signal.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3, framealpha=0.95)
     ax_signal.grid(True, alpha=0.3)
 
     if ax_pred is not None:
         ax_pred.fill_between(time, pred[:, 0], pred[:, 1], alpha=0.3, color=_GREEN)
         ax_pred.plot(time, pred[:, 0], color=_BLUE, lw=1.5, label="$P_{\\mathrm{lower}}$")
         ax_pred.plot(time, pred[:, 1], color=_RED, lw=1.5, label="$P_{\\mathrm{upper}}$")
-        ax_pred.set_ylabel("$P(\\varphi)$", fontsize=11)
+        ax_pred.set_ylabel("$P(\\varphi)$")
         ax_pred.set_ylim(-0.05, 1.05)
         ax_pred.set_title("(b) Predicate Satisfaction Probability", loc="left", fontweight="bold")
-        ax_pred.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2, fontsize=9, framealpha=0.95)
+        ax_pred.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2, framealpha=0.95)
         ax_pred.grid(True, alpha=0.3)
 
     ax_oper.fill_between(time, oper[:, 0], oper[:, 1], alpha=0.3, color=_GREEN)
     ax_oper.plot(time, oper[:, 0], color=_BLUE, lw=1.5, label="$P_{\\mathrm{lower}}$")
     ax_oper.plot(time, oper[:, 1], color=_RED, lw=1.5, label="$P_{\\mathrm{upper}}$")
-    ax_oper.set_xlabel("Time [s]", fontsize=11)
-    ax_oper.set_ylabel(f"$P({op_symbol}\\varphi)$", fontsize=11)
+    ax_oper.set_xlabel("Time [s]")
+    ax_oper.set_ylabel(f"$P({op_symbol}\\varphi)$")
     ax_oper.set_ylim(-0.05, 1.05)
     ax_oper.set_title("(c) Temporal Operator Output", loc="left", fontweight="bold")
-    ax_oper.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=9, framealpha=0.95)
+    ax_oper.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, framealpha=0.95)
     ax_oper.grid(True, alpha=0.3)
 
     if formula_str:
-        fig.suptitle(formula_str, fontsize=12, fontweight="bold")
+        fig.suptitle(formula_str, fontweight="bold")
 
     plt.tight_layout()
+    if save_path is not None:
+        save_figure(fig, save_path)
     plt.show()
 
     return fig, axes
@@ -115,7 +118,8 @@ def plot_piecewise_stl(
     formula_str=None,
     interval=None,
     operator_type="always",
-    figsize=(10, 12),
+    figsize=None,
+    save_path=None,
 ):
     time = np.asarray(time)
     T = len(time)
@@ -143,7 +147,9 @@ def plot_piecewise_stl(
     upper_color = _RED
 
     # Create one figure with 3 subplots sharing the x-axis
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=figsize, sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, figsize=figsize or _figsize("single", aspect=2.0), sharex=True
+    )
 
     if mean_trace is not None and sigma_trace is not None:
         for i in range(T):
@@ -189,19 +195,18 @@ def plot_piecewise_stl(
                 textcoords="offset points",
                 xytext=(0, offset),
                 ha="center",
-                fontsize=14,
+                fontsize="small",
             )
 
         ax1.annotate(
             f"h = {int(threshold)}",
             (time[-1] + 0.3, threshold),
-            fontsize=14,
+            fontsize="small",
             color=threshold_color,
         )
 
-    ax1.set_ylabel("x(t)", fontsize=18)
+    ax1.set_ylabel("x(t)")
     ax1.set_xlim(-0.3, time[-1] + 1)
-    ax1.tick_params(axis='both', which='major', labelsize=14)
     ax1.grid(True, alpha=0.3)
 
     if pred is not None:
@@ -236,14 +241,13 @@ def plot_piecewise_stl(
             ax2.plot(time[i], pred[i, 0], "o", color=_BLUE, markersize=5)
             ax2.plot(time[i], pred[i, 1], "o", color=_RED,  markersize=5)
 
-    ax2.set_ylabel("P(φ)", fontsize=18)
+    ax2.set_ylabel("P(φ)")
     ax2.set_ylim(-0.05, 1.05)
 
     ax2.plot([], [], color=_BLUE, lw=2, label=r"$P^{\downarrow}$")
     ax2.plot([], [], color=_RED,  lw=2, label=r"$P^{\uparrow}$")
-    ax2.legend(loc="lower right", fontsize=14, framealpha=0.95)
+    ax2.legend(loc="lower right", framealpha=0.95)
     ax2.set_xlim(-0.3, time[-1] + 1)
-    ax2.tick_params(axis='both', which='major', labelsize=14)
     ax2.grid(True, alpha=0.3)
 
     for i in range(T):
@@ -277,18 +281,19 @@ def plot_piecewise_stl(
         ax3.plot(time[i], oper[i, 0], "o", color=_BLUE, markersize=5)
         ax3.plot(time[i], oper[i, 1], "o", color=_RED,  markersize=5)
 
-    ax3.set_xlabel("Time t", fontsize=18)
-    ax3.set_ylabel(f"P({op_symbol}φ)", fontsize=18)
+    ax3.set_xlabel("Time t")
+    ax3.set_ylabel(f"P({op_symbol}φ)")
     ax3.set_ylim(-0.05, 1.05)
     ax3.plot([], [], color=_BLUE, lw=2, label=f"${op_symbol}P^{{\\downarrow}}$")
     ax3.plot([], [], color=_RED,  lw=2, label=f"${op_symbol}P^{{\\uparrow}}$")
-    ax3.legend(loc="lower right", fontsize=14, framealpha=0.95)
+    ax3.legend(loc="lower right", framealpha=0.95)
     ax3.set_xlim(-0.3, time[-1] + 1)
     ax3.set_xticks(time)
-    ax3.tick_params(axis='both', which='major', labelsize=14)
     ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
+    if save_path is not None:
+        save_figure(fig, save_path)
     plt.show()
     plt.close(fig)
 

@@ -5,17 +5,8 @@ Two conditions (set via `python run.py fly --condition ...`):
     deterministic  — nominal safe path, no optimisation
     pdstl          — pDSTL-optimised path
 
-Usage (from crazyflie.py):
-    logger = FlightLogger("pdstl", fan_speed=12)
-    logger.start()
-    logger.start_actual_logging(lambda: (cf_base.current_x,
-                                         cf_base.current_y,
-                                         cf_base.current_z))
-    ...
-    logger.log_waypoint(x, y, z)   # called at each go_to
-    ...
-    logger.stop_actual_logging()
-    logger.save()
+See components/crazyflie.py for real usage (start/start_actual_logging/
+log_waypoint/stop_actual_logging/save, in that order).
 
 Output files (logs/ directory, next to this file):
     <condition>_fan<XX>_run<NN>_<ts>_commanded.csv  — one row per go_to call
@@ -28,8 +19,7 @@ own first sample (e.g. a calibration abort that fires before any real flight)
 isn't saved at all — see save()'s early return.
 
 Columns (both files):
-    condition, baseline_path_id, t, x, y, z,
-    outside_obs1, outside_obs2, outside_obs3, safe
+    condition, t, x, y, z, outside_obs1, outside_obs2, outside_obs3, safe
 """
 
 from __future__ import annotations
@@ -44,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-from components.config import BASELINE_PATH_ID, LOGS_DIR
+from components.config import LOGS_DIR
 from components.config import OBSTACLES as _ENV_OBSTACLES
 from components.config import START_TOLERANCE
 
@@ -60,7 +50,7 @@ _OBSTACLES: list[tuple[float, float, float, float]] = [
     (obs['x'][0], obs['x'][1], obs['y'][0], obs['y'][1]) for obs in _ENV_OBSTACLES
 ]
 
-# ── Log directory (shared with uncertainty_calibration.py/analyze_logs.py) ──
+# ── Log directory (shared with analyze_logs.py) ─────────────────────────────
 _LOGS_DIR = LOGS_DIR
 
 # Actual-position sampling rate (Hz) — CrazyflieBase updates at 20 Hz so 10 is safe
@@ -81,7 +71,6 @@ def _safety_row(condition: str, t: float, x: float, y: float, z: float,
     outside = [not _inside(x, y, obs) for obs in obstacles]
     row: dict = {
         'condition': condition,
-        'baseline_path_id': BASELINE_PATH_ID,
         't': t,
         'x': round(x, 6),
         'y': round(y, 6),

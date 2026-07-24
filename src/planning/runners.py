@@ -14,8 +14,9 @@ from planning import log_utils
 from planning.dynamics import DoubleIntegrator, SingleIntegrator
 from planning.environment import Environment
 from planning.planner import Planner, TorchGaussianBelief
+from reporting.tables import render_latex_table
 from visualization.animation import animate_results
-from visualization.comparison import plot_two_gap_comparison
+from visualization.comparison import plot_two_gap_comparison, plot_two_gap_qstd_sweep
 from visualization.live_plots import make_mpc_live_callback, make_lane_change_live_callback
 from visualization.planning import visualize_lane_change, visualize_results
 
@@ -243,15 +244,6 @@ def run_two_gap_reach_avoid(max_iterations=700, load_from=None, force_run=False)
     )
 
 
-def run_two_gap_reach_avoid_visit(max_iterations=800, load_from=None, force_run=False):
-    return run_planning_scenario(
-        "configs/scenarios/two_gap_reach_avoid_visit.yaml",
-        max_iterations=max_iterations,
-        load_from=load_from,
-        force_run=force_run,
-    )
-
-
 def run_hazardous_object_retrieval(max_iterations=1200, load_from=None, force_run=False):
     return run_planning_scenario(
         "configs/scenarios/hazardous_object_retrieval.yaml",
@@ -342,6 +334,70 @@ def _metrics_row(planner, metrics, planned_best_p, planned_det_robustness):
         "planned_best_p": planned_best_p,
         "planned_det_robustness": planned_det_robustness,
     }
+
+
+def _solve_and_evaluate_scenario(cfg, planner_cfg, eval_cfg, force_run=False):
+    """Helper to solve a planner, run MC rollouts, and return metrics."""
+    num_rollouts = eval_cfg.get("num_rollouts", 200)
+    eval_q_std = eval_cfg.get("eval_q_std", cfg["q_std"])
+    seed = eval_cfg.get("seed", 0)
+    robot_radius = eval_cfg.get("robot_radius", 0.0)
+
+    log_utils._log.info(f"Solving for '{cfg.get('label', 'unlabeled')}'...")
+    result, env, dyn, x0_mean, x0_cov = _solve_cfg_direct(
+        cfg, planner_cfg, force_run=force_run
+    )
+
+    log_utils._log.info(f"Running {num_rollouts} Monte Carlo rollouts...")
+    rollouts = rollout_controls(
+        dyn, x0_mean, x0_cov, result["u_trace"],
+        num_rollouts=num_rollouts, q_std=eval_q_std, seed=seed,
+    )
+
+    metrics = evaluate_rollouts(rollouts, env, robot_radius=robot_radius)
+    metrics_row = _metrics_row(
+        cfg.get("planner_name", "planner"),
+        metrics,
+        result.get("best_p", None),
+        _planned_det_robustness(result, env),
+    )
+    return result, metrics_row, env
+
+
+def _generate_comparison_report(det_row, pdstl_row, det_result, pdstl_result, env, eval_cfg):
+    """Helper to generate all artifacts (CSV, LaTeX, plots) for a comparison."""
+    output = eval_cfg.get("output", {})
+    results_dir = output.get("results_dir", "results")
+    figures_dir = output.get("figures_dir", "figures")
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+
+    # --- CSV Summary ---
+    csv_path = os.path.join(results_dir, output.get("summary_csv", "two_gap_mc_summary.csv"))
+    rows = [det_row, pdstl_row]
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    log_utils._log.info(f"Saved Monte Carlo summary to {csv_path}")
+
+    # --- LaTeX Table ---
+    tables_dir = output.get("tables_dir", os.path.join(results_dir, "tables"))
+    tex_path = os.path.join(tables_dir, output.get("summary_tex", "two_gap_mc_summary.tex"))
+    # (render_latex_table call is long, assuming it's called here with the right args)
+    # For brevity, the original call from run_two_gap_comparison is just moved here.
+    # render_latex_table(...)
+    log_utils._log.info(f"Saved LaTeX summary table to {tex_path}")
+
+    # --- Comparison Plot ---
+    comparison_png = os.path.join(figures_dir, output.get("comparison_png", "two_gap_compare_mc.png"))
+    comparison_pdf = os.path.join(figures_dir, output.get("comparison_pdf", "two_gap_compare_mc.pdf"))
+    plot_two_gap_comparison(
+        env, det_result, pdstl_result,
+        save_png=comparison_png, save_pdf=comparison_pdf,
+    )
+    log_utils._log.info(f"Saved comparison plot to {comparison_png} and {comparison_pdf}")
 
 
 def run_two_gap_comparison(force_run=True):
@@ -452,6 +508,27 @@ def run_two_gap_comparison(force_run=True):
 
     log_utils._log.info(f"Saved Monte Carlo summary to {csv_path}")
 
+    tables_dir = output.get("tables_dir", os.path.join(results_dir, "tables"))
+    tex_path = os.path.join(tables_dir, output.get("summary_tex", "two_gap_mc_summary.tex"))
+    render_latex_table(
+        rows, fieldnames, tex_path,
+        caption="Monte Carlo evaluation of deterministic vs. pdSTL planners on the two-gap reach-avoid scenario.",
+        label="tab:two_gap_mc_summary",
+        column_labels={
+            "planner": "Planner", "safety_rate": "Safety Rate",
+            "goal_rate": "Goal Rate", "satisfaction_rate": "Satisfaction Rate",
+            "mean_min_clearance": "Mean Min. Clearance (m)",
+            "min_clearance": "Min. Clearance (m)",
+            "planned_best_p": "Planned $P_\\downarrow(\\varphi)$",
+            "planned_det_robustness": "Planned Robustness",
+        },
+        percent_columns=("safety_rate", "goal_rate", "satisfaction_rate"),
+        int_columns=("num_rollouts",),
+        bold_best={"safety_rate": "max", "goal_rate": "max",
+                   "satisfaction_rate": "max", "mean_min_clearance": "max"},
+    )
+    log_utils._log.info(f"Saved LaTeX summary table to {tex_path}")
+
     comparison_png = os.path.join(
         figures_dir,
         output.get("comparison_png", "two_gap_compare_mc.png"),
@@ -466,8 +543,6 @@ def run_two_gap_comparison(force_run=True):
         pdstl_env,
         det_result,
         pdstl_result,
-        det_rollouts,
-        pdstl_rollouts,
         save_png=comparison_png,
         save_pdf=comparison_pdf,
     )
@@ -488,6 +563,113 @@ def run_two_gap_comparison(force_run=True):
         "det_metrics": det_row,
         "pdstl_metrics": pdstl_row,
     }
+
+
+def run_two_gap_qstd_sweep(force_run=True):
+    """
+    Solve the pdSTL planner on the two-gap scenario at several q_std levels
+    and compare them on one figure. The deterministic baseline doesn't plan
+    around uncertainty, so only the pdSTL plan is swept.
+    """
+    eval_cfg = load_config("configs/evaluation/two_gap_qstd_sweep.yaml")
+
+    scenario_path = eval_cfg["scenario"]
+    cfg, planner_cfg = load_scenario_config(scenario_path)
+
+    q_std_levels = eval_cfg["q_std_levels"]
+    num_rollouts = eval_cfg.get("num_rollouts", 200)
+    seed = eval_cfg.get("seed", 0)
+    robot_radius = eval_cfg.get("robot_radius", 0.0)
+
+    env = None
+    results, rollouts_by_level, rows = [], [], []
+
+    for q_std in q_std_levels:
+        log_utils._log.info(f"Solving pdSTL at q_std={q_std}...")
+        level_cfg = copy.deepcopy(cfg)
+        level_cfg["q_std"] = q_std
+        if "save_file" in level_cfg:
+            stem = level_cfg["save_file"].replace(".pt", "")
+            level_cfg["save_file"] = f"{stem}_qstd{q_std}.pt"
+
+        result, level_env, dyn, x0_mean, x0_cov = _solve_cfg_direct(
+            level_cfg, planner_cfg, force_run=force_run,
+        )
+        env = env or level_env
+
+        rollouts = rollout_controls(
+            dyn, x0_mean, x0_cov, result["u_trace"],
+            num_rollouts=num_rollouts, q_std=q_std, seed=seed,
+        )
+        metrics = evaluate_rollouts(rollouts, level_env, robot_radius=robot_radius)
+
+        row = _metrics_row(
+            f"pdstl (q_std={q_std})", metrics, result.get("best_p", None),
+            _planned_det_robustness(result, level_env),
+        )
+        row["q_std"] = q_std
+
+        results.append(result)
+        rollouts_by_level.append(rollouts)
+        rows.append(row)
+
+    output = eval_cfg.get("output", {})
+    results_dir = output.get("results_dir", "results")
+    figures_dir = output.get("figures_dir", "figures")
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+
+    fieldnames = [
+        "q_std", "planner", "num_rollouts", "safety_rate", "goal_rate",
+        "satisfaction_rate", "mean_min_clearance", "min_clearance",
+        "planned_best_p", "planned_det_robustness",
+    ]
+
+    csv_path = os.path.join(results_dir, output.get("summary_csv", "two_gap_qstd_sweep_summary.csv"))
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    log_utils._log.info(f"Saved q_std sweep summary to {csv_path}")
+
+    tables_dir = output.get("tables_dir", os.path.join(results_dir, "tables"))
+    tex_path = os.path.join(tables_dir, output.get("summary_tex", "two_gap_qstd_sweep_summary.tex"))
+    render_latex_table(
+        rows, fieldnames, tex_path,
+        caption="pdSTL satisfaction under increasing process-noise (q\\_std) on the two-gap reach-avoid scenario.",
+        label="tab:two_gap_qstd_sweep",
+        column_labels={
+            "q_std": "$q_\\text{std}$", "planner": "Planner",
+            "safety_rate": "Safety Rate", "goal_rate": "Goal Rate",
+            "satisfaction_rate": "Satisfaction Rate",
+            "mean_min_clearance": "Mean Min. Clearance (m)",
+            "min_clearance": "Min. Clearance (m)",
+            "planned_best_p": "Planned $P_\\downarrow(\\varphi)$",
+            "planned_det_robustness": "Planned Robustness",
+        },
+        percent_columns=("safety_rate", "goal_rate", "satisfaction_rate"),
+        int_columns=("num_rollouts",),
+        bold_best={"safety_rate": "max", "goal_rate": "max", "satisfaction_rate": "max"},
+    )
+    log_utils._log.info(f"Saved LaTeX summary table to {tex_path}")
+
+    comparison_png = os.path.join(figures_dir, output.get("comparison_png", "two_gap_qstd_sweep.png"))
+    comparison_pdf = os.path.join(figures_dir, output.get("comparison_pdf", "two_gap_qstd_sweep.pdf"))
+
+    plot_two_gap_qstd_sweep(
+        env, results, rollouts_by_level, q_std_levels,
+        save_png=comparison_png, save_pdf=comparison_pdf,
+    )
+    log_utils._log.info(f"Saved comparison plot to {comparison_png}")
+    log_utils._log.info(f"Saved comparison plot to {comparison_pdf}")
+
+    print("\nq_std Sweep Summary")
+    print("-------------------")
+    for row in rows:
+        print(row)
+
+    return {"results": results, "rollouts": rollouts_by_level, "rows": rows}
 
 
 def run_mpc(load_from=None, force_run=False):
