@@ -4,12 +4,13 @@ Optimises a waypoint plan for one fan level/scenario and writes it to
 waypoints/pdstl[_<scenario>]_fan<L>.json. Called by `run.py plan`; has no
 hardware/ROS dependency (only torch/numpy, plus matplotlib for --plot).
 
-Shared CLI runner + plotting code for both scenarios -- environment/planner/
-dynamics construction is dimension-specific and lives in
+Shared CLI runner + plotting code for all three scenarios -- environment/
+planner/dynamics construction is dimension-specific and lives in
 components/planning_2d.py / components/planning_3d.py. `run_plan` dispatches
-to `_run_plan_2d`/`_run_plan_3d`, which share `_optimize_and_report` but plot
-with dimension-specific code: `_plot_2d`/`_draw_env_2d` for the baseline,
-`_plot`/`_draw_env` for the gate scenario.
+to `_run_plan_2d`/`_run_plan_3d`/`_run_plan_figure8`, which share
+`_optimize_and_report` but plot with dimension-specific code: `_plot_2d`/
+`_draw_env_2d` for the baseline, `_plot`/`_draw_env` for gate and figure8
+(figure8 passes its own obstacle list and no reference-line curve).
 """
 
 from __future__ import annotations
@@ -22,7 +23,12 @@ import torch
 # components.config must import before planning.*/pdstl.* below -- it does
 # the sys.path insert those packages need.
 from components.config import (
+    DT,
     EXPERIMENT_DIR,
+    FIG8_FLIGHT_POINTS,
+    FIG8_OBSTACLES,
+    FIG8_PLOT_POINTS,
+    FIG8_RETURN_TOLERANCE,
     FLIGHT_Z_BOUNDS,
     OBSTACLES,
     PLANNER_ALPHA,
@@ -48,9 +54,15 @@ from components.planning_2d import (
 )
 from components.planning_3d import (
     build_planner_3d,
+    build_planner_figure8,
+    figure8_min_clearances,
+    nominal_figure8_waypoints,
     nominal_gate_waypoints,
+    terminal_return_error,
     x0_belief_3d,
+    x0_belief_figure8,
     _nominal_init_guess_3d,
+    _nominal_init_guess_figure8,
 )
 
 
@@ -254,16 +266,30 @@ def _draw_env(ax, env) -> None:
     former, getattr(..., 'time_windowed_bounds', []) covers the fact that only
     Environment3D defines that attribute at all.
     """
-    ax.set_xlim(FLIGHT_X_BOUNDS[0] - 0.1, FLIGHT_X_BOUNDS[1] + 0.1)
-    ax.set_ylim(FLIGHT_Y_BOUNDS[0] - 0.1, FLIGHT_Y_BOUNDS[1] + 0.1)
-    ax.set_zlim(FLIGHT_Z_BOUNDS[0] - 0.1, FLIGHT_Z_BOUNDS[1] + 0.1)
+    # Use the env's own bounds (if set) rather than always the global arena
+    # bounds -- gate's workspace equals the arena bounds so this is a no-op
+    # for it, but figure8 has its own narrower workspace and the wireframe
+    # box/axis limits should reflect that, not the arena.
+    env_bounds = getattr(env, 'bounds', None) or {}
+    x_bounds = env_bounds.get('x', FLIGHT_X_BOUNDS)
+    y_bounds = env_bounds.get('y', FLIGHT_Y_BOUNDS)
+    z_bounds = env_bounds.get('z', FLIGHT_Z_BOUNDS)
+
+    ax.set_xlim(x_bounds[0] - 0.1, x_bounds[1] + 0.1)
+    ax.set_ylim(y_bounds[0] - 0.1, y_bounds[1] + 0.1)
+    ax.set_zlim(z_bounds[0] - 0.1, z_bounds[1] + 0.1)
     ax.set_xlabel('x [m]')
     ax.set_ylabel('y [m]')
     ax.set_zlabel('z [m]')
 
+    # facecolor=(0,0,0,0) (fully transparent RGBA), not the string 'none' --
+    # this matplotlib/mpl_toolkits version's Poly3DCollection.do_3d_projection
+    # crashes (ValueError: not enough values to unpack) on a genuinely
+    # colorless face; a transparent RGBA renders identically (invisible face,
+    # visible edges) without hitting that code path.
     _draw_box(
-        ax, FLIGHT_X_BOUNDS, FLIGHT_Y_BOUNDS, FLIGHT_Z_BOUNDS,
-        facecolor='none', edgecolor='black', alpha=0.15, linestyle='dashed',
+        ax, x_bounds, y_bounds, z_bounds,
+        facecolor=(0, 0, 0, 0), edgecolor='black', alpha=0.15, linestyle='dashed',
     )
     for obs in env.obstacles:
         _draw_box(
@@ -286,7 +312,7 @@ def _draw_env(ax, env) -> None:
     for region in getattr(env, 'time_windowed_bounds', []):
         _draw_box(
             ax, region['x'], region['y'], region['z'],
-            facecolor='none', edgecolor='purple', alpha=0.5, linestyle='dashed',
+            facecolor=(0, 0, 0, 0), edgecolor='purple', alpha=0.5, linestyle='dashed',
         )
 
 
@@ -308,8 +334,17 @@ def _cov_ellipsoid_surface(center: np.ndarray, cov: np.ndarray, n_std: float = 2
 
 
 def _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
-          opt_xyz, opt_cov, out_path) -> None:
+          opt_xyz, opt_cov, out_path, *, obstacles: list[dict] | None = None) -> None:
+    """reference_curve may be None to skip the dashed 'no obstacles' reference
+    line (no meaningful straight-line reference exists for a closed loop, so
+    the figure8 scenario passes None). obstacles defaults to the module-level
+    OBSTACLES global (gate/baseline's arena set); figure8 passes its own
+    FIG8_OBSTACLES so the clearance annotations match whichever env was
+    actually built, instead of always annotating against the arena set.
+    """
     import matplotlib.pyplot as plt
+
+    obs_list = OBSTACLES if obstacles is None else obstacles
 
     fig = plt.figure(figsize=(15, 7.5))
     ax_before = fig.add_subplot(1, 2, 1, projection='3d')
@@ -321,15 +356,16 @@ def _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
     # ── Before: deterministic safe path, obstacle-free reference + clearances ──
     _draw_env(ax_before, env)
     ax_before.set_title('Before (Deterministic Safe Path)')
-    ax_before.plot(reference_curve[:, 0], reference_curve[:, 1], reference_curve[:, 2],
-                   'k--', lw=1.2, alpha=0.6, label='reference (no obstacles)')
+    if reference_curve is not None:
+        ax_before.plot(reference_curve[:, 0], reference_curve[:, 1], reference_curve[:, 2],
+                       'k--', lw=1.2, alpha=0.6, label='reference (no obstacles)')
     ax_before.plot(nominal_curve[:, 0], nominal_curve[:, 1], nominal_curve[:, 2],
                    'b-', lw=1.5, alpha=0.8)
     ax_before.scatter(nominal_wps[:, 0], nominal_wps[:, 1], nominal_wps[:, 2],
                       c='blue', s=25, label='flown waypoints')
     ax_before.scatter(*nominal_wps[0], c='green', s=80, label='start')
     ax_before.scatter(*nominal_wps[-1], c='red', s=80, marker='s', label='end')
-    for obs in OBSTACLES:
+    for obs in obs_list:
         clearance = _obstacle_clearance(nominal_curve, obs)
         cx = (obs['x'][0] + obs['x'][1]) / 2
         cy = (obs['y'][0] + obs['y'][1]) / 2
@@ -341,12 +377,13 @@ def _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
     # ── After: pdSTL-optimised plan, with this fan's belief-covariance ellipsoids ──
     _draw_env(ax_after, env)
     ax_after.set_title('After (pdSTL Optimised)')
-    ax_after.plot(reference_curve[:, 0], reference_curve[:, 1], reference_curve[:, 2],
-                  'k--', lw=1.2, alpha=0.6)
+    if reference_curve is not None:
+        ax_after.plot(reference_curve[:, 0], reference_curve[:, 1], reference_curve[:, 2],
+                      'k--', lw=1.2, alpha=0.6)
     ax_after.plot(opt_xyz[:, 0], opt_xyz[:, 1], opt_xyz[:, 2], 'b.-', lw=2, ms=8)
     ax_after.scatter(*opt_xyz[0], c='green', s=80, label='start')
     ax_after.scatter(*opt_xyz[-1], c='red', s=80, marker='s', label='end')
-    for obs in OBSTACLES:
+    for obs in obs_list:
         clearance = _obstacle_clearance(opt_xyz, obs)
         cx = (obs['x'][0] + obs['x'][1]) / 2
         cy = (obs['y'][0] + obs['y'][1]) / 2
@@ -370,9 +407,11 @@ def _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, reference_curve,
 def _save_plan(
     fan: int, scenario: str, sigma0: float, q_std: float,
     rho_before: float, best_p: float,
-    waypoints: list[tuple[float, float, float]],
+    waypoints: list[tuple[float, float, float]], *,
+    T: int, dt: float, uncertainty_source: str = 'sigma0_per_fan_table',
+    extra_meta: dict | None = None,
 ) -> None:
-    """Validate + write the optimised plan JSON. Shared by both _run_plan_2d/_3d."""
+    """Validate + write the optimised plan JSON. Shared by all three scenario drivers."""
     validate_waypoints_in_bounds(waypoints, label='Generated waypoint')
     meta = {
         'sigma0': sigma0,
@@ -380,7 +419,11 @@ def _save_plan(
         'rho_before': round(rho_before, 4),
         'rho_after': round(float(best_p), 4),
         'alpha': PLANNER_ALPHA,
+        'T': T,
+        'dt': dt,
+        'uncertainty_source': uncertainty_source,
         'generated': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        **(extra_meta or {}),
     }
     out = save_pdstl_waypoints(fan, waypoints, meta, scenario=scenario)
     print(f'Wrote {len(waypoints)} waypoints to {out}')
@@ -403,7 +446,7 @@ def _run_plan_2d(fan: int, plot: bool) -> None:
     positions_xy = best_mean.squeeze(0).cpu().numpy()
     assert positions_xy.shape[-1] == 2, f'2D planned positions must be 2D, got {positions_xy.shape}'
     waypoints = [(float(x), float(y), Z_HEIGHT) for x, y in positions_xy]
-    _save_plan(fan, 'baseline', sigma0, q_std, rho_before, best_p, waypoints)
+    _save_plan(fan, 'baseline', sigma0, q_std, rho_before, best_p, waypoints, T=planner.T, dt=DT)
 
     if plot:
         nominal_wps = np.array(nominal_safe_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS))[:, :2]
@@ -434,7 +477,7 @@ def _run_plan_3d(fan: int, plot: bool) -> None:
     positions_xyz = best_mean.squeeze(0).cpu().numpy()
     assert positions_xyz.shape[-1] == 3, f'3D planned positions must be 3D, got {positions_xyz.shape}'
     waypoints = [(float(x), float(y), float(z)) for x, y, z in positions_xyz]
-    _save_plan(fan, 'gate', sigma0, q_std, rho_before, best_p, waypoints)
+    _save_plan(fan, 'gate', sigma0, q_std, rho_before, best_p, waypoints, T=planner.T, dt=DT)
 
     if plot:
         nominal_wps = np.array(nominal_gate_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS))
@@ -448,15 +491,61 @@ def _run_plan_3d(fan: int, plot: bool) -> None:
               positions_xyz, opt_cov, plot_path)
 
 
+def _run_plan_figure8(fan: int, plot: bool) -> None:
+    """Optimise and save a figure8 plan. Optimizer state is (x, y, z)."""
+    sigma0 = SIGMA0_PER_FAN[fan]
+    q_std = Q_STD
+    planner, _dynamics, env = build_planner_figure8()
+    print(f'Planning for fan {fan}  (Σ0 = {sigma0} m², q_std = {q_std} m/step, '
+          f'T = {planner.T}, scenario = figure8 [3D])')
+
+    x0_mean, x0_cov = x0_belief_figure8(fan)
+    init_u = _nominal_init_guess_figure8()
+    rho_before, best_mean, best_cov, _best_u, best_p = _optimize_and_report(
+        planner, x0_mean, x0_cov, init_u,
+    )
+
+    positions_xyz = best_mean.squeeze(0).cpu().numpy()
+    assert positions_xyz.shape[-1] == 3, f'figure8 planned positions must be 3D, got {positions_xyz.shape}'
+    waypoints = [(float(x), float(y), float(z)) for x, y, z in positions_xyz]
+
+    return_error = terminal_return_error(waypoints)
+    print(f'{"terminal return error (||mu[T]-mu[0]||):":<48} '
+          f'{return_error:.4f} m (tolerance {FIG8_RETURN_TOLERANCE} m)')
+
+    _save_plan(
+        fan, 'figure8', sigma0, q_std, rho_before, best_p, waypoints,
+        T=planner.T, dt=DT, uncertainty_source='sigma0_per_fan_table',
+        extra_meta={
+            'return_tolerance': FIG8_RETURN_TOLERANCE,
+            'return_error': round(return_error, 4),
+        },
+    )
+
+    if plot:
+        nominal_wps = np.array(nominal_figure8_waypoints(n_points=FIG8_FLIGHT_POINTS))
+        nominal_curve = np.array(nominal_figure8_waypoints(n_points=FIG8_PLOT_POINTS))
+        print('Dense-curve minimum clearance per obstacle:')
+        for name, clearance in figure8_min_clearances(nominal_curve).items():
+            print(f'  {name}: {clearance * 100:.1f} cm')
+        plot_path = EXPERIMENT_DIR / 'plots' / f'fan{fan}_figure8_comparison.png'
+        opt_cov = best_cov.squeeze(0).cpu().numpy()
+        assert opt_cov.shape[-2:] == (3, 3), f'planned covariance must be 3x3, got {opt_cov.shape}'
+        _plot(env, fan, sigma0, q_std, nominal_wps, nominal_curve, None,
+              positions_xyz, opt_cov, plot_path, obstacles=FIG8_OBSTACLES)
+
+
 def run_plan(fan: int, scenario: str = 'baseline', plot: bool = False) -> None:
     """Optimise and save waypoints for one fan level/scenario (optionally plot).
 
-    One-line dispatch to _run_plan_2d/_run_plan_3d -- everything scenario-
-    specific (construction, optimizer state shape, waypoint conversion) lives
-    in those two functions and the planning_2d/planning_3d modules they call
-    into; nothing here branches beyond this.
+    Explicit 3-way dispatch to _run_plan_2d/_run_plan_3d/_run_plan_figure8 --
+    everything scenario-specific (construction, optimizer state shape,
+    waypoint conversion) lives in those functions and the planning_2d/
+    planning_3d modules they call into; nothing here branches beyond this.
     """
     if scenario == 'gate':
         _run_plan_3d(fan, plot)
+    elif scenario == 'figure8':
+        _run_plan_figure8(fan, plot)
     else:
         _run_plan_2d(fan, plot)

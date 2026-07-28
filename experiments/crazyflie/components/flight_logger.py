@@ -9,17 +9,27 @@ See components/crazyflie.py for real usage (start/start_actual_logging/
 log_waypoint/stop_actual_logging/save, in that order).
 
 Output files (logs/ directory, next to this file):
-    <condition>_fan<XX>_run<NN>_<ts>_commanded.csv  — one row per go_to call
-    <condition>_fan<XX>_run<NN>_<ts>_actual.csv     — 10 Hz sampled Lighthouse position
-    (crashed trials get _CRASH, trials with any unsafe sample get _VIOLATION,
-    both inserted between the run tag and timestamp, in that order)
+    <condition>[_<scenario>]_fan<XX>_run<NN>_<ts>_commanded.csv  — one row per go_to call
+    <condition>[_<scenario>]_fan<XX>_run<NN>_<ts>_actual.csv     — 10 Hz sampled Lighthouse position
+    (the `_<scenario>` segment is omitted entirely for scenario='baseline',
+    exactly matching today's filenames -- 'gate'/'figure8' get it inserted
+    between condition and fan, same convention as components/config.py's
+    _waypoints_path; crashed trials get _CRASH, trials with any unsafe sample
+    get _VIOLATION, both inserted between the run tag and timestamp, in that
+    order)
 
 A trial whose actual position never moves more than START_TOLERANCE from its
 own first sample (e.g. a calibration abort that fires before any real flight)
 isn't saved at all — see save()'s early return.
 
 Columns (both files):
-    condition, t, x, y, z, outside_obs1, outside_obs2, outside_obs3, safe
+    condition, scenario, t, x, y, z, outside_obs1, outside_obs2, outside_obs3, safe
+
+Collision classification checks x, y AND z simultaneously against each
+obstacle's full 3D box (obstacles default to components.config.OBSTACLES,
+which already carries a canonical z-extent for every obstacle) -- a drone
+flying above or below an obstacle's z-range is correctly logged as safe even
+if its x,y falls inside the footprint.
 """
 
 from __future__ import annotations
@@ -44,10 +54,14 @@ CONDITIONS = (
     'pdstl',
 )
 
-# ── Obstacles (x_min, x_max, y_min, y_max), sourced from the single arena
-#    geometry config in config.yml — nothing hardcoded here ──────────────────
-_OBSTACLES: list[tuple[float, float, float, float]] = [
-    (obs['x'][0], obs['x'][1], obs['y'][0], obs['y'][1]) for obs in _ENV_OBSTACLES
+# ── Obstacles (x_min, x_max, y_min, y_max, z_min, z_max), sourced from the
+#    arena geometry config in config.yml — nothing hardcoded here. Every
+#    obstacle in components.config.OBSTACLES already carries a canonical
+#    'z' extent (floor-mounted or explicit), so no new parsing is needed
+#    here to make collision checks 3D-aware. ─────────────────────────────
+_OBSTACLES: list[tuple[float, float, float, float, float, float]] = [
+    (obs['x'][0], obs['x'][1], obs['y'][0], obs['y'][1], obs['z'][0], obs['z'][1])
+    for obs in _ENV_OBSTACLES
 ]
 
 # ── Log directory (shared with analyze_logs.py) ─────────────────────────────
@@ -60,17 +74,24 @@ _SAMPLE_HZ = 10
 _RUN_RE = re.compile(r'_run(\d+)_')
 
 
-def _inside(x: float, y: float, obs: tuple[float, float, float, float]) -> bool:
-    """Return True if point (x, y) is inside rectangular obstacle."""
-    x0, x1, y0, y1 = obs
-    return x0 <= x <= x1 and y0 <= y <= y1
+def _inside(x: float, y: float, z: float, obs: tuple[float, float, float, float, float, float]) -> bool:
+    """Return True if point (x, y, z) is inside the rectangular obstacle box.
+
+    Checking all three axes (not just x, y) means a drone flying above or
+    below an obstacle's z-range is correctly classified as safe, even with
+    its x, y inside the footprint -- x,y-only would incorrectly flag that as
+    unsafe for any 3D scenario that varies altitude.
+    """
+    x0, x1, y0, y1, z0, z1 = obs
+    return x0 <= x <= x1 and y0 <= y <= y1 and z0 <= z <= z1
 
 
-def _safety_row(condition: str, t: float, x: float, y: float, z: float,
-                obstacles: list[tuple[float, float, float, float]]) -> dict:
-    outside = [not _inside(x, y, obs) for obs in obstacles]
+def _safety_row(condition: str, scenario: str, t: float, x: float, y: float, z: float,
+                obstacles: list[tuple[float, float, float, float, float, float]]) -> dict:
+    outside = [not _inside(x, y, z, obs) for obs in obstacles]
     row: dict = {
         'condition': condition,
+        'scenario': scenario,
         't': t,
         'x': round(x, 6),
         'y': round(y, 6),
@@ -80,6 +101,18 @@ def _safety_row(condition: str, t: float, x: float, y: float, z: float,
         row[f'outside_obs{i}'] = int(out)
     row['safe'] = int(all(outside))
     return row
+
+
+def _log_prefix(condition: str, scenario: str, fan_speed: int) -> str:
+    """Filename prefix shared by save()'s stem and _next_run_number()'s glob.
+
+    Mirrors components.config._waypoints_path's suffix convention exactly:
+    scenario='baseline' adds nothing (today's filenames, unchanged),
+    'gate'/'figure8' insert a '_<scenario>' segment before 'fan', so their
+    run-numbering is scoped independently of baseline at the same fan level.
+    """
+    suffix = '' if scenario == 'baseline' else f'_{scenario}'
+    return f'{condition}{suffix}_fan{fan_speed:02d}_run'
 
 
 @dataclass
@@ -99,7 +132,8 @@ class FlightLogger:
 
     condition: str
     fan_speed: int = 0
-    obstacles: list[tuple[float, float, float, float]] = field(
+    scenario: str = 'baseline'
+    obstacles: list[tuple[float, float, float, float, float, float]] = field(
         default_factory=lambda: list(_OBSTACLES)
     )
 
@@ -142,7 +176,7 @@ class FlightLogger:
                 x, y, z = get_pos()
                 t = round(tick - self._t0, 4)
                 self._actual.append(
-                    _safety_row(self.condition, t, x, y, z, self.obstacles)
+                    _safety_row(self.condition, self.scenario, t, x, y, z, self.obstacles)
                 )
                 elapsed = time.monotonic() - tick
                 remaining = interval - elapsed
@@ -163,7 +197,7 @@ class FlightLogger:
         """Log one commanded waypoint with elapsed time and safety flags."""
         t = round(time.monotonic() - self._t0, 4)
         self._commanded.append(
-            _safety_row(self.condition, t, x, y, z, self.obstacles)
+            _safety_row(self.condition, self.scenario, t, x, y, z, self.obstacles)
         )
 
     def mark_crashed(self) -> None:
@@ -190,7 +224,7 @@ class FlightLogger:
     def _next_run_number(self) -> int:
         """Scan logs dir and return the next available run number for this cell."""
         _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        prefix = f'{self.condition}_fan{self.fan_speed:02d}_run'
+        prefix = _log_prefix(self.condition, self.scenario, self.fan_speed)
         existing = list(_LOGS_DIR.glob(f'{prefix}*_actual.csv'))
         run_nums = [
             int(m.group(1))
@@ -218,19 +252,19 @@ class FlightLogger:
         ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')
         run_num = self._next_run_number()
 
-        fan_tag = f'fan{self.fan_speed:02d}'
-        run_tag = f'run{run_num:02d}'
         crash_tag = '_CRASH' if self._crashed else ''
         violated = any(not r['safe'] for r in self._actual)
         violation_tag = '_VIOLATION' if violated else ''
-        stem = f'{self.condition}_{fan_tag}_{run_tag}{crash_tag}{violation_tag}_{ts}'
+        prefix = _log_prefix(self.condition, self.scenario, self.fan_speed)
+        stem = f'{prefix}{run_num:02d}{crash_tag}{violation_tag}_{ts}'
         cmd_path = _LOGS_DIR / f'{stem}_commanded.csv'
         act_path = _LOGS_DIR / f'{stem}_actual.csv'
 
         self._write_csv(cmd_path, self._commanded, label='commanded')
         self._write_csv(act_path, self._actual, label='actual')
 
-        print(f'[FlightLogger] Run {run_num:02d} | condition={self.condition} | fan={self.fan_speed}')
+        print(f'[FlightLogger] Run {run_num:02d} | condition={self.condition} | '
+              f'scenario={self.scenario} | fan={self.fan_speed}')
         if self._crashed:
             print('[FlightLogger] *** CRASH flagged — partial data saved ***')
         if violated:

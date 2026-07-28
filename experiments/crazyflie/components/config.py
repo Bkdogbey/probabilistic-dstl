@@ -14,6 +14,7 @@ import VALID_FANS` never pull in torch.
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import sys
 
@@ -29,6 +30,7 @@ import yaml
 EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 VALID_FANS: tuple[int, ...] = (2, 6, 12, 16)
+VALID_SCENARIOS: tuple[str, ...] = ('baseline', 'gate', 'figure8')
 
 
 def _t2(v) -> tuple[float, float]:
@@ -310,6 +312,30 @@ def pdstl_plan_meta(fan_speed: int, scenario: str = 'baseline') -> dict:
     return json.loads(path.read_text(encoding='utf-8'))
 
 
+def validate_waypoint_velocities(
+    waypoints: list[tuple[float, float, float]], *,
+    start: tuple[float, float, float], dt: float = DT, u_max: float = U_MAX,
+    label: str = 'Leg',
+) -> None:
+    """Raise ValueError if any inter-waypoint leg's implied velocity
+    (segment distance / dt) exceeds u_max -- called before takeoff so a bad
+    plan/nominal path is caught on the ground, not mid-flight. Shared by all
+    three scenarios' pre-flight checks in components/crazyflie.py.
+    """
+    pts = [start, *waypoints]
+    bad = []
+    for i in range(len(pts) - 1):
+        d = math.dist(pts[i], pts[i + 1])
+        v = d / dt
+        if v > u_max + 1e-9:
+            bad.append((i, v))
+    if bad:
+        details = ', '.join(f'#{i}->#{i + 1}={v:.3f} m/s' for i, v in bad)
+        raise ValueError(
+            f'{label}(s) exceed u_max={u_max} m/s given dt={dt}s: {details}'
+        )
+
+
 def load_pdstl_waypoints(fan_speed: int, scenario: str = 'baseline') -> list[tuple[float, float, float]]:
     """Load the optimised waypoints for one fan level/scenario, checking fan/scenario match.
 
@@ -329,3 +355,51 @@ def load_pdstl_waypoints(fan_speed: int, scenario: str = 'baseline') -> list[tup
             f'Waypoints file was generated for fan {data.get("fan")}, not {fan_speed}.'
         )
     return [tuple(wp) for wp in data['waypoints']]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 9. Figure8 scenario geometry (3D-only; construction logic lives entirely in
+#    planning_3d.py's figure8 section, which imports these names)
+# ═════════════════════════════════════════════════════════════════════════════
+_fig8 = _cfg['figure8']
+FIG8_X_BOUNDS: list[float] = list(_fig8['workspace']['x'])
+FIG8_Y_BOUNDS: list[float] = list(_fig8['workspace']['y'])
+FIG8_Z_BOUNDS: list[float] = list(_fig8['workspace']['z'])
+
+_fig8_path = _fig8['path']
+FIG8_CENTER_X: float = float(_fig8_path['center_x'])
+FIG8_CENTER_Y: float = float(_fig8_path['center_y'])
+FIG8_HALF_WIDTH: float = float(_fig8_path['half_width'])
+FIG8_Z_BASE: float = float(_fig8_path['z_base'])
+FIG8_Z_AMPLITUDE: float = float(_fig8_path['z_amplitude'])
+
+_fig8_mid = _fig8['midpoint_altitude']
+FIG8_MIDPOINT_Z: tuple[float, float] = _t2(_fig8_mid['z'])
+FIG8_MIDPOINT_T_START: int = int(_fig8_mid['t_start'])
+FIG8_MIDPOINT_T_END: int = int(_fig8_mid['t_end'])
+
+FIG8_RETURN_TOLERANCE: float = float(_fig8['return_tolerance'])
+
+FIG8_T: int = int(_fig8['T'])
+FIG8_FLIGHT_POINTS: int = int(_fig8['flight_points'])
+FIG8_PLOT_POINTS: int = int(_fig8['plot_points'])
+FIG8_NOMINAL_MIN_CLEARANCE: float = float(_fig8['nominal_min_clearance'])
+
+_fig8_planner_extra = _fig8['planner_extra']
+FIG8_W_REF_XY: float = float(_fig8_planner_extra['w_ref_xy'])
+FIG8_W_REF_Z: float = float(_fig8_planner_extra['w_ref_z'])
+FIG8_W_TERMINAL: float = float(_fig8_planner_extra['w_terminal'])
+
+FIG8_OBSTACLES: list[dict] = []
+for _o in _fig8['obstacles']:
+    _xr, _yr = _t2(_o['x']), _t2(_o['y'])
+    if _xr[0] >= _xr[1] or _yr[0] >= _yr[1]:
+        raise ValueError(
+            f"figure8 obstacle {_o['name']!r} needs ascending x/y ranges; "
+            f"got x={_xr}, y={_yr}."
+        )
+    FIG8_OBSTACLES.append({
+        'name': _o['name'], 'x': _xr, 'y': _yr,
+        'z': _obstacle_z_range(_o),
+        **({'height': float(_o['height'])} if 'height' in _o else {}),
+    })

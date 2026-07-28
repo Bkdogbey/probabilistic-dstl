@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 
 from attrs import define, field
@@ -8,23 +9,10 @@ from ros_sugar.config import BaseComponentConfig
 from ros_sugar.core import BaseComponent
 
 from components import calibration
-from components.config import (
-    CALIBRATION_HOVER_SECONDS,
-    DRONE_URI,
-    FLIGHT_VELOCITY,
-    LAND_Z,
-    POST_GATE_Z,
-    RETURN_Z,
-    SAFE_PATH_FLIGHT_POINTS,
-    START_TOLERANCE,
-    START_XY,
-    TAKEOFF_Z,
-    load_pdstl_waypoints,
-    validate_waypoints_in_bounds,
-)
+from components.config import CALIBRATION_HOVER_SECONDS, DRONE_URI, DT, FIG8_FLIGHT_POINTS, FLIGHT_VELOCITY, LAND_Z, POST_GATE_Z, RETURN_Z, SAFE_PATH_FLIGHT_POINTS, START_TOLERANCE, START_XY, TAKEOFF_Z, U_MAX, load_pdstl_waypoints, validate_waypoint_velocities, validate_waypoints_in_bounds
 from components.flight_logger import FlightLogger
 from components.planning_2d import nominal_safe_waypoints
-from components.planning_3d import nominal_gate_waypoints
+from components.planning_3d import nominal_figure8_waypoints, nominal_gate_waypoints
 from irobot.src.robots.crazyflie.config import CrazyflieConfig as CrazyflieHwConfig
 from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 
@@ -32,6 +20,18 @@ from irobot.src.robots.crazyflie.core.base import CrazyflieBase
 def _default_hw_config() -> CrazyflieHwConfig:
     """CrazyflieHwConfig seeded from config.py's DRONE_URI, if set."""
     return CrazyflieHwConfig(uri=DRONE_URI) if DRONE_URI else CrazyflieHwConfig()
+
+
+def _mission_start_xyz(scenario: str) -> tuple[float, float, float]:
+    """The point the drone hovers at during calibration, logs as its first
+    waypoint, and returns to before landing.
+
+    figure8's nominal start (0.50, -2.00, 0.25) is not the shared arena's
+    START_XY/TAKEOFF_Z -- baseline/gate get the same value they use today.
+    """
+    if scenario == 'figure8':
+        return nominal_figure8_waypoints(n_points=2)[0]
+    return (*START_XY, TAKEOFF_Z)
 
 
 @define(kw_only=True)
@@ -48,7 +48,7 @@ class CrazyflieConfig(BaseComponentConfig):
     z_hold: float = POST_GATE_Z  # shared with the gate scenario's post-gate descent altitude
     condition: str = 'pdstl'  # 'pdstl' or 'deterministic'
     fan_speed: int = 12  # 2, 6, 12, or 16
-    scenario: str = 'baseline'  # 'baseline' or 'gate'
+    scenario: str = 'baseline'  # 'baseline', 'gate', or 'figure8'
     hw_config: CrazyflieHwConfig = field(factory=_default_hw_config)
 
 
@@ -71,7 +71,7 @@ class CrazyfliePlanning(BaseComponent):
         return self.crazyflie.current_x, self.crazyflie.current_y
 
     def _calibrate_and_offset(
-        self, waypoints: list[tuple[float, float, float]]
+        self, waypoints: list[tuple[float, float, float]], start_xyz: tuple[float, float, float],
     ) -> list[tuple[float, float, float]]:
         """Hover at the assumed start, measure the real offset, and shift the plan to match.
 
@@ -79,37 +79,50 @@ class CrazyfliePlanning(BaseComponent):
         (tracking drift, imprecise placement). Aborts (raises) if the offset is
         too large to trust rather than silently flying a bad plan.
         """
-        self.position_commander.go_to(*START_XY, TAKEOFF_Z)
+        start_xy = start_xyz[:2]
+        self.position_commander.go_to(*start_xyz)
         measured = calibration.hover_and_measure(self._measured_xy, duration_s=CALIBRATION_HOVER_SECONDS)
-        offset = calibration.compute_offset(measured, START_XY)
-        print(f'[Calibration] measured={measured} assumed={START_XY} offset={offset}')
+        offset = calibration.compute_offset(measured, start_xy)
+        print(f'[Calibration] measured={measured} assumed={start_xy} offset={offset}')
         calibration.check_offset_or_abort(offset, START_TOLERANCE)
         return calibration.shift_waypoints(waypoints, offset)
 
     def _fly_forward_mission(
         self, logger, waypoints: list[tuple[float, float, float]],
+        start_xyz: tuple[float, float, float],
     ) -> tuple[float, float, float]:
-        waypoints = self._calibrate_and_offset(waypoints)
-        logger.log_waypoint(*START_XY, TAKEOFF_Z)
+        waypoints = self._calibrate_and_offset(waypoints, start_xyz)
+        logger.log_waypoint(*start_xyz)
 
+        prev = start_xyz
         for x, y, z in waypoints:
-            self.position_commander.go_to(x, y, z)
+            velocity = math.dist(prev, (x, y, z)) / DT
+            assert velocity <= U_MAX + 1e-6, (
+                f'Leg {prev}->{(x, y, z)} requires {velocity:.3f} m/s > U_MAX={U_MAX} m/s.'
+            )
+            self.position_commander.go_to(x, y, z, velocity=velocity)
             logger.log_waypoint(x, y, z)
+            prev = (x, y, z)
 
         return waypoints[-1]
 
-    def _return_to_start(self, last_xyz: tuple[float, float, float]) -> None:
+    def _return_to_start(
+        self, last_xyz: tuple[float, float, float], start_xyz: tuple[float, float, float],
+    ) -> None:
         """Fly back to the start and land — not part of the recorded trial.
 
         Run after the trial's data is already saved, so back-to-back runs don't
         need a manual reset and the return leg doesn't pollute the logged mission.
+        Uses the commander's constant default_velocity (not per-leg timing) --
+        this leg is untimed and not part of the recorded mission.
         """
         x, y, _z = last_xyz
+        start_x, start_y, _start_z = start_xyz
         self.position_commander.go_to(x, y, RETURN_Z)
         time.sleep(1.0)
-        self.position_commander.go_to(*START_XY, RETURN_Z)
+        self.position_commander.go_to(start_x, start_y, RETURN_Z)
         time.sleep(1.0)
-        self.position_commander.go_to(*START_XY, LAND_Z)
+        self.position_commander.go_to(start_x, start_y, LAND_Z)
         time.sleep(1.0)
         self.position_commander._hl_commander.stop()
         time.sleep(1.0)
@@ -119,8 +132,9 @@ class CrazyfliePlanning(BaseComponent):
         fan_speed = self.config.fan_speed
         scenario = self.config.scenario
         use_optimised = condition == 'pdstl'
+        start_xyz = _mission_start_xyz(scenario)
 
-        logger = FlightLogger(condition, fan_speed=fan_speed)
+        logger = FlightLogger(condition, fan_speed=fan_speed, scenario=scenario)
         logger.start()
         logger.start_actual_logging(
             lambda: (self.crazyflie.current_x, self.crazyflie.current_y, self.crazyflie.current_z)
@@ -130,13 +144,16 @@ class CrazyfliePlanning(BaseComponent):
             waypoints = load_pdstl_waypoints(fan_speed, scenario=scenario)
         elif scenario == 'gate':
             waypoints = nominal_gate_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
+        elif scenario == 'figure8':
+            waypoints = nominal_figure8_waypoints(n_points=FIG8_FLIGHT_POINTS)
         else:
             waypoints = nominal_safe_waypoints(n_points=SAFE_PATH_FLIGHT_POINTS)
         validate_waypoints_in_bounds(waypoints)
-        validate_waypoints_in_bounds([(*START_XY, RETURN_Z), (*START_XY, LAND_Z)])
+        validate_waypoints_in_bounds([(*start_xyz[:2], RETURN_Z), (*start_xyz[:2], LAND_Z)])
+        validate_waypoint_velocities(waypoints, start=start_xyz)
 
         try:
-            last_xyz = self._fly_forward_mission(logger, waypoints)
+            last_xyz = self._fly_forward_mission(logger, waypoints, start_xyz)
         except Exception:
             logger.mark_crashed()
             logger.stop_actual_logging()
@@ -150,7 +167,7 @@ class CrazyfliePlanning(BaseComponent):
         logger.save()
 
         try:
-            self._return_to_start(last_xyz)
+            self._return_to_start(last_xyz, start_xyz)
         finally:
             self.position_commander.land()
 

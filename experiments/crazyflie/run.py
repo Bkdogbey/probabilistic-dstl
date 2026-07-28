@@ -45,16 +45,18 @@ from components.config import (
     TRIAL_FAN,
     TRIAL_SCENARIO,
     VALID_FANS,
+    VALID_SCENARIOS,
     pdstl_plan_meta,
 )
 
 
 def _add_scenario_arg(parser: argparse.ArgumentParser) -> None:
-    """--scenario is identical on `plan` and `fly`; defined once here."""
-    parser.add_argument('--scenario', choices=['baseline', 'gate'], default=TRIAL_SCENARIO,
+    """--scenario is identical on `plan`, `fly` and `analyze`; defined once here."""
+    parser.add_argument('--scenario', choices=list(VALID_SCENARIOS), default=TRIAL_SCENARIO,
                         help=f"'baseline' = 2D single-phase reach-avoid; 'gate' = 3D climb "
-                             f"through a gate, descend to 0.3m, avoid, land (default: "
-                             f"config.yml's trial.scenario = {TRIAL_SCENARIO!r})")
+                             f"through a gate, descend to 0.3m, avoid, land; 'figure8' = 3D "
+                             f"closed-loop figure-eight with an oscillating altitude profile "
+                             f"(default: config.yml's trial.scenario = {TRIAL_SCENARIO!r})")
 
 
 def _check_pdstl_converged(fan: int, scenario: str) -> None:
@@ -94,6 +96,7 @@ def _analyze(args: argparse.Namespace) -> None:
 
     run_analyze(
         condition=args.condition, fan=args.fan, run=args.run, all_=args.all, summary=args.summary,
+        scenario=args.scenario,
     )
 
 
@@ -162,6 +165,7 @@ def main() -> None:
     p_analyze.add_argument('--summary', action='store_true',
                            help='Print a cross-run table + per-condition/fan rollup (crash rate, '
                                 'mean unsafe fraction, mean duration) instead of plotting')
+    _add_scenario_arg(p_analyze)
     p_analyze.set_defaults(func=_analyze)
 
     args = parser.parse_args()

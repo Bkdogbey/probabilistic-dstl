@@ -199,3 +199,73 @@ gate:
   t_start: 2
   t_end: 6
   t_descend_start: 7
+
+# ═══════════════════════════════════════════════════════════════════════
+# 8. Figure8 scenario geometry (3D-only; construction logic lives entirely in
+#    planning_3d.py's figure8 section -- this section is just the authored
+#    input values). Independent of arena.* -- figure8 uses its own narrower
+#    workspace and its own obstacle set, not arena.flight_*_bounds /
+#    arena.obstacles.
+# ═══════════════════════════════════════════════════════════════════════
+figure8:
+  workspace:
+    x: [-0.5, 1.0]
+    y: [-2.0, 0.5]
+    z: [0.20, 0.70]
+
+  # Analytical Gerono figure-eight parameters (see planning_3d.py's
+  # nominal_figure8_waypoints). x,y form the loop; z is an independent
+  # altitude profile: z(s) = z_base + z_amplitude * sin(2*pi*q(s))^2, giving
+  # z=0.25 at s=0, 0.5, 1 and two humps peaking at z=0.65.
+  path:
+    center_x: 0.50
+    center_y: -1.00
+    half_width: 0.28
+    z_base: 0.25
+    z_amplitude: 0.40
+
+  # Tightened altitude band enforced only around the temporal midpoint
+  # (Always, not a visit region) -- workspace-wide in x/y.
+  midpoint_altitude:
+    z: [0.20, 0.30]
+    t_start: 24
+    t_end: 26
+
+  # Soft terminal-return penalty tolerance (reporting only, not a hard
+  # STL constraint or optimizer guarantee).
+  return_tolerance: 0.08
+
+  T: 50
+  flight_points: 51
+  plot_points: 1000
+  nominal_min_clearance: 0.10
+
+  # Reference-tracking objective weights (Planner3D._compute_loss). Kept
+  # separate from planner.config since gate/baseline must never see these
+  # keys. Moderate initial values -- not tuned to force rho_after >= alpha.
+  planner_extra:
+    w_ref_xy: 5.0
+    w_ref_z: 5.0
+    w_terminal: 5.0
+
+  obstacles:
+    - name: obs_1
+      x: [0.74, 1.00]
+      y: [-1.117, -0.87]
+      height: 0.41
+    - name: obs_2
+      x: [0.47, 0.65]
+      y: [-0.37, -0.21]
+      height: 0.51
+    - name: obs_3
+      x: [0.00, 0.21]
+      y: [-0.92, -0.64]
+      height: 0.41
+    - name: obs_4
+      x: [0.37, 0.60]
+      y: [-1.74, -1.55]
+      height: 0.31
+    - name: obs_5
+      x: [0.44, 0.64]
+      y: [-1.17, -0.84]
+      height: 0.165
