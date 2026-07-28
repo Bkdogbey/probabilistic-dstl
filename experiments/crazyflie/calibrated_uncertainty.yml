@@ -1,0 +1,37 @@
+generated: '2026-07-28T17:36:48+00:00'
+scenario: figure8
+condition: deterministic
+model: Sigma_k = sigma0 + k * q_var (isotropic per-fan fit)
+fans:
+  2:
+    n_runs: 0
+    sigma0_fit: null
+    q_var_fit: null
+    q_std_fit: null
+    r_squared: null
+    residual_rms: null
+    fit_quality: NO DATA
+  6:
+    n_runs: 0
+    sigma0_fit: null
+    q_var_fit: null
+    q_std_fit: null
+    r_squared: null
+    residual_rms: null
+    fit_quality: NO DATA
+  12:
+    n_runs: 0
+    sigma0_fit: null
+    q_var_fit: null
+    q_std_fit: null
+    r_squared: null
+    residual_rms: null
+    fit_quality: NO DATA
+  16:
+    n_runs: 0
+    sigma0_fit: null
+    q_var_fit: null
+    q_std_fit: null
+    r_squared: null
+    residual_rms: null
+    fit_quality: NO DATA

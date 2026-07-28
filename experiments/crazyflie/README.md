@@ -22,6 +22,11 @@ config.yml              all input values: arena geometry, per-fan uncertainty,
 run.py                 entry point: plan (offline) | fly (hardware) | analyze (offline)
 waypoint_planning.py   shared CLI runner + plotting; dispatches to planning_2d/planning_3d
 analyze_logs.py        post-flight: plot a logged run against its planned path
+estimate_tracking_covariance.py
+                        offline: fits Sigma_k = Sigma0 + k*Q per fan level from
+                        repeated figure8 deterministic flights; writes
+                        calibrated_uncertainty.yml -- see
+                        [Tracking-covariance calibration](#tracking-covariance-calibration)
 components/
     config.py          thin config.yml loader + shared helpers (spline math,
                         waypoint validation/I/O) — edit config.yml, not this
@@ -224,6 +229,46 @@ anywhere except the waypoints JSON files themselves; run `python run.py plan
 generally fall short of `alpha=0.90`. `run.py fly --condition pdstl --fan L`
 refuses to fly a plan with `rho_after<=0`; `--condition deterministic` is
 unaffected at every fan level.
+
+## Tracking-covariance calibration
+
+The per-fan uncertainty above (`SIGMA0_PER_FAN`/`Q_STD`) is a placeholder:
+one scalar per fan level, applied identically to every waypoint.
+`estimate_tracking_covariance.py` checks whether that placeholder's
+functional form — `Sigma_k = Sigma0 + k·Q` (an initial variance plus a
+constant per-step increment) — actually matches real tracking error, using
+the existing `figure8` scenario's deterministic flight and logging, unchanged:
+
+```bash
+# Repeat several times per fan level (10+ recommended), no new flags:
+python run.py fly --scenario figure8 --condition deterministic --fan 2
+python run.py fly --scenario figure8 --condition deterministic --fan 6
+python run.py fly --scenario figure8 --condition deterministic --fan 12
+python run.py fly --scenario figure8 --condition deterministic --fan 16
+
+# Then, offline (no hardware):
+python estimate_tracking_covariance.py            # all four fan levels
+python estimate_tracking_covariance.py --fans 2 6  # or a subset
+```
+
+It reads the existing `components/logs/deterministic_figure8_fan<L>_run*_{commanded,actual}.csv`
+files (nothing about logging changes), aligns each run's commanded waypoints
+with the continuous actual-position trace (linear interpolation at each
+waypoint's arrival time), computes the empirical tracking-error mean and
+covariance **across runs** at each waypoint (not across the 10 Hz samples
+within one run — the independent samples are the repeated flights), and fits
+`Sigma0`/`Q` per fan level by least squares against that empirical
+covariance. Writes `calibrated_uncertainty.yml` (fan → fitted `sigma0`,
+`q_std`, and fit-quality metrics `r_squared`/`residual_rms`) and prints the
+same per-fan report plus a `GOOD FIT`/`POOR FIT` verdict.
+
+A poor fit (low `r_squared`, or a negative fitted parameter) is a stopping
+point, not something to work around — it means the real tracking error
+doesn't grow the way the current scalar model assumes, and the next step
+would be deciding whether the planner needs a real per-waypoint covariance
+schedule instead, not silently forcing this fit to look acceptable. This
+script does not wire `calibrated_uncertainty.yml` into planning itself; it
+only produces the calibration data for that future decision.
 
 ## Scenarios
 
