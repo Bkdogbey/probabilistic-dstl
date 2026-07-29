@@ -1,52 +1,20 @@
-"""Post-flight analysis for the Crazyflie experiment.
-
-Reads the commanded/actual CSVs written by components/flight_logger.py and
-plots the actual flown path against the planned one (pdSTL-optimised or
-nominal safe path), so a flight can be visually compared to the offline plan
-it was supposed to fly.
-
-Called by `run.py analyze`; has no hardware/ROS dependency (only torch/numpy,
-via components.planning_2d/planning_3d, plus matplotlib) -- same weight class
-as `plan`. `--scenario baseline` (the default) keeps the original flat 2D
-arena plot unchanged; `--scenario gate`/`figure8` draw the matching 3D
-environment (components.planning_3d's build_environment_3d/
-build_environment_figure8) instead of drawing 3D data against the 2D baseline
-arena.
-"""
+"""Post-flight plotting and cross-run summaries."""
 
 from __future__ import annotations
 
-import argparse
 import csv
 import pathlib
-import re
 
 import numpy as np
 
-from components.config import (
+from .utils import (
     EXPERIMENT_DIR,
-    LOGS_DIR,
     VALID_FANS,
-    VALID_SCENARIOS,
-    load_pdstl_waypoints,
-    pdstl_plan_meta,
+    PlanRepository,
+    logs_directory,
 )
-from components.flight_logger import CONDITIONS, _log_prefix
-from components.planning_2d import build_environment_2d, nominal_safe_waypoints
-from components.planning_3d import (
-    build_environment_3d,
-    build_environment_figure8,
-    nominal_figure8_waypoints,
-    nominal_gate_waypoints,
-)
-
-_LOGS_DIR = LOGS_DIR
-_RUN_RE = re.compile(r'_run(\d+)_')
-_SCENARIO_ALT = '|'.join(s for s in VALID_SCENARIOS if s != 'baseline')  # 'gate|figure8'
-_LOG_NAME_RE = re.compile(
-    rf'^(?P<condition>{"|".join(CONDITIONS)})(?:_(?P<scenario>{_SCENARIO_ALT}))?'
-    rf'_fan(?P<fan>\d+)_run(?P<run>\d+)(?P<crash>_CRASH)?(?:_VIOLATION)?_'
-)
+from .flight_logger import CONDITIONS, FlightLogRepository
+from .planner import build_environment_baseline, get_scenario
 
 
 def _find_run(
@@ -56,23 +24,10 @@ def _find_run(
 
     run=None picks the highest-numbered run for that cell (the latest trial).
     """
-    prefix = _log_prefix(condition, scenario, fan)
-    tagged = [
-        (int(m.group(1)), path)
-        for path in _LOGS_DIR.glob(f'{prefix}*_actual.csv')
-        if (m := _RUN_RE.search(path.name))
-    ]
-    if run is not None:
-        tagged = [(n, p) for n, p in tagged if n == run]
-    if not tagged:
-        raise FileNotFoundError(
-            f'No logs for condition={condition} scenario={scenario} fan={fan}'
-            + (f' run={run}' if run is not None else '') + f' in {_LOGS_DIR}'
-        )
-    run_num, actual_path = max(tagged, key=lambda t: t[0])
-    crashed = '_CRASH' in actual_path.name
-    commanded_path = pathlib.Path(str(actual_path).replace('_actual.csv', '_commanded.csv'))
-    return actual_path, (commanded_path if commanded_path.exists() else None), run_num, crashed
+    actual_path, commanded_path, identity = FlightLogRepository(logs_directory(scenario)).find(
+        condition, scenario, fan, run,
+    )
+    return actual_path, commanded_path, identity.run, identity.crashed
 
 
 def _read_csv(path: pathlib.Path) -> list[dict]:
@@ -91,17 +46,12 @@ def _summarize(rows: list[dict]) -> dict:
 
 
 def _planned_path(condition: str, fan: int, scenario: str = 'baseline') -> np.ndarray:
-    """Planned path as an [N, 3] array. Baseline/gate/figure8 all load through
-    the same load_pdstl_waypoints/nominal_* functions, scenario-dispatched."""
-    if scenario == 'gate':
-        wps = load_pdstl_waypoints(fan, scenario='gate') if condition == 'pdstl' else nominal_gate_waypoints()
-    elif scenario == 'figure8':
-        wps = (
-            load_pdstl_waypoints(fan, scenario='figure8') if condition == 'pdstl'
-            else nominal_figure8_waypoints()
-        )
-    else:
-        wps = load_pdstl_waypoints(fan) if condition == 'pdstl' else nominal_safe_waypoints()
+    scenario_model = get_scenario(scenario)
+    wps = (
+        PlanRepository().load(fan, scenario).waypoints
+        if condition == 'pdstl'
+        else scenario_model.nominal_waypoints(scenario_model.flight_points)
+    )
     return np.array(wps)
 
 
@@ -111,7 +61,7 @@ def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Pa
     Unchanged from before --scenario existed -- always the flat 2D baseline
     arena, only ever called for scenario='baseline'.
     """
-    from waypoint_planning import _draw_env_2d  # same flat arena drawing as baseline `plan`
+    from .utils import draw_environment_2d
 
     import matplotlib.pyplot as plt
 
@@ -124,7 +74,7 @@ def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Pa
     planned_xy = _planned_path(condition, fan)[:, :2]
 
     fig, ax = plt.subplots(figsize=_figsize("single", aspect=1.0))
-    _draw_env_2d(ax, build_environment_2d())
+    draw_environment_2d(ax, build_environment_baseline())
 
     title = f'{condition} fan {fan}  —  run {run_num:02d}'
     if crashed:
@@ -173,15 +123,16 @@ def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Pa
 
 
 def _plot_run_3d(condition: str, fan: int, run: int | None, scenario: str) -> pathlib.Path:
-    """Plot one logged gate/figure8 run in 3D against its own planned path and
+    """Plot one logged figure-eight run in 3D against its planned path and
     environment (not the 2D baseline arena)."""
-    from waypoint_planning import _draw_env  # scenario-general 3D env drawing
+    from .utils import draw_environment_3d
 
+    import numpy as np
     import matplotlib.pyplot as plt
 
     from visualization.style import PALETTE, save_figure
 
-    env = build_environment_3d() if scenario == 'gate' else build_environment_figure8()
+    env = get_scenario(scenario).build_environment()
 
     actual_path, commanded_path, run_num, crashed = _find_run(condition, fan, run, scenario=scenario)
     actual_rows = _read_csv(actual_path)
@@ -189,9 +140,13 @@ def _plot_run_3d(condition: str, fan: int, run: int | None, scenario: str) -> pa
     summary = _summarize(actual_rows)
     planned_xyz = _planned_path(condition, fan, scenario=scenario)
 
+    actual_xyz = np.array([[float(r['x']), float(r['y']), float(r['z'])] for r in actual_rows])
+    fit_points = np.vstack([planned_xyz, actual_xyz])
+
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(1, 1, 1, projection='3d')
-    _draw_env(ax, env)
+    ax.view_init(elev=22, azim=-50)
+    draw_environment_3d(ax, env, fit_points=fit_points)
 
     title = f'{condition} {scenario} fan {fan}  —  run {run_num:02d}'
     if crashed:
@@ -247,7 +202,7 @@ def plot_run(
     """Plot one logged run against its planned path; returns the saved PNG path.
 
     scenario='baseline' (default) keeps the original flat 2D arena plot,
-    byte-identical to before --scenario existed. 'gate'/'figure8' dispatch to
+    byte-identical to before scenario selection. Figure-eight dispatches to
     a 3D plot against their own environment.
     """
     if scenario == 'baseline':
@@ -274,23 +229,21 @@ def _run_stats(actual_path: pathlib.Path) -> dict:
     convention flight_logger.py writes and _find_run parses); n/duration/
     unsafe come from the actual-position CSV itself.
     """
-    m = _LOG_NAME_RE.match(actual_path.name)
-    if not m:
-        raise ValueError(f'Unrecognised log filename: {actual_path.name}')
-    condition = m.group('condition')
-    scenario = m.group('scenario') or 'baseline'
-    fan = int(m.group('fan'))
+    identity = FlightLogRepository.parse(actual_path)
+    condition = identity.condition
+    scenario = identity.scenario
+    fan = identity.fan
     row = {
         'condition': condition,
         'scenario': scenario,
         'fan': fan,
-        'run': int(m.group('run')),
-        'crashed': m.group('crash') is not None,
+        'run': identity.run,
+        'crashed': identity.crashed,
     }
     row.update(_summarize(_read_csv(actual_path)))
     if condition == 'pdstl':
         try:
-            meta = pdstl_plan_meta(fan, scenario)
+            meta = PlanRepository().load(fan, scenario).metadata
         except FileNotFoundError:
             meta = {}
         row['rho_before'] = meta.get('rho_before')
@@ -308,9 +261,13 @@ def summarize_all() -> list[dict]:
     every run ever logged -- the cross-run view for judging progress across a
     batch of real flights, not just the most recent trial.
     """
-    paths = sorted(_LOGS_DIR.glob('*_actual.csv'))
+    paths = sorted(
+        path
+        for scenario in ('baseline', 'figure8')
+        for path in logs_directory(scenario).glob('*_actual.csv')
+    )
     if not paths:
-        print(f'No logs yet in {_LOGS_DIR}.')
+        print('No Crazyflie logs yet.')
         return []
 
     rows = [_run_stats(p) for p in paths]
@@ -341,38 +298,21 @@ def summarize_all() -> list[dict]:
     return rows
 
 
-def run_analyze(
-    condition: str | None, fan: int | None, run: int | None, all_: bool, summary: bool = False,
-    scenario: str = 'baseline',
-) -> None:
-    if summary:
-        summarize_all()
-        return
-    if all_:
-        plot_all(scenario=scenario)
-        return
-    if condition is None or fan is None:
-        raise SystemExit('--condition and --fan are required unless --all is given')
-    plot_run(condition, fan, run, scenario=scenario)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description='Plot logged Crazyflie flight(s) against their planned path'
-    )
-    parser.add_argument('--condition', choices=CONDITIONS)
-    parser.add_argument('--fan', type=int, choices=VALID_FANS)
-    parser.add_argument('--run', type=int, default=None, help='Run number; defaults to the latest')
-    parser.add_argument('--all', action='store_true',
-                        help='Plot the latest run of every condition/fan pair with logs')
-    parser.add_argument('--summary', action='store_true',
-                        help='Print a cross-run table + per-condition/fan rollup instead of plotting')
-    parser.add_argument('--scenario', choices=list(VALID_SCENARIOS), default='baseline',
-                        help="'baseline' (default) plots the 2D arena; 'gate'/'figure8' plot "
-                             'their own 3D environment')
-    args = parser.parse_args()
-    run_analyze(args.condition, args.fan, args.run, args.all, args.summary, scenario=args.scenario)
-
-
-if __name__ == '__main__':
-    main()
+class AnalysisService:
+    def run(
+        self,
+        *,
+        condition: str,
+        fan: int,
+        scenario: str,
+        mode: str = 'latest',
+        run_number: int | None = None,
+    ) -> None:
+        if mode == 'summary':
+            summarize_all()
+        elif mode == 'all':
+            plot_all(scenario)
+        elif mode == 'latest':
+            plot_run(condition, fan, run_number, scenario)
+        else:
+            raise ValueError(f'Unknown analysis mode {mode!r}.')

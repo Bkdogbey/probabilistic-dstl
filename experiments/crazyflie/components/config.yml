@@ -1,0 +1,110 @@
+# Crazyflie experiment inputs. Distances are metres and times are seconds.
+
+arena:
+  flight_x_bounds: [-0.5, 1.5]
+  flight_y_bounds: [-2.0, 0.5]
+  flight_z_bounds: [0.1, 1.7]
+  z_height: 0.2
+  start_xy: [1.0, -2.0]
+  end_xy: [1.0, 0.0]
+  start_tolerance: 0.08
+  safe_path_flight_points: 30
+  safe_path_via_points:
+    - [0.25, -1.0]
+    - [0.617, -0.58]
+  obstacles:
+    - name: obs_1
+      x: [0.5, 0.8175]
+      y: [-1.38335, -1.11665]
+      height: 0.4064
+    - name: obs_2
+      x: [0.1547, 0.3453]
+      y: [-0.6651, -0.5]
+      height: 0.5143
+    - name: obs_3
+      x: [0.7508, 1.0429]
+      y: [-0.8128, -0.6096]
+      height: 0.4191
+  goal:
+    x: [0.85, 1.15]
+    y: [-0.15, 0.15]
+    z: [0.05, 0.35]
+
+deterministic_path:
+  via_points:
+    - [0.0, -1.0]
+    - [0.5, -0.5]
+
+uncertainty:
+  sigma0_per_fan:
+    2: 0.001
+    6: 0.006
+    12: 0.020
+    16: 0.050
+  q_std: 0.01
+  source_report: null     # Set after reviewing an offline covariance report.
+
+planner:
+  T: 10
+  dt: 0.693
+  u_max: 0.44
+  alpha: 0.90
+  config:
+    w_phi: 20.0
+    w_u: 0.1
+    w_dist: 5.0
+    w_obs: 5.0
+    w_visit: 5.0
+    obs_margin: 0.75
+    w_du: 0.1
+    lr: 0.02
+    max_iters: 1500
+    min_iters: 10
+    converge_patience: 50
+    loss_tol: 1.0e-4
+
+flight:
+  drone_uri: 'radio://0/85/2M/E7E7E7E85'
+  takeoff_velocity: 0.3
+  arming_wait_seconds: 1.0
+  start_settle_seconds: 1.0
+  return_z: 0.65
+  land_z: 0.1
+  estimator:
+    sample_period_ms: 100
+    sample_count: 10
+    spread_limit: 0.08
+    settle_timeout: 12.0
+    reset_wait_seconds: 2.0
+    min_base_stations: 1
+
+figure8:
+  workspace:
+    x: [-0.5, 1.0]
+    y: [-2.0, 0.5]
+    z: [0.20, 0.70]
+  path:
+    center_x: 0.50
+    center_y: -1.00
+    half_width: 0.28
+    z_base: 0.25
+    z_amplitude: 0.40
+  midpoint_altitude:
+    z: [0.25, 0.30]
+    t_start: 24
+    t_end: 26
+  return_tolerance: 0.08
+  T: 50
+  flight_points: 51
+  plot_points: 1000
+  nominal_min_clearance: 0.10
+  planner_extra:
+    w_ref_xy: 5.0
+    w_ref_z: 5.0
+    w_terminal: 5.0
+  obstacles:
+    - {name: obs_1, x: [0.74, 1.00], y: [-1.117, -0.87], height: 0.41}
+    - {name: obs_2, x: [0.47, 0.65], y: [-0.37, -0.21], height: 0.51}
+    - {name: obs_3, x: [0.00, 0.21], y: [-0.92, -0.64], height: 0.41}
+    - {name: obs_4, x: [0.37, 0.60], y: [-1.74, -1.55], height: 0.31}
+    - {name: obs_5, x: [0.44, 0.64], y: [-1.17, -0.84], height: 0.165}

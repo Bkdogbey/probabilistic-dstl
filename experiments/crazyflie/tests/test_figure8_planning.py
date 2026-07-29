@@ -2,27 +2,16 @@
 (no Crazyflie/ROS/radio hardware). Covers: the analytical trajectory's
 endpoints/ranges/finiteness, the T+1-states -> T-controls contract with no
 zero-padding, control-norm/clearance thresholds, the pdSTL environment's
-structure (no visit regions, exactly one time-windowed altitude band),
-Planner3D's reference-tracking extension (inert for gate), saved-plan
-metadata, and scenario dispatch for plan/fly/analyze -- including regression
-coverage that baseline/gate dispatch still works.
+structure, reference tracking, saved-plan metadata, and scenario dispatch.
 """
 
 from __future__ import annotations
-
-import math
-import pathlib
-import sys
-
-_EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_EXPERIMENT_DIR))
 
 import numpy as np
 import pytest
 import torch
 
-from components.config import (
-    DT,
+from experiments.crazyflie.components.utils import (
     FIG8_FLIGHT_POINTS,
     FIG8_NOMINAL_MIN_CLEARANCE,
     FIG8_OBSTACLES,
@@ -34,19 +23,17 @@ from components.config import (
     SIGMA0_PER_FAN,
     U_MAX,
     VALID_SCENARIOS,
-    _waypoints_path,
 )
-from components.planning_3d import (
-    Planner3D,
+from experiments.crazyflie.components.planner import PlanRepository
+from experiments.crazyflie.components.planner import (
     build_environment_figure8,
-    build_planner_3d,
     build_planner_figure8,
     figure8_min_clearances,
     figure8_obstacle_clearance,
     nominal_figure8_waypoints,
     terminal_return_error,
     x0_belief_figure8,
-    _nominal_init_guess_figure8,
+    nominal_initial_controls_figure8,
 )
 
 
@@ -94,12 +81,12 @@ def test_coordinate_ranges_and_finite():
 def test_state_and_control_counts():
     wps = nominal_figure8_waypoints(FIG8_T + 1)
     assert len(wps) == FIG8_T + 1
-    init_u = _nominal_init_guess_figure8()
+    init_u = nominal_initial_controls_figure8()
     assert tuple(init_u.shape) == (FIG8_T, 3)
 
 
 def test_no_zero_padding_on_last_control():
-    init_u = _nominal_init_guess_figure8()
+    init_u = nominal_initial_controls_figure8()
     last_norm = init_u[-1].norm().item()
     # Near-zero (S-curve endpoint velocity) but NOT an artificial exact zero.
     assert last_norm > 0.0
@@ -107,7 +94,7 @@ def test_no_zero_padding_on_last_control():
 
 
 def test_max_control_norm_within_u_max():
-    init_u = _nominal_init_guess_figure8()
+    init_u = nominal_initial_controls_figure8()
     norms = init_u.norm(dim=1)
     assert norms.max().item() <= U_MAX
 
@@ -156,7 +143,7 @@ def test_exactly_one_midpoint_altitude_band():
     band = env.time_windowed_bounds[0]
     assert band['label'] == 'midpoint_altitude'
     assert band['interval'] == [24, 26]
-    assert tuple(band['z']) == (0.20, 0.30)
+    assert tuple(band['z']) == (0.25, 0.30)
 
 
 def test_env_has_no_goal():
@@ -182,16 +169,6 @@ def test_planner_reference_trajectory_attached():
     assert tuple(planner.reference_trajectory.shape) == (FIG8_T + 1, 3)
     for key in ('w_ref_xy', 'w_ref_z', 'w_terminal'):
         assert planner.cfg.get(key, 0.0) > 0.0
-
-
-def test_gate_planner_unaffected_by_reference_extension():
-    """Regression: gate never sets reference_trajectory or w_ref_* weights,
-    so Planner3D._compute_loss must be byte-identical to the parent's for it.
-    """
-    planner, _dyn, _env = build_planner_3d()
-    assert getattr(planner, 'reference_trajectory', None) is None
-    for key in ('w_ref_xy', 'w_ref_z', 'w_terminal'):
-        assert key not in planner.cfg
 
 
 def test_compute_loss_adds_terms_only_when_reference_set():
@@ -233,28 +210,23 @@ def test_terminal_return_error_matches_math_dist():
 
 # ── Saved-plan filename/metadata ─────────────────────────────────────────
 def test_waypoints_path_format():
-    path = _waypoints_path(2, 'figure8')
+    path = PlanRepository().path(2, 'figure8')
     assert path.name == 'pdstl_figure8_fan2.json'
 
 
 def test_save_plan_metadata_keys(tmp_path, monkeypatch):
-    import components.config as cfg
-    monkeypatch.setattr(cfg, 'EXPERIMENT_DIR', tmp_path)
-
-    import waypoint_planning as wp
     waypoints = nominal_figure8_waypoints(2)
-    wp._save_plan(
-        fan=2, scenario='figure8', sigma0=0.001, q_std=0.01,
-        rho_before=0.1, best_p=0.0, waypoints=waypoints,
-        T=5, dt=0.1, uncertainty_source='sigma0_per_fan_table',
-        extra_meta={'return_tolerance': 0.08, 'return_error': 1.4142},
-    )
+    repository = PlanRepository(tmp_path / 'waypoints')
+    path = repository.save(2, 'figure8', waypoints, {
+        'sigma0': 0.001, 'q_std': 0.01, 'rho_before': 0.1, 'rho_after': 0.0,
+        'alpha': 0.9, 'T': 5, 'dt': 0.1, 'generated': 'test',
+        'return_tolerance': 0.08, 'return_error': 1.4142,
+    })
 
     import json
-    path = tmp_path / 'waypoints' / 'pdstl_figure8_fan2.json'
     data = json.loads(path.read_text())
     required = {
-        'fan', 'scenario', 'dt', 'T', 'sigma0', 'q_std', 'uncertainty_source',
+        'fan', 'scenario', 'dt', 'T', 'sigma0', 'q_std',
         'rho_before', 'rho_after', 'alpha', 'generated', 'waypoints',
     }
     assert required.issubset(data.keys())
@@ -262,31 +234,9 @@ def test_save_plan_metadata_keys(tmp_path, monkeypatch):
     assert data['return_tolerance'] == 0.08
 
 
-# ── Scenario dispatch regression (plan/fly/analyze; baseline+gate+figure8) ──
-def test_scenario_choices_include_all_three():
-    assert set(VALID_SCENARIOS) == {'baseline', 'gate', 'figure8'}
+# ── Scenario dispatch ─────────────────────────────────────────────────────
+def test_scenario_choices():
+    assert set(VALID_SCENARIOS) == {'baseline', 'figure8'}
+    from experiments.crazyflie.components.planner import get_scenario
 
-    import argparse
-    import run
-    parser = argparse.ArgumentParser()
-    run._add_scenario_arg(parser)
-    choices = next(a for a in parser._actions if a.dest == 'scenario').choices
-    assert set(choices) == {'baseline', 'gate', 'figure8'}
-
-
-def test_run_plan_dispatch(monkeypatch):
-    import waypoint_planning as wp
-
-    calls = []
-    monkeypatch.setattr(wp, '_run_plan_2d', lambda fan, plot: calls.append(('2d', fan, plot)))
-    monkeypatch.setattr(wp, '_run_plan_3d', lambda fan, plot: calls.append(('3d', fan, plot)))
-    monkeypatch.setattr(wp, '_run_plan_figure8', lambda fan, plot: calls.append(('figure8', fan, plot)))
-
-    wp.run_plan(2, scenario='baseline', plot=False)
-    wp.run_plan(2, scenario='gate', plot=False)
-    wp.run_plan(2, scenario='figure8', plot=False)
-    wp.run_plan(2, plot=False)  # default -> baseline
-
-    assert calls == [
-        ('2d', 2, False), ('3d', 2, False), ('figure8', 2, False), ('2d', 2, False),
-    ]
+    assert {get_scenario(name).name for name in VALID_SCENARIOS} == set(VALID_SCENARIOS)

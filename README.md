@@ -41,7 +41,7 @@ git clone https://github.com/iHuman-Lab/probabilistic-dstl
 cd probabilistic-dstl
 pip install -e .
 
-# 2. Run the demos (toggle skip/run flags in src/main.py)
+# 2. Choose the Crazyflie run at the top of src/main.py, then run it
 python src/main.py
 ```
 
@@ -79,7 +79,7 @@ p_sat = spec(beliefs)   # probability of satisfaction at each timestep
 | 5 | Lane change | Merge lanes while a car moves into your path |
 | 6 | Aggressive lane change | Same, but faster (and scarier) |
 
-Toggle which examples run by changing `"skip"` → `"run"` in [src/main.py](src/main.py).
+The library examples and Crazyflie run selection remain in [src/main.py](src/main.py).
 
 ---
 
@@ -92,7 +92,7 @@ src/
 ├── planning/       # Gradient-based planner, MPC runner, environments
 ├── visualization/  # Robustness plots, animations, live MPC callbacks
 ├── baselines/      # Deterministic STL baseline for comparison
-└── main.py         # Demo entry point
+└── main.py         # Library examples and Crazyflie entry point
 configs/            # YAML configs for scenarios and hyperparameters
 data/               # Video recordings of hardware experiments
 saved_data/         # Cached optimization results (.pt files)

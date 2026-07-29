@@ -4,16 +4,16 @@ all offline (no Crazyflie/ROS/radio hardware).
 
 from __future__ import annotations
 
-import pathlib
-import sys
-
-_EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_EXPERIMENT_DIR))
-
 import pytest
 
-from components.flight_logger import CONDITIONS, FlightLogger, _inside, _log_prefix
-import components.flight_logger as flight_logger
+from experiments.crazyflie.components.flight_logger import (
+    FlightLogger,
+    _FIG8_OBSTACLES,
+    _OBSTACLES,
+    _inside,
+    _log_prefix,
+)
+from experiments.crazyflie.components import flight_logger
 
 
 _OBS = (0.0, 1.0, 0.0, 1.0, 0.0, 0.5)  # x0,x1,y0,y1,z0,z1
@@ -40,9 +40,9 @@ def test_baseline_cruise_altitude_matches_2d_check_for_arena_obstacles():
     """Baseline flies at a constant Z_HEIGHT below every current arena
     obstacle's height, so the new 3D check must agree with what the old
     x,y-only check would have given -- this is the regression guarantee
-    that fixing gate's altitude bug doesn't change baseline's behavior.
+    that 3D volume checking does not change baseline behavior.
     """
-    from components.config import OBSTACLES, Z_HEIGHT
+    from experiments.crazyflie.components.utils import OBSTACLES, Z_HEIGHT
 
     for obs in OBSTACLES:
         assert obs['z'][0] <= Z_HEIGHT <= obs['z'][1], (
@@ -60,7 +60,6 @@ def test_log_prefix_baseline_has_no_scenario_suffix():
 
 
 def test_log_prefix_scenario_suffixed():
-    assert _log_prefix('pdstl', 'gate', 2) == 'pdstl_gate_fan02_run'
     assert _log_prefix('deterministic', 'figure8', 12) == 'deterministic_figure8_fan12_run'
 
 
@@ -99,6 +98,22 @@ def test_flight_logger_row_includes_scenario(tmp_path, monkeypatch):
     assert logger._commanded[0]['scenario'] == 'figure8'
 
 
+def test_figure8_logger_uses_all_five_scenario_obstacles():
+    logger = FlightLogger('deterministic', fan_speed=2, scenario='figure8')
+    assert logger.obstacles == _FIG8_OBSTACLES
+    assert len(logger.obstacles) == 5
+    logger.start()
+    logger.log_waypoint(0.5, -2.0, 0.25)
+    row = logger._commanded[0]
+    assert all(f'outside_obs{i}' in row for i in range(1, 6))
+
+
+def test_baseline_logger_keeps_the_three_arena_obstacles():
+    logger = FlightLogger('deterministic', fan_speed=2, scenario='baseline')
+    assert logger.obstacles == _OBSTACLES
+    assert len(logger.obstacles) == 3
+
+
 def test_run_number_scoped_independently_per_scenario(tmp_path, monkeypatch):
     monkeypatch.setattr(flight_logger, '_LOGS_DIR', tmp_path)
 
@@ -117,20 +132,20 @@ def test_run_number_scoped_independently_per_scenario(tmp_path, monkeypatch):
 
 
 def test_log_name_regex_parses_scenario_suffixed():
-    import analyze_logs as al
+    from experiments.crazyflie.components import flight_logger as log_module
 
-    m = al._LOG_NAME_RE.match('pdstl_gate_fan12_run03_VIOLATION_20260101T000000_actual.csv')
+    m = log_module._LOG_NAME_RE.match('pdstl_figure8_fan12_run03_VIOLATION_20260101T000000_actual.csv')
     assert m is not None
     assert m.group('condition') == 'pdstl'
-    assert m.group('scenario') == 'gate'
+    assert m.group('scenario') == 'figure8'
     assert m.group('fan') == '12'
     assert m.group('run') == '03'
 
 
 def test_log_name_regex_parses_legacy_baseline():
-    import analyze_logs as al
+    from experiments.crazyflie.components import flight_logger as log_module
 
-    m = al._LOG_NAME_RE.match('deterministic_fan06_run01_20260101T000000_actual.csv')
+    m = log_module._LOG_NAME_RE.match('deterministic_fan06_run01_20260101T000000_actual.csv')
     assert m is not None
     assert m.group('condition') == 'deterministic'
     assert m.group('scenario') is None

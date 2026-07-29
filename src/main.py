@@ -17,6 +17,15 @@ from visualization.robustness import plot_piecewise_stl, plot_stl_formula_bounds
 
 _demos = load_config("configs/stl_demos.yaml")
 
+# Crazyflie run selection.
+CRAZYFLIE_ACTION = "fly"            # plan | fly | analyze
+CRAZYFLIE_FAN = 2                    # 2 | 6 | 12 | 16
+CRAZYFLIE_CONDITION = "deterministic"         # pdstl | deterministic
+CRAZYFLIE_SCENARIO = "figure8"       # baseline | figure8
+CRAZYFLIE_PLOT = False
+CRAZYFLIE_ANALYSIS = "latest"         # latest | all | summary
+CRAZYFLIE_RUN_NUMBER = None
+
 # =============================================================================
 # EXAMPLE 1: Always Operator
 # =============================================================================
@@ -81,7 +90,7 @@ with skip_run("skip", "Example 3: Single Shot Motion Planning") as check, check(
 # EXAMPLE 3A: Two-Gap Reach-Avoid
 # =============================================================================
 
-with skip_run("run", "Example 3A: Two-Gap Reach-Avoid") as check, check():
+with skip_run("skip", "Example 3A: Two-Gap Reach-Avoid") as check, check():
     run_two_gap_reach_avoid(max_iterations=700, force_run=True)
 
 # =============================================================================
@@ -125,3 +134,20 @@ with skip_run("skip", "Example 6: Aggressive Lane Change") as check, check():
 
 with skip_run("skip", "Example 7: Hazardous Object Retrieval") as check, check():
     run_hazardous_object_retrieval(max_iterations=1200, force_run=True)
+
+# =============================================================================
+# CRAZYFLIE EXPERIMENT
+# =============================================================================
+
+with skip_run("run", "Crazyflie Experiment") as check, check():
+    from experiments.crazyflie import run_crazyflie_experiment
+
+    run_crazyflie_experiment(
+        action=CRAZYFLIE_ACTION,
+        fan=CRAZYFLIE_FAN,
+        condition=CRAZYFLIE_CONDITION,
+        scenario=CRAZYFLIE_SCENARIO,
+        plot=CRAZYFLIE_PLOT,
+        analysis=CRAZYFLIE_ANALYSIS,
+        run_number=CRAZYFLIE_RUN_NUMBER,
+    )

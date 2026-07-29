@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tracking-covariance calibration for the figure8 scenario.
-
-Reads the existing commanded/actual CSVs written by components/flight_logger.py
-for repeated `python run.py fly --scenario figure8 --condition deterministic
---fan <L>` flights (no changes to that command, the flight loop, or the
-logger). Aligns runs by waypoint, computes the empirical per-waypoint 3D
-tracking-error mean/covariance across runs (not across the 10 Hz samples
-within one run), fits the existing isotropic Sigma_k = Sigma0 + k*Q
-uncertainty model per fan level, and writes calibrated_uncertainty.yml -- the
-only artifact a later phase would consume to replace SIGMA0_PER_FAN/Q_STD's
-placeholder values.
-
-This script does not touch run.py, components/crazyflie.py,
-components/flight_logger.py, src/pdstl, or src/planning, and does not import
-torch/ROS/cflib -- only numpy/csv/yaml plus components.config and
-components.flight_logger's pure-Python helpers.
-
-Alignment against the *existing*, unmodified CSV format: every complete run
-logs exactly 1 + FIG8_FLIGHT_POINTS commanded rows in a fixed order -- row 0
-is the pre-mission hover-at-start call (logged before offset correction, not
-one of the K figure8 waypoints), and rows 1..FIG8_FLIGHT_POINTS are the
-offset-corrected figure8 waypoints, always visited in the same order. Row 0
-is dropped; the remaining rows' file order IS the waypoint index k=0..K-1,
-with no separate waypoint-index column needed.
-"""
+"""One-time covariance estimation from repeated deterministic figure-eight flights."""
 
 from __future__ import annotations
 
@@ -37,12 +13,20 @@ from datetime import datetime, timezone
 import numpy as np
 import yaml
 
-from components.config import EXPERIMENT_DIR, FIG8_FLIGHT_POINTS, LOGS_DIR, VALID_FANS
-from components.flight_logger import _log_prefix
+EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parent
+LOGS_DIR = EXPERIMENT_DIR / 'logs' / '3d'
+_CONFIG = yaml.safe_load((EXPERIMENT_DIR / 'components' / 'config.yml').read_text(encoding='utf-8'))
+VALID_FANS = tuple(int(fan) for fan in _CONFIG['uncertainty']['sigma0_per_fan'])
+FIG8_FLIGHT_POINTS = int(_CONFIG['figure8']['flight_points'])
 
 _SCENARIO = 'figure8'
 _CONDITION = 'deterministic'
 _POOR_FIT_R_SQUARED = 0.5
+
+
+def log_prefix(condition: str, scenario: str, fan: int) -> str:
+    suffix = '' if scenario == 'baseline' else f'_{scenario}'
+    return f'{condition}{suffix}_fan{fan:02d}_run'
 
 
 def _read_csv(path: pathlib.Path) -> list[dict]:
@@ -52,7 +36,7 @@ def _read_csv(path: pathlib.Path) -> list[dict]:
 
 def discover_runs(fan: int) -> list[tuple[pathlib.Path, pathlib.Path]]:
     """(commanded_path, actual_path) pairs for every logged run at this fan level."""
-    prefix = _log_prefix(_CONDITION, _SCENARIO, fan)
+    prefix = log_prefix(_CONDITION, _SCENARIO, fan)
     pairs = []
     for actual_path in sorted(LOGS_DIR.glob(f'{prefix}*_actual.csv')):
         commanded_path = pathlib.Path(str(actual_path).replace('_actual.csv', '_commanded.csv'))
@@ -200,7 +184,7 @@ def calibrate_fan(fan: int) -> dict:
 
     result: dict = {
         'fan': fan, 'n_runs': n_runs, 'included_runs': included, 'excluded_runs': excluded,
-        'mean_error': None,
+        'mean_error': None, 'covariance': None,
         'sigma0_fit': None, 'q_var_fit': None, 'q_std_fit': None,
         'r_squared': None, 'residual_rms': None,
     }
@@ -211,6 +195,7 @@ def calibrate_fan(fan: int) -> dict:
     fit = fit_sigma0_q(covariance_raw)
     result.update({
         'mean_error': mean_error.tolist(),
+        'covariance': covariance_raw.tolist(),
         'sigma0_fit': fit.sigma0, 'q_var_fit': fit.q_var, 'q_std_fit': fit.q_std,
         'r_squared': fit.r_squared, 'residual_rms': fit.residual_rms,
     })
@@ -229,7 +214,8 @@ def fit_quality_verdict(result: dict) -> str:
     return 'GOOD FIT'
 
 
-def write_calibrated_uncertainty_yml(results: dict[int, dict], out_path: pathlib.Path) -> None:
+def write_covariance_report(results: dict[int, dict], out_path: pathlib.Path) -> None:
+    """Write a provenance report. This function never updates config.yml."""
     payload = {
         'generated': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         'scenario': _SCENARIO,
@@ -238,6 +224,13 @@ def write_calibrated_uncertainty_yml(results: dict[int, dict], out_path: pathlib
         'fans': {
             fan: {
                 'n_runs': r['n_runs'],
+                'included_runs': r.get('included_runs', []),
+                'excluded_runs': [
+                    {'run': run_id, 'reason': reason}
+                    for run_id, reason in r.get('excluded_runs', [])
+                ],
+                'mean_error': r.get('mean_error'),
+                'covariance': r.get('covariance'),
                 'sigma0_fit': r['sigma0_fit'],
                 'q_var_fit': r['q_var_fit'],
                 'q_std_fit': r['q_std_fit'],
@@ -248,6 +241,7 @@ def write_calibrated_uncertainty_yml(results: dict[int, dict], out_path: pathlib
             for fan, r in results.items()
         },
     }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding='utf-8')
 
 
@@ -282,8 +276,9 @@ def main() -> None:
                 f'planner to a full per-waypoint covariance schedule based on this data.'
             )
 
-    out_path = EXPERIMENT_DIR / 'calibrated_uncertainty.yml'
-    write_calibrated_uncertainty_yml(results, out_path)
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    out_path = EXPERIMENT_DIR / 'calibration' / 'reports' / f'covariance_{timestamp}.yml'
+    write_covariance_report(results, out_path)
     print(f'\nWrote {out_path}')
 
 

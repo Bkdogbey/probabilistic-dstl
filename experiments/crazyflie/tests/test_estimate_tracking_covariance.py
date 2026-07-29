@@ -5,17 +5,12 @@ all synthetic (no Crazyflie/ROS/radio hardware, no real flight logs).
 from __future__ import annotations
 
 import csv
-import pathlib
-import sys
-
-_EXPERIMENT_DIR = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_EXPERIMENT_DIR))
 
 import numpy as np
 import pytest
 import yaml
 
-import estimate_tracking_covariance as etc
+from experiments.crazyflie import estimate_covariance as etc
 
 
 def _commanded_row(t, x, y, z):
@@ -144,7 +139,7 @@ def test_load_run_retains_large_but_finite_errors(tmp_path):
 def test_align_runs_orders_by_file_position_not_row_count(tmp_path, monkeypatch):
     monkeypatch.setattr(etc, 'LOGS_DIR', tmp_path)
     t, xyz = _reference_mission()
-    prefix = etc._log_prefix('deterministic', 'figure8', 2)
+    prefix = etc.log_prefix('deterministic', 'figure8', 2)
     _build_run(tmp_path, f'{prefix}01', t, xyz, actual_xyz_fn=lambda tt: (tt + 0.1, 0.0, 0.0))
     _build_run(tmp_path, f'{prefix}02', t, xyz, actual_xyz_fn=lambda tt: (tt + 0.3, 0.0, 0.0))
 
@@ -228,8 +223,8 @@ def test_yaml_round_trip(tmp_path):
             'r_squared': 0.87, 'residual_rms': 0.0002,
         },
     }
-    out_path = tmp_path / 'calibrated_uncertainty.yml'
-    etc.write_calibrated_uncertainty_yml(results, out_path)
+    out_path = tmp_path / 'covariance_report.yml'
+    etc.write_covariance_report(results, out_path)
 
     data = yaml.safe_load(out_path.read_text())
     assert data['scenario'] == 'figure8'

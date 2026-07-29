@@ -9,4 +9,4 @@ repos:
     rev: v2.2.6
     hooks:
       - id: codespell
-        args: ['--ignore-words-list', 'nd,te,chage'] # customize ignore words if needed
+        args: ['--ignore-words-list', 'nd,te,chage,initialy'] # customize ignore words if needed
