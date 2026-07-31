@@ -44,6 +44,16 @@ uncertainty:
   q_std: 0.01
   source_report: null     # Set after reviewing an offline covariance report.
 
+calibration:
+  active_campaign: pilot  # Change to final only after obstacle positions are frozen.
+  pilot_runs: 5
+  final_runs_per_fan: 20
+  bootstrap_samples: 1000
+  bootstrap_seed: 20260730
+  min_r_squared: 0.70
+  fit_bin_size: 10
+  plausible_position_margin: 0.50
+
 planner:
   T: 10
   dt: 0.693
@@ -55,7 +65,7 @@ planner:
     w_dist: 5.0
     w_obs: 5.0
     w_visit: 5.0
-    obs_margin: 0.75
+    obs_margin: 0.15
     w_du: 0.1
     lr: 0.02
     max_iters: 1500
@@ -66,6 +76,9 @@ planner:
 flight:
   drone_uri: 'radio://0/85/2M/E7E7E7E85'
   takeoff_velocity: 0.3
+  landing_velocity: 0.15
+  landing_settle_seconds: 1.0
+  log_sample_hz: 10
   arming_wait_seconds: 1.0
   start_settle_seconds: 1.0
   return_z: 0.65
@@ -79,6 +92,7 @@ flight:
     min_base_stations: 1
 
 figure8:
+  trajectory_version: 1  # Bump whenever the analytical waypoint formula changes.
   workspace:
     x: [-0.5, 1.0]
     y: [-2.0, 0.5]
@@ -86,25 +100,23 @@ figure8:
   path:
     center_x: 0.50
     center_y: -1.00
-    half_width: 0.28
-    z_base: 0.25
-    z_amplitude: 0.40
-  midpoint_altitude:
-    z: [0.25, 0.30]
-    t_start: 24
-    t_end: 26
+    half_width: 0.25
+    vertical_half: 1.00
+    base_height: 0.20
+    crossing_height: 0.275
+    top_height: 0.60
+  deterministic_cruise_velocity: 0.30
   return_tolerance: 0.08
   T: 50
-  flight_points: 51
+  flight_points: 100
   plot_points: 1000
-  nominal_min_clearance: 0.10
   planner_extra:
     w_ref_xy: 5.0
     w_ref_z: 5.0
     w_terminal: 5.0
   obstacles:
-    - {name: obs_1, x: [0.74, 1.00], y: [-1.117, -0.87], height: 0.41}
+    - {name: obs_1, x: [0.71, 1.00], y: [-1.19, -0.93], height: 0.41}
     - {name: obs_2, x: [0.47, 0.65], y: [-0.37, -0.21], height: 0.51}
-    - {name: obs_3, x: [0.00, 0.21], y: [-0.92, -0.64], height: 0.41}
+    - {name: obs_3, x: [0.00, 0.29], y: [-1.11, -0.91], height: 0.41}
     - {name: obs_4, x: [0.37, 0.60], y: [-1.74, -1.55], height: 0.31}
-    - {name: obs_5, x: [0.44, 0.64], y: [-1.17, -0.84], height: 0.165}
+    #- {name: obs_5, x: [0.44, 0.64], y: [-1.17, -0.84], height: 0.165}

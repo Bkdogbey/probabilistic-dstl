@@ -19,13 +19,18 @@ from .utils import (
     ESTIMATOR_SAMPLE_PERIOD_MS,
     ESTIMATOR_SETTLE_TIMEOUT,
     ESTIMATOR_SPREAD_LIMIT,
+    FIG8_DETERMINISTIC_CRUISE_VELOCITY,
     LAND_Z,
+    LANDING_SETTLE_SECONDS,
+    LANDING_VELOCITY,
     RETURN_Z,
     START_SETTLE_SECONDS,
     TAKEOFF_VELOCITY,
     U_MAX,
     PlanRepository,
     Waypoint,
+    build_return_legs,
+    needs_safe_transit,
     shutdown_hardware,
     validate_waypoints,
     validate_waypoint_velocities,
@@ -49,6 +54,7 @@ class PreparedMission:
     scenario: Scenario
     start: Waypoint
     waypoints: tuple[Waypoint, ...]
+    cruise_velocity: float | None = None
 
 
 class MissionPlanBuilder:
@@ -57,37 +63,54 @@ class MissionPlanBuilder:
         start = scenario.start()
         if condition == 'pdstl':
             waypoints = PlanRepository().require_flyable(fan, scenario_name).waypoints
+            cruise_velocity = None
         elif condition == 'deterministic':
             waypoints = tuple(scenario.nominal_waypoints(scenario.flight_points))
+            cruise_velocity = (
+                FIG8_DETERMINISTIC_CRUISE_VELOCITY
+                if scenario_name == 'figure8'
+                else None
+            )
         else:
             raise ValueError(f'Unknown flight condition {condition!r}.')
         scenario.validate(list(waypoints))
         validate_waypoints([(*start[:2], RETURN_Z), (*start[:2], LAND_Z)])
         validate_waypoint_velocities(list(waypoints), start=start)
-        return PreparedMission(scenario, start, waypoints)
+        return PreparedMission(scenario, start, waypoints, cruise_velocity)
 
 
 class MissionExecutor:
     def __init__(self, commander) -> None:
         self.commander = commander
 
-    def fly_to_start(self, start: Waypoint) -> None:
+    def fly_to_start(self, start: Waypoint, *, safe_transit: bool) -> None:
         """Move from wherever takeoff left the drone to the mission start.
 
-        Mirrors return_and_land's climb-move-descend shape: move at RETURN_Z
-        (above every configured obstacle) before descending at the
-        destination, so this works regardless of where within the workspace
-        the drone took off.
+        When the drone was placed near the mission start, takeoff already
+        stopped at the mission altitude and only a small positioning move is
+        needed. Otherwise, move at RETURN_Z (above every configured obstacle)
+        before descending at the destination.
         """
         start_x, start_y, start_z = start
-        self.commander.go_to(start_x, start_y, RETURN_Z)
-        self.commander.go_to(start_x, start_y, start_z)
+        if safe_transit:
+            self.commander.go_to(start_x, start_y, RETURN_Z, velocity=TAKEOFF_VELOCITY)
+        self.commander.go_to(start_x, start_y, start_z, velocity=TAKEOFF_VELOCITY)
 
-    def fly(self, logger, waypoints: list[Waypoint], start: Waypoint) -> Waypoint:
+    def fly(
+        self,
+        logger,
+        waypoints: list[Waypoint],
+        start: Waypoint,
+        cruise_velocity: float | None = None,
+    ) -> Waypoint:
         logger.log_waypoint(*start)
         previous = start
         for waypoint in waypoints:
-            velocity = math.dist(previous, waypoint) / DT
+            velocity = (
+                cruise_velocity
+                if cruise_velocity is not None
+                else math.dist(previous, waypoint) / DT
+            )
             if velocity > U_MAX + 1e-6:
                 raise ValueError(f'Leg requires {velocity:.3f} m/s; limit is {U_MAX} m/s.')
             self.commander.go_to(*waypoint, velocity=velocity)
@@ -95,12 +118,14 @@ class MissionExecutor:
             previous = waypoint
         return waypoints[-1]
 
-    def return_and_land(self, last: Waypoint, start: Waypoint) -> None:
-        x, y, _ = last
+    def return_and_land(self, waypoints: list[Waypoint], start: Waypoint) -> None:
+        """Retrace the flyable mission path, then descend and settle at 0.1 m."""
+        for waypoint, velocity in build_return_legs(waypoints, start):
+            self.commander.go_to(*waypoint, velocity=velocity)
+
         start_x, start_y, _ = start
-        self.commander.go_to(x, y, RETURN_Z)
-        self.commander.go_to(start_x, start_y, RETURN_Z)
-        self.commander.go_to(start_x, start_y, LAND_Z)
+        self.commander.go_to(start_x, start_y, LAND_Z, velocity=LANDING_VELOCITY)
+        time.sleep(LANDING_SETTLE_SECONDS)
 
 
 @define(kw_only=True)
@@ -155,7 +180,7 @@ class CrazyflieFlightComponent(BaseComponent):
             on_sample=self._report_preflight_sample,
         )
 
-    def _preflight_and_arm(self) -> None:
+    def _preflight_and_arm(self) -> Waypoint:
         """Disarm, wait for a flight-ready estimate, build the commander at
         the settled pose, then arm.
         """
@@ -173,6 +198,7 @@ class CrazyflieFlightComponent(BaseComponent):
         )
         self.crazyflie.arm()
         time.sleep(ARMING_WAIT_SECONDS)
+        return settled
 
     def _execute_once(self):
         condition = self.config.condition
@@ -190,12 +216,14 @@ class CrazyflieFlightComponent(BaseComponent):
         airborne = False
 
         try:
-            self._preflight_and_arm()
-            self.position_commander.take_off(RETURN_Z, TAKEOFF_VELOCITY)
+            settled = self._preflight_and_arm()
+            safe_transit = needs_safe_transit(settled, start_xyz)
+            takeoff_z = RETURN_Z if safe_transit else start_xyz[2]
+            self.position_commander.take_off(takeoff_z, TAKEOFF_VELOCITY)
             airborne = True
 
             executor = MissionExecutor(self.position_commander)
-            executor.fly_to_start(start_xyz)
+            executor.fly_to_start(start_xyz, safe_transit=safe_transit)
             # go_to() returns once its estimated move duration elapses, not once
             # position error has actually converged -- give the final descent
             # leg time to settle so logged data starts from rest, not mid-move.
@@ -206,8 +234,16 @@ class CrazyflieFlightComponent(BaseComponent):
             logger.start()
             logger.start_actual_logging(self.crazyflie.state_snapshot)
             actual_logging = True
-            last_xyz = executor.fly(logger, waypoints, start_xyz)
+            executor.fly(
+                logger,
+                waypoints,
+                start_xyz,
+                cruise_velocity=mission.cruise_velocity,
+            )
 
+            # Guarantee that the actual trace brackets the final commanded
+            # waypoint instead of relying on the next 10 Hz background tick.
+            logger.log_actual_position(*self.crazyflie.state_snapshot())
             logger.stop_actual_logging()
             actual_logging = False
             logger.save()
@@ -216,7 +252,7 @@ class CrazyflieFlightComponent(BaseComponent):
             # mission log (see FlightLogger.start_return_logging).
             logger.start_return_logging(self.crazyflie.state_snapshot)
             return_logging = True
-            executor.return_and_land(last_xyz, start_xyz)
+            executor.return_and_land(waypoints, start_xyz)
         except BaseException:
             if logger is not None and actual_logging:
                 logger.mark_crashed()
@@ -234,7 +270,7 @@ class CrazyflieFlightComponent(BaseComponent):
                         self.position_commander,
                         self.crazyflie,
                         airborne=airborne,
-                        landing_velocity=TAKEOFF_VELOCITY,
+                        landing_velocity=LANDING_VELOCITY,
                     )
                 finally:
                     if return_logging and logger is not None:

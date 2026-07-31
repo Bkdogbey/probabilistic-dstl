@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 import yaml
 
+from .profile import flight_profile_signature as _flight_profile_signature
+
 # On this machine, a legacy matplotlib-3.5.1-nspkg.pth in the system Python's
 # dist-packages pre-loads its own (mplot3d-incompatible) mpl_toolkits into
 # sys.modules at interpreter startup, before any project code runs. Evicting
@@ -87,6 +89,9 @@ PLANNER_CONFIG = {**_planner['config'], 'alpha': PLANNER_ALPHA}
 
 _flight = _cfg['flight']
 TAKEOFF_VELOCITY = float(_flight['takeoff_velocity'])
+LANDING_VELOCITY = float(_flight['landing_velocity'])
+LANDING_SETTLE_SECONDS = float(_flight['landing_settle_seconds'])
+LOG_SAMPLE_HZ = int(_flight['log_sample_hz'])
 ARMING_WAIT_SECONDS = float(_flight['arming_wait_seconds'])
 START_SETTLE_SECONDS = float(_flight['start_settle_seconds'])
 RETURN_Z = float(_flight['return_z'])
@@ -104,6 +109,19 @@ ESTIMATOR_MIN_BASE_STATIONS = int(_estimator['min_base_stations'])
 LOGS_2D_DIR = EXPERIMENT_DIR / 'logs' / '2d'
 LOGS_3D_DIR = EXPERIMENT_DIR / 'logs' / '3d'
 
+_calibration = _cfg['calibration']
+CALIBRATION_CAMPAIGN = str(_calibration['active_campaign'])
+CALIBRATION_PILOT_RUNS = int(_calibration['pilot_runs'])
+CALIBRATION_FINAL_RUNS = int(_calibration['final_runs_per_fan'])
+
+if CALIBRATION_CAMPAIGN not in ('pilot', 'final'):
+    raise ValueError("calibration.active_campaign must be 'pilot' or 'final'.")
+
+
+def flight_profile_signature(scenario: str) -> str:
+    """Hash the physical path, controller, estimator, logging, and obstacles."""
+    return _flight_profile_signature(_cfg, scenario)
+
 
 def logs_directory(scenario: str) -> pathlib.Path:
     return LOGS_3D_DIR if scenario == 'figure8' else LOGS_2D_DIR
@@ -116,20 +134,29 @@ FIG8_Z_BOUNDS = list(_figure8['workspace']['z'])
 FIG8_CENTER_X = float(_figure8['path']['center_x'])
 FIG8_CENTER_Y = float(_figure8['path']['center_y'])
 FIG8_HALF_WIDTH = float(_figure8['path']['half_width'])
-FIG8_Z_BASE = float(_figure8['path']['z_base'])
-FIG8_Z_AMPLITUDE = float(_figure8['path']['z_amplitude'])
-FIG8_MIDPOINT_Z = _pair(_figure8['midpoint_altitude']['z'])
-FIG8_MIDPOINT_T_START = int(_figure8['midpoint_altitude']['t_start'])
-FIG8_MIDPOINT_T_END = int(_figure8['midpoint_altitude']['t_end'])
+FIG8_VERTICAL_HALF = float(_figure8['path']['vertical_half'])
+FIG8_BASE_HEIGHT = float(_figure8['path']['base_height'])
+FIG8_CROSSING_HEIGHT = float(_figure8['path']['crossing_height'])
+FIG8_TOP_HEIGHT = float(_figure8['path']['top_height'])
+FIG8_DETERMINISTIC_CRUISE_VELOCITY = float(_figure8['deterministic_cruise_velocity'])
 FIG8_RETURN_TOLERANCE = float(_figure8['return_tolerance'])
 FIG8_T = int(_figure8['T'])
 FIG8_FLIGHT_POINTS = int(_figure8['flight_points'])
 FIG8_PLOT_POINTS = int(_figure8['plot_points'])
-FIG8_NOMINAL_MIN_CLEARANCE = float(_figure8['nominal_min_clearance'])
 FIG8_W_REF_XY = float(_figure8['planner_extra']['w_ref_xy'])
 FIG8_W_REF_Z = float(_figure8['planner_extra']['w_ref_z'])
 FIG8_W_TERMINAL = float(_figure8['planner_extra']['w_terminal'])
 FIG8_OBSTACLES = [_obstacle(source) for source in _figure8['obstacles']]
+
+if not 0.0 < FIG8_DETERMINISTIC_CRUISE_VELOCITY <= U_MAX:
+    raise ValueError(
+        'figure8.deterministic_cruise_velocity must be positive and no greater '
+        f'than planner.u_max ({U_MAX} m/s).'
+    )
+if not FIG8_BASE_HEIGHT < FIG8_CROSSING_HEIGHT < FIG8_TOP_HEIGHT:
+    raise ValueError(
+        'Figure-eight heights must satisfy base_height < crossing_height < top_height.'
+    )
 
 
 def plan_config_signature(fan: int, scenario: str) -> str:
@@ -160,7 +187,16 @@ def validate_waypoints(
     *,
     scenario: str = 'baseline',
     label: str = 'Waypoint',
+    tolerance: float = 0.01,
 ) -> None:
+    """Reject waypoints outside the scenario workspace.
+
+    `tolerance` absorbs sub-centimetre optimiser/float noise at the
+    boundary -- the figure8 curve's own nominal path touches the workspace
+    box exactly (its lowest point sits at both `workspace.y` and
+    `workspace.z`'s lower bound), so a strict inequality would spuriously
+    reject a numerically-clean plan.
+    """
     if scenario == 'figure8':
         bounds = (FIG8_X_BOUNDS, FIG8_Y_BOUNDS, FIG8_Z_BOUNDS)
     elif scenario == 'baseline':
@@ -170,7 +206,10 @@ def validate_waypoints(
     outside = [
         (index, x, y, z)
         for index, (x, y, z) in enumerate(waypoints)
-        if not all(low <= value <= high for value, (low, high) in zip((x, y, z), bounds))
+        if not all(
+            low - tolerance <= value <= high + tolerance
+            for value, (low, high) in zip((x, y, z), bounds)
+        )
     ]
     if outside:
         details = ', '.join(
@@ -196,6 +235,30 @@ def validate_waypoint_velocities(
     if invalid:
         details = ', '.join(f'#{index}->#{index + 1}={speed:.3f} m/s' for index, speed in invalid)
         raise ValueError(f'{label}(s) exceed u_max={u_max} m/s given dt={dt}s: {details}')
+
+
+def needs_safe_transit(current: Waypoint, start: Waypoint) -> bool:
+    """Whether reaching the mission start requires the obstacle-clearance altitude."""
+    return math.dist(current[:2], start[:2]) > START_TOLERANCE
+
+
+def build_return_legs(
+    waypoints: list[Waypoint], start: Waypoint,
+) -> list[tuple[Waypoint, float]]:
+    """Build reverse legs along the already-validated flyable mission path."""
+    previous = waypoints[-1]
+    if math.dist(previous[:2], start[:2]) <= START_TOLERANCE:
+        return []
+    legs = []
+    for waypoint in reversed([start, *waypoints[:-1]]):
+        if waypoint == previous:
+            continue
+        velocity = math.dist(previous, waypoint) / DT
+        if velocity > U_MAX + 1e-6:
+            raise ValueError(f'Return leg requires {velocity:.3f} m/s; limit is {U_MAX} m/s.')
+        legs.append((waypoint, velocity))
+        previous = waypoint
+    return legs
 
 
 def draw_environment_2d(axis, environment) -> None:

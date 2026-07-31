@@ -20,9 +20,9 @@ _demos = load_config("configs/stl_demos.yaml")
 # Crazyflie run selection.
 CRAZYFLIE_ACTION = "fly"            # plan | fly | analyze
 CRAZYFLIE_FAN = 2                    # 2 | 6 | 12 | 16
-CRAZYFLIE_CONDITION = "deterministic"         # pdstl | deterministic
+CRAZYFLIE_CONDITION = "pdstl"         # pdstl | deterministic
 CRAZYFLIE_SCENARIO = "figure8"       # baseline | figure8
-CRAZYFLIE_PLOT = False
+CRAZYFLIE_PLOT = True
 CRAZYFLIE_ANALYSIS = "latest"         # latest | all | summary
 CRAZYFLIE_RUN_NUMBER = None
 

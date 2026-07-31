@@ -96,16 +96,30 @@ def test_flight_logger_row_includes_scenario(tmp_path, monkeypatch):
     logger.start()
     logger.log_waypoint(0.5, -2.0, 0.25)
     assert logger._commanded[0]['scenario'] == 'figure8'
+    assert logger._commanded[0]['campaign'] == 'pilot'
+    assert len(logger._commanded[0]['profile_signature']) == 64
 
 
-def test_figure8_logger_uses_all_five_scenario_obstacles():
+def test_figure8_logger_uses_all_scenario_obstacles():
     logger = FlightLogger('deterministic', fan_speed=2, scenario='figure8')
     assert logger.obstacles == _FIG8_OBSTACLES
-    assert len(logger.obstacles) == 5
+    assert len(logger.obstacles) == len(_FIG8_OBSTACLES)
     logger.start()
     logger.log_waypoint(0.5, -2.0, 0.25)
     row = logger._commanded[0]
-    assert all(f'outside_obs{i}' in row for i in range(1, 6))
+    assert all(f'outside_obs{i}' in row for i in range(1, len(_FIG8_OBSTACLES) + 1))
+
+
+def test_explicit_actual_sample_is_after_final_waypoint(monkeypatch):
+    ticks = iter([100.0, 100.5, 100.6])
+    monkeypatch.setattr(flight_logger.time, 'monotonic', lambda: next(ticks))
+    logger = FlightLogger('deterministic', fan_speed=2, scenario='figure8')
+
+    logger.start()
+    logger.log_waypoint(0.5, -2.0, 0.25)
+    logger.log_actual_position(0.49, -2.01, 0.24)
+
+    assert logger._actual[-1]['t'] > logger._commanded[-1]['t']
 
 
 def test_baseline_logger_keeps_the_three_arena_obstacles():

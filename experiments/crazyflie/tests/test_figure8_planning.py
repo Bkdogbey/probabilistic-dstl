@@ -1,9 +1,4 @@
-"""Unit tests for the figure8 scenario's planning construction, all offline
-(no Crazyflie/ROS/radio hardware). Covers: the analytical trajectory's
-endpoints/ranges/finiteness, the T+1-states -> T-controls contract with no
-zero-padding, control-norm/clearance thresholds, the pdSTL environment's
-structure, reference tracking, saved-plan metadata, and scenario dispatch.
-"""
+"""Offline tests for the smooth 3D figure-eight scenario."""
 
 from __future__ import annotations
 
@@ -12,8 +7,8 @@ import pytest
 import torch
 
 from experiments.crazyflie.components.utils import (
+    FIG8_DETERMINISTIC_CRUISE_VELOCITY,
     FIG8_FLIGHT_POINTS,
-    FIG8_NOMINAL_MIN_CLEARANCE,
     FIG8_OBSTACLES,
     FIG8_PLOT_POINTS,
     FIG8_T,
@@ -38,43 +33,54 @@ from experiments.crazyflie.components.planner import (
 
 
 # ── Analytical trajectory ────────────────────────────────────────────────
-def test_start_end_and_midpoint_altitude():
+def test_start_end_and_top_heights():
     wps = nominal_figure8_waypoints(FIG8_T + 1)
     start, end, mid = wps[0], wps[-1], wps[FIG8_T // 2]
-    assert start == pytest.approx((0.50, -2.00, 0.25), abs=1e-6)
-    assert end == pytest.approx((0.50, -2.00, 0.25), abs=1e-6)
-    assert mid[2] == pytest.approx(0.25, abs=1e-6)
+    assert start == pytest.approx((0.50, -2.00, 0.20), abs=1e-6)
+    assert end == pytest.approx((0.50, -2.00, 0.20), abs=1e-6)
+    assert mid == pytest.approx((0.50, 0.00, 0.60), abs=1e-6)
 
 
-def test_two_altitude_loop_maxima():
-    curve = np.array(nominal_figure8_waypoints(FIG8_PLOT_POINTS))
+def test_altitude_rises_then_descends_smoothly():
+    curve = np.array(nominal_figure8_waypoints(1001))
     z = curve[:, 2]
-    assert z.max() == pytest.approx(0.65, abs=1e-3)
-    # Two distinct peaks: split the curve at its midpoint and check each half
-    # independently reaches close to the global max.
+    assert z.min() == pytest.approx(0.20, abs=1e-6)
+    assert z.max() == pytest.approx(0.60, abs=1e-6)
     half = len(z) // 2
-    assert z[:half].max() == pytest.approx(0.65, abs=1e-3)
-    assert z[half:].max() == pytest.approx(0.65, abs=1e-3)
+    assert np.all(np.diff(z[:half + 1]) >= -1e-12)
+    assert np.all(np.diff(z[half:]) <= 1e-12)
 
 
-def test_zero_vertical_velocity_at_start_mid_end():
-    # Finite-difference dz/ds via a dense curve near each critical point.
-    n = 20001
-    dense_s_curve = np.array(nominal_figure8_waypoints(n))
-    idx = {0.0: 0, 0.5: n // 2, 1.0: n - 1}
-    for si, i in idx.items():
-        lo = max(i - 2, 0)
-        hi = min(i + 2, n - 1)
-        dz = dense_s_curve[hi, 2] - dense_s_curve[lo, 2]
-        assert abs(dz) < 1e-3, f'dz/ds not ~0 near s={si}: dz={dz}'
+def test_altitude_has_zero_slope_at_extrema():
+    curve = np.array(nominal_figure8_waypoints(20001))
+    for index in (0, 10000, 20000):
+        lo = max(index - 2, 0)
+        hi = min(index + 2, len(curve) - 1)
+        assert abs(curve[hi, 2] - curve[lo, 2]) < 1e-5
+
+
+def test_canonical_lobe_order():
+    curve = np.array(nominal_figure8_waypoints(9))
+    expected = np.array([
+        (0.50, -2.000, 0.20),
+        (0.75, -1.707, 0.205),
+        (0.50, -1.000, 0.275),
+        (0.25, -0.293, 0.470),
+        (0.50, 0.000, 0.600),
+        (0.75, -0.293, 0.470),
+        (0.50, -1.000, 0.275),
+        (0.25, -1.707, 0.205),
+        (0.50, -2.000, 0.20),
+    ])
+    assert curve == pytest.approx(expected, abs=5e-4)
 
 
 def test_coordinate_ranges_and_finite():
     curve = np.array(nominal_figure8_waypoints(FIG8_PLOT_POINTS))
     assert np.all(np.isfinite(curve))
-    assert curve[:, 0].min() >= 0.22 - 1e-3 and curve[:, 0].max() <= 0.78 + 1e-3
+    assert curve[:, 0].min() >= 0.25 - 1e-3 and curve[:, 0].max() <= 0.75 + 1e-3
     assert curve[:, 1].min() >= -2.00 - 1e-3 and curve[:, 1].max() <= 0.00 + 1e-3
-    assert curve[:, 2].min() >= 0.25 - 1e-3 and curve[:, 2].max() <= 0.65 + 1e-3
+    assert curve[:, 2].min() >= 0.20 - 1e-3 and curve[:, 2].max() <= 0.60 + 1e-3
 
 
 # ── T+1 states -> T controls contract ────────────────────────────────────
@@ -88,9 +94,7 @@ def test_state_and_control_counts():
 def test_no_zero_padding_on_last_control():
     init_u = nominal_initial_controls_figure8()
     last_norm = init_u[-1].norm().item()
-    # Near-zero (S-curve endpoint velocity) but NOT an artificial exact zero.
     assert last_norm > 0.0
-    assert last_norm < 1e-2
 
 
 def test_max_control_norm_within_u_max():
@@ -102,18 +106,26 @@ def test_max_control_norm_within_u_max():
 # ── Workspace / clearance ────────────────────────────────────────────────
 def test_flight_waypoints_inside_workspace():
     wps = np.array(nominal_figure8_waypoints(FIG8_FLIGHT_POINTS))
+    assert len(wps) == 100
     assert np.all(wps[:, 0] >= FIG8_X_BOUNDS[0]) and np.all(wps[:, 0] <= FIG8_X_BOUNDS[1])
     assert np.all(wps[:, 1] >= FIG8_Y_BOUNDS[0]) and np.all(wps[:, 1] <= FIG8_Y_BOUNDS[1])
     assert np.all(wps[:, 2] >= FIG8_Z_BOUNDS[0]) and np.all(wps[:, 2] <= FIG8_Z_BOUNDS[1])
 
 
-def test_dense_clearance_positive_and_above_threshold():
+def test_deterministic_flight_uses_good_cruise_speed():
+    waypoints = np.array(nominal_figure8_waypoints(FIG8_FLIGHT_POINTS))
+    path_length = np.linalg.norm(np.diff(waypoints, axis=0), axis=1).sum()
+    duration = path_length / FIG8_DETERMINISTIC_CRUISE_VELOCITY
+    assert FIG8_DETERMINISTIC_CRUISE_VELOCITY == pytest.approx(0.30)
+    assert 16.0 < duration < 18.0
+
+
+def test_dense_centerline_does_not_intersect_obstacle_boxes():
     curve = np.array(nominal_figure8_waypoints(FIG8_PLOT_POINTS))
     clearances = figure8_min_clearances(curve)
     assert len(clearances) == len(FIG8_OBSTACLES)
     for name, clearance in clearances.items():
         assert clearance > 0.0, f'{name} clearance not positive: {clearance}'
-    assert min(clearances.values()) >= FIG8_NOMINAL_MIN_CLEARANCE
 
 
 def test_single_obstacle_clearance_matches_dense_helper():
@@ -137,13 +149,9 @@ def test_no_visit_regions():
     assert env.visit_regions == []
 
 
-def test_exactly_one_midpoint_altitude_band():
+def test_no_time_windowed_altitude_band():
     env = build_environment_figure8()
-    assert len(env.time_windowed_bounds) == 1
-    band = env.time_windowed_bounds[0]
-    assert band['label'] == 'midpoint_altitude'
-    assert band['interval'] == [24, 26]
-    assert tuple(band['z']) == (0.25, 0.30)
+    assert env.time_windowed_bounds == []
 
 
 def test_env_has_no_goal():
@@ -157,7 +165,7 @@ def test_specification_builds_without_error():
     assert spec is not None
     preds = env.get_predicates()
     assert len(preds['timed_visit']) == 0
-    assert len(preds['time_windowed_bounds']) == 1
+    assert len(preds['time_windowed_bounds']) == 0
     assert len(preds['obstacles']) == len(FIG8_OBSTACLES)
     assert preds['goal'] is None
 

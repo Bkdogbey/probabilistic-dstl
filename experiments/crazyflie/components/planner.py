@@ -16,22 +16,21 @@ from .utils import (
     DETERMINISTIC_VIA_POINTS,
     END_XY,
     EXPERIMENT_DIR,
+    FIG8_BASE_HEIGHT,
     FIG8_CENTER_X,
     FIG8_CENTER_Y,
+    FIG8_CROSSING_HEIGHT,
     FIG8_HALF_WIDTH,
-    FIG8_MIDPOINT_T_END,
-    FIG8_MIDPOINT_T_START,
-    FIG8_MIDPOINT_Z,
     FIG8_OBSTACLES,
     FIG8_FLIGHT_POINTS,
     FIG8_T,
+    FIG8_TOP_HEIGHT,
+    FIG8_VERTICAL_HALF,
     FIG8_W_REF_XY,
     FIG8_W_REF_Z,
     FIG8_W_TERMINAL,
     FIG8_X_BOUNDS,
     FIG8_Y_BOUNDS,
-    FIG8_Z_AMPLITUDE,
-    FIG8_Z_BASE,
     FIG8_Z_BOUNDS,
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
@@ -405,32 +404,34 @@ def initial_controls_baseline() -> torch.Tensor:
 
 
 def nominal_figure8_waypoints(n_points: int = FIG8_T + 1) -> list[tuple[float, float, float]]:
-    """Return the smooth 3D Gerono figure-eight reference path."""
+    """Return the smooth, altitude-varying vertical Gerono figure-eight."""
     if n_points < 2:
         raise ValueError('n_points must be at least 2')
-    s = np.linspace(0.0, 1.0, n_points)
-    q = 35 * s**4 - 84 * s**5 + 70 * s**6 - 20 * s**7
-    theta = np.pi + 2 * np.pi * q
+    theta = np.linspace(np.pi, 3 * np.pi, n_points)
     x = FIG8_CENTER_X + FIG8_HALF_WIDTH * np.sin(2 * theta)
-    y = FIG8_CENTER_Y + np.cos(theta)
-    z = FIG8_Z_BASE + FIG8_Z_AMPLITUDE * np.sin(2 * np.pi * q) ** 2
+    y = FIG8_CENTER_Y + FIG8_VERTICAL_HALF * np.cos(theta)
+    # Tie altitude to vertical progress through the figure: bottom -> crossing
+    # -> top -> crossing -> bottom. A monotone cubic places both centre-crossing
+    # passes at the configured intermediate height without abrupt reversals.
+    vertical_progress = (y - (FIG8_CENTER_Y - FIG8_VERTICAL_HALF)) / (2 * FIG8_VERTICAL_HALF)
+    crossing_gain = FIG8_CROSSING_HEIGHT - FIG8_BASE_HEIGHT
+    top_gain = FIG8_TOP_HEIGHT - FIG8_BASE_HEIGHT
+    quadratic = 8 * crossing_gain - top_gain
+    cubic = 2 * top_gain - 8 * crossing_gain
+    z = FIG8_BASE_HEIGHT + quadratic * vertical_progress**2 + cubic * vertical_progress**3
     return [(float(xi), float(yi), float(zi)) for xi, yi, zi in zip(x, y, z)]
 
 
 def build_environment_figure8() -> PositionEnvironment:
     """Build the pdSTL Environment for the figure8 mission.
 
-    The specification enforces workspace, obstacle avoidance, and the
-    midpoint altitude band. Reference tracking closes the loop.
+    The specification enforces workspace and obstacle avoidance. Reference
+    tracking keeps the solution near the smooth 3D figure-eight.
     """
     env = PositionEnvironment()
     env.set_bounds(x_range=FIG8_X_BOUNDS, y_range=FIG8_Y_BOUNDS, z_range=FIG8_Z_BOUNDS)
     for obs in FIG8_OBSTACLES:
         env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=list(obs['z']))
-    env.add_time_windowed_bounds(
-        x_range=FIG8_X_BOUNDS, y_range=FIG8_Y_BOUNDS, z_range=list(FIG8_MIDPOINT_Z),
-        interval=[FIG8_MIDPOINT_T_START, FIG8_MIDPOINT_T_END], label='midpoint_altitude',
-    )
     return env
 
 

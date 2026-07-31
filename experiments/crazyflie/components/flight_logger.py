@@ -13,11 +13,14 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .utils import (
+    CALIBRATION_CAMPAIGN,
     FIG8_OBSTACLES as _ENV_FIG8_OBSTACLES,
+    LOG_SAMPLE_HZ,
     LOGS_2D_DIR,
     OBSTACLES as _ENV_OBSTACLES,
     START_TOLERANCE,
     VALID_SCENARIOS,
+    flight_profile_signature,
     logs_directory,
 )
 
@@ -36,7 +39,7 @@ _FIG8_OBSTACLES: list[tuple[float, float, float, float, float, float]] = [
 ]
 
 _LOGS_DIR: pathlib.Path | None = None
-_SAMPLE_HZ = 10
+_SAMPLE_HZ = LOG_SAMPLE_HZ
 _RUN_RE = re.compile(r'_run(\d+)_')
 _SCENARIO_ALT = '|'.join(s for s in VALID_SCENARIOS if s != 'baseline')
 _LOG_NAME_RE = re.compile(
@@ -128,12 +131,23 @@ def _inside(x: float, y: float, z: float, obs: tuple[float, float, float, float,
     return x0 <= x <= x1 and y0 <= y <= y1 and z0 <= z <= z1
 
 
-def _safety_row(condition: str, scenario: str, t: float, x: float, y: float, z: float,
-                obstacles: list[tuple[float, float, float, float, float, float]]) -> dict:
+def _safety_row(
+    condition: str,
+    scenario: str,
+    campaign: str,
+    profile_signature: str,
+    t: float,
+    x: float,
+    y: float,
+    z: float,
+    obstacles: list[tuple[float, float, float, float, float, float]],
+) -> dict:
     outside = [not _inside(x, y, z, obs) for obs in obstacles]
     row: dict = {
         'condition': condition,
         'scenario': scenario,
+        'campaign': campaign,
+        'profile_signature': profile_signature,
         't': t,
         'x': round(x, 6),
         'y': round(y, 6),
@@ -182,6 +196,8 @@ class FlightLogger:
     _thread: threading.Thread | None = field(init=False, default=None)
     _crashed: bool = field(init=False, default=False)
     _stem: str | None = field(init=False, default=None)
+    _campaign: str = field(init=False, default='')
+    _profile_signature: str = field(init=False, default='')
 
     def __post_init__(self) -> None:
         if self.condition not in CONDITIONS:
@@ -192,6 +208,8 @@ class FlightLogger:
         if self.obstacles is None:
             source = _FIG8_OBSTACLES if self.scenario == 'figure8' else _OBSTACLES
             self.obstacles = list(source)
+        self._campaign = CALIBRATION_CAMPAIGN if self.scenario == 'figure8' else ''
+        self._profile_signature = flight_profile_signature(self.scenario)
 
     def start(self) -> None:
         """Record start time. Call just before the first go_to."""
@@ -235,7 +253,10 @@ class FlightLogger:
                 x, y, z = get_pos()
                 t = round(tick - self._t0, 4)
                 target.append(
-                    _safety_row(self.condition, self.scenario, t, x, y, z, self.obstacles)
+                    _safety_row(
+                        self.condition, self.scenario, self._campaign,
+                        self._profile_signature, t, x, y, z, self.obstacles,
+                    )
                 )
                 elapsed = time.monotonic() - tick
                 remaining = interval - elapsed
@@ -256,7 +277,20 @@ class FlightLogger:
         """Log one commanded waypoint with elapsed time and safety flags."""
         t = round(time.monotonic() - self._t0, 4)
         self._commanded.append(
-            _safety_row(self.condition, self.scenario, t, x, y, z, self.obstacles)
+            _safety_row(
+                self.condition, self.scenario, self._campaign,
+                self._profile_signature, t, x, y, z, self.obstacles,
+            )
+        )
+
+    def log_actual_position(self, x: float, y: float, z: float) -> None:
+        """Synchronously capture an actual sample, including at mission end."""
+        t = round(time.monotonic() - self._t0, 4)
+        self._actual.append(
+            _safety_row(
+                self.condition, self.scenario, self._campaign,
+                self._profile_signature, t, x, y, z, self.obstacles,
+            )
         )
 
     def mark_crashed(self) -> None:
@@ -319,6 +353,11 @@ class FlightLogger:
 
         print(f'[FlightLogger] Run {run_num:02d} | condition={self.condition} | '
               f'scenario={self.scenario} | fan={self.fan_speed}')
+        if self._campaign:
+            print(
+                f'[FlightLogger] Campaign={self._campaign} | '
+                f'profile={self._profile_signature[:12]}…'
+            )
         if self._crashed:
             print('[FlightLogger] *** CRASH flagged — partial data saved ***')
         if violated:
