@@ -32,7 +32,7 @@ _cfg = yaml.safe_load(_CONFIG_PATH.read_text(encoding='utf-8'))
 VALID_FANS = (2, 6, 12, 16)
 VALID_SCENARIOS = ('baseline', 'figure8')
 VALID_CONDITIONS = ('pdstl', 'deterministic')
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 4
 
 Waypoint = tuple[float, float, float]
 
@@ -73,12 +73,53 @@ GOAL = {axis: _pair(_arena['goal'][axis]) for axis in ('x', 'y', 'z')}
 DETERMINISTIC_VIA_POINTS = [_pair(point) for point in _cfg['deterministic_path']['via_points']]
 
 _uncertainty = _cfg['uncertainty']
-SIGMA0_PER_FAN = MappingProxyType({
-    int(fan): float(value) for fan, value in _uncertainty['sigma0_per_fan'].items()
-})
-Q_STD = float(_uncertainty['q_std'])
-if set(SIGMA0_PER_FAN) != set(VALID_FANS):
-    raise ValueError(f'uncertainty.sigma0_per_fan must define {VALID_FANS}.')
+UNCERTAINTY_MODEL = str(_uncertainty['model'])
+INITIAL_VARIANCE = float(_uncertainty['initial_variance'])
+
+
+def _fan_xyz_values(key: str) -> MappingProxyType:
+    values = {
+        int(fan): tuple(float(component) for component in vector)
+        for fan, vector in _uncertainty[key].items()
+    }
+    if set(values) != set(VALID_FANS):
+        raise ValueError(f'uncertainty.{key} must define {VALID_FANS}.')
+    if any(len(vector) != 3 for vector in values.values()):
+        raise ValueError(f'uncertainty.{key} values must be XYZ triples.')
+    if not all(math.isfinite(value) for vector in values.values() for value in vector):
+        raise ValueError(f'uncertainty.{key} must contain only finite values.')
+    return MappingProxyType(values)
+
+
+STATIONARY_RESIDUAL_VARIANCE_PER_FAN = _fan_xyz_values(
+    'stationary_residual_variance_per_fan'
+)
+RESIDUAL_MEAN_PER_FAN = _fan_xyz_values('residual_mean_per_fan')
+RESPONSE_ENABLED_AXES = tuple(bool(value) for value in _uncertainty['response_enabled_axes'])
+RESPONSE_TIME_CONSTANT = tuple(
+    float(value) for value in _uncertainty['response_time_constant']
+)
+
+if UNCERTAINTY_MODEL != 'first_order_response_stationary_residual_per_fan':
+    raise ValueError(f'Unsupported Crazyflie uncertainty model {UNCERTAINTY_MODEL!r}.')
+if not math.isfinite(INITIAL_VARIANCE) or INITIAL_VARIANCE != 0.0:
+    raise ValueError('uncertainty.initial_variance must be exactly 0.0.')
+if len(RESPONSE_ENABLED_AXES) != 3 or len(RESPONSE_TIME_CONSTANT) != 3:
+    raise ValueError('Response enabled flags and time constants must be XYZ triples.')
+if not all(math.isfinite(value) and value >= 0.0 for value in RESPONSE_TIME_CONSTANT):
+    raise ValueError('Response time constants must be finite and nonnegative.')
+if any(enabled != (tau > 0.0) for enabled, tau in zip(
+    RESPONSE_ENABLED_AXES, RESPONSE_TIME_CONSTANT,
+)):
+    raise ValueError(
+        'Enabled response axes require a positive time constant; disabled axes require 0.0.'
+    )
+if any(
+    value < 0.0
+    for vector in STATIONARY_RESIDUAL_VARIANCE_PER_FAN.values()
+    for value in vector
+):
+    raise ValueError('Stationary residual variances must be nonnegative.')
 
 _planner = _cfg['planner']
 T = int(_planner['T'])
@@ -93,10 +134,16 @@ LANDING_VELOCITY = float(_flight['landing_velocity'])
 LANDING_SETTLE_SECONDS = float(_flight['landing_settle_seconds'])
 LOG_SAMPLE_HZ = int(_flight['log_sample_hz'])
 ARMING_WAIT_SECONDS = float(_flight['arming_wait_seconds'])
+START_POSITION_TOLERANCE = float(_flight['start_position_tolerance'])
+START_POSITION_TIMEOUT = float(_flight['start_position_timeout'])
 START_SETTLE_SECONDS = float(_flight['start_settle_seconds'])
 RETURN_Z = float(_flight['return_z'])
 LAND_Z = float(_flight['land_z'])
 DRONE_URI = _flight.get('drone_uri')
+if not all(math.isfinite(value) and value > 0.0 for value in (
+    START_POSITION_TOLERANCE, START_POSITION_TIMEOUT, START_SETTLE_SECONDS,
+)):
+    raise ValueError('Flight start-position settings must be finite and positive.')
 
 _estimator = _flight['estimator']
 ESTIMATOR_SAMPLE_PERIOD_MS = int(_estimator['sample_period_ms'])
@@ -131,6 +178,9 @@ _figure8 = _cfg['figure8']
 FIG8_X_BOUNDS = list(_figure8['workspace']['x'])
 FIG8_Y_BOUNDS = list(_figure8['workspace']['y'])
 FIG8_Z_BOUNDS = list(_figure8['workspace']['z'])
+FIG8_CHANCE_X_BOUNDS = list(_figure8['chance_workspace']['x'])
+FIG8_CHANCE_Y_BOUNDS = list(_figure8['chance_workspace']['y'])
+FIG8_CHANCE_Z_BOUNDS = list(_figure8['chance_workspace']['z'])
 FIG8_CENTER_X = float(_figure8['path']['center_x'])
 FIG8_CENTER_Y = float(_figure8['path']['center_y'])
 FIG8_HALF_WIDTH = float(_figure8['path']['half_width'])
@@ -143,9 +193,13 @@ FIG8_RETURN_TOLERANCE = float(_figure8['return_tolerance'])
 FIG8_T = int(_figure8['T'])
 FIG8_FLIGHT_POINTS = int(_figure8['flight_points'])
 FIG8_PLOT_POINTS = int(_figure8['plot_points'])
+FIG8_W_PHI = float(_figure8['planner_extra']['w_phi'])
 FIG8_W_REF_XY = float(_figure8['planner_extra']['w_ref_xy'])
 FIG8_W_REF_Z = float(_figure8['planner_extra']['w_ref_z'])
 FIG8_W_TERMINAL = float(_figure8['planner_extra']['w_terminal'])
+FIG8_W_CORRIDOR = float(_figure8['planner_extra']['w_corridor'])
+FIG8_CORRIDOR_RADIUS = float(_figure8['planner_extra']['corridor_radius'])
+FIG8_MAX_CONTROL_DELTA = float(_figure8['planner_extra']['max_control_delta'])
 FIG8_OBSTACLES = [_obstacle(source) for source in _figure8['obstacles']]
 
 if not 0.0 < FIG8_DETERMINISTIC_CRUISE_VELOCITY <= U_MAX:
@@ -171,8 +225,14 @@ def plan_config_signature(fan: int, scenario: str) -> str:
         'fan': fan,
         'scenario': scenario,
         'uncertainty': {
-            'sigma0': float(_uncertainty['sigma0_per_fan'][fan]),
-            'q_std': Q_STD,
+            'model': _uncertainty['model'],
+            'initial_variance': float(_uncertainty['initial_variance']),
+            'response_enabled_axes': list(_uncertainty['response_enabled_axes']),
+            'response_time_constant': list(_uncertainty['response_time_constant']),
+            'stationary_residual_variance': list(
+                _uncertainty['stationary_residual_variance_per_fan'][fan]
+            ),
+            'residual_mean': list(_uncertainty['residual_mean_per_fan'][fan]),
             'source_report': _uncertainty.get('source_report'),
         },
         'planner': _planner,
@@ -180,6 +240,23 @@ def plan_config_signature(fan: int, scenario: str) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def uncertainty_metadata(fan: int) -> dict[str, Any]:
+    """Return the signed uncertainty inputs stored with a generated plan."""
+    if fan not in VALID_FANS:
+        raise ValueError(f'Invalid fan setting {fan}.')
+    return {
+        'uncertainty_model': UNCERTAINTY_MODEL,
+        'initial_variance': INITIAL_VARIANCE,
+        'response_enabled_axes': list(RESPONSE_ENABLED_AXES),
+        'response_time_constant': list(RESPONSE_TIME_CONSTANT),
+        'stationary_residual_variance': list(
+            STATIONARY_RESIDUAL_VARIANCE_PER_FAN[fan]
+        ),
+        'residual_mean': list(RESIDUAL_MEAN_PER_FAN[fan]),
+        'source_report': _uncertainty.get('source_report'),
+    }
 
 
 def validate_waypoints(
@@ -412,8 +489,38 @@ class PlanRepository:
             raise RuntimeError('Legacy plan; regenerate it before flight.')
         if metadata.get('config_signature') != plan_config_signature(fan, scenario):
             raise RuntimeError('Stale plan; regenerate it before flight.')
-        if metadata.get('sigma0') != SIGMA0_PER_FAN[fan] or metadata.get('q_std') != Q_STD:
+        expected_uncertainty = uncertainty_metadata(fan)
+        if any(metadata.get(key) != value for key, value in expected_uncertainty.items()):
             raise RuntimeError('Plan uncertainty does not match config.yml.')
-        if float(metadata.get('rho_after', 0.0)) <= 0.0:
-            raise RuntimeError('Plan requires a positive rho_after before flight.')
+        if not metadata.get('source_report'):
+            raise RuntimeError(
+                'Plan uncertainty is provisional; accept a final covariance report '
+                'and set uncertainty.source_report before flight.'
+            )
+        rho_after = float(metadata.get('rho_after', 0.0))
+        if not math.isfinite(rho_after) or rho_after < PLANNER_ALPHA:
+            raise RuntimeError(
+                f'Plan satisfaction {rho_after:.4f} is below alpha={PLANNER_ALPHA:.4f}.'
+            )
+        if scenario == 'figure8':
+            required_geometry = {
+                'return_error', 'return_tolerance', 'corridor_radius',
+                'max_reference_deviation', 'max_control_delta',
+                'max_control_delta_limit',
+            }
+            missing = sorted(required_geometry - metadata.keys())
+            if missing:
+                raise RuntimeError(
+                    f'Figure-eight plan lacks geometry validation metadata: {missing}.'
+                )
+            return_error = math.dist(plan.waypoints[0], plan.waypoints[-1])
+            if return_error > FIG8_RETURN_TOLERANCE:
+                raise RuntimeError(
+                    f'Figure-eight plan return error {return_error:.3f} m exceeds '
+                    f'{FIG8_RETURN_TOLERANCE:.3f} m.'
+                )
+            if float(metadata['max_reference_deviation']) > FIG8_CORRIDOR_RADIUS:
+                raise RuntimeError('Figure-eight plan leaves its reference corridor.')
+            if float(metadata['max_control_delta']) > FIG8_MAX_CONTROL_DELTA:
+                raise RuntimeError('Figure-eight plan exceeds its smoothness limit.')
         return plan

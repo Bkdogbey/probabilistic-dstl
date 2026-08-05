@@ -77,10 +77,15 @@ class SingleIntegrator(Dynamics):
 
         curr_mu = x0_mean
         curr_sigma = x0_cov
+        # Bound the complete sequence once. For ordinary dynamics this is
+        # identical to bounding one row at a time; scenario-specific dynamics
+        # may additionally impose sequence-level structure such as zero net
+        # displacement for a closed path.
+        u_sequence = self.bound_control(v_sequence)
 
         for t in range(T):
-            # 1. Squash the optimization variable to get physical control
-            u = self.bound_control(v_sequence[t])
+            # 1. Read the already-bounded physical control.
+            u = u_sequence[t]
 
             # 2. Update Mean (Differentiable)
             curr_mu = curr_mu + u * self.dt

@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 
-FLIGHT_PROFILE_SCHEMA_VERSION = 1
+FLIGHT_PROFILE_SCHEMA_VERSION = 2
 
 
 def flight_profile_payload(config: dict[str, Any], scenario: str) -> dict[str, Any]:
@@ -18,6 +18,11 @@ def flight_profile_payload(config: dict[str, Any], scenario: str) -> dict[str, A
         'scenario': scenario,
         'log_sample_hz': int(flight['log_sample_hz']),
         'estimator': flight['estimator'],
+        'start_position': {
+            'tolerance': flight['start_position_tolerance'],
+            'timeout': flight['start_position_timeout'],
+            'settle_seconds': flight['start_settle_seconds'],
+        },
         'controller': 'PositionHlCommander.CONTROLLER_PID',
     }
     if scenario == 'figure8':

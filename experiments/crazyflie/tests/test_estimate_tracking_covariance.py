@@ -67,6 +67,31 @@ def _reference_mission(k=5):
     return t, xyz
 
 
+def _synthetic_response_runs(
+    *, fans=(2, 6), n_runs=20, k=12, tau=(0.4, 0.7, 0.0), seed=10,
+):
+    """Build aligned runs with known first-order response and small noise."""
+    rng = np.random.default_rng(seed)
+    times = np.linspace(0.0, 3.0, k)
+    phase = np.linspace(0.0, 2.0 * np.pi, k)
+    commands = np.column_stack([
+        0.3 * np.sin(phase),
+        -1.0 + 0.5 * np.cos(phase),
+        0.3 + 0.1 * np.sin(phase / 2.0),
+    ])
+    mean = etc.predict_response(times, commands, tau)
+    return {
+        fan: [
+            etc.AlignedRun(
+                times.copy(), commands.copy(),
+                mean + rng.normal(0.0, 0.004 + fan / 10000.0, size=mean.shape),
+            )
+            for _ in range(n_runs)
+        ]
+        for fan in fans
+    }
+
+
 # ── load_run: interpolation, takeoff-row dropping, exclusion reasons ────────
 def test_load_run_interpolates_exactly_at_known_timestamp(tmp_path):
     t, xyz = _reference_mission()
@@ -173,7 +198,7 @@ def test_align_runs_orders_by_file_position_not_row_count(tmp_path, monkeypatch)
     assert np.allclose(errors[1, :, 0], 0.3, atol=1e-6)
 
 
-# ── compute_mean_and_covariance / fit_sigma0_q: pure numpy, no CSVs ─────────
+# ── centered tracking-error statistics: pure numpy, no CSVs ─────────────
 def test_known_mean_error_recovery():
     # 3 runs, constant per-run offset (1.0, -1.0, 2.0) applied identically at
     # every waypoint -- mean_error must recover that constant exactly.
@@ -202,26 +227,27 @@ def test_known_covariance_recovery():
     assert np.allclose(covariance_raw[0], covariance_raw[0].T)
 
 
-def test_fit_recovers_known_linear_variance_growth():
-    k = 10
-    sigma0, q_var = 0.002, 0.0005
-    var_isotropic = sigma0 + q_var * np.arange(k)
-    covariance_raw = np.stack([np.eye(3) * v for v in var_isotropic])
-    fit = etc.fit_sigma0_q(covariance_raw)
-    assert fit.sigma0 == pytest.approx(sigma0, abs=1e-9)
-    assert fit.q_var == pytest.approx(q_var, abs=1e-9)
-    assert fit.r_squared == pytest.approx(1.0, abs=1e-6)
-    assert fit.residual_rms == pytest.approx(0.0, abs=1e-9)
+def test_response_fit_recovers_horizontal_time_constants():
+    runs = _synthetic_response_runs(n_runs=8, k=30, tau=(0.4, 0.7, 0.0))
+
+    fitted = etc.fit_response_model(runs)
+
+    assert fitted['time_constant'][:2] == pytest.approx([0.4, 0.7], abs=0.04)
+    assert fitted['time_constant'][2] == 0.0
+    assert fitted['r_squared'][0] > 0.95
+    assert fitted['r_squared'][1] > 0.95
+    assert fitted['acceptable'] is True
 
 
-def test_fit_reports_poor_fit_for_nonlinear_data():
-    k = 10
-    # Oscillating, non-linear-in-k variance -- a linear fit should NOT claim
-    # a good match.
-    var_isotropic = 0.01 + 0.05 * np.abs(np.sin(np.arange(k)))
-    covariance_raw = np.stack([np.eye(3) * v for v in var_isotropic])
-    fit = etc.fit_sigma0_q(covariance_raw)
-    assert fit.r_squared < 0.5
+def test_response_residuals_remove_repeatable_lag_not_random_spread():
+    runs = _synthetic_response_runs(fans=(2,), n_runs=10, k=30)
+    raw = np.stack([run.tracking_error for run in runs[2]])
+    fitted = etc.fit_response_model(runs)
+    residual = etc.response_residuals(runs[2], fitted)
+
+    assert np.mean(residual[:, :, :2] ** 2) < np.mean(raw[:, :, :2] ** 2) / 10.0
+    # A shared deterministic mean correction cannot erase between-run noise.
+    assert np.mean(np.var(residual, axis=0, ddof=1)) > 0.0
 
 
 # ── calibrate_fan / verdict / YAML output ───────────────────────────────────
@@ -229,14 +255,9 @@ def test_calibrate_fan_zero_runs_no_crash(tmp_path, monkeypatch):
     monkeypatch.setattr(etc, 'LOGS_DIR', tmp_path)
     result = etc.calibrate_fan(2)
     assert result['n_runs'] == 0
-    assert result['mean_error'] is None
-    assert result['bias_inclusive_variance'] is None
+    assert result['mean_residual'] is None
+    assert result['bias_inclusive_residual_mse'] is None
     assert result['n_attempts'] == 0
-
-
-def test_fit_quality_verdict_flags_negative_params():
-    result = {'r_squared': 0.9, 'sigma0_fit': -0.001, 'q_var_fit': 0.0001}
-    assert etc.fit_quality_verdict(result) == 'POOR FIT'
 
 
 def test_yaml_round_trip(tmp_path):
@@ -331,77 +352,65 @@ def test_load_run_rejects_implausible_position(tmp_path, monkeypatch):
     assert 'plausible workspace envelope' in reason
 
 
-# ── bias-inclusive shared fit and bootstrap ──────────────────────────────
-def test_bias_inclusive_variance_preserves_systematic_error():
+# ── stationary empirical covariance and bootstrap ────────────────────
+def test_bias_inclusive_mse_preserves_systematic_error():
     errors = np.full((4, 3, 3), 0.2)
-    mean, covariance, second_moment, variance = etc.compute_error_statistics(errors)
+    mean, covariance, second_moment, mse = etc.compute_error_statistics(errors)
 
     assert np.allclose(mean, 0.2)
     assert np.allclose(covariance, 0.0)
     assert np.allclose(np.diagonal(second_moment, axis1=1, axis2=2), 0.04)
-    assert np.allclose(variance, 0.04)
+    assert np.allclose(mse, 0.04)
 
 
-def test_shared_fit_recovers_fan_intercepts_and_one_q():
-    k = np.arange(12, dtype=float)
-    variances = {
-        2: 0.001 + 0.0002 * k,
-        6: 0.004 + 0.0002 * k,
-        12: 0.009 + 0.0002 * k,
-        16: 0.016 + 0.0002 * k,
-    }
+def test_planner_variance_preserves_unmodeled_phase_bias():
+    residuals = np.zeros((4, 2, 3))
+    residuals[:, 0, 0] = -0.2
+    residuals[:, 1, 0] = 0.2
 
-    fit = etc.fit_shared_sigma0_q(variances)
+    stats = etc.planner_residual_statistics(residuals)
 
-    assert fit.q_var == pytest.approx(0.0002, abs=1e-12)
-    assert fit.q_std == pytest.approx(np.sqrt(0.0002), abs=1e-12)
-    for fan, expected in ((2, 0.001), (6, 0.004), (12, 0.009), (16, 0.016)):
-        assert fit.sigma0_by_fan[fan] == pytest.approx(expected, abs=1e-12)
-    assert fit.r_squared == pytest.approx(1.0)
+    assert stats['pooled_mean'][0] == pytest.approx(0.0)
+    assert stats['centered_stationary_variance'][0] == pytest.approx(0.0)
+    assert stats['stationary_variance'][0] == pytest.approx(0.04)
+    assert stats['phase_fraction'][0] == pytest.approx(1.0)
 
 
-def test_shared_fit_never_returns_negative_parameters():
-    fit = etc.fit_shared_sigma0_q({
-        2: np.array([0.5, 0.3, 0.1]),
-        6: np.array([0.2, 0.1, 0.0]),
-    })
+def test_stationarity_accepts_constant_per_axis_variance(monkeypatch):
+    monkeypatch.setattr(etc, 'STATIONARITY_BIN_SIZE', 2)
+    covariance = np.stack([np.diag([0.01, 0.02, 0.03])] * 6)
 
-    assert fit.q_var >= 0.0
-    assert all(value >= 0.0 for value in fit.sigma0_by_fan.values())
+    diagnostics = etc.stationarity_diagnostics(covariance)
+
+    assert diagnostics['acceptable'] is True
+    assert diagnostics['max_bin_to_pooled_ratio'] == pytest.approx([1.0, 1.0, 1.0])
 
 
-def test_binned_diagnostic_accepts_noisy_data_from_true_linear_model():
-    rng = np.random.default_rng(42)
-    variances = {}
-    for fan, sigma in zip(etc.VALID_FANS, (0.02, 0.03, 0.04, 0.05)):
-        k = np.arange(100)
-        errors = rng.normal(
-            0.03,
-            np.sqrt(sigma**2 + k * 1e-5)[None, :, None],
-            size=(20, 100, 3),
-        )
-        variances[fan] = np.mean(errors**2, axis=(0, 2))
+def test_stationarity_rejects_local_variance_spike(monkeypatch):
+    monkeypatch.setattr(etc, 'STATIONARITY_BIN_SIZE', 2)
+    covariance = np.stack([np.diag([0.01, 0.01, 0.01])] * 10)
+    covariance[:2, 0, 0] = 0.20
 
-    fit = etc.fit_shared_sigma0_q(variances)
+    diagnostics = etc.stationarity_diagnostics(covariance)
 
-    assert fit.r_squared >= etc.MIN_R_SQUARED
-    assert fit.q_var == pytest.approx(1e-5, rel=0.15)
+    assert diagnostics['acceptable'] is False
+    assert diagnostics['max_bin_to_pooled_ratio'][0] > etc.MAX_STATIONARITY_RATIO
 
 
 def test_bootstrap_is_reproducible_and_has_all_intervals():
-    rng = np.random.default_rng(10)
-    errors = {
-        fan: rng.normal(0.05, 0.01 + fan / 1000, size=(20, 6, 3))
-        for fan in (2, 6)
-    }
+    runs = _synthetic_response_runs(n_runs=8)
 
-    first = etc.bootstrap_joint_fit(errors, samples=40, seed=123)
-    second = etc.bootstrap_joint_fit(errors, samples=40, seed=123)
+    first = etc.bootstrap_response_model(runs, samples=12, seed=123)
+    second = etc.bootstrap_response_model(runs, samples=12, seed=123)
 
     assert first == second
-    assert first['samples_valid'] == 40
-    assert set(first['sigma0_ci95']) == {2, 6}
-    assert first['q_std_ci95']['lower'] <= first['q_std_ci95']['upper']
+    assert first['samples_valid'] == 12
+    assert set(first['stationary_residual_variance_ci95']) == {2, 6}
+    assert set(first['stationary_residual_variance_ci95'][2]) == set(etc.AXES)
+    assert first['stationary_residual_variance_ci95'][2]['x']['lower'] <= (
+        first['stationary_residual_variance_ci95'][2]['x']['upper']
+    )
+    assert set(first['response_time_constant_ci95']) == set(etc.AXES)
 
 
 def _campaign_result(fan, n_runs, excluded=()):
@@ -411,45 +420,72 @@ def _campaign_result(fan, n_runs, excluded=()):
         'n_attempts': n_runs + len(excluded),
         'included_runs': [f'run-{index}' for index in range(n_runs)],
         'excluded_runs': list(excluded),
-        'mean_error': [],
-        'centered_covariance': [],
-        'second_moment': [],
-        'bias_inclusive_variance': [],
-        '_errors': np.empty((n_runs, 5, 3)),
+        'raw_mean_tracking_error': [],
+        'raw_bias_inclusive_mse': [],
+        'mean_residual': [],
+        'centered_residual_covariance': [],
+        'residual_second_moment': [],
+        'bias_inclusive_residual_mse': [],
+        'pooled_residual_mean': [0.01, -0.01, 0.0],
+        'stationary_residual_variance': [0.001 * fan] * 3,
+        'residual_stationarity': {
+            'acceptable': True,
+            'max_bin_to_pooled_ratio': [1.0, 1.0, 1.0],
+        },
+        '_runs': [],
+        '_residuals': np.empty((n_runs, 5, 3)),
     }
 
 
-def _acceptable_fit_and_bootstrap():
-    fit = etc.JointFitResult(
-        sigma0_by_fan={fan: 0.001 * fan for fan in etc.VALID_FANS},
-        q_var=0.0001,
-        q_std=0.01,
-        r_squared=max(0.9, etc.MIN_R_SQUARED),
-        residual_rms=0.00001,
-    )
-    bootstrap = {
+def _acceptable_response():
+    return {
+        'enabled_axes': {'x': True, 'y': True, 'z': False},
+        'time_constant': [0.5, 0.55, 0.0],
+        'r_squared': [0.85, 0.90, 0.0],
+        'minimum_r_squared': etc.MIN_RESPONSE_R_SQUARED,
+        'time_constant_bounds': list(etc.RESPONSE_TIME_CONSTANT_BOUNDS),
+        'acceptable': True,
+    }
+
+
+def _acceptable_bootstrap():
+    return {
         'seed': 1,
         'samples_requested': etc.BOOTSTRAP_SAMPLES,
         'samples_valid': etc.BOOTSTRAP_SAMPLES,
-        'sigma0_ci95': {
-            fan: {'lower': 0.0005 * fan, 'upper': 0.0015 * fan}
+        'response_time_constant_ci95': {
+            'x': {'lower': 0.4, 'upper': 0.6},
+            'y': {'lower': 0.45, 'upper': 0.65},
+            'z': {'lower': 0.0, 'upper': 0.0},
+        },
+        'response_r_squared_ci95': {
+            axis: {'lower': 0.0, 'upper': 1.0} for axis in etc.AXES
+        },
+        'stationary_residual_variance_ci95': {
+            fan: {
+                axis: {'lower': 0.0005 * fan, 'upper': 0.0015 * fan}
+                for axis in etc.AXES
+            }
             for fan in etc.VALID_FANS
         },
-        'q_var_ci95': {'lower': 0.00005, 'upper': 0.00015},
-        'q_std_ci95': {'lower': 0.007, 'upper': 0.013},
+        'pooled_residual_mean_ci95': {
+            fan: {
+                axis: {'lower': -0.02, 'upper': 0.02} for axis in etc.AXES
+            }
+            for fan in etc.VALID_FANS
+        },
     }
-    return fit, bootstrap
 
 
 def test_final_report_requires_20_valid_runs_for_every_fan(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'final')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
+    bootstrap = _acceptable_bootstrap()
     results = {
         fan: _campaign_result(fan, 20 if fan != 16 else 19)
         for fan in etc.VALID_FANS
     }
 
-    report = etc.build_campaign_report('final', results, fit, bootstrap)
+    report = etc.build_campaign_report('final', results, _acceptable_response(), bootstrap)
 
     assert report['accepted'] is False
     assert report['status'] == 'INCOMPLETE_FINAL_DATASET'
@@ -458,65 +494,73 @@ def test_final_report_requires_20_valid_runs_for_every_fan(monkeypatch):
 
 def test_accepted_final_report_uses_conservative_upper_bounds(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'final')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
+    bootstrap = _acceptable_bootstrap()
     results = {fan: _campaign_result(fan, 20) for fan in etc.VALID_FANS}
     results[2]['excluded_runs'] = [('failed-run', 'run marked VIOLATION')]
     results[2]['n_attempts'] = 21
 
-    report = etc.build_campaign_report('final', results, fit, bootstrap)
+    report = etc.build_campaign_report('final', results, _acceptable_response(), bootstrap)
 
     assert report['accepted'] is True
     assert report['status'] == 'ACCEPTED'
-    assert report['approved_values']['q_std'] == pytest.approx(0.013)
-    assert report['approved_values']['sigma0_per_fan'][16] == pytest.approx(0.024)
+    assert report['approved_values']['initial_variance'] == 0.0
+    assert report['approved_values']['stationary_residual_variance_per_fan'][16] == (
+        pytest.approx([0.024, 0.024, 0.024])
+    )
+    assert set(report['approved_values']) == {
+        'model', 'initial_variance', 'response_enabled_axes',
+        'response_time_constant', 'stationary_residual_variance_per_fan',
+        'residual_mean_per_fan',
+    }
     assert report['fans'][2]['n_attempts'] == 21
     assert report['fans'][2]['excluded_runs'][0]['run'] == 'failed-run'
 
 
-def test_poor_fit_never_exposes_approved_values(monkeypatch):
+def test_nonstationary_variance_never_exposes_approved_values(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'final')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
-    fit = etc.JointFitResult(
-        sigma0_by_fan=fit.sigma0_by_fan,
-        q_var=fit.q_var,
-        q_std=fit.q_std,
-        r_squared=etc.MIN_R_SQUARED - 0.01,
-        residual_rms=fit.residual_rms,
-    )
+    bootstrap = _acceptable_bootstrap()
     results = {fan: _campaign_result(fan, 20) for fan in etc.VALID_FANS}
+    results[12]['residual_stationarity']['acceptable'] = False
 
-    report = etc.build_campaign_report('final', results, fit, bootstrap)
+    report = etc.build_campaign_report('final', results, _acceptable_response(), bootstrap)
 
     assert report['accepted'] is False
-    assert report['status'] == 'POOR_FIT'
+    assert report['status'] == 'MODEL_REJECTED'
+    assert report['approved_values'] is None
+
+
+def test_poor_response_fit_never_exposes_approved_values(monkeypatch):
+    monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'final')
+    bootstrap = _acceptable_bootstrap()
+    response = _acceptable_response()
+    response['r_squared'][0] = 0.10
+    response['acceptable'] = False
+    results = {fan: _campaign_result(fan, 20) for fan in etc.VALID_FANS}
+
+    report = etc.build_campaign_report('final', results, response, bootstrap)
+
+    assert report['accepted'] is False
+    assert report['status'] == 'MODEL_REJECTED'
     assert report['approved_values'] is None
 
 
 def test_pilot_report_is_never_accepted(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'pilot')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
     result = {2: _campaign_result(2, etc.PILOT_RUNS)}
-    pilot_fit = etc.JointFitResult(
-        sigma0_by_fan={2: fit.sigma0_by_fan[2]},
-        q_var=fit.q_var,
-        q_std=fit.q_std,
-        r_squared=fit.r_squared,
-        residual_rms=fit.residual_rms,
-    )
-    bootstrap['sigma0_ci95'] = {2: bootstrap['sigma0_ci95'][2]}
 
-    report = etc.build_campaign_report('pilot', result, pilot_fit, bootstrap)
+    report = etc.build_campaign_report('pilot', result, _acceptable_response(), None)
 
     assert report['accepted'] is False
     assert report['status'] == 'PILOT_ONLY'
     assert report['approved_values'] is None
 
 
-# ── pooled Sigma_0 diagnostic (constant per-fan, no k-dependence) ────────
-def test_calibrate_fan_pooled_sigma0_matches_mean_of_bias_inclusive_variance(
+# ── stationary fan model and strict report accounting ─────────────────
+def test_calibrate_fan_separates_residual_mean_from_stationary_variance(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(etc, 'LOGS_DIR', tmp_path)
+    monkeypatch.setattr(etc, 'RESPONSE_ENABLED_AXES', (False, False, False))
     t, xyz = _reference_mission()
     prefix = etc.log_prefix('deterministic', 'figure8', 2)
     _build_run(tmp_path, f'{prefix}01', t, xyz, actual_xyz_fn=lambda tt: (tt + 0.1, 0.0, 0.0))
@@ -524,78 +568,63 @@ def test_calibrate_fan_pooled_sigma0_matches_mean_of_bias_inclusive_variance(
 
     result = etc.calibrate_fan(2)
 
-    assert result['pooled_sigma0'] == pytest.approx(
-        float(np.mean(result['bias_inclusive_variance']))
-    )
+    assert result['pooled_residual_mean'] == pytest.approx([0.2, 0.0, 0.0], abs=0.01)
+    assert result['stationary_residual_variance'] == pytest.approx([0.01, 0.0, 0.0])
+    assert result['residual_stationarity']['acceptable'] is True
 
 
-def test_calibrate_fan_pooled_sigma0_none_with_zero_runs(tmp_path, monkeypatch):
+def test_calibrate_fan_stationary_residual_variance_none_with_zero_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(etc, 'LOGS_DIR', tmp_path)
     result = etc.calibrate_fan(2)
-    assert result['pooled_sigma0'] is None
+    assert result['stationary_residual_variance'] is None
 
 
-def test_bootstrap_reports_pooled_sigma0_ci_per_fan():
-    rng = np.random.default_rng(10)
-    errors = {
-        fan: rng.normal(0.05, 0.01 + fan / 1000, size=(20, 6, 3))
-        for fan in (2, 6)
-    }
+def test_bootstrap_reports_per_axis_variance_and_mean_intervals():
+    runs = _synthetic_response_runs(n_runs=8)
 
-    bootstrap = etc.bootstrap_joint_fit(errors, samples=40, seed=123)
+    bootstrap = etc.bootstrap_response_model(runs, samples=12, seed=123)
 
-    assert set(bootstrap['pooled_sigma0_ci95']) == {2, 6}
+    assert set(bootstrap['stationary_residual_variance_ci95']) == {2, 6}
     for fan in (2, 6):
-        interval = bootstrap['pooled_sigma0_ci95'][fan]
-        assert interval['lower'] <= interval['upper']
+        for axis in etc.AXES:
+            variance = bootstrap['stationary_residual_variance_ci95'][fan][axis]
+            mean = bootstrap['pooled_residual_mean_ci95'][fan][axis]
+            assert 0.0 <= variance['lower'] <= variance['upper']
+            assert mean['lower'] <= mean['upper']
 
 
-def test_pooled_model_present_and_diagnostic_only(monkeypatch):
+def test_incomplete_attempt_accounting_blocks_acceptance(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'final')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
-    bootstrap['pooled_sigma0_ci95'] = {
-        fan: {'lower': 0.001 * fan, 'upper': 0.002 * fan} for fan in etc.VALID_FANS
-    }
+    bootstrap = _acceptable_bootstrap()
     results = {fan: _campaign_result(fan, 20) for fan in etc.VALID_FANS}
-    for fan, result in results.items():
-        result['pooled_sigma0'] = 0.0015 * fan
+    results[6]['n_attempts'] = 21
 
-    report = etc.build_campaign_report('final', results, fit, bootstrap)
+    report = etc.build_campaign_report('final', results, _acceptable_response(), bootstrap)
 
-    assert report['pooled_model']['sigma0_per_fan'][16] == pytest.approx(0.024)
-    assert report['pooled_model']['sigma0_ci95'][16] == {'lower': 0.016, 'upper': 0.032}
-    # Pooled model never gates acceptance or feeds approved_values.
-    assert report['accepted'] is True
-    assert 'pooled' not in report['approved_values']
+    assert report['accepted'] is False
+    assert report['attempts_accounted_for'] is False
+    assert report['status'] == 'INCOMPLETE_ATTEMPT_ACCOUNTING'
 
 
-def test_pooled_model_survives_missing_bootstrap_key(monkeypatch):
-    """Report-building callers that hand-build a bootstrap dict without the
-    pooled key (as older tests do) must not crash."""
+def test_missing_bootstrap_interval_blocks_acceptance(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'final')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
-    assert 'pooled_sigma0_ci95' not in bootstrap
+    bootstrap = _acceptable_bootstrap()
+    del bootstrap['stationary_residual_variance_ci95'][16]['z']
     results = {fan: _campaign_result(fan, 20) for fan in etc.VALID_FANS}
 
-    report = etc.build_campaign_report('final', results, fit, bootstrap)
+    report = etc.build_campaign_report('final', results, _acceptable_response(), bootstrap)
 
-    assert report['pooled_model']['sigma0_ci95'][16] is None
-    assert report['pooled_model']['sigma0_per_fan'][16] is None
+    assert report['accepted'] is False
+    assert report['status'] == 'MODEL_REJECTED'
 
 
 def test_pilot_report_flags_any_excluded_attempt(monkeypatch):
     monkeypatch.setattr(etc, 'ACTIVE_CAMPAIGN', 'pilot')
-    fit, bootstrap = _acceptable_fit_and_bootstrap()
     result = {2: _campaign_result(
         2, etc.PILOT_RUNS, excluded=(('bad-run', 'run marked VIOLATION'),),
     )}
-    pilot_fit = etc.JointFitResult(
-        sigma0_by_fan={2: fit.sigma0_by_fan[2]}, q_var=fit.q_var,
-        q_std=fit.q_std, r_squared=fit.r_squared, residual_rms=fit.residual_rms,
-    )
-    bootstrap['sigma0_ci95'] = {2: bootstrap['sigma0_ci95'][2]}
 
-    report = etc.build_campaign_report('pilot', result, pilot_fit, bootstrap)
+    report = etc.build_campaign_report('pilot', result, _acceptable_response(), None)
 
     assert report['status'] == 'PILOT_HAS_EXCLUSIONS'
     assert report['accepted'] is False

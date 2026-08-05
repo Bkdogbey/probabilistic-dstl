@@ -17,8 +17,12 @@ from .utils import (
     END_XY,
     EXPERIMENT_DIR,
     FIG8_BASE_HEIGHT,
+    FIG8_CHANCE_X_BOUNDS,
+    FIG8_CHANCE_Y_BOUNDS,
+    FIG8_CHANCE_Z_BOUNDS,
     FIG8_CENTER_X,
     FIG8_CENTER_Y,
+    FIG8_CORRIDOR_RADIUS,
     FIG8_CROSSING_HEIGHT,
     FIG8_HALF_WIDTH,
     FIG8_OBSTACLES,
@@ -26,20 +30,23 @@ from .utils import (
     FIG8_T,
     FIG8_TOP_HEIGHT,
     FIG8_VERTICAL_HALF,
+    FIG8_MAX_CONTROL_DELTA,
+    FIG8_RETURN_TOLERANCE,
+    FIG8_W_CORRIDOR,
+    FIG8_W_PHI,
     FIG8_W_REF_XY,
     FIG8_W_REF_Z,
     FIG8_W_TERMINAL,
-    FIG8_X_BOUNDS,
-    FIG8_Y_BOUNDS,
-    FIG8_Z_BOUNDS,
     FLIGHT_X_BOUNDS,
     FLIGHT_Y_BOUNDS,
     GOAL,
+    INITIAL_VARIANCE,
     OBSTACLES,
     PLANNER_CONFIG,
     PLANNER_ALPHA,
-    Q_STD,
-    SIGMA0_PER_FAN,
+    RESIDUAL_MEAN_PER_FAN,
+    RESPONSE_TIME_CONSTANT,
+    STATIONARY_RESIDUAL_VARIANCE_PER_FAN,
     START_XY,
     T,
     SAFE_PATH_FLIGHT_POINTS,
@@ -47,11 +54,12 @@ from .utils import (
     Waypoint,
     Z_HEIGHT,
     PlanRepository,
+    uncertainty_metadata,
     validate_waypoints,
 )
 from pdstl.base import BeliefTrajectory
 from pdstl.operators import Always, And, Eventually, Or, STL_Formula
-from planning.dynamics import SingleIntegrator
+from planning.dynamics import Dynamics
 from planning.environment import (
     CircularObstaclePredicate,
     Environment,
@@ -61,10 +69,127 @@ from planning.environment import (
 from planning.planner import Planner, TorchGaussianBelief
 
 
-class PositionDynamics(SingleIntegrator):
-    def __init__(self, dimension: int, dt=0.2, u_max=1.0, q_std=0.05, device='cpu'):
-        super().__init__(dt=dt, u_max=u_max, q_std=q_std, device=device)
-        self.Q = torch.eye(dimension, device=self.device) * q_std**2
+class PositionDynamics(Dynamics):
+    """First-order command response with stationary empirical residuals.
+
+    Controls move an internal commanded position. The Gaussian mean follows a
+    continuous first-order velocity response, discretized exactly over each
+    planner step. A zero time constant selects instantaneous response for an
+    axis (currently z). The belief is exact at time zero; fan-conditioned
+    residual mean and covariance are applied at future steps without random-
+    walk accumulation.
+    """
+
+    def __init__(
+        self, dimension: int, stationary_residual_variance,
+        response_time_constant, residual_mean=None,
+        dt=0.2, u_max=1.0,
+        device='cpu', enforce_return: bool = False,
+    ):
+        super().__init__(dt=dt, u_max=u_max, device=device)
+        variance = torch.as_tensor(
+            stationary_residual_variance, dtype=torch.float32, device=device,
+        )
+        if variance.shape != (dimension,) or not torch.all(torch.isfinite(variance)):
+            raise ValueError(
+                f'stationary_residual_variance must be a finite {dimension}-vector.'
+            )
+        if torch.any(variance < 0):
+            raise ValueError('stationary_residual_variance must be nonnegative.')
+        time_constant = torch.as_tensor(
+            response_time_constant, dtype=torch.float32, device=device,
+        )
+        if (
+            time_constant.shape != (dimension,)
+            or not torch.all(torch.isfinite(time_constant))
+            or torch.any(time_constant < 0)
+        ):
+            raise ValueError(
+                f'response_time_constant must be a finite nonnegative {dimension}-vector.'
+            )
+        bias = torch.zeros(dimension, dtype=torch.float32, device=device)
+        if residual_mean is not None:
+            bias = torch.as_tensor(residual_mean, dtype=torch.float32, device=device)
+        if bias.shape != (dimension,) or not torch.all(torch.isfinite(bias)):
+            raise ValueError(f'residual_mean must be a finite {dimension}-vector.')
+        self.residual_covariance = torch.diag(variance)
+        self.response_time_constant = time_constant
+        self.residual_mean = bias
+        # Some generic planner utilities sample ``dyn.Q``. Here Q is an
+        # output-residual covariance, not an accumulating process covariance.
+        self.Q = self.residual_covariance
+        self.enforce_return = enforce_return
+
+    def step(self, x, _covariance, control):
+        """Single-step fallback with zero incoming response velocity.
+
+        Full trajectory planning uses :meth:`forward`, which carries response
+        velocity between steps. This method remains available to generic
+        one-step callers and is exact for disabled (instantaneous) axes.
+        """
+        velocity = torch.zeros_like(control)
+        response, _velocity = self._response_step(x, velocity, control)
+        return response + self.residual_mean, self.residual_covariance
+
+    def _response_step(self, position, velocity, control):
+        """Apply the exact zero-order-hold solution of the response ODE."""
+        enabled = self.response_time_constant > 0
+        safe_tau = torch.where(
+            enabled, self.response_time_constant, torch.ones_like(self.response_time_constant),
+        )
+        decay = torch.exp(-self.dt / safe_tau)
+        response_displacement = (
+            safe_tau * (1.0 - decay) * velocity
+            + (self.dt - safe_tau * (1.0 - decay)) * control
+        )
+        next_position = torch.where(
+            enabled,
+            position + response_displacement,
+            position + control * self.dt,
+        )
+        next_velocity = torch.where(
+            enabled,
+            decay * velocity + (1.0 - decay) * control,
+            control,
+        )
+        return next_position, next_velocity
+
+    def bound_control(self, v):
+        controls = super().bound_control(v)
+        if not self.enforce_return or controls.ndim != 2:
+            return controls
+        # A closed figure-eight must have zero integrated velocity. Centering
+        # the whole sequence enforces that invariant exactly, then a common
+        # scale preserves it while respecting the Euclidean speed bound.
+        controls = controls - torch.mean(controls, dim=0, keepdim=True)
+        max_speed = torch.linalg.vector_norm(controls, dim=1).max()
+        scale = torch.clamp(self.u_max / (max_speed + 1e-9), max=1.0)
+        return controls * scale
+
+    def forward(self, v_sequence, x0_mean, x0_cov):
+        """Roll out command response and the stationary residual belief."""
+        controls = self.bound_control(v_sequence)
+        response_position = x0_mean
+        response_velocity = torch.zeros_like(x0_mean)
+        means = [x0_mean]
+        covariances = [x0_cov]
+        for control in controls:
+            response_position, response_velocity = self._response_step(
+                response_position, response_velocity, control,
+            )
+            means.append(response_position + self.residual_mean)
+            covariances.append(self.residual_covariance)
+        return torch.stack(means).unsqueeze(0), torch.stack(covariances).unsqueeze(0)
+
+    def commanded_trace(
+        self, belief_mean_trace: torch.Tensor, controls: torch.Tensor,
+    ) -> torch.Tensor:
+        """Recover command waypoints from the optimized physical controls."""
+        if controls.ndim != 2 or controls.shape[1] != belief_mean_trace.shape[-1]:
+            raise ValueError('controls must have shape [T, dimension].')
+        start = belief_mean_trace[:, :1, :]
+        increments = torch.cumsum(controls * self.dt, dim=0).unsqueeze(0)
+        return torch.cat([start, start + increments], dim=1)
 
 
 class RectangularGoalPredicate(STL_Formula):
@@ -95,7 +220,13 @@ class RectangularGoalPredicate(STL_Formula):
 
 
 class RectangularObstaclePredicate(STL_Formula):
-    """Probability of being outside a 2D or 3D obstacle box."""
+    """Probability of being outside a 2D or 3D obstacle box.
+
+    The planner propagates diagonal Gaussian covariance, so coordinate events
+    are independent. Computing ``1 - P(inside)`` is smooth and exact for that
+    model; selecting the largest single-face escape probability with max()
+    created discontinuous gradients whenever the active obstacle face changed.
+    """
 
     def __init__(self, region):
         super().__init__()
@@ -108,21 +239,22 @@ class RectangularObstaclePredicate(STL_Formula):
 
         mu_x, mu_y = mu[..., 0], mu[..., 1]
         var_x, var_y = var[..., 0], var[..., 1]
-        probs = [
-            normal_cdf(self.x_min, mu_x, var_x),
-            1.0 - normal_cdf(self.x_max, mu_x, var_x),
-            normal_cdf(self.y_min, mu_y, var_y),
-            1.0 - normal_cdf(self.y_max, mu_y, var_y),
-        ]
+        p_x_inside = normal_cdf(self.x_max, mu_x, var_x) - normal_cdf(
+            self.x_min, mu_x, var_x,
+        )
+        p_y_inside = normal_cdf(self.y_max, mu_y, var_y) - normal_cdf(
+            self.y_min, mu_y, var_y,
+        )
+        p_inside = p_x_inside * p_y_inside
 
         if self.z_min is not None:
             mu_z, var_z = mu[..., 2], var[..., 2]
-            probs.append(normal_cdf(self.z_min, mu_z, var_z))
-            probs.append(1.0 - normal_cdf(self.z_max, mu_z, var_z))
+            p_z_inside = normal_cdf(self.z_max, mu_z, var_z) - normal_cdf(
+                self.z_min, mu_z, var_z,
+            )
+            p_inside = p_inside * p_z_inside
 
-        stacked_probs = torch.stack(probs, dim=0)
-        p_safe, _ = torch.max(stacked_probs, dim=0)
-
+        p_safe = torch.clamp(1.0 - p_inside, min=0.0, max=1.0)
         return torch.stack([p_safe, p_safe], dim=-1)
 
 
@@ -132,6 +264,7 @@ class PositionEnvironment(Environment):
     def __init__(self, device="cpu"):
         super().__init__(device=device)
         self.time_windowed_bounds = []
+        self.bounds_interval = None
 
     def add_obstacle(self, x_range, y_range, z_range=None):
         obstacle = {"x": x_range, "y": y_range}
@@ -163,10 +296,11 @@ class PositionEnvironment(Environment):
             self.goal["z"] = z_range
         self.goal_interval = interval
 
-    def set_bounds(self, x_range, y_range, z_range=None):
+    def set_bounds(self, x_range, y_range, z_range=None, interval=None):
         self.bounds = {"x": x_range, "y": y_range}
         if z_range is not None:
             self.bounds["z"] = z_range
+        self.bounds_interval = interval
 
     def get_predicates(self):
         preds = {
@@ -264,8 +398,11 @@ class PositionEnvironment(Environment):
             specs.append(Always(current_safe_formula, interval=[t_constraints_start, T]))
 
         if self.bounds is not None:
+            bounds_interval = self.bounds_interval
+            if bounds_interval is None:
+                bounds_interval = [t_constraints_start, T]
             specs.append(
-                Always(RectangularGoalPredicate(self.bounds), interval=[t_constraints_start, T])
+                Always(RectangularGoalPredicate(self.bounds), interval=bounds_interval)
             )
 
         if not specs:
@@ -299,19 +436,26 @@ class PositionPlanner(Planner):
         margin = self.cfg["obs_margin"]
 
         for obs in self.env.obstacles:
-            cx = (obs["x"][0] + obs["x"][1]) / 2.0
-            cy = (obs["y"][0] + obs["y"][1]) / 2.0
-            radius = max(obs["x"][1] - obs["x"][0], obs["y"][1] - obs["y"][0]) / 2.0 + margin
-            obs_z = obs.get("z")
-            if obs_z is not None:
-                cz = (obs_z[0] + obs_z[1]) / 2.0
-                center = torch.tensor([[cx, cy, cz]], device=self.device)
-                radius = max(radius, (obs_z[1] - obs_z[0]) / 2.0 + margin)
-                dists = torch.norm(mean_trace[:, :, :3] - center, dim=2)
-            else:
-                center = torch.tensor([[cx, cy]], device=self.device)
-                dists = torch.norm(mean_trace[:, :, :2] - center, dim=2)
-            loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
+            ranges = [obs["x"], obs["y"]]
+            if obs.get("z") is not None:
+                ranges.append(obs["z"])
+            position = mean_trace[:, :, :len(ranges)]
+            lower = torch.tensor(
+                [axis[0] for axis in ranges], device=self.device, dtype=position.dtype,
+            )
+            upper = torch.tensor(
+                [axis[1] for axis in ranges], device=self.device, dtype=position.dtype,
+            )
+            center = (lower + upper) / 2.0
+            half_extent = (upper - lower) / 2.0
+            relative = torch.abs(position - center) - half_extent
+            outside_distance = torch.norm(torch.relu(relative), dim=2)
+            inside_distance = torch.minimum(
+                torch.max(relative, dim=2).values,
+                torch.zeros_like(outside_distance),
+            )
+            signed_distance = outside_distance + inside_distance
+            loss = loss + torch.sum(torch.relu(margin - signed_distance) ** 2)
 
         for obs in self.env.circle_obstacles:
             center = torch.tensor([obs["center"]], device=self.device)
@@ -331,9 +475,9 @@ class PositionPlanner(Planner):
 
         return loss
 
-    def _compute_loss(self, mean_trace, u_seq, p_all, loss_fn):
-        """Add figure-eight reference and terminal-return losses when configured."""
-        loss = super()._compute_loss(mean_trace, u_seq, p_all, loss_fn)
+    def _guidance_loss(self, mean_trace, u_seq):
+        """Add reference, corridor, and terminal quality to shared guidance."""
+        loss = super()._guidance_loss(mean_trace, u_seq)
         ref = getattr(self, 'reference_trajectory', None)
         if ref is None:
             return loss
@@ -344,12 +488,16 @@ class PositionPlanner(Planner):
         loss_ref_xy = torch.sum((mean_trace[:, :, :2] - ref_xy) ** 2)
         loss_ref_z = torch.sum((mean_trace[:, :, 2] - ref_z) ** 2)
         loss_terminal = torch.sum((mean_trace[:, -1, :3] - ref[0, :3]) ** 2)
+        reference_distance = torch.norm(mean_trace[:, :, :3] - ref.unsqueeze(0), dim=2)
+        corridor_radius = self.cfg.get('corridor_radius', float('inf'))
+        loss_corridor = torch.sum(torch.relu(reference_distance - corridor_radius) ** 2)
 
         return (
             loss
             + self.cfg.get('w_ref_xy', 0.0) * loss_ref_xy
             + self.cfg.get('w_ref_z', 0.0) * loss_ref_z
             + self.cfg.get('w_terminal', 0.0) * loss_terminal
+            + self.cfg.get('w_corridor', 0.0) * loss_corridor
         )
 
 
@@ -385,16 +533,24 @@ def build_environment_baseline() -> PositionEnvironment:
 
 
 def build_planner_baseline(fan: int) -> tuple[PositionPlanner, PositionDynamics, PositionEnvironment]:
-    dynamics = PositionDynamics(2, dt=DT, u_max=U_MAX, q_std=Q_STD)
+    dynamics = PositionDynamics(
+        2,
+        STATIONARY_RESIDUAL_VARIANCE_PER_FAN[fan][:2],
+        RESPONSE_TIME_CONSTANT[:2],
+        RESIDUAL_MEAN_PER_FAN[fan][:2],
+        dt=DT,
+        u_max=U_MAX,
+    )
     environment = build_environment_baseline()
     planner = PositionPlanner(dynamics, environment, T, config=dict(PLANNER_CONFIG))
     return planner, dynamics, environment
 
 
 def initial_belief_baseline(fan: int) -> tuple[torch.Tensor, torch.Tensor]:
-    sigma0 = SIGMA0_PER_FAN[fan]
+    if fan not in STATIONARY_RESIDUAL_VARIANCE_PER_FAN:
+        raise ValueError(f'Invalid fan setting {fan}.')
     mean = torch.tensor(START_XY, dtype=torch.float32)
-    covariance = torch.eye(2, dtype=torch.float32) * sigma0
+    covariance = torch.eye(2, dtype=torch.float32) * INITIAL_VARIANCE
     return mean, covariance
 
 
@@ -429,22 +585,46 @@ def build_environment_figure8() -> PositionEnvironment:
     tracking keeps the solution near the smooth 3D figure-eight.
     """
     env = PositionEnvironment()
-    env.set_bounds(x_range=FIG8_X_BOUNDS, y_range=FIG8_Y_BOUNDS, z_range=FIG8_Z_BOUNDS)
+    # Commanded waypoints use the narrower FIG8_*_BOUNDS. The probabilistic
+    # workspace describes the physical room available to the uncertain state;
+    # it must extend beyond a nominal curve that intentionally touches its
+    # commanded y/z limits, otherwise boundary containment can never reach
+    # alpha even for a perfectly closed mean trajectory.
+    env.set_bounds(
+        x_range=FIG8_CHANCE_X_BOUNDS,
+        y_range=FIG8_CHANCE_Y_BOUNDS,
+        z_range=FIG8_CHANCE_Z_BOUNDS,
+    )
     for obs in FIG8_OBSTACLES:
         env.add_obstacle(x_range=list(obs['x']), y_range=list(obs['y']), z_range=list(obs['z']))
     return env
 
 
-def build_planner_figure8() -> tuple[PositionPlanner, PositionDynamics, PositionEnvironment]:
+def build_planner_figure8(
+    fan: int = 2,
+) -> tuple[PositionPlanner, PositionDynamics, PositionEnvironment]:
     """Build a (Planner, dynamics, environment) for the figure8 mission.
 
     Attach the analytical path as the figure-eight reference trajectory.
     """
-    dynamics = PositionDynamics(3, dt=DT, u_max=U_MAX, q_std=Q_STD)
+    dynamics = PositionDynamics(
+        3,
+        STATIONARY_RESIDUAL_VARIANCE_PER_FAN[fan],
+        RESPONSE_TIME_CONSTANT,
+        RESIDUAL_MEAN_PER_FAN[fan],
+        dt=DT,
+        u_max=U_MAX,
+        enforce_return=True,
+    )
     env = build_environment_figure8()
     planner = PositionPlanner(dynamics, env, FIG8_T, config={
         **PLANNER_CONFIG,
-        'w_ref_xy': FIG8_W_REF_XY, 'w_ref_z': FIG8_W_REF_Z, 'w_terminal': FIG8_W_TERMINAL,
+        'w_phi': FIG8_W_PHI,
+        'w_ref_xy': FIG8_W_REF_XY,
+        'w_ref_z': FIG8_W_REF_Z,
+        'w_terminal': FIG8_W_TERMINAL,
+        'w_corridor': FIG8_W_CORRIDOR,
+        'corridor_radius': FIG8_CORRIDOR_RADIUS,
     })
     planner.reference_trajectory = torch.tensor(
         nominal_figure8_waypoints(FIG8_T + 1), dtype=torch.float32,
@@ -453,11 +633,12 @@ def build_planner_figure8() -> tuple[PositionPlanner, PositionDynamics, Position
 
 
 def x0_belief_figure8(fan_speed: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Initial belief using the approved fan covariance from config.yml."""
-    sigma0 = SIGMA0_PER_FAN[fan_speed]
+    """Return the known figure-eight start with exactly zero covariance."""
+    if fan_speed not in STATIONARY_RESIDUAL_VARIANCE_PER_FAN:
+        raise ValueError(f'Invalid fan setting {fan_speed}.')
     start = nominal_figure8_waypoints(n_points=2)[0]
     mean = torch.tensor(start, dtype=torch.float32)
-    cov = torch.diag(torch.tensor([sigma0, sigma0, sigma0], dtype=torch.float32))
+    cov = torch.eye(3, dtype=torch.float32) * INITIAL_VARIANCE
     assert mean.shape == (3,), f'x0 mean must be 3D, got {tuple(mean.shape)}'
     assert cov.shape == (3, 3), f'x0 cov must be 3x3, got {tuple(cov.shape)}'
     return mean, cov
@@ -494,6 +675,27 @@ def figure8_min_clearances(
 def terminal_return_error(waypoints: list[tuple[float, float, float]]) -> float:
     """Euclidean distance between the final and initial waypoints."""
     return math.dist(waypoints[0], waypoints[-1])
+
+
+def maximum_control_delta(
+    waypoints: list[tuple[float, float, float]], dt: float = DT,
+) -> float:
+    """Largest change in consecutive Cartesian velocity commands."""
+    if len(waypoints) < 3:
+        return 0.0
+    controls = np.diff(np.asarray(waypoints, dtype=float), axis=0) / dt
+    return float(np.max(np.linalg.norm(np.diff(controls, axis=0), axis=1)))
+
+
+def maximum_reference_deviation(
+    waypoints: list[tuple[float, float, float]],
+) -> float:
+    """Maximum phase-aligned distance from the analytical figure-eight."""
+    if not waypoints:
+        return float('inf')
+    actual = np.asarray(waypoints, dtype=float)
+    reference = np.asarray(nominal_figure8_waypoints(len(waypoints)), dtype=float)
+    return float(np.max(np.linalg.norm(actual - reference, axis=1)))
 
 
 @dataclass(frozen=True)
@@ -563,7 +765,28 @@ class FigureEightScenario(Scenario):
     def nominal_waypoints(self, n_points=None):
         return nominal_figure8_waypoints(n_points or self.horizon + 1)
 
-    def build_planner(self, fan): return build_planner_figure8()
+    def validate(self, waypoints, *, label='Waypoint'):
+        super().validate(waypoints, label=label)
+        return_error = terminal_return_error(waypoints)
+        if return_error > FIG8_RETURN_TOLERANCE:
+            raise ValueError(
+                f'{label} path does not close: return error {return_error:.3f} m '
+                f'exceeds {FIG8_RETURN_TOLERANCE:.3f} m.'
+            )
+        reference_deviation = maximum_reference_deviation(waypoints)
+        if reference_deviation > FIG8_CORRIDOR_RADIUS:
+            raise ValueError(
+                f'{label} path leaves figure-eight corridor: maximum deviation '
+                f'{reference_deviation:.3f} m exceeds {FIG8_CORRIDOR_RADIUS:.3f} m.'
+            )
+        control_delta = maximum_control_delta(waypoints)
+        if control_delta > FIG8_MAX_CONTROL_DELTA:
+            raise ValueError(
+                f'{label} path is not smooth: maximum control change '
+                f'{control_delta:.3f} m/s exceeds {FIG8_MAX_CONTROL_DELTA:.3f} m/s.'
+            )
+
+    def build_planner(self, fan): return build_planner_figure8(fan)
     def initial_belief(self, fan): return x0_belief_figure8(fan)
     def initial_controls(self): return nominal_initial_controls_figure8()
     def build_environment(self): return build_environment_figure8()
@@ -595,57 +818,132 @@ class PlanningService:
 
     def run(self, *, fan: int, scenario: str, plot: bool = False) -> pathlib.Path:
         model = get_scenario(scenario)
-        planner, _dynamics, environment = model.build_planner(fan)
+        planner, dynamics, environment = model.build_planner(fan)
         initial_mean, initial_covariance = model.initial_belief(fan)
         initial_controls = model.initial_controls()
         rho_before = _satisfaction(planner, initial_controls, initial_mean, initial_covariance)
-        best_mean, _covariance, _controls, rho_after, _history = planner._optimize_window(
+        best_mean, _covariance, controls, rho_after, _history = planner._optimize_window(
             initial_mean, initial_covariance, init_guess=initial_controls, verbose=True,
         )
-        positions = best_mean.squeeze(0).cpu().numpy()
+        commanded_trace = dynamics.commanded_trace(best_mean, controls)
+        positions = commanded_trace.squeeze(0).cpu().numpy()
+        predicted_positions = best_mean.squeeze(0).cpu().numpy()
         if model.dimension == 2:
             waypoints = [(float(x), float(y), Z_HEIGHT) for x, y in positions]
         else:
             waypoints = [tuple(map(float, point)) for point in positions]
+        if float(rho_after) < PLANNER_ALPHA:
+            raise RuntimeError(
+                f'Refusing to save fan-{fan} {scenario} plan: exact satisfaction '
+                f'{float(rho_after):.4f} is below alpha={PLANNER_ALPHA:.4f}.'
+            )
         model.validate(waypoints, label='Generated waypoint')
+        geometry_metadata = {}
+        if scenario == 'figure8':
+            geometry_metadata = {
+                'return_tolerance': FIG8_RETURN_TOLERANCE,
+                'return_error': terminal_return_error(waypoints),
+                'corridor_radius': FIG8_CORRIDOR_RADIUS,
+                'max_reference_deviation': maximum_reference_deviation(waypoints),
+                'max_control_delta_limit': FIG8_MAX_CONTROL_DELTA,
+                'max_control_delta': maximum_control_delta(waypoints),
+            }
         path = self.plans.save(fan, scenario, waypoints, {
-            'sigma0': SIGMA0_PER_FAN[fan],
-            'q_std': Q_STD,
+            **uncertainty_metadata(fan),
             'rho_before': round(rho_before, 4),
             'rho_after': round(float(rho_after), 4),
             'alpha': PLANNER_ALPHA,
             'T': planner.T,
             'dt': DT,
             'generated': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            **geometry_metadata,
         })
         print(f'Wrote {len(waypoints)} waypoints to {path}')
         if plot:
-            self._plot(model, environment, waypoints, fan)
+            self._plot(
+                model, environment, waypoints, predicted_positions,
+                fan, float(rho_after),
+            )
         return path
 
     @staticmethod
-    def _plot(model: Scenario, environment, waypoints, fan: int) -> None:
+    def _plot(
+        model: Scenario,
+        environment,
+        waypoints,
+        predicted_positions,
+        fan: int,
+        satisfaction: float,
+    ) -> None:
         import matplotlib.pyplot as plt
 
         from .utils import draw_environment_2d, draw_environment_3d
+        from visualization.style import PALETTE, save_figure
 
         nominal = np.array(model.nominal_waypoints(model.flight_points))
         planned = np.array(waypoints)
+        predicted = np.asarray(predicted_positions, dtype=float)
+        standard_deviation = np.sqrt(
+            np.asarray(STATIONARY_RESIDUAL_VARIANCE_PER_FAN[fan])
+        )
+        uncertainty_indices = np.linspace(1, len(planned) - 1, 8, dtype=int)
         if model.dimension == 2:
             figure, axis = plt.subplots(figsize=(7, 7))
             draw_environment_2d(axis, environment)
-            axis.plot(nominal[:, 0], nominal[:, 1], '--', label='nominal')
-            axis.plot(planned[:, 0], planned[:, 1], '.-', label='pdSTL')
+            axis.plot(
+                nominal[:, 0], nominal[:, 1], '--',
+                color=PALETTE['plan']['stroke'], alpha=0.65, label='nominal',
+            )
+            axis.plot(
+                planned[:, 0], planned[:, 1], '-',
+                color=PALETTE['ego']['stroke'], label='pdSTL command',
+            )
+            axis.plot(
+                predicted[:, 0], predicted[:, 1], '-',
+                color=PALETTE['lane']['stroke'], label='predicted actual mean',
+            )
+            axis.errorbar(
+                predicted[uncertainty_indices, 0], predicted[uncertainty_indices, 1],
+                xerr=standard_deviation[0], yerr=standard_deviation[1],
+                fmt='none', ecolor=PALETTE['lane']['stroke'], alpha=0.35,
+                capsize=2, label='1σ residual uncertainty',
+            )
         else:
             figure = plt.figure(figsize=(8, 8))
             axis = figure.add_subplot(projection='3d')
             axis.view_init(elev=22, azim=-50)
-            draw_environment_3d(axis, environment, fit_points=np.vstack([nominal, planned]))
-            axis.plot(*nominal.T, '--', label='nominal')
-            axis.plot(*planned.T, '.-', label='pdSTL')
+            draw_environment_3d(
+                axis, environment, fit_points=np.vstack([nominal, planned, predicted]),
+            )
+            axis.plot(
+                *nominal.T, '--', color=PALETTE['plan']['stroke'],
+                alpha=0.65, label='nominal',
+            )
+            axis.plot(
+                *planned.T, '-', color=PALETTE['ego']['stroke'],
+                label='pdSTL command',
+            )
+            axis.plot(
+                *predicted.T, '-', color=PALETTE['lane']['stroke'],
+                label='predicted actual mean',
+            )
+            axis.errorbar(
+                predicted[uncertainty_indices, 0],
+                predicted[uncertainty_indices, 1],
+                predicted[uncertainty_indices, 2],
+                xerr=standard_deviation[0],
+                yerr=standard_deviation[1],
+                zerr=standard_deviation[2],
+                fmt='none', ecolor=PALETTE['lane']['stroke'], alpha=0.35,
+                capsize=2, label='1σ residual uncertainty',
+            )
+        axis.set_title(
+            f'{model.name} fan {fan}: P(sat)={satisfaction:.3f}, '
+            f'α={PLANNER_ALPHA:.2f}'
+        )
         axis.legend()
-        output = EXPERIMENT_DIR / 'plots' / f'{model.name}_fan{fan}_comparison.png'
-        output.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(output, dpi=150, bbox_inches='tight')
+        figure.tight_layout()
+        output = EXPERIMENT_DIR / 'plots' / f'planning_{model.name}_fan{fan:02d}'
+        written = save_figure(figure, output, formats=('png', 'pdf'))
         plt.close(figure)
-        print(f'Plot saved to {output}')
+        print(f'Plots saved to {written["png"]} and {written["pdf"]}')

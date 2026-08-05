@@ -45,22 +45,29 @@ def _summarize(rows: list[dict]) -> dict:
     }
 
 
-def _planned_path(condition: str, fan: int, scenario: str = 'baseline') -> np.ndarray:
+def _reference_path(
+    condition: str,
+    fan: int,
+    scenario: str,
+    commanded_rows: list[dict],
+) -> np.ndarray | None:
+    """Prefer the commands recorded for this run over mutable plan files."""
+    if commanded_rows:
+        return np.asarray([
+            [float(row['x']), float(row['y']), float(row['z'])]
+            for row in commanded_rows
+        ])
     scenario_model = get_scenario(scenario)
-    wps = (
-        PlanRepository().load(fan, scenario).waypoints
-        if condition == 'pdstl'
-        else scenario_model.nominal_waypoints(scenario_model.flight_points)
-    )
-    return np.array(wps)
+    if condition == 'deterministic':
+        return np.asarray(scenario_model.nominal_waypoints(scenario_model.flight_points))
+    try:
+        return np.asarray(PlanRepository().load(fan, scenario).waypoints)
+    except FileNotFoundError:
+        return None
 
 
 def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Path:
-    """Plot one logged baseline run against its planned path; returns the saved PNG path.
-
-    Unchanged from before --scenario existed -- always the flat 2D baseline
-    arena, only ever called for scenario='baseline'.
-    """
+    """Plot one logged baseline run against its recorded commands."""
     from .utils import draw_environment_2d
 
     import matplotlib.pyplot as plt
@@ -71,7 +78,7 @@ def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Pa
     actual_rows = _read_csv(actual_path)
     commanded_rows = _read_csv(commanded_path) if commanded_path else []
     summary = _summarize(actual_rows)
-    planned_xy = _planned_path(condition, fan)[:, :2]
+    reference = _reference_path(condition, fan, 'baseline', commanded_rows)
 
     fig, ax = plt.subplots(figsize=_figsize("single", aspect=1.0))
     draw_environment_2d(ax, build_environment_baseline())
@@ -81,10 +88,12 @@ def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Pa
         title += '  (CRASH)'
     ax.set_title(title)
 
-    ax.plot(
-        planned_xy[:, 0], planned_xy[:, 1],
-        color=PALETTE["plan"]["stroke"], linestyle='--', lw=1.5, alpha=0.7, label='planned',
-    )
+    if reference is not None:
+        ax.plot(
+            reference[:, 0], reference[:, 1],
+            color=PALETTE["plan"]["stroke"], linestyle='--', lw=1.5,
+            alpha=0.8, label='commanded',
+        )
 
     ax_x = [float(r['x']) for r in actual_rows]
     ax_y = [float(r['y']) for r in actual_rows]
@@ -98,18 +107,10 @@ def _plot_run_2d(condition: str, fan: int, run: int | None = None) -> pathlib.Pa
         ux, uy = zip(*unsafe_xy)
         ax.scatter(ux, uy, c=PALETTE["obs_static"]["stroke"], s=20, zorder=5, label='unsafe sample')
 
-    if commanded_rows:
-        cx = [float(r['x']) for r in commanded_rows]
-        cy = [float(r['y']) for r in commanded_rows]
-        ax.plot(
-            cx, cy, 'o',
-            color=PALETTE["goal"]["stroke"], ms=4, alpha=0.6, label='commanded waypoint',
-        )
-
     ax.legend()
     fig.tight_layout()
 
-    out_path = EXPERIMENT_DIR / 'plots' / f'{condition}_fan{fan:02d}_run{run_num:02d}_actual.png'
+    out_path = EXPERIMENT_DIR / 'plots' / f'flight_{condition}_fan{fan:02d}_run{run_num:02d}.png'
     save_figure(fig, out_path.with_suffix(""), formats=("png", "pdf"))
     plt.close(fig)
 
@@ -138,10 +139,10 @@ def _plot_run_3d(condition: str, fan: int, run: int | None, scenario: str) -> pa
     actual_rows = _read_csv(actual_path)
     commanded_rows = _read_csv(commanded_path) if commanded_path else []
     summary = _summarize(actual_rows)
-    planned_xyz = _planned_path(condition, fan, scenario=scenario)
+    reference = _reference_path(condition, fan, scenario, commanded_rows)
 
     actual_xyz = np.array([[float(r['x']), float(r['y']), float(r['z'])] for r in actual_rows])
-    fit_points = np.vstack([planned_xyz, actual_xyz])
+    fit_points = actual_xyz if reference is None else np.vstack([reference, actual_xyz])
 
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(1, 1, 1, projection='3d')
@@ -153,10 +154,12 @@ def _plot_run_3d(condition: str, fan: int, run: int | None, scenario: str) -> pa
         title += '  (CRASH)'
     ax.set_title(title)
 
-    ax.plot(
-        planned_xyz[:, 0], planned_xyz[:, 1], planned_xyz[:, 2],
-        color=PALETTE["plan"]["stroke"], linestyle='--', lw=1.5, alpha=0.7, label='planned',
-    )
+    if reference is not None:
+        ax.plot(
+            reference[:, 0], reference[:, 1], reference[:, 2],
+            color=PALETTE["plan"]["stroke"], linestyle='--', lw=1.5,
+            alpha=0.8, label='commanded',
+        )
 
     ax_x = [float(r['x']) for r in actual_rows]
     ax_y = [float(r['y']) for r in actual_rows]
@@ -171,19 +174,13 @@ def _plot_run_3d(condition: str, fan: int, run: int | None, scenario: str) -> pa
         ux, uy, uz = zip(*unsafe_xyz)
         ax.scatter(ux, uy, uz, c=PALETTE["obs_static"]["stroke"], s=20, zorder=5, label='unsafe sample')
 
-    if commanded_rows:
-        cx = [float(r['x']) for r in commanded_rows]
-        cy = [float(r['y']) for r in commanded_rows]
-        cz = [float(r['z']) for r in commanded_rows]
-        ax.plot(
-            cx, cy, cz, 'o',
-            color=PALETTE["goal"]["stroke"], ms=4, alpha=0.6, label='commanded waypoint',
-        )
-
     ax.legend()
     fig.tight_layout()
 
-    out_path = EXPERIMENT_DIR / 'plots' / f'{condition}_{scenario}_fan{fan:02d}_run{run_num:02d}_actual.png'
+    out_path = (
+        EXPERIMENT_DIR / 'plots'
+        / f'flight_{condition}_{scenario}_fan{fan:02d}_run{run_num:02d}.png'
+    )
     save_figure(fig, out_path.with_suffix(""), formats=("png", "pdf"))
     plt.close(fig)
 

@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -124,20 +125,42 @@ class Planner:
 
         return loss
 
-    def _compute_loss(self, mean_trace, u_seq, p_all, loss_fn):
-        """Compute the total weighted objective J."""
+    def _guidance_loss(self, mean_trace, u_seq):
+        """Return every path-quality term except the STL probability term."""
         loss_u = torch.sum(u_seq ** 2)
         u_diff = u_seq[1:] - u_seq[:-1]
         loss_du = torch.sum(u_diff ** 2) + torch.sum(u_seq[0] ** 2)
-        loss_phi = loss_fn(p_all) if loss_fn is not None else -torch.log(p_all + 1e-4)
-
         return (
             self.cfg["w_u"]     * loss_u
             + self.cfg["w_du"]  * loss_du
-            + self.cfg["w_phi"] * loss_phi
             + self.cfg["w_dist"] * self._goal_dist_loss(mean_trace)
             + self.cfg["w_obs"]  * self._obs_repulsion_loss(mean_trace)
             + self.cfg["w_visit"] * self._visit_loss(mean_trace)
+        )
+
+    def _compute_loss(self, mean_trace, u_seq, p_all, loss_fn):
+        """Compute the differentiable optimization objective J."""
+        probability = torch.clamp(p_all, min=1e-6, max=1.0)
+        loss_phi = loss_fn(probability) if loss_fn is not None else -torch.log(probability)
+        return self._guidance_loss(mean_trace, u_seq) + self.cfg["w_phi"] * loss_phi
+
+    @staticmethod
+    def _candidate_is_better(
+        probability, quality, best_probability, best_quality, alpha,
+    ):
+        """Prefer feasibility first, then path quality; maximize p until feasible."""
+        if not np.isfinite(probability) or not np.isfinite(quality):
+            return False
+        if best_probability == -float("inf"):
+            return True
+        feasible = probability >= alpha
+        best_feasible = best_probability >= alpha
+        if feasible != best_feasible:
+            return feasible
+        if feasible:
+            return quality < best_quality
+        return probability > best_probability or (
+            np.isclose(probability, best_probability) and quality < best_quality
         )
 
     def _optimize_window(
@@ -161,9 +184,13 @@ class Planner:
 
         best_u, best_mean, best_cov = None, None, None
         best_p = -float("inf")
+        best_quality = float("inf")
         history = []
         prev_loss = float("inf")
         converged_iters = 0
+        smoothing_scale = float(self.cfg.get("stl_smoothing_scale", -1.0))
+        max_seen_probability = -float("inf")
+        last_probability_improvement = 0
 
         if verbose:
             log_utils._log.info(f"Starting optimisation (max iters: {self.cfg['max_iters']})")
@@ -180,18 +207,36 @@ class Planner:
             ]
             traj = BeliefTrajectory(beliefs)
 
-            stl_trace = phi(traj)
-            p_all = stl_trace[0, 0, 0]
+            # Optimize a smooth temporal minimum, but select and report plans
+            # using the exact pdSTL probability. This prevents one worst-time
+            # waypoint from receiving the entire gradient while preserving the
+            # original acceptance semantics.
+            stl_trace = phi(traj, scale=smoothing_scale)
+            p_objective = stl_trace[0, 0, 0]
+            if smoothing_scale > 0:
+                with torch.no_grad():
+                    p_exact = phi(traj)[0, 0, 0]
+            else:
+                p_exact = p_objective.detach()
 
-            J = self._compute_loss(mean_trace, u_seq, p_all, loss_fn)
+            J = self._compute_loss(mean_trace, u_seq, p_objective, loss_fn)
+            quality = self._guidance_loss(mean_trace, u_seq)
             J.backward()
             optimizer.step()
 
-            current_p = p_all.item()
+            current_p = p_exact.item()
+            current_quality = quality.detach().item()
             history.append(J.item())
+            probability_tol = float(self.cfg.get("probability_improvement_tol", 1e-4))
+            if current_p > max_seen_probability + probability_tol:
+                max_seen_probability = current_p
+                last_probability_improvement = k
 
-            if current_p > best_p:
+            if self._candidate_is_better(
+                current_p, current_quality, best_p, best_quality, self.cfg["alpha"],
+            ):
                 best_p = current_p
+                best_quality = current_quality
                 best_u = u_seq.detach().clone()
                 best_mean = mean_trace.detach().clone()
                 best_cov = cov_trace.detach().clone()
@@ -204,7 +249,27 @@ class Planner:
             else:
                 converged_iters = 0
 
-            if abs(prev_loss - J.item()) < self.cfg["loss_tol"] and k > self.cfg["min_iters"]:
+            infeasible_patience = int(self.cfg.get("infeasible_stall_patience", 0))
+            if (
+                infeasible_patience > 0
+                and max_seen_probability < self.cfg["alpha"]
+                and k - last_probability_improvement >= infeasible_patience
+            ):
+                if verbose:
+                    log_utils._log.info(
+                        f"Stopped infeasible plateau at iter {k}. "
+                        f"Best exact P(Sat): {max_seen_probability:.4f}"
+                    )
+                break
+
+            # A flat surrogate loss is not success. Keep optimizing until an
+            # exactly feasible trajectory exists; otherwise a near-obstacle
+            # local plateau would be saved as a failed plan.
+            if (
+                current_p >= self.cfg["alpha"]
+                and abs(prev_loss - J.item()) < self.cfg["loss_tol"]
+                and k > self.cfg["min_iters"]
+            ):
                 if verbose:
                     log_utils._log.info(f"Loss converged at iter {k}.")
                 break

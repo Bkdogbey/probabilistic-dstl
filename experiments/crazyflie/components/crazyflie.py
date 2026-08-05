@@ -24,6 +24,8 @@ from .utils import (
     LANDING_SETTLE_SECONDS,
     LANDING_VELOCITY,
     RETURN_Z,
+    START_POSITION_TOLERANCE,
+    START_POSITION_TIMEOUT,
     START_SETTLE_SECONDS,
     TAKEOFF_VELOCITY,
     U_MAX,
@@ -224,10 +226,29 @@ class CrazyflieFlightComponent(BaseComponent):
 
             executor = MissionExecutor(self.position_commander)
             executor.fly_to_start(start_xyz, safe_transit=safe_transit)
-            # go_to() returns once its estimated move duration elapses, not once
-            # position error has actually converged -- give the final descent
-            # leg time to settle so logged data starts from rest, not mid-move.
+
+            # go_to() returns after its estimated duration, not measured arrival.
+            # Wait for the actual start position before mission logging.
+            deadline = time.monotonic() + START_POSITION_TIMEOUT
+            while True:
+                measured_start = self.crazyflie.state_snapshot()
+                if (
+                    all(math.isfinite(value) for value in measured_start)
+                    and math.dist(measured_start, start_xyz) <= START_POSITION_TOLERANCE
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f'Start position did not settle within {START_POSITION_TIMEOUT:.1f}s.'
+                    )
+                time.sleep(0.1)
             time.sleep(START_SETTLE_SECONDS)
+            measured_start = self.crazyflie.state_snapshot()
+            print(
+                '[StartGate] Stable at '
+                f'({measured_start[0]:+.3f}, {measured_start[1]:+.3f}, '
+                f'{measured_start[2]:+.3f})'
+            )
 
             # Takeoff and transit-to-start are preflight, not experiment data.
             logger = FlightLogger(condition, fan_speed=fan_speed, scenario=scenario)

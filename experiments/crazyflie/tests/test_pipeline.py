@@ -8,8 +8,15 @@ import pytest
 from experiments.crazyflie import estimate_covariance
 from experiments.crazyflie.components import utils as config
 from experiments.crazyflie.components.planner import PlanRepository, get_scenario
-from experiments.crazyflie.components.utils import validate_waypoints
+from experiments.crazyflie.components.utils import uncertainty_metadata, validate_waypoints
 from experiments.crazyflie.run import ExperimentRunner, RunRequest
+
+
+@pytest.fixture(autouse=True)
+def _accepted_uncertainty_source(monkeypatch):
+    monkeypatch.setitem(
+        config._cfg['uncertainty'], 'source_report', 'accepted-test-report.yml',
+    )
 
 
 def _request(action: str) -> RunRequest:
@@ -57,7 +64,7 @@ def test_one_planner_supports_2d_and_3d():
         scenario = get_scenario(name)
         planner, dynamics, environment = scenario.build_planner(2)
         mean, covariance = scenario.initial_belief(2)
-        assert dynamics.Q.shape == (dimension, dimension)
+        assert dynamics.residual_covariance.shape == (dimension, dimension)
         assert mean.shape == (dimension,)
         assert covariance.shape == (dimension, dimension)
         assert planner.env is environment
@@ -71,7 +78,7 @@ def test_figure8_uses_narrow_workspace():
 def _save_plan(repository: PlanRepository):
     return repository.save(
         2, 'baseline', [(1.0, -2.0, 0.2), (1.0, 0.0, 0.2)],
-        {'sigma0': 0.001, 'q_std': 0.01, 'rho_after': 0.5},
+        {**uncertainty_metadata(2), 'rho_after': 0.95, 'alpha': 0.90},
     )
 
 
@@ -89,8 +96,42 @@ def test_plan_signature_and_stale_rejection(tmp_path):
 def test_uncertainty_change_invalidates_plan(tmp_path, monkeypatch):
     repository = PlanRepository(tmp_path)
     _save_plan(repository)
-    monkeypatch.setitem(config._cfg['uncertainty']['sigma0_per_fan'], 2, 0.002)
+    monkeypatch.setitem(
+        config._cfg['uncertainty']['stationary_residual_variance_per_fan'],
+        2,
+        [0.002, 0.002, 0.002],
+    )
     with pytest.raises(RuntimeError, match='Stale'):
+        repository.require_flyable(2)
+
+
+def test_response_change_invalidates_plan(tmp_path, monkeypatch):
+    repository = PlanRepository(tmp_path)
+    _save_plan(repository)
+    monkeypatch.setitem(
+        config._cfg['uncertainty'],
+        'response_time_constant',
+        [0.70, 0.53, 0.0],
+    )
+    with pytest.raises(RuntimeError, match='Stale'):
+        repository.require_flyable(2)
+
+
+def test_plan_below_alpha_is_not_flyable(tmp_path):
+    repository = PlanRepository(tmp_path)
+    path = _save_plan(repository)
+    payload = json.loads(path.read_text())
+    payload['rho_after'] = 0.8999
+    path.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match='below alpha'):
+        repository.require_flyable(2)
+
+
+def test_provisional_uncertainty_plan_is_not_flyable(tmp_path, monkeypatch):
+    monkeypatch.setitem(config._cfg['uncertainty'], 'source_report', None)
+    repository = PlanRepository(tmp_path)
+    _save_plan(repository)
+    with pytest.raises(RuntimeError, match='provisional'):
         repository.require_flyable(2)
 
 

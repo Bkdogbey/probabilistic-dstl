@@ -27,7 +27,7 @@ def test_signature_changes_with_obstacle_position():
     )
 
 
-def test_signature_changes_with_speed_path_and_estimator():
+def test_signature_changes_with_speed_path_estimator_and_start_position():
     original = copy.deepcopy(utils._cfg)
     mutations = []
     speed = copy.deepcopy(original)
@@ -39,6 +39,9 @@ def test_signature_changes_with_speed_path_and_estimator():
     estimator = copy.deepcopy(original)
     estimator['flight']['estimator']['spread_limit'] += 0.01
     mutations.append(estimator)
+    start_position = copy.deepcopy(original)
+    start_position['flight']['start_position_tolerance'] += 0.01
+    mutations.append(start_position)
 
     signature = flight_profile_signature(original, 'figure8')
     assert all(flight_profile_signature(config, 'figure8') != signature for config in mutations)
@@ -48,5 +51,5 @@ def test_payload_contains_required_provenance_inputs():
     payload = flight_profile_payload(utils._cfg, 'figure8')
     assert {
         'trajectory_version', 'path', 'deterministic_cruise_velocity', 'flight_points',
-        'estimator', 'obstacles', 'log_sample_hz',
+        'estimator', 'start_position', 'obstacles', 'log_sample_hz',
     }.issubset(payload)
