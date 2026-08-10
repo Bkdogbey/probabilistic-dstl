@@ -1,3 +1,7 @@
+import os
+
+import matplotlib.pyplot as plt
+
 """Shared IEEE-paper plotting style: palette, figure sizing, rcParams, export.
 
 Single source of truth so every script in `visualization`/`planning`/the
@@ -5,9 +9,7 @@ crazyflie experiment renders with the same fonts, sizes, and colors instead of
 each picking its own figsize/fontsize/dpi.
 """
 
-import os
 
-import matplotlib.pyplot as plt
 
 # Tableau 10 colors, semantic roles shared across all environment/trajectory plots.
 PALETTE = {
