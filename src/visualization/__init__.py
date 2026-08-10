@@ -7,7 +7,7 @@ from visualization.style import (
     set_ieee_style as set_ieee_style,
 )
 
-set_ieee_style(mode=os.environ.get("PDSTL_PLOT_MODE", "paper"))
+
 
 from visualization.planning import (
     cov_ellipse_params as cov_ellipse_params,
@@ -30,3 +30,6 @@ from visualization.robustness import (
     plot_stl_formula_bounds as plot_stl_formula_bounds,
     plot_piecewise_stl as plot_piecewise_stl,
 )
+
+
+set_ieee_style(mode=os.environ.get("PDSTL_PLOT_MODE", "paper"))
