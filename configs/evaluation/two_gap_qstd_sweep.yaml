@@ -1,0 +1,22 @@
+# pdSTL covariance-level sweep for the two-gap reach-avoid scenario.
+# Levels chosen empirically (see src/planning/runners.py's
+# run_two_gap_qstd_sweep): satisfaction degrades smoothly from ~0.89 (0.02)
+# to ~0.65 (0.03, today's planning default) to ~0.40 (0.04), then collapses
+# to ~0 by 0.045 -- these three stay on the informative side of that cliff.
+
+scenario: configs/scenarios/two_gap_reach_avoid.yaml
+
+q_std_levels: [0.02, 0.03, 0.04]
+
+num_rollouts: 200
+seed: 7
+robot_radius: 0.0
+
+output:
+  results_dir: results
+  figures_dir: figures
+  tables_dir: results/tables
+  summary_csv: two_gap_qstd_sweep_summary.csv
+  summary_tex: two_gap_qstd_sweep_summary.tex
+  comparison_png: two_gap_qstd_sweep.png
+  comparison_pdf: two_gap_qstd_sweep.pdf

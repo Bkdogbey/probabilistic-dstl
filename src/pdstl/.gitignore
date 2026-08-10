@@ -1,0 +1,34 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE / Editor configuration
+.vscode/
+.idea/
+
+# Generated data, results, and logs
+saved_data/
+results/
+experiments/crazyflie/waypoints/
+experiments/crazyflie/components/logs/
+
+# Generated plots, images, and documents
+figures/
+*.png
+*.pdf
+*.gif
+experiments/crazyflie/plots/
+benchmark_complexity.pdf

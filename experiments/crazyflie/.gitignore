@@ -1,0 +1,17 @@
+# Generated runtime artifacts
+logs/
+plots/
+
+# cflib's own radio TOC cache (keyed by CRC, unrelated to experiment data) --
+# regenerates automatically on the next hardware connect.
+cache/
+
+# Flight-input waypoints (waypoints/pdstl_fan<L>.json) ARE tracked — they are
+# what the configured fly action loads. Only generated figures/logs/cache are
+# ignored.
+
+# The repo root's .gitignore has a blanket (unscoped) "config.yml" rule --
+# components/config.yml is the tracked source of truth for every
+# input value (arena geometry, uncertainty model, planner/flight params),
+# not a generated or user-local file, so un-ignore it here.
+!config.yml

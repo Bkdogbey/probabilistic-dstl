@@ -116,3 +116,6 @@ data/*
 
 
 
+
+# crazyflie experiment flight logs
+experiments/crazyflie/components/logs/

@@ -1,0 +1,18 @@
+# Monte Carlo evaluation settings for two-gap reach-avoid.
+
+scenario: configs/scenarios/two_gap_reach_avoid.yaml
+
+num_rollouts: 200
+eval_q_std: 0.03
+seed: 7
+
+robot_radius: 0.0
+
+output:
+  results_dir: results
+  figures_dir: figures
+  tables_dir: results/tables
+  summary_csv: two_gap_mc_summary.csv
+  summary_tex: two_gap_mc_summary.tex
+  comparison_png: two_gap_compare_mc.png
+  comparison_pdf: two_gap_compare_mc.pdf
