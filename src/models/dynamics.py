@@ -1,11 +1,7 @@
 import numpy as np
 import torch
 from pdstl.base import Belief
-
-
-def normal_cdf(z):
-    """Cumulative distribution function for standard normal distribution"""
-    return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
+from pdstl.probability import gaussian_residual_probability
 
 
 def constant_input(t):
@@ -108,6 +104,4 @@ class GaussianBelief(Belief):
 
     def probability_of(self, residual):
         """Probability that residual >= 0"""
-        std = torch.sqrt(self.var)
-        z = residual / (std)
-        return normal_cdf(z)
+        return gaussian_residual_probability(residual, self.var)

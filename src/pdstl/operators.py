@@ -74,10 +74,7 @@ class Maxish(torch.nn.Module):
 class GreaterThan(STL_Formula):
     """
     Predicate: x >= threshold
-    Returns conservative probability intervals [lower, upper].
-
-    Lower bound: Pessimistic
-    Upper bound: Optimistic
+    Returns the exact atomic event probability as [p, p].
     """
 
     def __init__(self, threshold):
@@ -85,38 +82,21 @@ class GreaterThan(STL_Formula):
         self.threshold = threshold
 
     def robustness_trace(self, belief_trajectory, **kwargs):
-        probs_lower = []
-        probs_upper = []
+        probabilities = []
 
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
-
-            # LOWER BOUND:
-
-            lower_bound = belief.lower_bound()  # μ - k*σ
-            residual_lower = lower_bound - self.threshold
-            prob_lower = belief.probability_of(residual_lower)
-
-            # UPPER BOUND: Optimistic assumption
-
-            upper_bound = belief.upper_bound() 
-            residual_upper = upper_bound - self.threshold
-            prob_upper = belief.probability_of(residual_upper)
-
-            probs_lower.append(prob_lower)
-            probs_upper.append(prob_upper)
+            residual = belief.value() - self.threshold
+            probabilities.append(belief.probability_of(residual))
 
         # Stack along time dimension
-        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
-        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
+        probability = torch.cat(probabilities, dim=1)  # [B, T, D]
 
         # Remove the D dimension (assuming D=1 for scalar signals)
-        if lower_tensor.shape[2] == 1:
-            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
-            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
+        if probability.shape[2] == 1:
+            probability = probability.squeeze(2)  # [B, T]
 
-        # Return as [lower, upper] bounds
-        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
+        return torch.stack([probability, probability], dim=-1)  # [B, T, 2]
 
     def __str__(self):
         return f"x >= {self.threshold}"
@@ -125,7 +105,7 @@ class GreaterThan(STL_Formula):
 class LessThan(STL_Formula):
     """
     Predicate: x <= threshold
-    Returns conservative probability intervals [lower, upper].
+    Returns the exact atomic event probability as [p, p].
     """
 
     def __init__(self, threshold):
@@ -133,34 +113,20 @@ class LessThan(STL_Formula):
         self.threshold = threshold
 
     def robustness_trace(self, belief_trajectory, **kwargs):
-        probs_lower = []
-        probs_upper = []
+        probabilities = []
 
         for t in range(len(belief_trajectory)):
             belief = belief_trajectory[t]
-
-            # LOWER BOUND: Pessimistic assumption
-            upper_bound = belief.upper_bound()  # μ + k*σ
-            residual_lower = self.threshold - upper_bound
-            prob_lower = belief.probability_of(residual_lower)
-
-            # UPPER BOUND: Optimistic assumption
-            lower_bound = belief.lower_bound()  # μ - k*σ
-            residual_upper = self.threshold - lower_bound
-            prob_upper = belief.probability_of(residual_upper)
-
-            probs_lower.append(prob_lower)
-            probs_upper.append(prob_upper)
+            residual = self.threshold - belief.value()
+            probabilities.append(belief.probability_of(residual))
 
         # Stack along time dimension
-        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
-        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
+        probability = torch.cat(probabilities, dim=1)  # [B, T, D]
 
-        if lower_tensor.shape[2] == 1:
-            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
-            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
+        if probability.shape[2] == 1:
+            probability = probability.squeeze(2)  # [B, T]
 
-        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
+        return torch.stack([probability, probability], dim=-1)  # [B, T, 2]
 
     def __str__(self):
         return f"x <= {self.threshold}"
@@ -533,23 +499,33 @@ class Until(STL_Formula):
             tau_vals = []  # candidate values for each τ
 
             for tau in range(start, end + 1):
-                # min_{k ∈ [t, τ)} ϕ(k)
-                if tau == t:
-                    # Empty prefix: ϕ vacuously holds with probability 1
-                    min_phi = torch.ones_like(phi[:, 0, :])  # [B,2]
+                if scale <= 0:
+                    # Exact StoRI Until uses the inclusive prefix [t, τ].
+                    phi_segment = phi[:, t : tau + 1, :]
+                    min_phi = torch.min(phi_segment, dim=1).values
+                    psi_tau = psi[:, tau, :]
+
+                    lower = torch.clamp(
+                        min_phi[:, 0] + psi_tau[:, 0] - 1.0, min=0.0
+                    )
+                    upper = torch.minimum(min_phi[:, 1], psi_tau[:, 1])
+                    val_tau = torch.stack([lower, upper], dim=-1)
                 else:
-                    phi_segment = phi[:, t:tau, :]  # [B,τ-t,2]
-                    # min over time dim=1
-                    min_phi = self.min_op(
-                        phi_segment, scale, dim=1, keepdim=False
-                    )  # [B,2]
+                    # Preserve the existing smooth Until path. Its relation to
+                    # the exact Fréchet recursion is audited separately.
+                    if tau == t:
+                        min_phi = torch.ones_like(phi[:, 0, :])
+                    else:
+                        phi_segment = phi[:, t:tau, :]
+                        min_phi = self.min_op(
+                            phi_segment, scale, dim=1, keepdim=False
+                        )
 
-                # ψ(τ)
-                psi_tau = psi[:, tau, :]  # [B,2]
-
-                # min(ψ(τ), min_prefix_ϕ)
-                pair = torch.stack([min_phi, psi_tau], dim=1)  # [B,2,2]
-                val_tau = self.min_op(pair, scale, dim=1, keepdim=False)  # [B,2]
+                    psi_tau = psi[:, tau, :]
+                    pair = torch.stack([min_phi, psi_tau], dim=1)
+                    val_tau = self.min_op(
+                        pair, scale, dim=1, keepdim=False
+                    )
 
                 tau_vals.append(val_tau.unsqueeze(1))  # [B,1,2]
 

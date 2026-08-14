@@ -1,10 +1,9 @@
-import math
-
 import numpy as np
 
 import torch
 
 from pdstl.operators import Always, And, Or, Eventually, STL_Formula
+from pdstl.probability import gaussian_residual_probability
 
 
 def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
@@ -388,18 +387,35 @@ class Environment:
 def normal_cdf(value, mean, var):
     """
     Computes P(X <= value) for X ~ N(mean, var).
-    Standard Normal CDF Phi(z) where z = (value - mean) / sigma
+    Uses the shared Gaussian residual primitive on value - X.
     """
-    std = torch.sqrt(var + 1e-6)  # Add epsilon for stability
-    z = (value - mean) / std
-    return 0.5 * (1 + torch.erf(z / math.sqrt(2)))
+    return gaussian_residual_probability(value - mean, var)
+
+
+def _gaussian_interval_probability(lower, upper, mean, var):
+    """Return ``P(lower <= X <= upper)`` from Gaussian marginal statistics."""
+    upper_probability = normal_cdf(upper, mean, var)
+    lower_probability = normal_cdf(lower, mean, var)
+    continuous_probability = upper_probability - lower_probability
+    deterministic_probability = ((mean >= lower) & (mean <= upper)).to(
+        dtype=continuous_probability.dtype
+    )
+    return torch.where(var > 0, continuous_probability, deterministic_probability)
+
+
+def _frechet_box_probability_bounds(marginal_probabilities):
+    """Bound a box intersection using only its marginal probabilities."""
+    probabilities = torch.stack(marginal_probabilities, dim=-1)
+    dimension = probabilities.shape[-1]
+    lower = torch.clamp(
+        probabilities.sum(dim=-1) - (dimension - 1), min=0.0, max=1.0
+    )
+    upper = torch.min(probabilities, dim=-1).values
+    return lower, upper
 
 
 class RectangularGoalPredicate(STL_Formula):
-    """
-    Implements PDF Eq (9):
-    P_goal(t) = min( P(x >= x_min), P(x <= x_max), P(y >= y_min), P(y <= y_max) )
-    """
+    """Fréchet probability bounds for containment in a 2D box."""
 
     def __init__(self, region):
         super().__init__()
@@ -413,28 +429,18 @@ class RectangularGoalPredicate(STL_Formula):
         mu_x, mu_y = mu[..., 0], mu[..., 1]
         var_x, var_y = var[..., 0], var[..., 1]
 
-        # 2. Compute Probabilities for intervals (assuming independence)
-        # P(x_min <= x <= x_max) = CDF(x_max) - CDF(x_min)
-        p_x = normal_cdf(self.x_max, mu_x, var_x) - normal_cdf(self.x_min, mu_x, var_x)
-
-        # P(y_min <= y <= y_max) = CDF(y_max) - CDF(y_min)
-        p_y = normal_cdf(self.y_max, mu_y, var_y) - normal_cdf(self.y_min, mu_y, var_y)
-
-        # 3. Combine using Product (Independence)
-        # This is more accurate for a rectangular region than min()
-        p_goal = torch.clamp(p_x * p_y, min=0.0, max=1.0)
-
-        # 4. Format Output for Operators
-        # Since we calculated exact probabilities (surrogates), Lower = Upper
-        return torch.stack([p_goal, p_goal], dim=-1)
+        p_x = _gaussian_interval_probability(
+            self.x_min, self.x_max, mu_x, var_x
+        )
+        p_y = _gaussian_interval_probability(
+            self.y_min, self.y_max, mu_y, var_y
+        )
+        lower, upper = _frechet_box_probability_bounds([p_x, p_y])
+        return torch.stack([lower, upper], dim=-1)
 
 
 class RectangularObstaclePredicate(STL_Formula):
-    """
-    Implements PDF Eq (10):
-    P_safe(t) = max( P(x <= x_min), P(x >= x_max), P(y <= y_min), P(y >= y_max) )
-    (Safe if Left OR Right OR Below OR Above)
-    """
+    """Fréchet probability bounds for being outside a 2D box."""
 
     def __init__(self, region):
         super().__init__()
@@ -447,26 +453,16 @@ class RectangularObstaclePredicate(STL_Formula):
         mu_x, mu_y = mu[..., 0], mu[..., 1]
         var_x, var_y = var[..., 0], var[..., 1]
 
-        # 2. Compute Probabilities for being OUTSIDE
-        # P(x <= x_min) (Left of Obs)
-        p_left = normal_cdf(self.x_min, mu_x, var_x)
-
-        # P(x >= x_max) (Right of Obs)
-        p_right = 1.0 - normal_cdf(self.x_max, mu_x, var_x)
-
-        # P(y <= y_min) (Below Obs)
-        p_below = normal_cdf(self.y_min, mu_y, var_y)
-
-        # P(y >= y_max) (Above Obs)
-        p_above = 1.0 - normal_cdf(self.y_max, mu_y, var_y)
-
-        # 3. Combine using Max (Union)
-        # Safe if ANY of these are true
-        stacked_probs = torch.stack([p_left, p_right, p_below, p_above], dim=0)
-        p_safe, _ = torch.max(stacked_probs, dim=0)
-
-        # 4. Format Output
-        return torch.stack([p_safe, p_safe], dim=-1)
+        p_x = _gaussian_interval_probability(
+            self.x_min, self.x_max, mu_x, var_x
+        )
+        p_y = _gaussian_interval_probability(
+            self.y_min, self.y_max, mu_y, var_y
+        )
+        inside_lower, inside_upper = _frechet_box_probability_bounds([p_x, p_y])
+        safe_lower = 1.0 - inside_upper
+        safe_upper = 1.0 - inside_lower
+        return torch.stack([safe_lower, safe_upper], dim=-1)
 
 
 class CircularObstaclePredicate(STL_Formula):
@@ -500,8 +496,8 @@ class CircularObstaclePredicate(STL_Formula):
             # v^T * Sigma * v
             sigma_proj = torch.einsum("bti,btij,btj->bt", dir_vec, sigma_stack, dir_vec)
 
-        # P(safe) = P(actual_dist > radius) ~= 1 - CDF(radius | N(dist, sigma_proj))
-        p_safe = 1.0 - normal_cdf(self.radius, dist, sigma_proj)
+        # P(safe) ~= P(actual_dist - radius >= 0)
+        p_safe = gaussian_residual_probability(dist - self.radius, sigma_proj)
 
         return torch.stack([p_safe, p_safe], dim=-1)
 
@@ -536,10 +532,10 @@ class MovingRectangularObstaclePredicate(STL_Formula):
         y_max = self.y_traj + self.height / 2.0
 
         # Compute Probabilities (Safe if Outside)
-        p_left = normal_cdf(x_min, mu_x, var_x)
-        p_right = 1.0 - normal_cdf(x_max, mu_x, var_x)
-        p_below = normal_cdf(y_min, mu_y, var_y)
-        p_above = 1.0 - normal_cdf(y_max, mu_y, var_y)
+        p_left = gaussian_residual_probability(x_min - mu_x, var_x)
+        p_right = gaussian_residual_probability(mu_x - x_max, var_x)
+        p_below = gaussian_residual_probability(y_min - mu_y, var_y)
+        p_above = gaussian_residual_probability(mu_y - y_max, var_y)
 
         stacked_probs = torch.stack([p_left, p_right, p_below, p_above], dim=0)
         p_safe, _ = torch.max(stacked_probs, dim=0)
