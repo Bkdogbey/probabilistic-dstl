@@ -1,565 +1,399 @@
+"""STL formula structure and the hard probability combination equations.
+
+This module defines *what each STL operation means mathematically*. It does not
+know where probabilities come from (``base.py``) and it does not traverse
+children or index time (``propagate.py``). Each operator exposes only a small
+``combine`` step, so every equation appears exactly once in the codebase.
+
+Scope
+-----
+Finite, bounded, discrete-time STL only. Temporal operators require an explicit
+interval ``[a, b]`` with ``0 <= a <= b``. There is no ``interval=None``, no
+``np.inf``, and no unbounded operator: the code matches the theory exactly.
+
+Only the **hard** probability semantics live here. No smoothing, no
+log-sum-exp, no differentiable surrogate.
+
+Semantics
+---------
+Given child enclosures ``[l, u]``, all combinations are dependence-agnostic
+Frechet bounds::
+
+    ~A              lower = 1 - u
+                    upper = 1 - l
+
+    A and B         lower = max(0, l1 + l2 - 1)
+                    upper = min(u1, u2)
+
+    A or B          lower = max(l1, l2)
+                    upper = min(1, u1 + u2)
+
+    G_[a,b] A       lower = max(0, sum_j l_j - (n - 1))     n = b - a + 1
+                    upper = min_j u_j
+
+    F_[a,b] A       lower = max_j l_j
+                    upper = min(1, sum_j u_j)
+
+No independence is assumed anywhere, in particular not across time.
+
+Formula objects are plain classes, not ``torch.nn.Module``. Autograd operates on
+tensor operations regardless of whether the object performing them is a Module,
+so a future differentiable semantics does not require this to change. A formula
+tree is a syntax tree, not a neural network; only genuinely learnable semantic
+parameters would justify revisiting that.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Hashable, Sequence
+
 import torch
-import numpy as np
+
+__all__ = [
+    "Always",
+    "And",
+    "Eventually",
+    "Negation",
+    "Or",
+    "Predicate",
+    "STLFormula",
+    "TemporalOperator",
+]
 
 
-class STL_Formula(torch.nn.Module):
+def _clamp(bounds: torch.Tensor) -> torch.Tensor:
+    """Guard a combination result against float drift outside ``[0, 1]``.
+
+    Each equation below already applies its own ``max(0, .)`` / ``min(1, .)``
+    where the mathematics calls for one, and each already preserves
+    ``lower <= upper`` (for ``And``: ``l1 + l2 - 1 <= u1 + u2 - 1 <=
+    min(u1, u2)`` because ``u1, u2 <= 1``). This final clamp exists only so
+    accumulated float error cannot produce a technically invalid interval,
+    which is what lets ``validate_bounds`` stay strict at the source boundary.
     """
-    Base class for Probabilistic STL formulas.
-    """
+    return bounds.clamp(0.0, 1.0)
 
-    def __init__(self):
-        super(STL_Formula, self).__init__()
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
+class STLFormula(ABC):
+    """Base class for bounded-time pdSTL formulas."""
+
+    @abstractmethod
+    def horizon(self) -> int:
+        """Required lookahead ``H(phi)`` in discrete steps.
+
+        ``H(mu) = 0``; ``H(~phi) = H(phi)``;
+        ``H(phi1 and phi2) = H(phi1 or phi2) = max(H(phi1), H(phi2))``;
+        ``H(G_[a,b] phi) = H(F_[a,b] phi) = b + H(phi)``.
+
+        A formula evaluated at time ``t`` reads source data over
+        ``t ... t + H(phi)``.
         """
-        Compute robustness trace for belief trajectory.
-
-        Args:
-           belief_trajectory: BeliefTrajectory object
-           scale: smoothing parameter (scale > 0 for smooth, <= 0 for exact)
-           keepdim: keep dimensions
-
-        Returns:
-           [B,T,2] probability bounds on robustness trace where
-           [..., 0] is lower bound and [..., 1] is upper bound
-        """
-        raise NotImplementedError("robustness_trace not yet implemented")
-
-    def forward(self, belief_trajectory, **kwargs):
-        """Forward pass delegates to robustness_trace"""
-        return self.robustness_trace(belief_trajectory, **kwargs)
-
-    def __str__(self):
-        raise NotImplementedError("__str__ not yet implemented")
-
-    def __and__(self, other):
-        """Overload & operator for And"""
-        return And(self, other)
-
-    def __or__(self, other):
-        """Overload | operator for Or"""
-        return Or(self, other)
-
-    def __invert__(self):
-        """Overload ~ operator for Negation"""
-        return Negation(self)
-
-
-class Minish(torch.nn.Module):
-    """Compute minimum (exact or smooth) over specified dimension"""
-
-    def forward(self, x, scale, dim=1, keepdim=True):
-        """
-        The bounds dimension [..., 2] is automatically processed element-wise.
-        """
-        if scale > 0:
-            return -torch.logsumexp(-x * scale, dim=dim, keepdim=keepdim) / scale
-        else:
-            return x.min(dim=dim, keepdim=keepdim)[0]
-
-
-class Maxish(torch.nn.Module):
-    """Compute maximum (exact or smooth) over specified dimension"""
-
-    def forward(self, x, scale, dim=1, keepdim=True):
-        """
-        The bounds dimension [..., 2] is automatically processed element-wise.
-        """
-        if scale > 0:
-            return torch.logsumexp(x * scale, dim=dim, keepdim=keepdim) / scale
-        else:
-            return x.max(dim=dim, keepdim=keepdim)[0]
-
-
-class GreaterThan(STL_Formula):
-    """
-    Predicate: x >= threshold
-    Returns conservative probability intervals [lower, upper].
-
-    Lower bound: Pessimistic
-    Upper bound: Optimistic
-    """
-
-    def __init__(self, threshold):
-        super(GreaterThan, self).__init__()
-        self.threshold = threshold
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        probs_lower = []
-        probs_upper = []
-
-        for t in range(len(belief_trajectory)):
-            belief = belief_trajectory[t]
-
-            # LOWER BOUND:
-
-            lower_bound = belief.lower_bound()  # μ - k*σ
-            residual_lower = lower_bound - self.threshold
-            prob_lower = belief.probability_of(residual_lower)
-
-            # UPPER BOUND: Optimistic assumption
-
-            upper_bound = belief.upper_bound() 
-            residual_upper = upper_bound - self.threshold
-            prob_upper = belief.probability_of(residual_upper)
-
-            probs_lower.append(prob_lower)
-            probs_upper.append(prob_upper)
-
-        # Stack along time dimension
-        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
-        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
-
-        # Remove the D dimension (assuming D=1 for scalar signals)
-        if lower_tensor.shape[2] == 1:
-            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
-            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
-
-        # Return as [lower, upper] bounds
-        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
-
-    def __str__(self):
-        return f"x >= {self.threshold}"
-
-
-class LessThan(STL_Formula):
-    """
-    Predicate: x <= threshold
-    Returns conservative probability intervals [lower, upper].
-    """
-
-    def __init__(self, threshold):
-        super(LessThan, self).__init__()
-        self.threshold = threshold
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        probs_lower = []
-        probs_upper = []
-
-        for t in range(len(belief_trajectory)):
-            belief = belief_trajectory[t]
-
-            # LOWER BOUND: Pessimistic assumption
-            upper_bound = belief.upper_bound()  # μ + k*σ
-            residual_lower = self.threshold - upper_bound
-            prob_lower = belief.probability_of(residual_lower)
-
-            # UPPER BOUND: Optimistic assumption
-            lower_bound = belief.lower_bound()  # μ - k*σ
-            residual_upper = self.threshold - lower_bound
-            prob_upper = belief.probability_of(residual_upper)
-
-            probs_lower.append(prob_lower)
-            probs_upper.append(prob_upper)
-
-        # Stack along time dimension
-        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
-        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
-
-        if lower_tensor.shape[2] == 1:
-            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
-            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
-
-        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
-
-    def __str__(self):
-        return f"x <= {self.threshold}"
-
-
-class Negation(STL_Formula):
-    """
-    Negation: ¬ϕ
-    For StoRI: Swaps and complements bounds
-    """
-
-    def __init__(self, subformula):
-        super(Negation, self).__init__()
-        self.subformula = subformula
-
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace = self.subformula(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        # trace: [B,T,2]
-        # [lower, upper] -> [1 - upper, 1 - lower]
-        lower = 1.0 - trace[..., 1]
-        upper = 1.0 - trace[..., 0]
-        return torch.stack([lower, upper], dim=-1)
-
-    def __str__(self):
-        return f"¬({self.subformula})"
-
-
-class And(STL_Formula):
-    """
-    Conjunction: ϕ₁ ∧ ϕ₂
-    Uses Frechet bounds element-wise:
-      lower = max(l1 + l2 - 1, 0)
-      upper = min(u1, u2)
-    """
-
-    def __init__(self, subformula1, subformula2):
-        super(And, self).__init__()
-        self.subformula1 = subformula1
-        self.subformula2 = subformula2
-
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace1 = self.subformula1(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        trace2 = self.subformula2(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        # Both: [B,T,2]
-        l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
-        l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
-
-        # Product lower bound: P(A ∩ B) ≥ P(A)·P(B) under independence.
-        # Valid when sub-formulas constrain independent spatial regions (goal vs obstacles).
-        # Tighter than Fréchet (max(l1+l2-1,0)) and gives better gradients for optimisation.
-        lower = l1 * l2
-        upper = torch.minimum(u1, u2)
-
-        return torch.cat([lower, upper], dim=-1)
-
-    def __str__(self):
-        return f"({self.subformula1}) ∧ ({self.subformula2})"
-
-
-class Or(STL_Formula):
-    """
-    Disjunction: ϕ₁ ∨ ϕ₂
-    Uses Frechet bounds element-wise:
-      lower = max(l1, l2)
-      upper = min(u1 + u2, 1)
-    """
-
-    def __init__(self, subformula1, subformula2):
-        super(Or, self).__init__()
-        self.subformula1 = subformula1
-        self.subformula2 = subformula2
-
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace1 = self.subformula1(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        trace2 = self.subformula2(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        # Both: [B,T,2]
-        l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
-        l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
-
-        lower = torch.maximum(l1, l2)
-        upper = torch.minimum(u1 + u2, torch.ones_like(u1))
-
-        return torch.cat([lower, upper], dim=-1)
-
-    def __str__(self):
-        return f"({self.subformula1}) ∨ ({self.subformula2})"
-
-
-class Implies(STL_Formula):
-    """
-    Implication: ϕ₁ ⇒ ϕ₂
-    Defined as: ¬ϕ₁ ∨ ϕ₂
-    """
-
-    def __init__(self, subformula1, subformula2):
-        super(Implies, self).__init__()
-        self.subformula1 = subformula1
-        self.subformula2 = subformula2
-        self.equivalent = Or(Negation(subformula1), subformula2)
-
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        return self.equivalent(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-
-    def __str__(self):
-        return f"({self.subformula1}) ⇒ ({self.subformula2})"
-
-
-class Temporal_Operator(STL_Formula):
-    """
-    Base class for temporal operators.
-    """
-
-    def __init__(self, subformula, interval=None):
-        super(Temporal_Operator, self).__init__()
-        self.subformula = subformula
-        self.interval = interval
-        self._interval = [0, np.inf] if self.interval is None else self.interval
-
-        # RNN memory length in time
-        if not self.interval:
-            self.rnn_dim = 1
-        else:
-            # approximate memory length; for bounded interval use window length
-            a, b = self._interval
-            if np.isinf(b):
-                self.rnn_dim = int(max(1, a))
-            else:
-                self.rnn_dim = int(b + 1)
-
-        # Operation set by subclass (Minish or Maxish)
-        self.operation = None
-
-        # Shift matrices (for sliding window)
-        self.M = (
-            torch.tensor(np.diag(np.ones(self.rnn_dim - 1), k=1))
-            .requires_grad_(False)
-            .float()
-        )
-        self.b = torch.zeros(self.rnn_dim).unsqueeze(-1).requires_grad_(False).float()
-        self.b[-1] = 1.0
-
-    def _initialize_rnn_cell(self, x):
-        """
-        Initialize hidden state.
-        x: [B,T,2]
-        Returns: h0 with same shape structure
-        """
-        if x.is_cuda:
-            self.M = self.M.cuda()
-            self.b = self.b.cuda()
-
-        # Padding with first value - automatically handles bounds dimension
-        h0 = x[:, :1, :].expand(-1, self.rnn_dim, -1).clone()  # [B,rnn_dim,2]
-        count = 0.0
-
-        # Special case for [a, inf)
-        if (self._interval[1] == np.inf) and (self._interval[0] > 0):
-            d0 = x[:, :1, :]
-            return ((d0, h0), count)
-
-        return (h0, count)
-
-    def _apply_shift(self, h0, x):
-        """
-        Apply M @ h0 + b * x
-        h0: [B,rnn_dim,2]
-        x: [B,1,2]
-        """
-        batch, rnn_dim, bounds = h0.shape
-
-        # Treat (batch, bounds) as batch dimension for matmul
-        h0_reshaped = h0.permute(0, 2, 1)  # [B,2,rnn_dim]
-
-        h0_flat = h0_reshaped.reshape(-1, rnn_dim)  # [B*2,rnn_dim]
-
-        # Shift
-        shifted_flat = torch.matmul(h0_flat, self.M.t())  # [B*2,rnn_dim]
-        shifted = shifted_flat.reshape(batch, bounds, rnn_dim)
-        shifted = shifted.permute(0, 2, 1)  # [B,rnn_dim,2]
-
-        # Add new value into last position
-        b_broadcast = self.b.view(1, -1, 1)  # [1,rnn_dim,1]
-        x_broadcast = x.squeeze(1).unsqueeze(1)  # [B,1,2]
-
-        return shifted + b_broadcast * x_broadcast
-
-    def _rnn_cell(self, x, hc, scale=-1, **kwargs):
-        """Must be implemented by subclass"""
         raise NotImplementedError
 
-    def _run_cell(self, x, scale):
-        """Run RNN through entire trace"""
-        outputs = []
-        hc = self._initialize_rnn_cell(x)
-        xs = torch.split(x, 1, dim=1)  # list of [B,1,2]
+    @property
+    @abstractmethod
+    def tag(self) -> Hashable:
+        """Small hashable structural label used to build event identity keys."""
+        raise NotImplementedError
 
-        for xs_i in xs:
-            o, hc = self._rnn_cell(xs_i, hc, scale)
-            outputs.append(o)
+    def __and__(self, other: STLFormula) -> And:
+        return And(self, other)
 
-        return torch.cat(outputs, dim=1)  # [B,T,2]
+    def __or__(self, other: STLFormula) -> Or:
+        return Or(self, other)
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace = self.subformula(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        # FORWARD-LOOKING
-        trace_reversed = torch.flip(trace, dims=[1])
-        output_reversed = self._run_cell(trace_reversed, scale=scale)
-        return torch.flip(output_reversed, dims=[1])
+    def __invert__(self) -> Negation:
+        return Negation(self)
 
+    @abstractmethod
+    def __str__(self) -> str:
+        raise NotImplementedError
 
-class Always(Temporal_Operator):
-    """
-    □_I ϕ: Always operator
-    Computes min over time interval.
-    """
-
-    def __init__(self, subformula, interval=None):
-        super(Always, self).__init__(subformula=subformula, interval=interval)
-        self.operation = Minish()
-        self.oper = "min"
-
-    def _rnn_cell(self, x, hc, scale=-1, **kwargs):
-        """
-        Compute running minimum.
-        """
-        h0, c = hc
-
-        if self.operation is None:
-            raise Exception("Operation not initialized")
-
-        # CASE 1: Global Always (no interval)
-        if self.interval is None:
-            # h0: [B,rnn_dim,2], x: [B,1,2]
-            input_ = torch.cat([h0, x], dim=1)  # [B,rnn_dim+1,2]
-            output = self.operation(input_, scale, dim=1, keepdim=True)  # [B,1,2]
-            state = (output, None)
-
-        # CASE 2: Unbounded future [a, inf)
-        elif (self._interval[1] == np.inf) and (self._interval[0] > 0):
-            d0, h0 = h0  # unpack tuple state
-            dh = torch.cat([d0, h0[:, :1, :]], dim=1)  # [B,2,2]
-            output = self.operation(dh, scale, dim=1, keepdim=True)
-            new_h0 = self._apply_shift(h0, x)
-            state = ((output, new_h0), None)
-
-        # CASE 3: Bounded interval [a,b]
-        else:
-            a, b = int(self._interval[0]), int(self._interval[1])
-            new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, : b - a + 1, :]
-            output = self.operation(window, scale, dim=1, keepdim=True)
-            state = (new_h0, None)
-
-        return output, state
-
-    def __str__(self):
-        if self.interval is None:
-            return f"□({self.subformula})"
-        return f"□_{self._interval}({self.subformula})"
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self})"
 
 
-class Eventually(Temporal_Operator):
-    """
-    Eventually operator: ♢_I ϕ
-    Computes max over time interval.
-    The bounds dimension is processed automatically.
+class Predicate(STLFormula):
+    """The atomic object ``mu_i : h_i(x) >= 0``.
+
+    Two usage modes, both valid:
+
+    ``Predicate(h=callable, name=...)``
+        *State-resolved predicate.* ``h`` is the real ``h_i``, and a future
+        model-based source (Gaussian, sampling, learned) evaluates it against a
+        state representation to derive ``P(E_{i,k})``.
+
+    ``Predicate(h=None, name="...")``
+        *Symbolic predicate.* The user supplies event probabilities directly
+        with no state model behind them. ``h_i`` exists mathematically but is
+        not available to the code. This is the mode ``TableProbabilitySource``
+        uses.
+
+    Either way the hard core never calls ``h``: translating a state model into
+    ``P(E_{i,k})`` is the source's job, which is exactly the separation this
+    package is built around.
+
+    Example
+    -------
+    >>> mu = Predicate(lambda x: x[..., 0] - 5.0, name="x_ge_5")
+
+    Identity
+    --------
+    Each predicate carries a stable ``uid`` from a module-level counter, and
+    uses default identity equality. So:
+
+    - repeated use of the **same object** is the same atomic event;
+    - two separately constructed predicates are **never** the same event, even
+      with an identical callable, threshold, or name;
+    - ``name`` is human-readable presentation only and carries no mathematical
+      meaning.
+
+    A counter is used rather than ``id()``, which can be recycled by the
+    allocator and is not reproducible across runs.
     """
 
-    def __init__(self, subformula, interval=None):
-        super(Eventually, self).__init__(subformula=subformula, interval=interval)
-        self.operation = Maxish()
-        self.oper = "max"
+    _uid_counter = itertools.count()
 
-    def _rnn_cell(self, x, hc, scale=-1, **kwargs):
-        """
-        Compute running maximum.
-        """
-        h0, c = hc
+    def __init__(self, h: Callable | None = None, name: str | None = None) -> None:
+        if h is not None and not callable(h):
+            raise TypeError(f"h must be callable or None, got {type(h).__name__}")
+        self.h = h
+        self.name = name
+        self.uid: int = next(Predicate._uid_counter)
 
-        if self.operation is None:
-            raise Exception("Operation not initialized")
+    def horizon(self) -> int:
+        return 0
 
-        # Case 1: Global Eventually
-        if self.interval is None:
-            input_ = torch.cat([h0, x], dim=1)
-            output = self.operation(input_, scale, dim=1, keepdim=True)
-            state = (output, None)
+    @property
+    def tag(self) -> Hashable:
+        return ("atom", self.uid)
 
-        # Case 2: Unbounded future [a, inf)
-        elif (self._interval[1] == np.inf) and (self._interval[0] > 0):
-            d0, h0 = h0
-            dh = torch.cat([d0, h0[:, :1, :]], dim=1)
-            output = self.operation(dh, scale, dim=1, keepdim=True)
-            new_h0 = self._apply_shift(h0, x)
-            state = ((output, new_h0), None)
-
-        # Case 3: Bounded interval [a,b]
-        else:
-            a, b = int(self._interval[0]), int(self._interval[1])
-            new_h0 = self._apply_shift(h0, x)
-            window = new_h0[:, : b - a + 1, :]
-            output = self.operation(window, scale, dim=1, keepdim=True)
-            state = (new_h0, None)
-
-        return output, state
-
-    def __str__(self):
-        if self.interval is None:
-            return f"♢({self.subformula})"
-        return f"♢_{self._interval}({self.subformula})"
+    def __str__(self) -> str:
+        return self.name if self.name is not None else f"mu_{self.uid}"
 
 
-class Until(STL_Formula):
-    """
-    ϕ U_I ψ : Until operator
+class Negation(STLFormula):
+    """Negation ``~mu``, restricted to atomic predicates.
+
+    The target theory works in negation normal form, so this class deliberately
+    refuses to define arbitrary formula negation rather than silently inventing
+    a semantics for it. The restriction also makes the complement identity
+    ``A and ~A = empty`` / ``A or ~A = universe`` exactly decidable during
+    propagation.
     """
 
-    def __init__(self, left, right, interval=None):
-        super(Until, self).__init__()
+    def __init__(self, subformula: STLFormula) -> None:
+        if not isinstance(subformula, Predicate):
+            raise TypeError(
+                "negation is only defined for atomic predicates in this "
+                f"implementation, got {type(subformula).__name__}; the target "
+                "semantics is negation normal form, so push negations down to "
+                "the predicates instead of negating a compound formula"
+            )
+        self.subformula = subformula
+
+    def horizon(self) -> int:
+        return self.subformula.horizon()
+
+    @property
+    def tag(self) -> Hashable:
+        return ("not",)
+
+    def combine(self, value: torch.Tensor) -> torch.Tensor:
+        """``[l, u] -> [1 - u, 1 - l]``. Shape ``[B, 2]`` in, ``[B, 2]`` out."""
+        lower = 1.0 - value[..., 1]
+        upper = 1.0 - value[..., 0]
+        return _clamp(torch.stack([lower, upper], dim=-1))
+
+    def __str__(self) -> str:
+        return f"¬{self.subformula}"
+
+
+class _BinaryOperator(STLFormula):
+    """Shared structure for the two-argument Boolean operators."""
+
+    def __init__(self, left: STLFormula, right: STLFormula) -> None:
+        for side, operand in (("left", left), ("right", right)):
+            if not isinstance(operand, STLFormula):
+                raise TypeError(
+                    f"{side} operand must be an STLFormula, got "
+                    f"{type(operand).__name__}"
+                )
         self.left = left
         self.right = right
-        self.interval = [0, np.inf] if interval is None else interval
-        self._interval = self.interval
 
-        self.min_op = Minish()
-        self.max_op = Maxish()
+    def horizon(self) -> int:
+        return max(self.left.horizon(), self.right.horizon())
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        # ϕ and ψ traces: [B,T,2]
-        phi = self.left(belief_trajectory, scale=scale, keepdim=True, **kwargs)
-        psi = self.right(belief_trajectory, scale=scale, keepdim=True, **kwargs)
 
-        B, T, _ = phi.shape
-        a, b = self._interval
-        a = int(a)
-        if np.isinf(b):
-            b = T - 1
-        else:
-            b = int(b)
+class And(_BinaryOperator):
+    """Conjunction ``phi1 and phi2`` under dependence-agnostic Frechet bounds."""
 
-        device = phi.device
-        dtype = phi.dtype
+    @property
+    def tag(self) -> Hashable:
+        return ("and",)
 
-        results = []  # list of [B,2], one per t
+    def combine(self, value1: torch.Tensor, value2: torch.Tensor) -> torch.Tensor:
+        """``lower = max(0, l1 + l2 - 1)``, ``upper = min(u1, u2)``.
 
-        for t in range(T):
-            start = t + a
-            end = min(t + b, T - 1)
+        Shapes ``[B, 2]`` in, ``[B, 2]`` out. Symmetric in its arguments, which
+        is what lets propagation canonicalise the operand order.
+        """
+        l1, u1 = value1[..., 0], value1[..., 1]
+        l2, u2 = value2[..., 0], value2[..., 1]
+        lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
+        upper = torch.minimum(u1, u2)
+        return _clamp(torch.stack([lower, upper], dim=-1))
 
-            # If the interval is empty for this t, probability of satisfaction is 0
-            if start > end:
-                results.append(torch.zeros(B, 2, device=device, dtype=dtype))
-                continue
+    def __str__(self) -> str:
+        return f"({self.left}) ∧ ({self.right})"
 
-            tau_vals = []  # candidate values for each τ
 
-            for tau in range(start, end + 1):
-                # min_{k ∈ [t, τ)} ϕ(k)
-                if tau == t:
-                    # Empty prefix: ϕ vacuously holds with probability 1
-                    min_phi = torch.ones_like(phi[:, 0, :])  # [B,2]
-                else:
-                    phi_segment = phi[:, t:tau, :]  # [B,τ-t,2]
-                    # min over time dim=1
-                    min_phi = self.min_op(
-                        phi_segment, scale, dim=1, keepdim=False
-                    )  # [B,2]
+class Or(_BinaryOperator):
+    """Disjunction ``phi1 or phi2`` under dependence-agnostic Frechet bounds."""
 
-                # ψ(τ)
-                psi_tau = psi[:, tau, :]  # [B,2]
+    @property
+    def tag(self) -> Hashable:
+        return ("or",)
 
-                # min(ψ(τ), min_prefix_ϕ)
-                pair = torch.stack([min_phi, psi_tau], dim=1)  # [B,2,2]
-                val_tau = self.min_op(pair, scale, dim=1, keepdim=False)  # [B,2]
+    def combine(self, value1: torch.Tensor, value2: torch.Tensor) -> torch.Tensor:
+        """``lower = max(l1, l2)``, ``upper = min(1, u1 + u2)``.
 
-                tau_vals.append(val_tau.unsqueeze(1))  # [B,1,2]
+        Shapes ``[B, 2]`` in, ``[B, 2]`` out. Symmetric in its arguments.
+        """
+        l1, u1 = value1[..., 0], value1[..., 1]
+        l2, u2 = value2[..., 0], value2[..., 1]
+        lower = torch.maximum(l1, l2)
+        upper = torch.clamp(u1 + u2, max=1.0)
+        return _clamp(torch.stack([lower, upper], dim=-1))
 
-            # max over τ ∈ [t+a, t+b]
-            tau_tensor = torch.cat(tau_vals, dim=1)  # [B,τ_count,2]
-            best = self.max_op(tau_tensor, scale, dim=1, keepdim=False)  # [B,2]
+    def __str__(self) -> str:
+        return f"({self.left}) ∨ ({self.right})"
 
-            results.append(best)
 
-        out = torch.stack(results, dim=1)  # [B,T,2]
-        return out
+class TemporalOperator(STLFormula):
+    """Base class for the bounded temporal operators.
 
-    def __str__(self):
-        return f"({self.left}) U_{self._interval} ({self.right})"
+    ``interval`` is required and must satisfy ``0 <= a <= b`` with integral
+    endpoints. Unbounded time is not representable by design.
+    """
+
+    def __init__(self, subformula: STLFormula, interval: Sequence[int]) -> None:
+        if not isinstance(subformula, STLFormula):
+            raise TypeError(
+                f"subformula must be an STLFormula, got {type(subformula).__name__}"
+            )
+
+        try:
+            endpoints = tuple(interval)
+        except TypeError:
+            raise TypeError(
+                f"interval must be a sequence [a, b], got {interval!r}; "
+                f"this branch implements bounded-time STL only, so there is no "
+                f"unbounded default"
+            ) from None
+
+        if len(endpoints) != 2:
+            raise ValueError(
+                f"interval must have exactly 2 endpoints [a, b], got {endpoints!r}"
+            )
+
+        a, b = endpoints
+        for label, value in (("a", a), ("b", b)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"interval endpoint {label} must be a number, got {value!r}"
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"interval endpoint {label} must be finite; this branch "
+                    f"implements bounded-time STL only, so infinity is not a "
+                    f"valid endpoint, got {value!r}"
+                )
+            if float(value) != int(value):
+                raise ValueError(
+                    f"interval endpoint {label} must be integral (bounded "
+                    f"discrete time), got {value!r}"
+                )
+        a, b = int(a), int(b)
+
+        if a < 0:
+            raise ValueError(f"interval must satisfy 0 <= a <= b, got a={a}")
+        if a > b:
+            raise ValueError(f"interval must satisfy 0 <= a <= b, got [{a}, {b}]")
+
+        self.subformula = subformula
+        self.interval: tuple[int, int] = (a, b)
+
+    @property
+    def a(self) -> int:
+        return self.interval[0]
+
+    @property
+    def b(self) -> int:
+        return self.interval[1]
+
+    def horizon(self) -> int:
+        return self.b + self.subformula.horizon()
+
+
+class Always(TemporalOperator):
+    """``G_[a,b] phi``: the subformula holds at every time in the window."""
+
+    @property
+    def tag(self) -> Hashable:
+        return ("always", self.a, self.b)
+
+    def combine(self, stacked: torch.Tensor) -> torch.Tensor:
+        """``lower = max(0, sum_j l_j - (n - 1))``, ``upper = min_j u_j``.
+
+        Parameters
+        ----------
+        stacked : torch.Tensor
+            Shape ``[B, n, 2]``: the child enclosures at the ``n = b - a + 1``
+            times in the window.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``[B, 2]``. No temporal independence is assumed.
+        """
+        n = stacked.shape[-2]
+        lower = torch.clamp(stacked[..., 0].sum(dim=-1) - (n - 1), min=0.0)
+        upper = stacked[..., 1].amin(dim=-1)
+        return _clamp(torch.stack([lower, upper], dim=-1))
+
+    def __str__(self) -> str:
+        return f"□[{self.a},{self.b}]({self.subformula})"
+
+
+class Eventually(TemporalOperator):
+    """``F_[a,b] phi``: the subformula holds at some time in the window."""
+
+    @property
+    def tag(self) -> Hashable:
+        return ("eventually", self.a, self.b)
+
+    def combine(self, stacked: torch.Tensor) -> torch.Tensor:
+        """``lower = max_j l_j``, ``upper = min(1, sum_j u_j)``.
+
+        Parameters
+        ----------
+        stacked : torch.Tensor
+            Shape ``[B, n, 2]``: the child enclosures at the ``n = b - a + 1``
+            times in the window.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``[B, 2]``. No temporal independence is assumed.
+        """
+        lower = stacked[..., 0].amax(dim=-1)
+        upper = torch.clamp(stacked[..., 1].sum(dim=-1), max=1.0)
+        return _clamp(torch.stack([lower, upper], dim=-1))
+
+    def __str__(self) -> str:
+        return f"♢[{self.a},{self.b}]({self.subformula})"
