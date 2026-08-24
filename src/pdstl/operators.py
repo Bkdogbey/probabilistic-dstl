@@ -1,46 +1,11 @@
-"""STL formula structure and the hard probability combination equations.
+"""Bounded discrete-time STL formulas and hard probability semantics.
 
-This module defines *what each STL operation means mathematically*. It does not
-know where probabilities come from (``base.py``) and it does not traverse
-children or index time (``propagate.py``). Each operator exposes only a small
-``combine`` step, so every equation appears exactly once in the codebase.
+Operators combine probability enclosures with dependence-agnostic Frechet
+bounds. Temporal intervals are finite and explicit; no smoothing or
+independence assumptions are used.
 
-Scope
------
-Finite, bounded, discrete-time STL only. Temporal operators require an explicit
-interval ``[a, b]`` with ``0 <= a <= b``. There is no ``interval=None``, no
-``np.inf``, and no unbounded operator: the code matches the theory exactly.
-
-Only the **hard** probability semantics live here. No smoothing, no
-log-sum-exp, no differentiable surrogate.
-
-Semantics
----------
-Given child enclosures ``[l, u]``, all combinations are dependence-agnostic
-Frechet bounds::
-
-    ~A              lower = 1 - u
-                    upper = 1 - l
-
-    A and B         lower = max(0, l1 + l2 - 1)
-                    upper = min(u1, u2)
-
-    A or B          lower = max(l1, l2)
-                    upper = min(1, u1 + u2)
-
-    G_[a,b] A       lower = max(0, sum_j l_j - (n - 1))     n = b - a + 1
-                    upper = min_j u_j
-
-    F_[a,b] A       lower = max_j l_j
-                    upper = min(1, sum_j u_j)
-
-No independence is assumed anywhere, in particular not across time.
-
-Formula objects are plain classes, not ``torch.nn.Module``. Autograd operates on
-tensor operations regardless of whether the object performing them is a Module,
-so a future differentiable semantics does not require this to change. A formula
-tree is a syntax tree, not a neural network; only genuinely learnable semantic
-parameters would justify revisiting that.
+Boolean combinations consume ``[B, 2]`` bounds; temporal combinations consume
+windows of shape ``[B, n, 2]``.
 """
 
 from __future__ import annotations
@@ -65,14 +30,10 @@ __all__ = [
 
 
 def _clamp(bounds: torch.Tensor) -> torch.Tensor:
-    """Guard a combination result against float drift outside ``[0, 1]``.
+    """Clamp combination results against floating-point drift.
 
-    Each equation below already applies its own ``max(0, .)`` / ``min(1, .)``
-    where the mathematics calls for one, and each already preserves
-    ``lower <= upper`` (for ``And``: ``l1 + l2 - 1 <= u1 + u2 - 1 <=
-    min(u1, u2)`` because ``u1, u2 <= 1``). This final clamp exists only so
-    accumulated float error cannot produce a technically invalid interval,
-    which is what lets ``validate_bounds`` stay strict at the source boundary.
+    The equations already enforce their mathematical extrema; this final clamp
+    only prevents accumulated numerical error from leaving ``[0, 1]``.
     """
     return bounds.clamp(0.0, 1.0)
 
@@ -84,12 +45,11 @@ class STLFormula(ABC):
     def horizon(self) -> int:
         """Required lookahead ``H(phi)`` in discrete steps.
 
-        ``H(mu) = 0``; ``H(~phi) = H(phi)``;
-        ``H(phi1 and phi2) = H(phi1 or phi2) = max(H(phi1), H(phi2))``;
-        ``H(G_[a,b] phi) = H(F_[a,b] phi) = b + H(phi)``.
+        ``H(mu) = 0`` and ``H(~phi) = H(phi)``. Boolean operators take the
+        maximum child horizon; bounded temporal operators add ``b`` to the
+        child horizon.
 
-        A formula evaluated at time ``t`` reads source data over
-        ``t ... t + H(phi)``.
+        Evaluation at ``t`` reads source data through ``t + H(phi)``.
         """
         raise NotImplementedError
 
@@ -119,40 +79,18 @@ class STLFormula(ABC):
 class Predicate(STLFormula):
     """The atomic object ``mu_i : h_i(x) >= 0``.
 
-    Two usage modes, both valid:
-
     ``Predicate(h=callable, name=...)``
-        *State-resolved predicate.* ``h`` is the real ``h_i``, and a future
-        model-based source (Gaussian, sampling, learned) evaluates it against a
-        state representation to derive ``P(E_{i,k})``.
+        A state-resolved predicate available to model-based sources.
 
     ``Predicate(h=None, name="...")``
-        *Symbolic predicate.* The user supplies event probabilities directly
-        with no state model behind them. ``h_i`` exists mathematically but is
-        not available to the code. This is the mode ``TableProbabilitySource``
-        uses.
+        A symbolic predicate whose probabilities are supplied directly.
 
-    Either way the hard core never calls ``h``: translating a state model into
-    ``P(E_{i,k})`` is the source's job, which is exactly the separation this
-    package is built around.
-
-    Example
-    -------
-    >>> mu = Predicate(lambda x: x[..., 0] - 5.0, name="x_ge_5")
-
-    Identity
-    --------
-    Each predicate carries a stable ``uid`` from a module-level counter, and
-    uses default identity equality. So:
-
-    - repeated use of the **same object** is the same atomic event;
-    - two separately constructed predicates are **never** the same event, even
-      with an identical callable, threshold, or name;
-    - ``name`` is human-readable presentation only and carries no mathematical
-      meaning.
-
-    A counter is used rather than ``id()``, which can be recycled by the
-    allocator and is not reproducible across runs.
+    The evaluator never calls ``h``; deriving atomic probabilities belongs to
+    the source. Event identity follows object identity through a stable ``uid``:
+    reusing one predicate means the same event, while separately constructed
+    predicates remain distinct regardless of callable or name. The name is
+    presentation only; the counter-backed ``uid`` avoids recycled ``id()``
+    values.
     """
 
     _uid_counter = itertools.count()
@@ -176,13 +114,10 @@ class Predicate(STLFormula):
 
 
 class Negation(STLFormula):
-    """Negation ``~mu``, restricted to atomic predicates.
+    """Negation ``~mu``, restricted to atoms by NNF semantics.
 
-    The target theory works in negation normal form, so this class deliberately
-    refuses to define arbitrary formula negation rather than silently inventing
-    a semantics for it. The restriction also makes the complement identity
-    ``A and ~A = empty`` / ``A or ~A = universe`` exactly decidable during
-    propagation.
+    Keeping negation at atoms also makes exact complements structurally
+    recognizable during evaluation.
     """
 
     def __init__(self, subformula: STLFormula) -> None:
@@ -203,7 +138,7 @@ class Negation(STLFormula):
         return ("not",)
 
     def combine(self, value: torch.Tensor) -> torch.Tensor:
-        """``[l, u] -> [1 - u, 1 - l]``. Shape ``[B, 2]`` in, ``[B, 2]`` out."""
+        """Return ``[1 - u, 1 - l]`` from bounds ``[l, u]`` of shape ``[B, 2]``."""
         lower = 1.0 - value[..., 1]
         upper = 1.0 - value[..., 0]
         return _clamp(torch.stack([lower, upper], dim=-1))
@@ -275,10 +210,9 @@ class Or(_BinaryOperator):
 
 
 class TemporalOperator(STLFormula):
-    """Base class for the bounded temporal operators.
+    """Base class for finite intervals ``[a, b]`` with ``0 <= a <= b``.
 
-    ``interval`` is required and must satisfy ``0 <= a <= b`` with integral
-    endpoints. Unbounded time is not representable by design.
+    Endpoints must be integral; unbounded time is not representable.
     """
 
     def __init__(self, subformula: STLFormula, interval: Sequence[int]) -> None:

@@ -1,36 +1,11 @@
-"""Bounded-time evaluation of a pdSTL formula against a probability source.
+"""Bounded-time evaluation of pdSTL formulas.
 
-This module owns *how* a formula is traversed, cached and indexed over discrete
-time. It contains no probability equations: every combination step is delegated
-to the operator's own ``combine`` method in ``operators.py``, so the semantics
-are defined in exactly one place.
-
-Pipeline::
-
-    ProbabilitySource
-        -> atomic bounds [l_{i,k}, u_{i,k}]
-        -> propagation graph (this module)
-        -> Boolean / temporal composition (operators.py)
-        -> [P_lower(phi, k), P_upper(phi, k)]
-
-Event identity
---------------
-Every ``(subformula, time)`` node is given a canonical hashable **event key**
-built bottom-up. Keys do two jobs:
-
-1. they let structurally identical events share a cached value;
-2. they make two Boolean relationships exactly decidable, so the recursive
-   Frechet bound is not needlessly weakened.
-
-The two identities handled are *repetition* (``A and A = A``, ``A or A = A``)
-and *complement* (``A and ~A = empty``, ``A or ~A = universe``). The complement
-case matters because generic Frechet cannot recover it from interval marginals:
-with ``A = [0.4, 0.7]`` and therefore ``~A = [0.3, 0.6]``, blind Frechet reports
-``A and ~A = [0, 0.6]`` -- an upper bound of 0.6 on an impossible event.
-
-Nothing more is attempted: no distributivity, no absorption, no correlation
-model, and no canonicalisation of associativity. The recursive result stays
-**sound**, but it is not claimed to be globally sharp for arbitrary formulas.
+Traverses a formula over discrete time, obtains atomic probability bounds from
+a :class:`ProbabilitySource`, and delegates composition to the operators.
+Structural event identity tracks exact repetitions and complements.
+Event keys also share cached values between structurally identical formulas;
+no broader Boolean simplification or dependence model is attempted.
+The public result has shape ``[B, T_valid, 2]``.
 """
 
 from __future__ import annotations
@@ -49,59 +24,50 @@ from .operators import (
     TemporalOperator,
 )
 
-__all__ = ["PropagationContext", "evaluate"]
+__all__ = ["EvaluationContext", "evaluate"]
 
 
 def _canonical_pair(key1: Hashable, key2: Hashable) -> tuple:
-    """Order two event keys deterministically.
+    """Return a deterministic ordering for a commutative event pair.
 
-    ``And`` and ``Or`` are symmetric in their arguments, so ``A and B`` and
-    ``B and A`` denote the same event and must share a key. Sorting by ``repr``
-    gives a total order that never raises on the mixed ``str``/``int``/``tuple``
-    elements that make up a key, unlike direct tuple comparison.
+    Ordering by ``repr`` supports the mixed element types used in event keys.
     """
     return tuple(sorted((key1, key2), key=repr))
 
 
 def _is_complement(key1: Hashable, key2: Hashable) -> bool:
-    """True when one key is exactly the Boolean complement of the other.
+    """Return True if one event key is the complement of the other.
 
-    Negation is restricted to atomic predicates, so the only ``("not", k)`` keys
-    that exist wrap an atom. That makes complementarity a purely structural
-    check rather than any form of dependence modelling.
+    NNF restricts negation keys to wrapped atoms, so this check is structural.
     """
     return key1 == ("not", key2) or key2 == ("not", key1)
 
 
-class PropagationContext:
+class EvaluationContext:
     """Evaluation state for a single ``evaluate`` call.
 
-    Owns the probability source, the atomic event cache and the formula cache.
-    This class is internal: it is importable for inspection and testing but is
-    deliberately not part of the public package API.
+    Owns the source and per-evaluation caches for atoms, formula objects, and
+    structural events. This class is internal to the propagation module.
     """
 
     def __init__(self, source: ProbabilitySource) -> None:
         self.source = source
         # (predicate.uid, time) -> [B, 2]
         self._atoms: dict[tuple[int, int], torch.Tensor] = {}
-        # (formula, time) -> ([B, 2], key); short-circuits repeated traversal
-        # of the same subformula object.
+        # Preserve exact formula-object identity across repeated traversal.
         self._formula_cache: dict[
             tuple[STLFormula, int], tuple[torch.Tensor, Hashable]
         ] = {}
-        # key -> [B, 2]; shares values between structurally identical events
-        # reached through different objects.
+        # Preserve structural event identity across different formula objects.
         self._event_cache: dict[Hashable, torch.Tensor] = {}
         self._batch: int | None = None
         self.n_source_queries = 0
 
-    def atom(self, predicate: Predicate, time: int) -> torch.Tensor:
-        """Bounds for ``E_{i,k}``, querying the source at most once per event.
+    def atomic_bounds(self, predicate: Predicate, time: int) -> torch.Tensor:
+        """Return validated bounds for one atomic predicate-time event.
 
-        Returns shape ``[B, 2]``. Validation runs here rather than inside each
-        source, so *every* source is checked at the core boundary regardless of
-        what it does internally.
+        Results have shape ``[B, 2]`` and each event queries the source at most
+        once. Validation here applies the same boundary checks to every source.
         """
         cache_key = (predicate.uid, time)
         if cache_key in self._atoms:
@@ -127,18 +93,17 @@ class PropagationContext:
         return bounds
 
     def evaluate(self, formula: STLFormula, time: int) -> torch.Tensor:
-        """Probability enclosure of ``formula`` at discrete ``time``.
+        """Return probability bounds for a formula at one discrete time.
 
-        Returns shape ``[B, 2]`` holding
-        ``[P_lower(phi, time), P_upper(phi, time)]``.
+        The result has shape ``[B, 2]`` with lower and upper bounds last.
         """
-        value, _ = self._eval_keyed(formula, time)
+        value, _ = self._evaluate_with_key(formula, time)
         return value
 
-    def _eval_keyed(
+    def _evaluate_with_key(
         self, formula: STLFormula, time: int
     ) -> tuple[torch.Tensor, Hashable]:
-        """Evaluate one node, returning its value and its canonical event key."""
+        """Evaluate one formula-time node and return its bounds and event key."""
         memo_key = (formula, time)
         if memo_key in self._formula_cache:
             return self._formula_cache[memo_key]
@@ -151,20 +116,16 @@ class PropagationContext:
     def _dispatch(
         self, formula: STLFormula, time: int
     ) -> tuple[torch.Tensor, Hashable]:
-        """Traverse one node.
-
-        Dispatch lives here rather than as a method on each formula class: a
-        ``formula._evaluate(context, time)`` double dispatch would be shorter,
-        but it would push child traversal and time indexing back into
-        ``operators.py`` and blur the responsibility boundary.
-        """
+        """Evaluate one formula node according to its type."""
         if isinstance(formula, Predicate):
-            return self.atom(formula, time), ("atom", formula.uid, time)
+            return self.atomic_bounds(formula, time), ("atom", formula.uid, time)
 
         if isinstance(formula, Negation):
-            # Derived from the positive atom. The source is never asked for a
-            # negated predicate.
-            child_value, child_key = self._eval_keyed(formula.subformula, time)
+            # Negated atoms derive from the positive event; the source is not
+            # queried independently for ~A.
+            child_value, child_key = self._evaluate_with_key(
+                formula.subformula, time
+            )
             return formula.combine(child_value), ("not", child_key)
 
         if isinstance(formula, (And, Or)):
@@ -178,18 +139,18 @@ class PropagationContext:
     def _eval_binary(
         self, formula: And | Or, time: int
     ) -> tuple[torch.Tensor, Hashable]:
-        left_value, left_key = self._eval_keyed(formula.left, time)
-        right_value, right_key = self._eval_keyed(formula.right, time)
+        """Evaluate a Boolean binary operator at one time."""
+        left_value, left_key = self._evaluate_with_key(formula.left, time)
+        right_value, right_key = self._evaluate_with_key(formula.right, time)
 
         is_and = isinstance(formula, And)
         key = (formula.tag[0], _canonical_pair(left_key, right_key))
 
-        # Identity 1: repetition. A and A = A, A or A = A. Applying generic
-        # Frechet here would weaken the interval for no reason.
+        # Exact repetition: A ∩ A = A and A ∪ A = A.
         if left_key == right_key:
             return left_value, key
 
-        # Identity 2: complement. A and ~A is impossible, A or ~A is certain.
+        # Exact complements: A ∩ Aᶜ = ∅ and A ∪ Aᶜ = Ω.
         if _is_complement(left_key, right_key):
             constant = 0.0 if is_and else 1.0
             return torch.full_like(left_value, constant), key
@@ -203,12 +164,15 @@ class PropagationContext:
     def _eval_temporal(
         self, formula: TemporalOperator, time: int
     ) -> tuple[torch.Tensor, Hashable]:
+        """Evaluate a bounded temporal operator at one time."""
         a, b = formula.a, formula.b
         values: list[torch.Tensor] = []
         child_keys: list[Hashable] = []
 
         for offset in range(a, b + 1):
-            value, child_key = self._eval_keyed(formula.subformula, time + offset)
+            value, child_key = self._evaluate_with_key(
+                formula.subformula, time + offset
+            )
             values.append(value)
             child_keys.append(child_key)
 
@@ -225,8 +189,6 @@ class PropagationContext:
 def evaluate(formula: STLFormula, source: ProbabilitySource) -> torch.Tensor:
     """Evaluate ``formula`` at every valid discrete time.
 
-    This is the single canonical evaluation API for the package.
-
     Parameters
     ----------
     formula : STLFormula
@@ -239,17 +201,13 @@ def evaluate(formula: STLFormula, source: ProbabilitySource) -> torch.Tensor:
     torch.Tensor
         Shape ``[B, T_valid, 2]`` where
         ``T_valid = source.horizon - formula.horizon() + 1``, and
-        ``trace[..., 0]`` / ``trace[..., 1]`` are the lower and upper
-        probability bounds.
+        the last dimension stores lower and upper probability bounds.
 
-        ``trace[:, 0, :]`` is the probability enclosure of the formula, i.e.
-        the quantity the paper reports.
+        ``trace[:, 0, :]`` is the enclosure at the initial time.
 
     Notes
     -----
-    Times whose evaluation would need source data past ``source.horizon`` are
-    **not produced at all**. The tail is never padded and no value is
-    fabricated; the returned trace is exactly as long as the source supports.
+    Times requiring data past ``source.horizon`` are omitted rather than padded.
 
     Raises
     ------
@@ -272,6 +230,6 @@ def evaluate(formula: STLFormula, source: ProbabilitySource) -> torch.Tensor:
             f"least times 0 ... {required}"
         )
 
-    context = PropagationContext(source)
+    context = EvaluationContext(source)
     per_time = [context.evaluate(formula, time) for time in range(n_valid)]
     return torch.stack(per_time, dim=-2)  # [B, T_valid, 2]

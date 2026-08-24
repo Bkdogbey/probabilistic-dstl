@@ -1,18 +1,7 @@
 """Probabilistic discrete-time Signal Temporal Logic (pdSTL).
 
-The package is deliberately small and splits three concerns:
-
-``base.py``
-    *What* probabilistic information a user supplies: the
-    :class:`ProbabilitySource` contract and centralised bound validation.
-
-``operators.py``
-    *What* each STL operation means mathematically: the formula classes and the
-    hard Frechet combination equations.
-
-``propagate.py``
-    *How* a formula is traversed, cached and evaluated over bounded discrete
-    time.
+The package provides atomic probability sources, bounded STL formula classes,
+and hard probability-bound evaluation.
 
 Example
 -------

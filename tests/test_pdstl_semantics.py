@@ -90,13 +90,13 @@ def test_binary_operators_are_commutative(ab_source):
 
 def test_commutative_operands_share_one_event_key(ab_source):
     """``A & B`` and ``B & A`` are the same event, so they share a cache entry."""
-    from pdstl.propagate import PropagationContext
+    from pdstl.propagate import EvaluationContext
 
     a, b, source = ab_source
-    context = PropagationContext(source)
+    context = EvaluationContext(source)
 
-    _, key_ab = context._eval_keyed(a & b, 0)
-    _, key_ba = context._eval_keyed(b & a, 0)
+    _, key_ab = context._evaluate_with_key(a & b, 0)
+    _, key_ba = context._evaluate_with_key(b & a, 0)
 
     assert key_ab == key_ba
 

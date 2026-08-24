@@ -1,36 +1,12 @@
-"""User input contract for pdSTL.
+"""Probability input interfaces for pdSTL.
 
-This module defines *what probabilistic information a user must supply*. It says
-nothing about STL syntax (``operators.py``) and nothing about how a formula is
-traversed (``propagate.py``).
+A :class:`ProbabilitySource` supplies bounds ``[lower, upper]`` on the
+satisfaction probability of an atomic predicate at a discrete time. Atomic
+bounds use shape ``[B, 2]`` with a consistent batch size per evaluation.
+Formula traces use shape ``[B, T_valid, 2]``.
 
-The pdSTL core is deliberately agnostic about where atomic probabilities come
-from. A source may wrap exact probabilities, a Gaussian belief, samples,
-statistical confidence intervals, learned predictions, or numbers a human typed
-in. None of that reaches the semantics.
-
-Bound representation
---------------------
-Probability bounds are plain tensors with trailing dimension 2::
-
-    bounds[..., 0] = lower
-    bounds[..., 1] = upper
-
-There is no wrapper class; a tensor is sufficient.
-
-Batch-shape contract
---------------------
-A source must return a *consistent* leading batch shape for every predicate-time
-query participating in one evaluation::
-
-    atomic bounds  ->  [B, 2]
-    formula trace  ->  [B, T_valid, 2]
-
-The core does not broadcast. Temporal evaluation stacks several time-indexed
-values, and ``torch.stack`` does not broadcast mismatched batch dimensions, so a
-ragged source would fail with an opaque shape error deep inside propagation.
-``PropagationContext`` instead records the batch size of the first atom it sees
-and reports a clear error if a later atom disagrees.
+The trailing entries are ``bounds[..., 0] = lower`` and
+``bounds[..., 1] = upper``.
 """
 
 from __future__ import annotations
@@ -44,20 +20,12 @@ __all__ = ["ProbabilitySource", "TableProbabilitySource", "validate_bounds"]
 
 
 def validate_bounds(bounds: torch.Tensor, *, context: str = "") -> torch.Tensor:
-    """Validate a probability-bound tensor and return it unchanged.
+    """Validate bounds of shape ``[B, 2]`` and return them unchanged.
 
-    Enforces the atomic contract::
-
-        0 <= lower <= P(E) <= upper <= 1
-
-    Validation is **strict**: there is no numerical tolerance. Admitting
-    something like ``[-5e-7, 0.8]`` would mean the core carries an invalid
-    probability interval, which makes the invariant ambiguous everywhere
-    downstream. Sources are responsible for clamping their own numerics before
-    returning them. The complementary half of this rule lives in
-    ``operators.py``, where every combination result is clamped to ``[0, 1]``,
-    so float drift is removed where it is produced rather than tolerated where
-    it is checked.
+    The check strictly enforces finite values and
+    ``0 <= lower <= upper <= 1``. Sources must clamp their own numerical drift.
+    No tolerance is applied at this boundary, so the invariant remains exact
+    throughout evaluation.
 
     Parameters
     ----------
@@ -112,13 +80,10 @@ def validate_bounds(bounds: torch.Tensor, *, context: str = "") -> torch.Tensor:
 
 
 class ProbabilitySource(ABC):
-    """Abstract supplier of atomic predicate probability bounds.
+    """Supply bounds on atomic predicate satisfaction probabilities.
 
-    A source answers one question: for predicate ``mu_i`` at discrete time
-    ``k``, what is a valid enclosure of ``P(E_{i,k})``?
-
-    Implementations are duck-typed on the predicate: only ``predicate.uid`` is
-    required, so this module does not import ``operators.py``.
+    For predicate ``mu_i`` at time ``k``, a source encloses ``P(E_{i,k})``.
+    Predicate arguments are duck-typed; only ``predicate.uid`` is required.
     """
 
     @property
@@ -126,14 +91,13 @@ class ProbabilitySource(ABC):
     def horizon(self) -> int:
         """Largest valid discrete time index.
 
-        Valid times are ``0 ... horizon`` **inclusive**, so a source covering
-        four time steps has ``horizon == 3``.
+        Valid times are ``0 ... horizon`` inclusive.
         """
         raise NotImplementedError
 
     @abstractmethod
     def bounds(self, predicate, time: int) -> torch.Tensor:
-        """Return probability bounds for the atomic event ``E_{i,k}``.
+        """Return bounds for atomic event ``E_{i,k}`` with shape ``[B, 2]``.
 
         Parameters
         ----------
@@ -145,23 +109,22 @@ class ProbabilitySource(ABC):
         Returns
         -------
         torch.Tensor
-            Shape ``[B, 2]`` satisfying ``0 <= lower <= P(E_{i,k}) <= upper <= 1``.
+            Bounds satisfying ``0 <= lower <= P(E_{i,k}) <= upper <= 1``.
         """
         raise NotImplementedError
 
 
 class TableProbabilitySource(ProbabilitySource):
-    """A small table-driven source for testing and examples.
+    """Table-driven probability bounds for tests and examples.
 
-    Semantic correctness must be testable without any dynamics model, so this
-    source lets bounds be written down directly::
+    Entries are keyed by ``(predicate.uid, time)`` and validated on insertion::
 
         mu = Predicate(name="mu")
         source = TableProbabilitySource({(mu, 0): (0.9, 0.9), (mu, 1): (0.9, 0.9)})
 
-    Entries are keyed on ``(predicate.uid, time)`` and validated eagerly on
-    insertion, so a malformed interval is reported at the point it was written
-    rather than during evaluation.
+    Eager validation reports malformed intervals where they are defined.
+    The horizon is explicit when provided and otherwise inferred from the
+    largest recorded time.
     """
 
     def __init__(
