@@ -13,6 +13,7 @@ Example
 """
 
 from .base import ProbabilitySource, TableProbabilitySource, validate_bounds
+from .graph import CompiledFormula, compile_formula
 from .operators import (
     Always,
     And,
@@ -29,6 +30,7 @@ from .propagate import evaluate
 __all__ = [
     "Always",
     "And",
+    "CompiledFormula",
     "Eventually",
     "Negation",
     "Or",
@@ -38,6 +40,7 @@ __all__ = [
     "TableProbabilitySource",
     "TemporalOperator",
     "Until",
+    "compile_formula",
     "evaluate",
     "validate_bounds",
 ]
