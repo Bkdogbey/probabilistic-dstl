@@ -1,8 +1,10 @@
 """Bounded-time evaluation of pdSTL formulas.
 
 Traverses a formula over discrete time, obtains atomic probability bounds from
-a :class:`ProbabilitySource`, and delegates composition to the operators.
-Structural event identity tracks exact repetitions and complements.
+a :class:`ProbabilitySource`, and composes them with the shared Frechet rules.
+Structural event identity tracks exact repetitions and complements: a reduction
+that leaves one event returns *that event's* key, so the identities compose
+through nesting instead of holding only one level deep.
 Event keys also share cached values between structurally identical formulas;
 no broader Boolean simplification or dependence model is attempted.
 The public result has shape ``[B, T_valid, 2]``.
@@ -10,29 +12,37 @@ The public result has shape ``[B, T_valid, 2]``.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
+import itertools
+from collections.abc import Callable, Hashable, Sequence
 
 import torch
 
 from .base import ProbabilitySource, validate_bounds
 from .operators import (
+    Always,
     And,
     Negation,
     Or,
     Predicate,
     STLFormula,
     TemporalOperator,
+    Until,
+    frechet_intersection,
+    frechet_union,
 )
 
 __all__ = ["EvaluationContext", "evaluate"]
 
+# One evaluated node: its probability bounds and its structural event key.
+Entry = tuple[torch.Tensor, Hashable]
 
-def _canonical_pair(key1: Hashable, key2: Hashable) -> tuple:
-    """Return a deterministic ordering for a commutative event pair.
+
+def _canonical_keys(keys: Sequence[Hashable]) -> tuple:
+    """Return a deterministic ordering for a commutative set of event keys.
 
     Ordering by ``repr`` supports the mixed element types used in event keys.
     """
-    return tuple(sorted((key1, key2), key=repr))
+    return tuple(sorted(keys, key=repr))
 
 
 def _is_complement(key1: Hashable, key2: Hashable) -> bool:
@@ -131,59 +141,152 @@ class EvaluationContext:
         if isinstance(formula, (And, Or)):
             return self._eval_binary(formula, time)
 
+        if isinstance(formula, Until):
+            return self._eval_until(formula, time)
+
         if isinstance(formula, TemporalOperator):
             return self._eval_temporal(formula, time)
 
         raise TypeError(f"unsupported formula type: {type(formula).__name__}")
 
+    def _combine_events(
+        self,
+        entries: Sequence[Entry],
+        *,
+        intersection: bool,
+        make_key: Callable[[tuple[Hashable, ...]], Hashable],
+    ) -> Entry:
+        """Reduce operand events under set intersection or union.
+
+        The identity rules are applied to the event *keys* before any Frechet
+        combination, so exact structure is never discarded:
+
+        1. duplicate events collapse (``A ∩ A = A``, ``A ∪ A = A``);
+        2. a single surviving event is returned *under its own key*, which is
+           what makes the identities compositional -- ``(A ∧ A) ∧ A`` reduces
+           to ``A`` rather than to a compound event that merely happens to
+           carry ``A``'s bounds. Singleton temporal windows land here too, so
+           ``G[a,a] phi`` is the child event at ``k + a``;
+        3. exact complements are recognised: ``A ∩ Aᶜ = ∅``, ``A ∪ Aᶜ = Ω``.
+
+        Anything else falls back to the dependence-agnostic Frechet rule, under
+        the compound key supplied by ``make_key``.
+        """
+        unique: list[Entry] = []
+        seen: set[Hashable] = set()
+        for value, key in entries:
+            if key not in seen:
+                seen.add(key)
+                unique.append((value, key))
+
+        if len(unique) == 1:
+            return unique[0]
+
+        keys = tuple(key for _, key in unique)
+        key = make_key(keys)
+
+        if any(_is_complement(k1, k2) for k1, k2 in itertools.combinations(keys, 2)):
+            constant = 0.0 if intersection else 1.0
+            return torch.full_like(unique[0][0], constant), key
+
+        cached = self._event_cache.get(key)
+        if cached is not None:
+            return cached, key
+
+        stacked = torch.stack([value for value, _ in unique], dim=-2)  # [B, n, 2]
+        combine = frechet_intersection if intersection else frechet_union
+        return combine(stacked), key
+
     def _eval_binary(
         self, formula: And | Or, time: int
     ) -> tuple[torch.Tensor, Hashable]:
         """Evaluate a Boolean binary operator at one time."""
-        left_value, left_key = self._evaluate_with_key(formula.left, time)
-        right_value, right_key = self._evaluate_with_key(formula.right, time)
-
-        is_and = isinstance(formula, And)
-        key = (formula.tag[0], _canonical_pair(left_key, right_key))
-
-        # Exact repetition: A ∩ A = A and A ∪ A = A.
-        if left_key == right_key:
-            return left_value, key
-
-        # Exact complements: A ∩ Aᶜ = ∅ and A ∪ Aᶜ = Ω.
-        if _is_complement(left_key, right_key):
-            constant = 0.0 if is_and else 1.0
-            return torch.full_like(left_value, constant), key
-
-        cached = self._event_cache.get(key)
-        if cached is not None:
-            return cached, key
-
-        return formula.combine(left_value, right_value), key
+        entries = [
+            self._evaluate_with_key(operand, time)
+            for operand in (formula.left, formula.right)
+        ]
+        tag = formula.tag[0]
+        return self._combine_events(
+            entries,
+            intersection=isinstance(formula, And),
+            make_key=lambda keys: (tag, _canonical_keys(keys)),
+        )
 
     def _eval_temporal(
         self, formula: TemporalOperator, time: int
     ) -> tuple[torch.Tensor, Hashable]:
-        """Evaluate a bounded temporal operator at one time."""
+        """Evaluate a bounded temporal operator at one time.
+
+        ``G`` intersects its window and ``F`` unions it. A singleton window
+        reduces to the child event itself, by the identity rules in
+        :meth:`_combine_events`.
+        """
         a, b = formula.a, formula.b
-        values: list[torch.Tensor] = []
-        child_keys: list[Hashable] = []
+        entries = [
+            self._evaluate_with_key(formula.subformula, time + offset)
+            for offset in range(a, b + 1)
+        ]
+        tag = formula.tag[0]
+        return self._combine_events(
+            entries,
+            intersection=isinstance(formula, Always),
+            make_key=lambda keys: (tag, a, b, keys),
+        )
 
-        for offset in range(a, b + 1):
-            value, child_key = self._evaluate_with_key(
-                formula.subformula, time + offset
+    def _eval_until(self, formula: Until, time: int) -> tuple[torch.Tensor, Hashable]:
+        """Evaluate bounded strong until at one time.
+
+        Builds the candidates ``C_j = E_{phi2, k+j} ∩ (∩_{r<j} E_{phi1, k+r})``
+        for ``j = a ... b`` and unions them. The ``phi1`` prefix is grown lazily
+        from ``r = 0``, so the source is queried for ``phi1`` only at offsets
+        ``0 ... b-1`` and for ``phi2`` only at ``a ... b`` -- exactly the window
+        that :meth:`Until.horizon` accounts for.
+        """
+        a, b = formula.a, formula.b
+        prefix: list[Entry] = []  # E_{phi1, k+r}, r = 0, 1, ...
+        candidates: list[Entry] = []
+
+        def conjunction_key(keys: tuple[Hashable, ...]) -> Hashable:
+            return ("and", _canonical_keys(keys))
+
+        for j in range(b + 1):
+            while len(prefix) < j:
+                prefix.append(
+                    self._evaluate_with_key(formula.left, time + len(prefix))
+                )
+            if j < a:
+                continue
+            right_entry = self._evaluate_with_key(formula.right, time + j)
+            # j = 0 leaves the prefix empty, so C_0 is E_{phi2, k} itself and
+            # the reduction hands back the right child's own event key.
+            candidates.append(
+                self._combine_events(
+                    [right_entry, *prefix[:j]],
+                    intersection=True,
+                    make_key=conjunction_key,
+                )
             )
-            values.append(value)
-            child_keys.append(child_key)
 
-        key = (formula.tag[0], a, b, tuple(child_keys))
+        value, key = self._combine_events(
+            candidates,
+            intersection=False,
+            # Not the "or" namespace: the value below carries the common-prefix
+            # tightening, so it must not be aliased with a plain disjunction of
+            # the same candidate events.
+            make_key=lambda keys: ("until", a, b, keys),
+        )
 
-        cached = self._event_cache.get(key)
-        if cached is not None:
-            return cached, key
+        if a > 0:
+            # Every candidate contains the common prefix P_a = ∩_{r<a} E_{phi1,k+r},
+            # so E_U ⊆ P_a and the union's upper bound cannot exceed P(P_a).
+            # The lower bound is untouched, and no dependence is assumed.
+            prefix_value, _ = self._combine_events(
+                prefix[:a], intersection=True, make_key=conjunction_key
+            )
+            upper = torch.minimum(value[..., 1], prefix_value[..., 1])
+            value = torch.stack([value[..., 0], upper], dim=-1)
 
-        stacked = torch.stack(values, dim=-2)  # [B, n, 2]
-        return formula.combine(stacked), key
+        return value, key
 
 
 def evaluate(formula: STLFormula, source: ProbabilitySource) -> torch.Tensor:

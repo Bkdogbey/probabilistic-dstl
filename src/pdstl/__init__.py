@@ -22,6 +22,7 @@ from .operators import (
     Predicate,
     STLFormula,
     TemporalOperator,
+    Until,
 )
 from .propagate import evaluate
 
@@ -36,6 +37,7 @@ __all__ = [
     "STLFormula",
     "TableProbabilitySource",
     "TemporalOperator",
+    "Until",
     "evaluate",
     "validate_bounds",
 ]
