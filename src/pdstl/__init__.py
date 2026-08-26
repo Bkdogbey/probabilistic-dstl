@@ -15,7 +15,12 @@ Example
 [0.7999999523162842, 0.8999999761581421]
 """
 
-from .base import ProbabilitySource, TableProbabilitySource, validate_bounds
+from .base import (
+    ProbabilitySource,
+    TableProbabilitySource,
+    TensorProbabilitySource,
+    validate_bounds,
+)
 from .graph import CompiledFormula, compile_formula
 from .operators import (
     Always,
@@ -44,6 +49,7 @@ __all__ = [
     "STLFormula",
     "TableProbabilitySource",
     "TemporalOperator",
+    "TensorProbabilitySource",
     "Until",
     "compile_formula",
     "compile_recurrent_formula",

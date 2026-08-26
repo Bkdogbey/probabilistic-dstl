@@ -78,7 +78,7 @@ class _NodeRef:
 
     __slots__ = ("node", "offset")
 
-    def __init__(self, node: "_Node", offset: int) -> None:
+    def __init__(self, node: _Node, offset: int) -> None:
         self.node = node
         self.offset = offset
 
@@ -102,7 +102,7 @@ class _AtomNode:
     only the reading offset differs, not the underlying data.
     """
 
-    __slots__ = ("uid", "tensor")
+    __slots__ = ("tensor", "uid")
 
     def __init__(self, uid: int) -> None:
         self.uid = uid
@@ -115,7 +115,7 @@ class _AtomNode:
 class _NegationNode:
     """Pointwise complement of a child tensor; no offset shift."""
 
-    __slots__ = ("child", "ast_node", "tensor")
+    __slots__ = ("ast_node", "child", "tensor")
 
     def __init__(self, child: _Ref, ast_node: Negation) -> None:
         self.child = child
@@ -157,7 +157,7 @@ class _UntilTightenNode:
     dependence assumption).
     """
 
-    __slots__ = ("union", "prefix", "tensor")
+    __slots__ = ("prefix", "tensor", "union")
 
     def __init__(self, union: _Ref, prefix: _Ref) -> None:
         self.union = union

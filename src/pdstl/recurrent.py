@@ -162,7 +162,7 @@ class _CellRef:
 
     __slots__ = ("cell", "offset")
 
-    def __init__(self, cell: "_Cell", offset: int) -> None:
+    def __init__(self, cell: _Cell, offset: int) -> None:
         self.cell = cell
         self.offset = offset
 
@@ -297,7 +297,7 @@ class _AtomCell(_Cell):
 class _NegationCell(_Cell):
     """Exact negation ``[l, u] -> [1-u, 1-l]``; pointwise in time."""
 
-    __slots__ = ("child", "ast_node")
+    __slots__ = ("ast_node", "child")
 
     def __init__(self, child: _Ref, ast_node: Negation) -> None:
         super().__init__()
@@ -375,7 +375,7 @@ class _WindowCell(_Cell, _LadderMixin):
     populated by the time it is read.
     """
 
-    __slots__ = ("intersection", "child", "a", "b", "last_scan_indices")
+    __slots__ = ("a", "b", "child", "intersection", "last_scan_indices")
 
     def __init__(self, intersection: bool, child: _Ref, a: int, b: int) -> None:
         super().__init__()
@@ -467,16 +467,16 @@ class _UntilCell(_Cell, _LadderMixin):
     """
 
     __slots__ = (
-        "left",
-        "right",
-        "a",
-        "b",
-        "_offsets",
         "_counts",
-        "_include_psi",
         "_false_mask",
         "_has_false",
+        "_include_psi",
+        "_offsets",
+        "a",
+        "b",
         "last_scan_indices",
+        "left",
+        "right",
     )
 
     def __init__(
@@ -771,8 +771,7 @@ def _assign_lengths(
         if isinstance(ref, _ConstRef):
             return
         needed = ref.offset + length
-        if needed > demands[id(ref.cell)]:
-            demands[id(ref.cell)] = needed
+        demands[id(ref.cell)] = max(demands[id(ref.cell)], needed)
 
     require(root_ref, valid_length)
 

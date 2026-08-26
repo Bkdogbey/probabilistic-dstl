@@ -1,6 +1,24 @@
+"""Dynamics and Gaussian belief propagation used by the demos in ``main.py``.
+
+Two propagators live here:
+
+``linear_system``
+    A scalar (1-D) numpy propagator for the introductory signal examples --
+    no autograd, no control optimization.
+``linear_gaussian_rollout``
+    A differentiable torch propagator for the whole-pipeline verification,
+    in explicit ``mu_{k+1} = A mu_k + B u_k``,
+    ``Sigma_{k+1} = A Sigma_k A^T + Q`` form.
+
+Linear-Gaussian dynamics are used because they give transparent, exact
+mean/covariance propagation, which is what makes a verification example
+checkable by hand. **pdSTL itself requires none of this**: it consumes atomic
+event probabilities from whatever provider produces them, and assumes nothing
+about linearity, Gaussianity, or mean/covariance beliefs.
+"""
+
 import numpy as np
 import torch
-from pdstl.base import Belief
 
 
 def normal_cdf(z):
@@ -86,7 +104,75 @@ def piecewise_signal(n_steps=7):
     return t, mean_trace, var_trace
 
 
-class GaussianBelief(Belief):
+def bound_controls(v, u_max):
+    """Map unconstrained parameters ``v`` to controls in ``[-u_max, u_max]``.
+
+    ``u = u_max * tanh(v)``. This is an *optimizer/application* choice -- a way
+    to impose a box constraint on the controls without a projection step -- and
+    is deliberately kept out of :func:`linear_gaussian_rollout` so that the
+    dynamics stay a plain linear map. It is not part of the pdSTL semantics in
+    any sense.
+    """
+    return u_max * torch.tanh(v)
+
+
+def linear_gaussian_rollout(controls, x0_mean, x0_cov, A, B, Q):
+    """Propagate a Gaussian belief through ``x_{k+1} = A x_k + B u_k + w_k``.
+
+    For open-loop controls the mean and covariance recursions decouple::
+
+        mu_{k+1}    = A mu_k + B u_k
+        Sigma_{k+1} = A Sigma_k A^T + Q
+
+    so no sampling is involved and the result is exact. Every operation is a
+    differentiable torch op, so gradients flow from the returned belief back to
+    ``controls`` (and to whatever produced them).
+
+    Parameters
+    ----------
+    controls : torch.Tensor
+        Shape ``[N, M]``, already in physical units -- apply
+        :func:`bound_controls` first if the controls are box-constrained.
+    x0_mean : torch.Tensor
+        Shape ``[D]``.
+    x0_cov : torch.Tensor
+        Shape ``[D, D]``. May be exactly zero for a known initial state.
+    A : torch.Tensor
+        Shape ``[D, D]``.
+    B : torch.Tensor
+        Shape ``[D, M]``.
+    Q : torch.Tensor
+        Shape ``[D, D]``, the per-step process-noise covariance.
+
+    Returns
+    -------
+    mean : torch.Tensor
+        Shape ``[1, N+1, D]``.
+    covariance : torch.Tensor
+        Shape ``[1, N+1, D, D]``.
+
+    Notes
+    -----
+    The leading singleton batch axis matches the ``[B, T, D]`` /
+    ``[B, T, D, D]`` contract of
+    :func:`pdstl.gaussian.gaussian_atom_traces`, so the result can be handed
+    straight to the atomic probability provider.
+    """
+    mean_k = x0_mean
+    cov_k = x0_cov
+    means = [mean_k]
+    covs = [cov_k]
+
+    for k in range(controls.shape[0]):
+        mean_k = A @ mean_k + B @ controls[k]
+        cov_k = A @ cov_k @ A.T + Q
+        means.append(mean_k)
+        covs.append(cov_k)
+
+    return torch.stack(means, dim=0).unsqueeze(0), torch.stack(covs, dim=0).unsqueeze(0)
+
+
+class GaussianBelief:
     def __init__(self, mean, var, confidence_level=2.0):
         self.mean = mean
         self.var = var

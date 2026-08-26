@@ -1,15 +1,31 @@
-"""Foundational pdSTL examples.
+"""The pdSTL pipeline entry point.
 
-Three small demonstrations of the probability-first core, in the spirit of the
-original pdSTL examples but with no planning, no dynamics model and no plotting:
+Run the whole thing with::
+
+    python src/main.py
+
+Two groups of blocks, each toggled independently by flipping ``"run"`` /
+``"skip"`` in the ``skip_run`` call below.
+
+**Foundational examples** -- the probability-first core with no dynamics and no
+plotting:
 
 1. manually supplied atomic probabilities;
 2. Boolean composition;
 3. Always / Eventually.
 
-Run with::
+**Verification suite** (:mod:`verification`) -- three demonstrations that the
+complete probability-first pipeline behaves as intended, with
+publication-quality figures written to ``figures/verification/``:
 
-    python src/main.py
+A. ``F[5,10](x >= 8)``    -- temporal union;
+B. ``G[2,6](3 < z < 5)``  -- probabilistic conjunction + temporal intersection;
+C. ``G Safe AND F Goal``  -- the complete stochastic-system pipeline, direct
+   optimization of the hard lower probability bound, and the known
+   zero-gradient diagnostic.
+
+These are *verification* examples, not the final application experiments. Every
+bound reported anywhere below comes from the exact hard probability semantics.
 """
 
 import sys
@@ -20,6 +36,14 @@ from pdstl import (
     Predicate,
     TableProbabilitySource,
     evaluate,
+)
+from utils import skip_run
+from verification import (
+    run_always,
+    run_eventually,
+    run_stochastic_forward,
+    run_stochastic_optimization,
+    run_zero_gradient_diagnostic,
 )
 
 # Formula strings use the usual logic symbols, which the default Windows
@@ -130,8 +154,30 @@ def example_temporal():
     print("  out-of-range tail times are omitted, never padded")
 
 
+# =============================================================================
+# PIPELINE
+# =============================================================================
+
 if __name__ == "__main__":
-    example_atomic()
-    example_boolean()
-    example_temporal()
+    with skip_run("run", "Foundational pdSTL examples") as check, check():
+        example_atomic()
+        example_boolean()
+        example_temporal()
+        print()
+
+    with skip_run("run", "Verification A: Eventually   F[5,10](x >= 8)") as check, check():
+        run_eventually()
+
+    with skip_run("run", "Verification B: Always       G[2,6](3 < z < 5)") as check, check():
+        run_always()
+
+    with skip_run("run", "Verification C1: forward pipeline   G Safe AND F Goal") as check, check():
+        run_stochastic_forward()
+
+    with skip_run("run", "Verification C2: hard lower-bound optimization") as check, check():
+        run_stochastic_optimization()
+
+    with skip_run("run", "Verification C3: zero-gradient diagnostic") as check, check():
+        run_zero_gradient_diagnostic()
+
     print()

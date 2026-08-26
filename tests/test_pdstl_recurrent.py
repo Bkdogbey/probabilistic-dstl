@@ -16,6 +16,7 @@ really is a backward stateful scan rather than another static fold graph.
 
 import ast
 import inspect
+import itertools
 import random
 
 import pytest
@@ -36,7 +37,6 @@ from pdstl import recurrent as recurrent_module
 from pdstl.gaussian import GaussianHalfspace, gaussian_atom_traces
 from pdstl.graph import compile_formula, materialize_atom_traces
 from pdstl.recurrent import compile_recurrent_formula
-
 from tests.pdstl_rollout import differentiable_rollout
 
 SEED = 20260825
@@ -998,7 +998,7 @@ def test_forward_time_operators_are_evaluated_by_a_backward_scan():
             order = cell.last_scan_indices
             assert len(order) > 1
             assert all(
-                later < earlier for earlier, later in zip(order, order[1:])
+                later < earlier for earlier, later in itertools.pairwise(order)
             ), f"{formula}: scan order is not strictly decreasing: {order}"
             assert order[0] > order[-1]
 

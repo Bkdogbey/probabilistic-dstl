@@ -16,7 +16,12 @@ from collections.abc import Iterable, Mapping, Sequence
 
 import torch
 
-__all__ = ["ProbabilitySource", "TableProbabilitySource", "validate_bounds"]
+__all__ = [
+    "ProbabilitySource",
+    "TableProbabilitySource",
+    "TensorProbabilitySource",
+    "validate_bounds",
+]
 
 
 def validate_bounds(bounds: torch.Tensor, *, context: str = "") -> torch.Tensor:
@@ -186,3 +191,69 @@ class TableProbabilitySource(ProbabilitySource):
                 f"no probability bounds recorded for {predicate} at time {time}; "
                 f"this predicate has entries at times {known}"
             ) from None
+
+
+class TensorProbabilitySource(ProbabilitySource):
+    """Expose already-materialized atomic traces to the reference interpreter.
+
+    The tensor backends (:class:`~pdstl.graph.CompiledFormula` and
+    :class:`~pdstl.recurrent.RecurrentFormula`) consume
+    ``dict[predicate.uid, Tensor[B, horizon+1, 2]]`` directly, while
+    :func:`pdstl.propagate.evaluate` consumes a
+    :class:`ProbabilitySource`. This adapter closes that gap, so all three
+    backends can be run against *bit-identical* atomic inputs -- which is what
+    makes a three-way equivalence check meaningful rather than a comparison of
+    two separately-computed sets of numbers.
+
+    It is an input adapter only: no probabilities are computed or altered here.
+    Unlike :class:`TableProbabilitySource` it does not copy or re-validate on
+    construction, so tensors carrying an autograd graph pass through with that
+    graph intact.
+
+    Parameters
+    ----------
+    traces : Mapping[int, torch.Tensor]
+        Keyed by ``predicate.uid``, each of shape ``[B, horizon+1, 2]``.
+    horizon : int
+        Largest valid discrete time index; inferred from the traces when
+        omitted.
+    """
+
+    def __init__(self, traces: Mapping[int, torch.Tensor], horizon: int | None = None) -> None:
+        if not traces:
+            raise ValueError("traces must contain at least one predicate")
+
+        lengths = {tensor.shape[1] for tensor in traces.values()}
+        if len(lengths) != 1:
+            raise ValueError(
+                f"every atom trace must cover the same number of times, got lengths {sorted(lengths)}"
+            )
+        (length,) = lengths
+
+        if horizon is None:
+            horizon = length - 1
+        elif horizon > length - 1:
+            raise ValueError(
+                f"horizon {horizon} exceeds the {length} times supplied by the atom traces"
+            )
+
+        self._traces = dict(traces)
+        self._horizon = horizon
+
+    @property
+    def horizon(self) -> int:
+        return self._horizon
+
+    def bounds(self, predicate, time: int) -> torch.Tensor:
+        try:
+            trace = self._traces[predicate.uid]
+        except KeyError:
+            raise KeyError(
+                f"no atom trace supplied for {predicate} (uid={predicate.uid}); "
+                f"traces are available for uids {sorted(self._traces)}"
+            ) from None
+        if not 0 <= time <= self._horizon:
+            raise KeyError(
+                f"time {time} is outside the valid range 0 ... {self._horizon} for {predicate}"
+            )
+        return trace[:, time, :]
