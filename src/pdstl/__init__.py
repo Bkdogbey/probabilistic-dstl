@@ -1,7 +1,10 @@
 """Probabilistic discrete-time Signal Temporal Logic (pdSTL).
 
 The package provides atomic probability sources, bounded STL formula classes,
-and hard probability-bound evaluation.
+and hard probability-bound evaluation. Three backends compute the same exact
+hard semantics: the reference interpreter (:func:`evaluate`), the compiled
+fold graph (:func:`compile_formula`), and the formula-structured recurrent
+evaluator (:func:`compile_recurrent_formula`).
 
 Example
 -------
@@ -26,6 +29,7 @@ from .operators import (
     Until,
 )
 from .propagate import evaluate
+from .recurrent import RecurrentFormula, compile_recurrent_formula
 
 __all__ = [
     "Always",
@@ -36,11 +40,13 @@ __all__ = [
     "Or",
     "Predicate",
     "ProbabilitySource",
+    "RecurrentFormula",
     "STLFormula",
     "TableProbabilitySource",
     "TemporalOperator",
     "Until",
     "compile_formula",
+    "compile_recurrent_formula",
     "evaluate",
     "validate_bounds",
 ]

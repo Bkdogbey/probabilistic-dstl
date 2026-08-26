@@ -175,6 +175,61 @@ class _UntilTightenNode:
 _Node = _AtomNode | _NegationNode | _FoldNode | _UntilTightenNode
 
 
+def _validate_atom_traces(
+    atom_traces: Mapping[int, torch.Tensor],
+    *,
+    referenced_uids: frozenset[int] | set[int],
+    predicate_names: Mapping[int, str],
+    horizon: int,
+    context: str,
+) -> tuple[int, torch.dtype, torch.device]:
+    """Check a materialized ``{uid: [B, horizon+1, 2]}`` mapping and report ``B``/dtype/device.
+
+    Shared by every backend that consumes the tensor-input contract -- the
+    compiled graph here and the recurrent evaluator in :mod:`pdstl.recurrent`
+    -- so the two cannot drift in what they accept. ``context`` only labels
+    error messages.
+    """
+    missing = set(referenced_uids) - set(atom_traces)
+    if missing:
+        names = ", ".join(predicate_names.get(uid, f"uid={uid}") for uid in sorted(missing))
+        raise KeyError(f"missing atom traces for: {names}")
+
+    expected_time = horizon + 1
+    batch: int | None = None
+    dtype: torch.dtype | None = None
+    device: torch.device | None = None
+    for uid in sorted(referenced_uids):
+        tensor = atom_traces[uid]
+        name = predicate_names.get(uid, f"uid={uid}")
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"atom trace for {name} must be a torch.Tensor, got {type(tensor).__name__}"
+            )
+        if tensor.ndim != 3 or tensor.shape[1] != expected_time or tensor.shape[2] != 2:
+            raise ValueError(
+                f"atom trace for {name} must have shape [B, {expected_time}, 2], "
+                f"got {tuple(tensor.shape)}"
+            )
+        validate_bounds(tensor.reshape(-1, 2), context=f"{name} ({context})")
+
+        if batch is None:
+            batch, dtype, device = tensor.shape[0], tensor.dtype, tensor.device
+        else:
+            if tensor.shape[0] != batch:
+                raise ValueError(
+                    f"inconsistent batch size: {name} has batch {tensor.shape[0]}, "
+                    f"expected {batch}"
+                )
+            if tensor.dtype != dtype:
+                raise ValueError(f"inconsistent dtype: {name} has {tensor.dtype}, expected {dtype}")
+            if tensor.device != device:
+                raise ValueError(f"inconsistent device: {name} has {tensor.device}, expected {device}")
+
+    assert batch is not None and dtype is not None and device is not None
+    return batch, dtype, device
+
+
 def _dedupe_entries(entries: Sequence[_Entry]) -> list[_Entry]:
     """Drop exact key repeats, preserving first-seen order."""
     seen: set[Hashable] = set()
@@ -387,44 +442,13 @@ class CompiledFormula:
         return resolve(self._root_ref)
 
     def _validate(self, atom_traces: Mapping[int, torch.Tensor]) -> tuple[int, torch.dtype, torch.device]:
-        missing = self._referenced_uids - set(atom_traces)
-        if missing:
-            names = ", ".join(self._predicate_names.get(uid, f"uid={uid}") for uid in sorted(missing))
-            raise KeyError(f"missing atom traces for: {names}")
-
-        expected_time = self.horizon + 1
-        batch: int | None = None
-        dtype: torch.dtype | None = None
-        device: torch.device | None = None
-        for uid in sorted(self._referenced_uids):
-            tensor = atom_traces[uid]
-            name = self._predicate_names.get(uid, f"uid={uid}")
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(
-                    f"atom trace for {name} must be a torch.Tensor, got {type(tensor).__name__}"
-                )
-            if tensor.ndim != 3 or tensor.shape[1] != expected_time or tensor.shape[2] != 2:
-                raise ValueError(
-                    f"atom trace for {name} must have shape [B, {expected_time}, 2], "
-                    f"got {tuple(tensor.shape)}"
-                )
-            validate_bounds(tensor.reshape(-1, 2), context=f"{name} (compiled graph)")
-
-            if batch is None:
-                batch, dtype, device = tensor.shape[0], tensor.dtype, tensor.device
-            else:
-                if tensor.shape[0] != batch:
-                    raise ValueError(
-                        f"inconsistent batch size: {name} has batch {tensor.shape[0]}, "
-                        f"expected {batch}"
-                    )
-                if tensor.dtype != dtype:
-                    raise ValueError(f"inconsistent dtype: {name} has {tensor.dtype}, expected {dtype}")
-                if tensor.device != device:
-                    raise ValueError(f"inconsistent device: {name} has {tensor.device}, expected {device}")
-
-        assert batch is not None and dtype is not None and device is not None
-        return batch, dtype, device
+        return _validate_atom_traces(
+            atom_traces,
+            referenced_uids=self._referenced_uids,
+            predicate_names=self._predicate_names,
+            horizon=self.horizon,
+            context="compiled graph",
+        )
 
 
 def compile_formula(formula: STLFormula, *, horizon: int) -> CompiledFormula:

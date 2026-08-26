@@ -41,6 +41,52 @@ def _clamp(bounds: torch.Tensor) -> torch.Tensor:
     return bounds.clamp(0.0, 1.0)
 
 
+def _frechet_intersection_from_totals(
+    total_lower: torch.Tensor,
+    min_upper: torch.Tensor,
+    count: int | torch.Tensor,
+) -> torch.Tensor:
+    """The intersection equation itself, in terms of already-reduced totals.
+
+    ``lower = max(0, total_lower - (count - 1))`` and ``upper = min_upper``,
+    where ``total_lower`` is ``sum_i l_i`` and ``min_upper`` is ``min_i u_i``
+    over the ``count`` operands *surviving structural reduction*.
+
+    Factored out so callers that accumulate the two totals recurrently -- see
+    :mod:`pdstl.recurrent` -- share this one copy of the equation instead of
+    restating it. ``count`` may be an int or a broadcastable tensor, which is
+    what lets a recurrent caller evaluate several operand counts at once.
+
+    Parameters
+    ----------
+    total_lower, min_upper : torch.Tensor
+        Any common shape; typically ``[B]`` or ``[B, n_candidates]``.
+    count : int or torch.Tensor
+        The post-reduction operand count ``m``, broadcastable against the
+        totals.
+
+    Returns
+    -------
+    torch.Tensor
+        The totals' shape with a trailing ``2`` appended.
+    """
+    lower = torch.clamp(total_lower - (count - 1), min=0.0)
+    return _clamp(torch.stack([lower, min_upper], dim=-1))
+
+
+def _frechet_union_from_totals(
+    max_lower: torch.Tensor, total_upper: torch.Tensor
+) -> torch.Tensor:
+    """The union equation itself, in terms of already-reduced totals.
+
+    ``lower = max_lower`` and ``upper = min(1, total_upper)``. The dual of
+    :func:`_frechet_intersection_from_totals`; unlike it, the union rule does
+    not reference the operand count, so no ``count`` argument is needed.
+    """
+    upper = torch.clamp(total_upper, max=1.0)
+    return _clamp(torch.stack([max_lower, upper], dim=-1))
+
+
 def frechet_intersection(stacked: torch.Tensor) -> torch.Tensor:
     """Dependence-agnostic bounds on ``P(E_1 and ... and E_n)``.
 
@@ -60,10 +106,9 @@ def frechet_intersection(stacked: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         Shape ``[B, 2]``.
     """
-    n = stacked.shape[-2]
-    lower = torch.clamp(stacked[..., 0].sum(dim=-1) - (n - 1), min=0.0)
-    upper = stacked[..., 1].amin(dim=-1)
-    return _clamp(torch.stack([lower, upper], dim=-1))
+    return _frechet_intersection_from_totals(
+        stacked[..., 0].sum(dim=-1), stacked[..., 1].amin(dim=-1), stacked.shape[-2]
+    )
 
 
 def frechet_union(stacked: torch.Tensor) -> torch.Tensor:
@@ -82,9 +127,9 @@ def frechet_union(stacked: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         Shape ``[B, 2]``.
     """
-    lower = stacked[..., 0].amax(dim=-1)
-    upper = torch.clamp(stacked[..., 1].sum(dim=-1), max=1.0)
-    return _clamp(torch.stack([lower, upper], dim=-1))
+    return _frechet_union_from_totals(
+        stacked[..., 0].amax(dim=-1), stacked[..., 1].sum(dim=-1)
+    )
 
 
 def _validate_interval(interval: Sequence[int]) -> tuple[int, int]:
