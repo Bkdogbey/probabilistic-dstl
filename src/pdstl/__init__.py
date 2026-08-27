@@ -8,17 +8,18 @@ evaluator (:func:`compile_recurrent_formula`).
 
 Example
 -------
+>>> import torch
 >>> mu = Predicate(name="mu")
->>> source = TableProbabilitySource({(mu, 0): (0.9, 0.9), (mu, 1): (0.9, 0.9)})
+>>> source = OfflineSource({mu: torch.tensor([[[0.9, 0.9], [0.9, 0.9]]])})
 >>> trace = evaluate(Always(mu, interval=[0, 1]), source)
 >>> trace[0, 0].tolist()
 [0.7999999523162842, 0.8999999761581421]
 """
 
 from .base import (
+    OfflineSource,
+    OnlineSource,
     ProbabilitySource,
-    TableProbabilitySource,
-    TensorProbabilitySource,
     validate_bounds,
 )
 from .graph import CompiledFormula, compile_formula
@@ -42,14 +43,14 @@ __all__ = [
     "CompiledFormula",
     "Eventually",
     "Negation",
+    "OfflineSource",
+    "OnlineSource",
     "Or",
     "Predicate",
     "ProbabilitySource",
     "RecurrentFormula",
     "STLFormula",
-    "TableProbabilitySource",
     "TemporalOperator",
-    "TensorProbabilitySource",
     "Until",
     "compile_formula",
     "compile_recurrent_formula",

@@ -880,7 +880,7 @@ def compile_recurrent_formula(formula: STLFormula, *, horizon: int) -> Recurrent
         A bounded-time pdSTL formula.
     horizon : int
         The largest discrete time index atomic traces will cover; valid times
-        are ``0 .. horizon`` inclusive, matching ``ProbabilitySource.horizon``.
+        are ``0 .. horizon`` inclusive, matching ``len(source) - 1``.
 
     Returns
     -------

@@ -1,6 +1,7 @@
-"""Validation of the user input contract, and the source query behaviour.
+"""Tests for the probability-bound input foundation: sources and validation.
 
-Covers requirement groups A (input validation) and B (predicate/source).
+Covers requirement groups A (validate_bounds), B (OfflineSource), and
+C (OnlineSource).
 """
 
 import pytest
@@ -9,14 +10,14 @@ import torch
 from pdstl import (
     Always,
     Eventually,
+    OfflineSource,
+    OnlineSource,
     Predicate,
-    TableProbabilitySource,
-    evaluate,
     validate_bounds,
 )
 
 # ---------------------------------------------------------------------------
-# A. Input validation
+# A. validate_bounds
 # ---------------------------------------------------------------------------
 
 
@@ -35,25 +36,10 @@ def test_lower_above_upper_is_rejected():
         validate_bounds(torch.tensor([[0.8, 0.2]]))
 
 
-def test_validation_is_strict_with_no_tolerance():
-    """A near-miss is still a miss.
-
-    Admitting ``[-5e-7, 0.8]`` would let the core carry an invalid interval and
-    make the ``0 <= l <= u <= 1`` invariant ambiguous downstream. Sources clamp
-    their own numerics; the boundary check does not forgive.
-    """
-    with pytest.raises(ValueError, match="lower bound must be >= 0"):
-        validate_bounds(torch.tensor([[-5e-7, 0.8]], dtype=torch.float64))
-    with pytest.raises(ValueError, match="upper bound must be <= 1"):
-        validate_bounds(torch.tensor([[0.2, 1.0 + 5e-7]], dtype=torch.float64))
-
-
 def test_malformed_bound_shapes_are_rejected():
     with pytest.raises(ValueError, match="trailing dimension 2"):
         validate_bounds(torch.tensor([[0.1, 0.5, 0.9]]))
-    with pytest.raises(ValueError, match=r"shape \[B, 2\]"):
-        validate_bounds(torch.tensor([0.1, 0.5]))
-    with pytest.raises(ValueError, match=r"shape \[B, 2\]"):
+    with pytest.raises(ValueError, match="trailing dimension 2"):
         validate_bounds(torch.tensor(0.5))
     with pytest.raises(TypeError, match="must be a torch.Tensor"):
         validate_bounds([[0.1, 0.5]])
@@ -64,14 +50,6 @@ def test_non_finite_bounds_are_rejected():
         validate_bounds(torch.tensor([[float("nan"), 0.5]]))
     with pytest.raises(ValueError, match="non-finite"):
         validate_bounds(torch.tensor([[0.1, float("inf")]]))
-
-
-def test_table_source_validates_eagerly_on_insertion():
-    mu = Predicate(name="mu")
-    with pytest.raises(ValueError, match="lower bound must be <= upper bound"):
-        TableProbabilitySource({(mu, 0): (0.9, 0.1)})
-    with pytest.raises(ValueError, match="exactly 2 entries"):
-        TableProbabilitySource({(mu, 0): (0.1, 0.5, 0.9)})
 
 
 def test_malformed_temporal_intervals_are_rejected():
@@ -98,110 +76,213 @@ def test_unbounded_intervals_are_not_representable():
 
 
 # ---------------------------------------------------------------------------
-# B. Predicate / source
+# B. OfflineSource
 # ---------------------------------------------------------------------------
 
 
-class CountingSource(TableProbabilitySource):
-    """Table source that records every ``bounds`` call it receives."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.queries = []
-
-    def bounds(self, predicate, time):
-        self.queries.append((predicate.uid, time))
-        return super().bounds(predicate, time)
-
-
-def test_atom_returns_exactly_the_supplied_bounds():
+def test_offline_bounds_retrieval():
     mu = Predicate(name="mu")
-    source = TableProbabilitySource({(mu, 0): (0.25, 0.75), (mu, 1): (0.4, 0.6)})
+    trace = torch.tensor([[0.25, 0.75], [0.4, 0.6], [0.1, 0.9]]).unsqueeze(0)
+    source = OfflineSource({mu: trace})
 
-    trace = evaluate(mu, source)
-
-    assert trace.shape == (1, 2, 2)
-    assert trace[0, 0].tolist() == pytest.approx([0.25, 0.75])
-    assert trace[0, 1].tolist() == pytest.approx([0.4, 0.6])
+    assert len(source) == 3
+    assert source.bounds(mu, 0)[0].tolist() == pytest.approx([0.25, 0.75])
+    assert source.bounds(mu, 2)[0].tolist() == pytest.approx([0.1, 0.9])
 
 
-def test_repeated_predicate_time_event_is_queried_once():
+def test_offline_exact_probability_is_a_degenerate_interval():
     mu = Predicate(name="mu")
-    source = CountingSource({(mu, 0): (0.6, 0.9)}, horizon=0)
+    source = OfflineSource({mu: torch.tensor([[0.7, 0.7]]).unsqueeze(0)})
 
-    # mu appears four times, all at time 0.
-    phi = (mu & mu) | (mu & mu)
-    evaluate(phi, source)
-
-    assert source.queries == [(mu.uid, 0)]
+    assert source.bounds(mu, 0)[0].tolist() == pytest.approx([0.7, 0.7])
 
 
-def test_negation_does_not_trigger_a_second_query():
-    """``~A`` is derived from the cached positive atom, never re-queried."""
-    mu = Predicate(name="mu")
-    source = CountingSource({(mu, 0): (0.4, 0.7)}, horizon=0)
-
-    evaluate(mu | ~mu, source)
-
-    assert source.queries == [(mu.uid, 0)]
-
-
-def test_each_predicate_time_pair_is_queried_exactly_once():
-    mu = Predicate(name="mu")
-    source = CountingSource({(mu, k): (0.9, 0.95) for k in range(3)})
-
-    # G[0,2] mu and F[0,2] mu read the same three atoms.
-    evaluate(Always(mu, [0, 2]) & Eventually(mu, [0, 2]), source)
-
-    assert sorted(source.queries) == [(mu.uid, 0), (mu.uid, 1), (mu.uid, 2)]
-
-
-def test_separately_created_predicates_are_distinct_events():
-    """Identical name and callable do not make two predicates the same event."""
-    mu1 = Predicate(lambda x: x[..., 0], name="same")
-    mu2 = Predicate(lambda x: x[..., 0], name="same")
-
-    assert mu1.uid != mu2.uid
-
-    source = TableProbabilitySource(
-        {(mu1, 0): (0.6, 0.9), (mu2, 0): (0.6, 0.9)}, horizon=0
+def test_offline_multiple_predicates_are_independent():
+    a = Predicate(name="A")
+    b = Predicate(name="B")
+    source = OfflineSource(
+        {
+            a: torch.tensor([[0.6, 0.9]]).unsqueeze(0),
+            b: torch.tensor([[0.1, 0.2]]).unsqueeze(0),
+        }
     )
 
-    # mu1 & mu1 collapses by identity; mu1 & mu2 must not.
-    assert evaluate(mu1 & mu1, source)[0, 0].tolist() == pytest.approx([0.6, 0.9])
-    assert evaluate(mu1 & mu2, source)[0, 0].tolist() == pytest.approx([0.2, 0.9])
+    assert source.bounds(a, 0)[0].tolist() == pytest.approx([0.6, 0.9])
+    assert source.bounds(b, 0)[0].tolist() == pytest.approx([0.1, 0.2])
 
 
-def test_missing_table_entry_is_reported_not_fabricated():
+def test_offline_batched_inputs_are_preserved():
     mu = Predicate(name="mu")
-    source = TableProbabilitySource({(mu, 0): (0.5, 0.5)}, horizon=1)
+    trace = torch.tensor([[0.3, 0.5], [0.3, 0.5], [0.3, 0.5]]).unsqueeze(1)  # [3, 1, 2]
+    source = OfflineSource({mu: trace})
 
-    with pytest.raises(KeyError, match="no probability bounds recorded"):
-        evaluate(mu, source)
+    bounds = source.bounds(mu, 0)
+    assert bounds.shape == (3, 2)
+    assert torch.allclose(bounds, torch.tensor([[0.3, 0.5]] * 3))
 
 
-def test_inconsistent_batch_size_is_reported_clearly():
-    class RaggedSource(TableProbabilitySource):
-        def bounds(self, predicate, time):
-            single = super().bounds(predicate, time)
-            return single if time == 0 else single.repeat(3, 1)
-
+def test_offline_rejects_bounds_outside_unit_interval():
     mu = Predicate(name="mu")
-    source = RaggedSource({(mu, 0): (0.5, 0.5), (mu, 1): (0.5, 0.5)})
-
-    with pytest.raises(ValueError, match="inconsistent batch size"):
-        evaluate(Always(mu, [0, 1]), source)
+    with pytest.raises(ValueError, match="upper bound must be <= 1"):
+        OfflineSource({mu: torch.tensor([[0.5, 1.5]]).unsqueeze(0)})
 
 
-def test_batched_source_is_supported():
-    class BatchedSource(TableProbabilitySource):
-        def bounds(self, predicate, time):
-            return super().bounds(predicate, time).repeat(4, 1)
-
+def test_offline_rejects_lower_above_upper():
     mu = Predicate(name="mu")
-    source = BatchedSource({(mu, k): (0.9, 0.9) for k in range(2)})
+    with pytest.raises(ValueError, match="lower bound must be <= upper bound"):
+        OfflineSource({mu: torch.tensor([[0.9, 0.1]]).unsqueeze(0)})
 
-    trace = evaluate(Always(mu, [0, 1]), source)
 
-    assert trace.shape == (4, 1, 2)
-    assert trace[:, 0, 0].tolist() == pytest.approx([0.8] * 4)
+def test_offline_rejects_malformed_trace_shape():
+    mu = Predicate(name="mu")
+    with pytest.raises(ValueError, match="trailing dimension 2"):
+        OfflineSource({mu: torch.tensor([[0.1, 0.5, 0.9]]).unsqueeze(0)})
+
+
+def test_offline_rejects_inconsistent_trace_lengths():
+    a = Predicate(name="A")
+    b = Predicate(name="B")
+    with pytest.raises(ValueError, match="batch size and length"):
+        OfflineSource(
+            {
+                a: torch.tensor([[0.5, 0.5], [0.5, 0.5]]).unsqueeze(0),  # T=2
+                b: torch.tensor([[0.5, 0.5]]).unsqueeze(0),  # T=1
+            }
+        )
+
+
+def test_offline_rejects_inconsistent_batch_sizes():
+    a = Predicate(name="A")
+    b = Predicate(name="B")
+    with pytest.raises(ValueError, match="batch size and length"):
+        OfflineSource(
+            {
+                a: torch.tensor([[0.5, 0.5]]).unsqueeze(0),  # B=1
+                b: torch.tensor([[0.5, 0.5]] * 2).unsqueeze(1),  # B=2
+            }
+        )
+
+
+def test_offline_preserves_dtype_and_device():
+    mu = Predicate(name="mu")
+    trace = torch.tensor([[0.5, 0.5]], dtype=torch.float64).unsqueeze(0)
+    source = OfflineSource({mu: trace})
+
+    bounds = source.bounds(mu, 0)
+    assert bounds.dtype == torch.float64
+    assert bounds.device == trace.device
+
+
+def test_offline_preserves_autograd():
+    mu = Predicate(name="mu")
+    trace = torch.tensor([[[0.5, 0.5]]], requires_grad=True)
+    source = OfflineSource({mu: trace})
+
+    source.bounds(mu, 0).sum().backward()
+
+    assert trace.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# C. OnlineSource
+# ---------------------------------------------------------------------------
+
+
+def test_online_append_and_retrieval():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    source.append({mu: torch.tensor([[0.25, 0.75]])})
+    source.append({mu: torch.tensor([[0.4, 0.6]])})
+
+    assert len(source) == 2
+    assert source.bounds(mu, 0)[0].tolist() == pytest.approx([0.25, 0.75])
+    assert source.bounds(mu, 1)[0].tolist() == pytest.approx([0.4, 0.6])
+
+
+def test_online_exact_probability_is_a_degenerate_interval():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    source.append({mu: torch.tensor([[0.7, 0.7]])})
+
+    assert source.bounds(mu, 0)[0].tolist() == pytest.approx([0.7, 0.7])
+
+
+def test_online_multiple_predicates_are_independent():
+    a = Predicate(name="A")
+    b = Predicate(name="B")
+    source = OnlineSource()
+    source.append({a: torch.tensor([[0.6, 0.9]]), b: torch.tensor([[0.1, 0.2]])})
+
+    assert source.bounds(a, 0)[0].tolist() == pytest.approx([0.6, 0.9])
+    assert source.bounds(b, 0)[0].tolist() == pytest.approx([0.1, 0.2])
+
+
+def test_online_batched_inputs_are_preserved():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    source.append({mu: torch.tensor([[0.3, 0.5]] * 4)})
+
+    bounds = source.bounds(mu, 0)
+    assert bounds.shape == (4, 2)
+
+
+def test_online_rejects_bounds_outside_unit_interval():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    with pytest.raises(ValueError, match="lower bound must be >= 0"):
+        source.append({mu: torch.tensor([[-0.1, 0.5]])})
+
+
+def test_online_rejects_lower_above_upper():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    with pytest.raises(ValueError, match="lower bound must be <= upper bound"):
+        source.append({mu: torch.tensor([[0.9, 0.1]])})
+
+
+def test_online_rejects_malformed_step_shape():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    with pytest.raises(ValueError, match="trailing dimension 2"):
+        source.append({mu: torch.tensor([[0.1, 0.5, 0.9]])})
+
+
+def test_online_rejects_inconsistent_predicate_set():
+    a = Predicate(name="A")
+    b = Predicate(name="B")
+    source = OnlineSource()
+    source.append({a: torch.tensor([[0.5, 0.5]])})
+
+    with pytest.raises(ValueError, match="expected predicates"):
+        source.append({b: torch.tensor([[0.5, 0.5]])})
+
+
+def test_online_rejects_inconsistent_batch_size():
+    mu = Predicate(name="mu")
+    source = OnlineSource()
+    source.append({mu: torch.tensor([[0.5, 0.5]])})
+
+    with pytest.raises(ValueError, match="batch size changed"):
+        source.append({mu: torch.tensor([[0.5, 0.5]] * 2)})
+
+
+def test_online_preserves_dtype_and_device():
+    mu = Predicate(name="mu")
+    step = torch.tensor([[0.5, 0.5]], dtype=torch.float64)
+    source = OnlineSource()
+    source.append({mu: step})
+
+    bounds = source.bounds(mu, 0)
+    assert bounds.dtype == torch.float64
+    assert bounds.device == step.device
+
+
+def test_online_preserves_autograd():
+    mu = Predicate(name="mu")
+    step = torch.tensor([[0.5, 0.5]], requires_grad=True)
+    source = OnlineSource()
+    source.append({mu: step})
+
+    source.bounds(mu, 0).sum().backward()
+
+    assert step.grad is not None

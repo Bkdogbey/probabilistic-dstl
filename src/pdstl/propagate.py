@@ -303,19 +303,20 @@ def evaluate(formula: STLFormula, source: ProbabilitySource) -> torch.Tensor:
     -------
     torch.Tensor
         Shape ``[B, T_valid, 2]`` where
-        ``T_valid = source.horizon - formula.horizon() + 1``, and
+        ``T_valid = len(source) - formula.horizon()``, and
         the last dimension stores lower and upper probability bounds.
 
         ``trace[:, 0, :]`` is the enclosure at the initial time.
 
     Notes
     -----
-    Times requiring data past ``source.horizon`` are omitted rather than padded.
+    Times requiring data past the available time steps are omitted rather
+    than padded.
 
     Raises
     ------
     ValueError
-        If the source horizon is too short for the formula's lookahead.
+        If the source has too few time steps for the formula's lookahead.
     """
     if not isinstance(formula, STLFormula):
         raise TypeError(f"formula must be an STLFormula, got {type(formula).__name__}")
@@ -325,12 +326,12 @@ def evaluate(formula: STLFormula, source: ProbabilitySource) -> torch.Tensor:
         )
 
     required = formula.horizon()
-    n_valid = source.horizon - required + 1
+    n_valid = len(source) - required
     if n_valid <= 0:
         raise ValueError(
-            f"source horizon {source.horizon} is too short for {formula}, which "
+            f"source has {len(source)} time steps, too short for {formula}, which "
             f"needs a lookahead of {required} steps; the source must cover at "
-            f"least times 0 ... {required}"
+            f"least {required + 1} time steps"
         )
 
     context = EvaluationContext(source)

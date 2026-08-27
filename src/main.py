@@ -30,11 +30,13 @@ bound reported anywhere below comes from the exact hard probability semantics.
 
 import sys
 
+import torch
+
 from pdstl import (
     Always,
     Eventually,
+    OfflineSource,
     Predicate,
-    TableProbabilitySource,
     evaluate,
 )
 from utils import skip_run
@@ -77,15 +79,20 @@ def example_atomic():
     banner("Example 1: manually supplied atomic probabilities")
 
     mu = Predicate(name="mu")
-    source = TableProbabilitySource(
+    source = OfflineSource(
         {
-            (mu, 0): (0.90, 0.90),  # known exactly
-            (mu, 1): (0.60, 0.85),  # only bracketed
-            (mu, 2): (0.20, 0.40),
+            mu: torch.tensor(
+                [
+                    [0.90, 0.90],  # known exactly
+                    [0.60, 0.85],  # only bracketed
+                    [0.20, 0.40],
+                ]
+            ).unsqueeze(0)
         }
     )
 
-    print(f"  source horizon = {source.horizon} (valid times 0 ... {source.horizon})")
+    horizon = len(source) - 1
+    print(f"  source horizon = {horizon} (valid times 0 ... {horizon})")
     trace = evaluate(mu, source)
     print(f"  trace shape    = {tuple(trace.shape)}  [B, T_valid, 2]")
     for k in range(trace.shape[1]):
@@ -104,8 +111,11 @@ def example_boolean():
 
     a = Predicate(name="A")
     b = Predicate(name="B")
-    source = TableProbabilitySource(
-        {(a, 0): (0.6, 0.9), (b, 0): (0.7, 0.95)}, horizon=0
+    source = OfflineSource(
+        {
+            a: torch.tensor([[0.6, 0.9]]).unsqueeze(0),
+            b: torch.tensor([[0.7, 0.95]]).unsqueeze(0),
+        }
     )
 
     print("  A = [0.600, 0.900]   B = [0.700, 0.950]")
@@ -116,7 +126,7 @@ def example_boolean():
 
     # A separate source so the complement example uses the paper's numbers.
     c = Predicate(name="C")
-    complement_source = TableProbabilitySource({(c, 0): (0.4, 0.7)}, horizon=0)
+    complement_source = OfflineSource({c: torch.tensor([[0.4, 0.7]]).unsqueeze(0)})
 
     print("\n  C = [0.400, 0.700]")
     show(~c, complement_source, "[l, u] -> [1-u, 1-l]")
@@ -134,7 +144,7 @@ def example_temporal():
     banner("Example 3: Always / Eventually")
 
     a = Predicate(name="A")
-    source = TableProbabilitySource({(a, 0): (0.9, 0.9), (a, 1): (0.9, 0.9)})
+    source = OfflineSource({a: torch.tensor([[0.9, 0.9], [0.9, 0.9]]).unsqueeze(0)})
 
     print("  P(A_0) = P(A_1) = 0.900")
     show(Always(a, interval=[0, 1]), source, "sum(l) - (n-1), min(u)")
@@ -143,13 +153,15 @@ def example_temporal():
 
     banner("Example 3b: horizon and the valid trace")
 
-    long_source = TableProbabilitySource({(a, k): (0.9, 0.95) for k in range(6)})
+    long_trace = torch.tensor([[0.9, 0.95]] * 6).unsqueeze(0)
+    long_source = OfflineSource({a: long_trace})
+    long_horizon = len(long_source) - 1
     for formula in [a, Always(a, [0, 1]), Always(Eventually(a, [0, 2]), [0, 1])]:
         trace = evaluate(formula, long_source)
         print(
             f"  {formula!s:<34} H={formula.horizon()}  "
             f"trace {tuple(trace.shape)}  "
-            f"(= horizon {long_source.horizon} - H + 1)"
+            f"(= horizon {long_horizon} - H + 1)"
         )
     print("  out-of-range tail times are omitted, never padded")
 

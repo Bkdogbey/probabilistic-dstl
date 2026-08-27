@@ -461,7 +461,7 @@ def compile_formula(formula: STLFormula, *, horizon: int) -> CompiledFormula:
     horizon : int
         The largest discrete time index atomic traces will cover; valid
         times are ``0 .. horizon`` inclusive, matching
-        ``ProbabilitySource.horizon``.
+        ``len(source) - 1``.
 
     Returns
     -------
