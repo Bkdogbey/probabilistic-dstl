@@ -8,8 +8,6 @@ import pytest
 import torch
 
 from pdstl import (
-    Always,
-    Eventually,
     OfflineSource,
     OnlineSource,
     Predicate,
@@ -50,29 +48,6 @@ def test_non_finite_bounds_are_rejected():
         validate_bounds(torch.tensor([[float("nan"), 0.5]]))
     with pytest.raises(ValueError, match="non-finite"):
         validate_bounds(torch.tensor([[0.1, float("inf")]]))
-
-
-def test_malformed_temporal_intervals_are_rejected():
-    mu = Predicate(name="mu")
-    with pytest.raises(ValueError, match=r"0 <= a <= b"):
-        Always(mu, interval=[2, 1])
-    with pytest.raises(ValueError, match=r"0 <= a <= b"):
-        Eventually(mu, interval=[-1, 3])
-    with pytest.raises(ValueError, match="exactly 2 endpoints"):
-        Always(mu, interval=[0, 1, 2])
-    with pytest.raises(ValueError, match="must be integral"):
-        Always(mu, interval=[0, 1.5])
-
-
-def test_unbounded_intervals_are_not_representable():
-    """This branch is bounded-time only: no ``None``, no infinity."""
-    mu = Predicate(name="mu")
-    with pytest.raises(TypeError):
-        Always(mu)
-    with pytest.raises(TypeError, match="no unbounded default"):
-        Always(mu, interval=None)
-    with pytest.raises(ValueError, match="must be finite"):
-        Always(mu, interval=[0, float("inf")])
 
 
 # ---------------------------------------------------------------------------

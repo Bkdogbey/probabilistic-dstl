@@ -1,485 +1,101 @@
-"""Bounded discrete-time STL formulas and hard probability semantics.
+"""pdSTL formula core: atomic predicates and pointwise Boolean operators.
 
-Operators combine probability enclosures with dependence-agnostic Frechet
-bounds. Temporal intervals are finite and explicit; no smoothing or
-independence assumptions are used.
-
-Boolean combinations consume ``[B, 2]`` bounds; temporal combinations consume
-windows of shape ``[B, n, 2]``.
+Every Formula is a torch.nn.Module. forward(source) queries a
+ProbabilitySource and returns Tensor[B, T, 2] with [..., 0] = lower and
+[..., 1] = upper. Boolean combinations use dependence-agnostic Frechet
+bounds; no independence assumption, no smoothing.
 """
-
-from __future__ import annotations
-
-import itertools
-import math
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Hashable, Sequence
 
 import torch
 
-__all__ = [
-    "Always",
-    "And",
-    "Eventually",
-    "Negation",
-    "Or",
-    "Predicate",
-    "STLFormula",
-    "TemporalOperator",
-    "Until",
-    "frechet_intersection",
-    "frechet_union",
-]
+__all__ = ["And", "Formula", "Not", "Or", "Predicate"]
 
 
-def _clamp(bounds: torch.Tensor) -> torch.Tensor:
-    """Clamp combination results against floating-point drift.
+class Formula(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
 
-    The equations already enforce their mathematical extrema; this final clamp
-    only prevents accumulated numerical error from leaving ``[0, 1]``.
-    """
-    return bounds.clamp(0.0, 1.0)
-
-
-def _frechet_intersection_from_totals(
-    total_lower: torch.Tensor,
-    min_upper: torch.Tensor,
-    count: int | torch.Tensor,
-) -> torch.Tensor:
-    """The intersection equation itself, in terms of already-reduced totals.
-
-    ``lower = max(0, total_lower - (count - 1))`` and ``upper = min_upper``,
-    where ``total_lower`` is ``sum_i l_i`` and ``min_upper`` is ``min_i u_i``
-    over the ``count`` operands *surviving structural reduction*.
-
-    Factored out so callers that accumulate the two totals recurrently -- see
-    :mod:`pdstl.recurrent` -- share this one copy of the equation instead of
-    restating it. ``count`` may be an int or a broadcastable tensor, which is
-    what lets a recurrent caller evaluate several operand counts at once.
-
-    Parameters
-    ----------
-    total_lower, min_upper : torch.Tensor
-        Any common shape; typically ``[B]`` or ``[B, n_candidates]``.
-    count : int or torch.Tensor
-        The post-reduction operand count ``m``, broadcastable against the
-        totals.
-
-    Returns
-    -------
-    torch.Tensor
-        The totals' shape with a trailing ``2`` appended.
-    """
-    lower = torch.clamp(total_lower - (count - 1), min=0.0)
-    return _clamp(torch.stack([lower, min_upper], dim=-1))
-
-
-def _frechet_union_from_totals(
-    max_lower: torch.Tensor, total_upper: torch.Tensor
-) -> torch.Tensor:
-    """The union equation itself, in terms of already-reduced totals.
-
-    ``lower = max_lower`` and ``upper = min(1, total_upper)``. The dual of
-    :func:`_frechet_intersection_from_totals`; unlike it, the union rule does
-    not reference the operand count, so no ``count`` argument is needed.
-    """
-    upper = torch.clamp(total_upper, max=1.0)
-    return _clamp(torch.stack([max_lower, upper], dim=-1))
-
-
-def frechet_intersection(stacked: torch.Tensor) -> torch.Tensor:
-    """Dependence-agnostic bounds on ``P(E_1 and ... and E_n)``.
-
-    ``lower = max(0, sum_i l_i - (n - 1))`` and ``upper = min_i u_i``.
-
-    Both extrema are attained by some joint distribution with the given
-    marginals, so the enclosure is the tightest one available without a
-    dependence model.
-
-    Parameters
-    ----------
-    stacked : torch.Tensor
-        Shape ``[B, n, 2]``: the ``n`` enclosures being intersected.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape ``[B, 2]``.
-    """
-    return _frechet_intersection_from_totals(
-        stacked[..., 0].sum(dim=-1), stacked[..., 1].amin(dim=-1), stacked.shape[-2]
-    )
-
-
-def frechet_union(stacked: torch.Tensor) -> torch.Tensor:
-    """Dependence-agnostic bounds on ``P(E_1 or ... or E_n)``.
-
-    ``lower = max_i l_i`` and ``upper = min(1, sum_i u_i)``. The dual of
-    :func:`frechet_intersection`, and equally tight.
-
-    Parameters
-    ----------
-    stacked : torch.Tensor
-        Shape ``[B, n, 2]``: the ``n`` enclosures being unioned.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape ``[B, 2]``.
-    """
-    return _frechet_union_from_totals(
-        stacked[..., 0].amax(dim=-1), stacked[..., 1].sum(dim=-1)
-    )
-
-
-def _validate_interval(interval: Sequence[int]) -> tuple[int, int]:
-    """Validate a finite discrete interval ``[a, b]`` with ``0 <= a <= b``.
-
-    Shared by :class:`TemporalOperator` and :class:`Until`, which both carry a
-    bounded window but differ in arity.
-    """
-    try:
-        endpoints = tuple(interval)
-    except TypeError:
-        raise TypeError(
-            f"interval must be a sequence [a, b], got {interval!r}; "
-            f"this branch implements bounded-time STL only, so there is no "
-            f"unbounded default"
-        ) from None
-
-    if len(endpoints) != 2:
-        raise ValueError(
-            f"interval must have exactly 2 endpoints [a, b], got {endpoints!r}"
-        )
-
-    a, b = endpoints
-    for label, value in (("a", a), ("b", b)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError(
-                f"interval endpoint {label} must be a number, got {value!r}"
-            )
-        if not math.isfinite(value):
-            raise ValueError(
-                f"interval endpoint {label} must be finite; this branch "
-                f"implements bounded-time STL only, so infinity is not a "
-                f"valid endpoint, got {value!r}"
-            )
-        if float(value) != int(value):
-            raise ValueError(
-                f"interval endpoint {label} must be integral (bounded "
-                f"discrete time), got {value!r}"
-            )
-    a, b = int(a), int(b)
-
-    if a < 0:
-        raise ValueError(f"interval must satisfy 0 <= a <= b, got a={a}")
-    if a > b:
-        raise ValueError(f"interval must satisfy 0 <= a <= b, got [{a}, {b}]")
-
-    return a, b
-
-
-class STLFormula(ABC):
-    """Base class for bounded-time pdSTL formulas."""
-
-    @abstractmethod
-    def horizon(self) -> int:
-        """Required lookahead ``H(phi)`` in discrete steps.
-
-        ``H(mu) = 0`` and ``H(~phi) = H(phi)``. Boolean operators take the
-        maximum child horizon; ``G_[a,b]`` and ``F_[a,b]`` add ``b`` to the
-        child horizon; :class:`Until` reads its two children over different
-        offsets and so has its own rule.
-
-        Evaluation at ``t`` reads source data through ``t + H(phi)``.
-        """
+    def forward(self, source):
         raise NotImplementedError
 
-    @property
-    @abstractmethod
-    def tag(self) -> Hashable:
-        """Small hashable structural label used to build event identity keys."""
-        raise NotImplementedError
-
-    def __and__(self, other: STLFormula) -> And:
+    def __and__(self, other):
         return And(self, other)
 
-    def __or__(self, other: STLFormula) -> Or:
+    def __or__(self, other):
         return Or(self, other)
 
-    def __invert__(self) -> Negation:
-        return Negation(self)
-
-    @abstractmethod
-    def __str__(self) -> str:
-        raise NotImplementedError
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}({self})"
+    def __invert__(self):
+        return Not(self)
 
 
-class Predicate(STLFormula):
-    """The atomic object ``mu_i : h_i(x) >= 0``.
-
-    ``Predicate(h=callable, name=...)``
-        A state-resolved predicate available to model-based sources.
-
-    ``Predicate(h=None, name="...")``
-        A symbolic predicate whose probabilities are supplied directly.
-
-    The evaluator never calls ``h``; deriving atomic probabilities belongs to
-    the source. Event identity follows object identity through a stable ``uid``:
-    reusing one predicate means the same event, while separately constructed
-    predicates remain distinct regardless of callable or name. The name is
-    presentation only; the counter-backed ``uid`` avoids recycled ``id()``
-    values.
-    """
-
-    _uid_counter = itertools.count()
-
-    def __init__(self, h: Callable | None = None, name: str | None = None) -> None:
-        if h is not None and not callable(h):
-            raise TypeError(f"h must be callable or None, got {type(h).__name__}")
-        self.h = h
+class Predicate(Formula):
+    def __init__(self, name):
+        super().__init__()
         self.name = name
-        self.uid: int = next(Predicate._uid_counter)
 
-    def horizon(self) -> int:
-        return 0
+    def forward(self, source):
+        return torch.stack([source.bounds(self, t) for t in range(len(source))], dim=1)
 
-    @property
-    def tag(self) -> Hashable:
-        return ("atom", self.uid)
-
-    def __str__(self) -> str:
-        return self.name if self.name is not None else f"mu_{self.uid}"
+    def __str__(self):
+        return self.name
 
 
-class Negation(STLFormula):
-    """Negation ``~mu``, restricted to atoms by NNF semantics.
+class Not(Formula):
+    def __init__(self, child):
+        super().__init__()
+        self.child = child
 
-    Keeping negation at atoms also makes exact complements structurally
-    recognizable during evaluation.
-    """
+    def forward(self, source):
+        bounds = self.child(source)
+        lower_not = 1 - bounds[..., 1]
+        upper_not = 1 - bounds[..., 0]
+        return torch.stack([lower_not, upper_not], dim=-1)
 
-    def __init__(self, subformula: STLFormula) -> None:
-        if not isinstance(subformula, Predicate):
-            raise TypeError(
-                "negation is only defined for atomic predicates in this "
-                f"implementation, got {type(subformula).__name__}; the target "
-                "semantics is negation normal form, so push negations down to "
-                "the predicates instead of negating a compound formula"
-            )
-        self.subformula = subformula
-
-    def horizon(self) -> int:
-        return self.subformula.horizon()
-
-    @property
-    def tag(self) -> Hashable:
-        return ("not",)
-
-    def combine(self, value: torch.Tensor) -> torch.Tensor:
-        """Return ``[1 - u, 1 - l]`` from bounds ``[l, u]`` of shape ``[B, 2]``."""
-        lower = 1.0 - value[..., 1]
-        upper = 1.0 - value[..., 0]
-        return _clamp(torch.stack([lower, upper], dim=-1))
-
-    def __str__(self) -> str:
-        return f"¬{self.subformula}"
+    def __str__(self):
+        return f"¬({self.child})"
 
 
-class _BinaryOperator(STLFormula):
-    """Shared structure for the two-argument Boolean operators."""
-
-    def __init__(self, left: STLFormula, right: STLFormula) -> None:
-        for side, operand in (("left", left), ("right", right)):
-            if not isinstance(operand, STLFormula):
-                raise TypeError(
-                    f"{side} operand must be an STLFormula, got "
-                    f"{type(operand).__name__}"
-                )
+class And(Formula):
+    def __init__(self, left, right):
+        super().__init__()
         self.left = left
         self.right = right
 
-    def horizon(self) -> int:
-        return max(self.left.horizon(), self.right.horizon())
+    def forward(self, source):
+        left_bounds = self.left(source)
+        if self.left is self.right:
+            return left_bounds
+        right_bounds = self.right(source)
 
+        left_lower, left_upper = left_bounds[..., 0], left_bounds[..., 1]
+        right_lower, right_upper = right_bounds[..., 0], right_bounds[..., 1]
 
-class And(_BinaryOperator):
-    """Conjunction ``phi1 and phi2`` under dependence-agnostic Frechet bounds."""
+        lower = torch.clamp(left_lower + right_lower - 1, min=0.0)
+        upper = torch.minimum(left_upper, right_upper)
+        return torch.stack([lower, upper], dim=-1)
 
-    @property
-    def tag(self) -> Hashable:
-        return ("and",)
-
-    def combine(self, value1: torch.Tensor, value2: torch.Tensor) -> torch.Tensor:
-        """The two-operand case of :func:`frechet_intersection`.
-
-        Shapes ``[B, 2]`` in, ``[B, 2]`` out. Symmetric in its arguments, which
-        is what lets propagation canonicalise the operand order.
-        """
-        return frechet_intersection(torch.stack([value1, value2], dim=-2))
-
-    def __str__(self) -> str:
+    def __str__(self):
         return f"({self.left}) ∧ ({self.right})"
 
 
-class Or(_BinaryOperator):
-    """Disjunction ``phi1 or phi2`` under dependence-agnostic Frechet bounds."""
+class Or(Formula):
+    def __init__(self, left, right):
+        super().__init__()
+        self.left = left
+        self.right = right
 
-    @property
-    def tag(self) -> Hashable:
-        return ("or",)
+    def forward(self, source):
+        left_bounds = self.left(source)
+        if self.left is self.right:
+            return left_bounds
+        right_bounds = self.right(source)
 
-    def combine(self, value1: torch.Tensor, value2: torch.Tensor) -> torch.Tensor:
-        """The two-operand case of :func:`frechet_union`.
+        left_lower, left_upper = left_bounds[..., 0], left_bounds[..., 1]
+        right_lower, right_upper = right_bounds[..., 0], right_bounds[..., 1]
 
-        Shapes ``[B, 2]`` in, ``[B, 2]`` out. Symmetric in its arguments.
-        """
-        return frechet_union(torch.stack([value1, value2], dim=-2))
+        lower = torch.maximum(left_lower, right_lower)
+        upper = torch.clamp(left_upper + right_upper, max=1.0)
+        return torch.stack([lower, upper], dim=-1)
 
-    def __str__(self) -> str:
+    def __str__(self):
         return f"({self.left}) ∨ ({self.right})"
-
-
-class TemporalOperator(STLFormula):
-    """Base class for finite intervals ``[a, b]`` with ``0 <= a <= b``.
-
-    Endpoints must be integral; unbounded time is not representable.
-    """
-
-    def __init__(self, subformula: STLFormula, interval: Sequence[int]) -> None:
-        if not isinstance(subformula, STLFormula):
-            raise TypeError(
-                f"subformula must be an STLFormula, got {type(subformula).__name__}"
-            )
-
-        self.subformula = subformula
-        self.interval: tuple[int, int] = _validate_interval(interval)
-
-    @property
-    def a(self) -> int:
-        return self.interval[0]
-
-    @property
-    def b(self) -> int:
-        return self.interval[1]
-
-    def horizon(self) -> int:
-        return self.b + self.subformula.horizon()
-
-
-class Always(TemporalOperator):
-    """``G_[a,b] phi``: the subformula holds at every time in the window."""
-
-    @property
-    def tag(self) -> Hashable:
-        return ("always", self.a, self.b)
-
-    def combine(self, stacked: torch.Tensor) -> torch.Tensor:
-        """Intersect the window via :func:`frechet_intersection`.
-
-        Parameters
-        ----------
-        stacked : torch.Tensor
-            Shape ``[B, n, 2]``: the child enclosures at the ``n = b - a + 1``
-            times in the window.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``[B, 2]``. No temporal independence is assumed.
-        """
-        return frechet_intersection(stacked)
-
-    def __str__(self) -> str:
-        return f"□[{self.a},{self.b}]({self.subformula})"
-
-
-class Eventually(TemporalOperator):
-    """``F_[a,b] phi``: the subformula holds at some time in the window."""
-
-    @property
-    def tag(self) -> Hashable:
-        return ("eventually", self.a, self.b)
-
-    def combine(self, stacked: torch.Tensor) -> torch.Tensor:
-        """Union the window via :func:`frechet_union`.
-
-        Parameters
-        ----------
-        stacked : torch.Tensor
-            Shape ``[B, n, 2]``: the child enclosures at the ``n = b - a + 1``
-            times in the window.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``[B, 2]``. No temporal independence is assumed.
-        """
-        return frechet_union(stacked)
-
-    def __str__(self) -> str:
-        return f"♢[{self.a},{self.b}]({self.subformula})"
-
-
-class Until(_BinaryOperator):
-    """``phi1 U_[a,b] phi2``: bounded strong until.
-
-    Strong until requires ``phi2`` to actually occur somewhere in ``[a, b]``,
-    with ``phi1`` holding at every step strictly before it. The satisfaction
-    event at time ``k`` is::
-
-        E_U = union_{j=a..b} C_j,
-        C_j = E_{phi2, k+j} intersect (intersect_{r=0..j-1} E_{phi1, k+r})
-
-    The ``phi1`` prefix always starts at ``r = 0``, not at ``r = a``: the
-    formula is not satisfied by a run that violates ``phi1`` before the window
-    opens. For ``j = 0`` the prefix is empty, so ``C_0 = E_{phi2, k}`` and
-    ``phi1 U_[0,0] phi2`` is exactly ``phi2``.
-
-    This is a two-argument temporal operator, so it shares the operand
-    validation of the Boolean binaries rather than the single-``subformula``
-    shape of :class:`TemporalOperator`.
-    """
-
-    def __init__(
-        self, left: STLFormula, right: STLFormula, interval: Sequence[int]
-    ) -> None:
-        super().__init__(left, right)
-        self.interval: tuple[int, int] = _validate_interval(interval)
-
-    @property
-    def a(self) -> int:
-        return self.interval[0]
-
-    @property
-    def b(self) -> int:
-        return self.interval[1]
-
-    def horizon(self) -> int:
-        """The actual lookahead required, which is not ``b + max(H1, H2)``.
-
-        ``phi2`` is read at offsets up to ``b`` and ``phi1`` only at offsets up
-        to ``b - 1``, so::
-
-            H = H(phi2)                                  if b == 0
-            H = max(b + H(phi2), b - 1 + H(phi1))        if b > 0
-
-        When ``b == 0`` the prefix is empty and ``phi1`` is never read at all,
-        so its own lookahead does not enter.
-        """
-        if self.b == 0:
-            return self.right.horizon()
-        return max(
-            self.b + self.right.horizon(),
-            self.b - 1 + self.left.horizon(),
-        )
-
-    @property
-    def tag(self) -> Hashable:
-        return ("until", self.a, self.b)
-
-    def __str__(self) -> str:
-        return f"({self.left}) U[{self.a},{self.b}] ({self.right})"

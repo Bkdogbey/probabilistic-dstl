@@ -1,19 +1,19 @@
 """Probabilistic discrete-time Signal Temporal Logic (pdSTL).
 
-The package provides atomic probability sources, bounded STL formula classes,
-and hard probability-bound evaluation. Three backends compute the same exact
-hard semantics: the reference interpreter (:func:`evaluate`), the compiled
-fold graph (:func:`compile_formula`), and the formula-structured recurrent
-evaluator (:func:`compile_recurrent_formula`).
+The package provides atomic probability sources and pointwise Boolean
+formula classes. A Formula is a torch.nn.Module: calling it on a source
+returns Tensor[B, T, 2] of [lower, upper] probability bounds.
 
 Example
 -------
 >>> import torch
->>> mu = Predicate(name="mu")
->>> source = OfflineSource({mu: torch.tensor([[[0.9, 0.9], [0.9, 0.9]]])})
->>> trace = evaluate(Always(mu, interval=[0, 1]), source)
->>> trace[0, 0].tolist()
-[0.7999999523162842, 0.8999999761581421]
+>>> a = Predicate("safe")
+>>> b = Predicate("goal")
+>>> source = OfflineSource(
+...     {a: torch.tensor([[0.6, 0.9]]).unsqueeze(0), b: torch.tensor([[0.7, 0.95]]).unsqueeze(0)}
+... )
+>>> (a & b)(source)[0, 0].tolist()
+[0.30000001192092896, 0.9]
 """
 
 from .base import (
@@ -22,38 +22,16 @@ from .base import (
     ProbabilitySource,
     validate_bounds,
 )
-from .graph import CompiledFormula, compile_formula
-from .operators import (
-    Always,
-    And,
-    Eventually,
-    Negation,
-    Or,
-    Predicate,
-    STLFormula,
-    TemporalOperator,
-    Until,
-)
-from .propagate import evaluate
-from .recurrent import RecurrentFormula, compile_recurrent_formula
+from .operators import And, Formula, Not, Or, Predicate
 
 __all__ = [
-    "Always",
     "And",
-    "CompiledFormula",
-    "Eventually",
-    "Negation",
+    "Formula",
+    "Not",
     "OfflineSource",
     "OnlineSource",
     "Or",
     "Predicate",
     "ProbabilitySource",
-    "RecurrentFormula",
-    "STLFormula",
-    "TemporalOperator",
-    "Until",
-    "compile_formula",
-    "compile_recurrent_formula",
-    "evaluate",
     "validate_bounds",
 ]
