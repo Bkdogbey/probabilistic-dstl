@@ -10,54 +10,53 @@ from experiments.streaming import (
     run_streaming_always_example,
     run_streaming_eventually_example,
 )
-from utils import skip_run
+from utils import load_config, skip_run
 
-# Choose the examples to run.
-RUN_BOOLEAN = "run"
-RUN_ALWAYS = "run"
-RUN_EVENTUALLY = "run"
-RUN_SLIDING_ALWAYS = "run"
-RUN_STREAMING_ALWAYS = "run"
-RUN_STREAMING_EVENTUALLY = "run"
-
-# Offline Gaussian-belief examples. These retain the user's current intervals.
-ALWAYS_THRESHOLD = 50.0
-ALWAYS_INTERVAL = (0, 1)
-EVENTUALLY_THRESHOLD = 55.0
-EVENTUALLY_INTERVAL = (0, 1)
-
-# Separate 11-step sliding and streaming examples.
-SLIDING_INTERVAL = (0, 5)
+DEFAULT_CONFIG = "configs/examples.yml"
 
 
-def main(
-    *,
-    show=True,
-    run_boolean=RUN_BOOLEAN,
-    run_always=RUN_ALWAYS,
-    run_eventually=RUN_EVENTUALLY,
-    run_sliding_always=RUN_SLIDING_ALWAYS,
-    run_streaming_always=RUN_STREAMING_ALWAYS,
-    run_streaming_eventually=RUN_STREAMING_EVENTUALLY,
-):
-    """Run the selected examples; ``show=False`` keeps tests noninteractive."""
-    with skip_run(run_boolean, "Boolean operators") as check, check():
+def _flag(settings):
+    return "run" if settings["run"] else "skip"
+
+
+def _interval(settings):
+    return tuple(settings["interval"])
+
+
+def main(config_path=DEFAULT_CONFIG, *, show=None):
+    """Run examples selected in the YAML configuration."""
+    config = load_config(config_path)
+    examples = config["experiments"]
+    show = config["show_plots"] if show is None else show
+
+    with skip_run(_flag(examples["boolean"]), "Boolean operators") as check, check():
         run_boolean_example()
 
-    with skip_run(run_always, "Offline Always") as check, check():
-        run_always_example(ALWAYS_THRESHOLD, ALWAYS_INTERVAL, show=show)
+    always = examples["always"]
+    with skip_run(_flag(always), "Offline Always") as check, check():
+        run_always_example(always["threshold"], _interval(always), show=show)
 
-    with skip_run(run_eventually, "Offline Eventually") as check, check():
-        run_eventually_example(EVENTUALLY_THRESHOLD, EVENTUALLY_INTERVAL, show=show)
+    eventually = examples["eventually"]
+    with skip_run(_flag(eventually), "Offline Eventually") as check, check():
+        run_eventually_example(
+            eventually["threshold"],
+            _interval(eventually),
+            show=show,
+        )
 
-    with skip_run(run_sliding_always, "Offline sliding Always") as check, check():
-        run_sliding_always_example(SLIDING_INTERVAL, show=show)
+    sliding = examples["sliding_always"]
+    with skip_run(_flag(sliding), "Offline sliding Always") as check, check():
+        run_sliding_always_example(_interval(sliding), show=show)
 
-    with skip_run(run_streaming_always, "Streaming Always") as check, check():
-        run_streaming_always_example(SLIDING_INTERVAL, show=show)
+    streaming_always = examples["streaming_always"]
+    with skip_run(_flag(streaming_always), "Streaming Always") as check, check():
+        run_streaming_always_example(_interval(streaming_always), show=show)
 
-    with skip_run(run_streaming_eventually, "Streaming Eventually") as check, check():
-        run_streaming_eventually_example(SLIDING_INTERVAL, show=show)
+    streaming_eventually = examples["streaming_eventually"]
+    with skip_run(
+        _flag(streaming_eventually), "Streaming Eventually"
+    ) as check, check():
+        run_streaming_eventually_example(_interval(streaming_eventually), show=show)
 
 
 if __name__ == "__main__":

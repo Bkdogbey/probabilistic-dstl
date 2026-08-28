@@ -8,9 +8,16 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+import yaml
 
 import main as main_module
-from main import run_always_example, run_boolean_example, run_eventually_example
+from main import (
+    DEFAULT_CONFIG,
+    run_always_example,
+    run_boolean_example,
+    run_eventually_example,
+)
+from utils import load_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -101,16 +108,23 @@ def test_importing_main_has_no_execution_side_effects(capsys):
     assert captured.err == ""
 
 
-def test_real_main_pipeline_runs_all_examples(capsys):
-    main_module.main(
-        show=False,
-        run_boolean="run",
-        run_always="run",
-        run_eventually="run",
-        run_sliding_always="run",
-        run_streaming_always="run",
-        run_streaming_eventually="run",
-    )
+def test_default_yaml_config_contains_each_independent_example():
+    config = load_config(DEFAULT_CONFIG)
+
+    assert set(config["experiments"]) == {
+        "boolean",
+        "always",
+        "eventually",
+        "sliding_always",
+        "streaming_always",
+        "streaming_eventually",
+    }
+    assert config["experiments"]["always"]["interval"] == [0, 1]
+    assert config["experiments"]["streaming_always"]["interval"] == [0, 5]
+
+
+def test_real_main_pipeline_runs_default_yaml_examples(capsys):
+    main_module.main(show=False)
 
     output = capsys.readouterr().out
     for expected in (
@@ -124,6 +138,22 @@ def test_real_main_pipeline_runs_all_examples(capsys):
     ):
         assert expected in output
     plt.close("all")
+
+
+def test_yaml_config_can_select_one_example(tmp_path, capsys):
+    config = load_config(DEFAULT_CONFIG)
+    for settings in config["experiments"].values():
+        settings["run"] = False
+    config["experiments"]["boolean"]["run"] = True
+    config_path = tmp_path / "examples.yml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    main_module.main(config_path, show=False)
+
+    output = capsys.readouterr().out
+    assert "A AND B" in output
+    assert "Offline Always" not in output
+    assert "Streaming Always" not in output
 
 
 def test_executable_entry_point_runs_real_pipeline(tmp_path):

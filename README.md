@@ -86,30 +86,26 @@ and streaming examples then verify the bounded recurrent state.
 6. **Streaming Eventually** — repeats the incremental check with the union
    reduction used by Eventually.
 
-The editable configuration is grouped at the top of `src/main.py`:
+All experiment choices live in `configs/examples.yml`:
 
-```python
-RUN_BOOLEAN = "run"
-RUN_ALWAYS = "run"
-RUN_EVENTUALLY = "run"
-RUN_SLIDING_ALWAYS = "run"
-RUN_STREAMING_ALWAYS = "run"
-RUN_STREAMING_EVENTUALLY = "run"
+```yaml
+show_plots: true
 
-ALWAYS_THRESHOLD = 50.0
-ALWAYS_INTERVAL = (0, 1)
+experiments:
+  always:
+    run: true
+    threshold: 50.0
+    interval: [0, 1]
 
-EVENTUALLY_THRESHOLD = 55.0
-EVENTUALLY_INTERVAL = (0, 1)
-
-SLIDING_INTERVAL = (0, 5)
+  streaming_always:
+    run: true
+    interval: [0, 5]
 ```
 
-Set a `RUN_*` value to `"skip"` to omit that experiment through `skip_run`.
-Change an experiment's threshold or bounded integer interval in this same
-configuration block; its model, predicate, operator, output, and plot labels
-all use the configured values. A skipped experiment builds nothing, evaluates
-nothing, and prints nothing.
+Set `run: false` to skip an experiment. Change its threshold or bounded
+integer interval in the same entry; every example has an independent interval.
+Set `show_plots: false` for a noninteractive run. A skipped experiment builds
+nothing, evaluates nothing, and prints no experiment results.
 
 For the temporal examples, the uncertain altitude follows
 
@@ -172,6 +168,8 @@ src/
 ├── planning/        # trajectory optimization and receding-horizon control
 ├── visualization/   # offline temporal and streaming-state plots
 └── main.py          # the single demonstration entry point
+configs/
+└── examples.yml     # run switches, thresholds, intervals, and plotting
 ```
 
 `baselines/`, `data/`, `datasets/`, `features/`, and `planning/` are

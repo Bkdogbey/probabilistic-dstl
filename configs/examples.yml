@@ -1,0 +1,29 @@
+# Plot windows when an experiment finishes.
+show_plots: true
+
+# Each example is independent. Set run to false to skip it.
+experiments:
+  boolean:
+    run: true
+
+  always:
+    run: true
+    threshold: 50.0
+    interval: [0, 1]
+
+  eventually:
+    run: true
+    threshold: 55.0
+    interval: [0, 1]
+
+  sliding_always:
+    run: true
+    interval: [0, 5]
+
+  streaming_always:
+    run: true
+    interval: [0, 5]
+
+  streaming_eventually:
+    run: true
+    interval: [0, 5]
