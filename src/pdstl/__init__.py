@@ -1,8 +1,10 @@
 """Probabilistic discrete-time Signal Temporal Logic (pdSTL).
 
-The package provides atomic probability sources and pointwise Boolean
-formula classes. A Formula is a torch.nn.Module: calling it on a source
-returns Tensor[B, T, 2] of [lower, upper] probability bounds.
+The package provides atomic probability sources, pointwise Boolean formula
+classes, and bounded temporal operators. A Formula is a torch.nn.Module:
+calling it on a source returns Tensor[B, T, 2] of [lower, upper] probability
+bounds. Pass ``smooth=True`` for a differentiable optimization surrogate;
+the default ``smooth=False`` gives the hard, certifiable Frechet bounds.
 
 Example
 -------
@@ -14,6 +16,13 @@ Example
 ... )
 >>> (a & b)(source)[0, 0].tolist()
 [0.30000001192092896, 0.9]
+
+A bounded temporal operator over [a, b] consumes b + 1 steps per output, so a
+length-T trace yields max(T - b, 0) outputs:
+
+>>> trace = torch.tensor([[0.9, 0.9], [0.8, 0.95], [0.85, 0.9]]).unsqueeze(0)
+>>> Always(a, (0, 1))(OfflineSource({a: trace})).shape
+torch.Size([1, 2, 2])
 """
 
 from .base import (
@@ -22,10 +31,21 @@ from .base import (
     ProbabilitySource,
     validate_bounds,
 )
-from .operators import And, Formula, Not, Or, Predicate
+from .operators import (
+    Always,
+    And,
+    Eventually,
+    Formula,
+    Not,
+    Or,
+    Predicate,
+    TemporalOperator,
+)
 
 __all__ = [
+    "Always",
     "And",
+    "Eventually",
     "Formula",
     "Not",
     "OfflineSource",
@@ -33,5 +53,6 @@ __all__ = [
     "Or",
     "Predicate",
     "ProbabilitySource",
+    "TemporalOperator",
     "validate_bounds",
 ]
