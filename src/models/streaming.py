@@ -14,6 +14,15 @@ class ProbabilityTrace:
     predicate_name: str
 
 
+@dataclass(frozen=True)
+class MissionTrace:
+    """Two aligned atomic traces for the composed mission example."""
+
+    time: torch.Tensor
+    safe_bounds: torch.Tensor
+    goal_bounds: torch.Tensor
+
+
 def _trace(rows, predicate_name, dtype):
     bounds = torch.tensor(rows, dtype=dtype).unsqueeze(0)
     return ProbabilityTrace(
@@ -64,3 +73,13 @@ def sliding_eventually_example(dtype=torch.float64):
         dtype,
     )
 
+
+def mission_example(dtype=torch.float64):
+    """Return aligned safety and goal traces for mission composition."""
+    safe = sliding_always_example(dtype)
+    goal = sliding_eventually_example(dtype)
+    return MissionTrace(
+        time=safe.time,
+        safe_bounds=safe.bounds,
+        goal_bounds=goal.bounds,
+    )

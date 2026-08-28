@@ -115,6 +115,7 @@ def test_default_yaml_config_contains_each_independent_example():
         "boolean",
         "always",
         "eventually",
+        "mission",
         "sliding_always",
         "streaming_always",
         "streaming_animation",
@@ -134,7 +135,9 @@ def test_real_main_pipeline_runs_default_yaml_examples(capsys):
         "Offline sliding Always",
         "Streaming Always",
         "Streaming Eventually",
+        "Mission = Always",
         "Online step() outputs match",
+        "mission outputs match the offline graph",
         "t=0",
         "k=0",
     ):

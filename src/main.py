@@ -1,5 +1,6 @@
 """Single entry point for the selectable pdSTL examples."""
 
+from experiments.mission import run_mission_example
 from experiments.offline import (
     run_always_example,
     run_boolean_example,
@@ -58,6 +59,10 @@ def main(config_path=DEFAULT_CONFIG, *, show=None):
         _flag(streaming_eventually), "Streaming Eventually"
     ) as check, check():
         run_streaming_eventually_example(_interval(streaming_eventually), show=show)
+
+    mission = examples["mission"]
+    with skip_run(_flag(mission), "Composed mission") as check, check():
+        run_mission_example(_interval(mission), show=show)
 
     animation = examples["streaming_animation"]
     with skip_run(_flag(animation), "Streaming Always animation") as check, check():

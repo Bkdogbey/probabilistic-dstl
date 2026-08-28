@@ -127,6 +127,17 @@ def test_nested_boolean_formulas():
     assert out[0, 0].tolist() == pytest.approx([expected_lower, expected_upper])
 
 
+def test_stateless_boolean_steps_match_their_frechet_equations():
+    a = Predicate("A")
+    b = Predicate("B")
+    left = torch.tensor([[0.6, 0.9]])
+    right = torch.tensor([[0.7, 0.95]])
+
+    assert Not(a).step(left)[0].tolist() == pytest.approx([0.1, 0.4])
+    assert And(a, b).step(left, right)[0].tolist() == pytest.approx([0.3, 0.9])
+    assert Or(a, b).step(left, right)[0].tolist() == pytest.approx([0.7, 1.0])
+
+
 def test_operator_overloads_construct_expected_types():
     a = Predicate("A")
     b = Predicate("B")

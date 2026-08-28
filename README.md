@@ -86,7 +86,11 @@ and streaming examples then verify the bounded recurrent state.
    same bounds as the offline evaluation.
 6. **Streaming Eventually** — repeats the incremental check with the union
    reduction used by Eventually.
-7. **Streaming Always animation** — reveals one arrival at a time, highlights
+7. **Composed mission** — evaluates `Always[0,2](safe) AND
+   Eventually[0,2](goal)` as one offline formula graph and as two recurrent
+   temporal branches followed by a stateless conjunction. The two evaluations
+   must agree at every anchor.
+8. **Streaming Always animation** — reveals one arrival at a time, highlights
    the retained and expired entries, writes out the current Fréchet calculation,
    and adds each completed temporal bound to the output history.
 
@@ -102,6 +106,10 @@ experiments:
     interval: [0, 1]
 
   streaming_always:
+    run: true
+    interval: [0, 2]
+
+  mission:
     run: true
     interval: [0, 2]
 
@@ -181,7 +189,7 @@ src/
 ├── models/          # Boolean, Gaussian-belief, and streaming inputs
 ├── pdstl/           # the pdSTL core: sources, predicates, Boolean/temporal operators
 ├── planning/        # trajectory optimization and receding-horizon control
-├── visualization/   # offline temporal and streaming-state plots
+├── visualization/   # offline, streaming-state, and mission plots
 └── main.py          # the single demonstration entry point
 configs/
 └── examples.yml     # run switches, thresholds, intervals, and plotting

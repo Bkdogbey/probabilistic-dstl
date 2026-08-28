@@ -94,12 +94,15 @@ class Not(Formula):
         super().__init__()
         self.child = child
 
-    def forward(self, source, *, smooth=False, beta=20.0):
-        # Negation is exact in both modes; only the child may need smoothing.
-        bounds = self.child(source, smooth=smooth, beta=beta)
+    def step(self, bounds):
+        """Negate one supplied probability interval without recurrent state."""
         lower_not = 1 - bounds[..., 1]
         upper_not = 1 - bounds[..., 0]
         return torch.stack([lower_not, upper_not], dim=-1)
+
+    def forward(self, source, *, smooth=False, beta=20.0):
+        # Negation is exact in both modes; only the child may need smoothing.
+        return self.step(self.child(source, smooth=smooth, beta=beta))
 
     def __str__(self):
         return f"¬({self.child})"
@@ -111,12 +114,8 @@ class And(Formula):
         self.left = left
         self.right = right
 
-    def forward(self, source, *, smooth=False, beta=20.0):
-        left_bounds = self.left(source, smooth=smooth, beta=beta)
-        if self.left is self.right:
-            return left_bounds
-        right_bounds = self.right(source, smooth=smooth, beta=beta)
-
+    def step(self, left_bounds, right_bounds, *, smooth=False, beta=20.0):
+        """Combine one pair of supplied intervals without recurrent state."""
         left_lower, left_upper = left_bounds[..., 0], left_bounds[..., 1]
         right_lower, right_upper = right_bounds[..., 0], right_bounds[..., 1]
 
@@ -129,6 +128,18 @@ class And(Formula):
             upper = torch.minimum(left_upper, right_upper)
         return torch.stack([lower, upper], dim=-1)
 
+    def forward(self, source, *, smooth=False, beta=20.0):
+        left_bounds = self.left(source, smooth=smooth, beta=beta)
+        if self.left is self.right:
+            return left_bounds
+        right_bounds = self.right(source, smooth=smooth, beta=beta)
+        return self.step(
+            left_bounds,
+            right_bounds,
+            smooth=smooth,
+            beta=beta,
+        )
+
     def __str__(self):
         return f"({self.left}) ∧ ({self.right})"
 
@@ -139,12 +150,8 @@ class Or(Formula):
         self.left = left
         self.right = right
 
-    def forward(self, source, *, smooth=False, beta=20.0):
-        left_bounds = self.left(source, smooth=smooth, beta=beta)
-        if self.left is self.right:
-            return left_bounds
-        right_bounds = self.right(source, smooth=smooth, beta=beta)
-
+    def step(self, left_bounds, right_bounds, *, smooth=False, beta=20.0):
+        """Combine one pair of supplied intervals without recurrent state."""
         left_lower, left_upper = left_bounds[..., 0], left_bounds[..., 1]
         right_lower, right_upper = right_bounds[..., 0], right_bounds[..., 1]
 
@@ -157,6 +164,18 @@ class Or(Formula):
             lower = torch.maximum(left_lower, right_lower)
             upper = torch.clamp(left_upper + right_upper, max=1.0)
         return torch.stack([lower, upper], dim=-1)
+
+    def forward(self, source, *, smooth=False, beta=20.0):
+        left_bounds = self.left(source, smooth=smooth, beta=beta)
+        if self.left is self.right:
+            return left_bounds
+        right_bounds = self.right(source, smooth=smooth, beta=beta)
+        return self.step(
+            left_bounds,
+            right_bounds,
+            smooth=smooth,
+            beta=beta,
+        )
 
     def __str__(self):
         return f"({self.left}) ∨ ({self.right})"
