@@ -1,24 +1,20 @@
-"""The pdSTL demonstration entry point.
-
-Run with::
-
-    python src/main.py
-
-Three independent experiments, each toggled by flipping "run"/"skip" in
-main()'s skip_run(...) calls. A skipped experiment builds nothing and
-prints nothing. The Always/Eventually windows are plain literals passed to
-Always(...)/Eventually(...) below -- edit them directly to experiment; the
-verification, labels, and prints all derive from the constructed operator
-and its actual output, so they stay correct for any window or trace length.
-"""
-
 import torch
 
 from models.boolean import boolean_example
 from models.drone import always_altitude_example, eventually_altitude_example
-from pdstl import And, Always, Eventually, Not, OfflineSource, Or, Predicate
+from pdstl import Always, Eventually, OfflineSource, Predicate
 from utils import skip_run
 from visualization.temporal import plot_temporal_example
+
+RUN_BOOLEAN = "run"
+RUN_ALWAYS = "run"
+RUN_EVENTUALLY = "run"
+
+ALWAYS_THRESHOLD = 50.0
+ALWAYS_INTERVAL = (0, 2)
+
+EVENTUALLY_THRESHOLD = 55.0
+EVENTUALLY_INTERVAL = (0, 2)
 
 
 def run_boolean_example():
@@ -30,9 +26,9 @@ def run_boolean_example():
     torch.testing.assert_close(a(source), bounds_a)
     torch.testing.assert_close(b(source), bounds_b)
 
-    not_a = Not(a)(source)
-    and_ab = And(a, b)(source)
-    or_ab = Or(a, b)(source)
+    not_a = (~a)(source)
+    and_ab = (a & b)(source)
+    or_ab = (a | b)(source)
 
     dtype = bounds_a.dtype
     torch.testing.assert_close(not_a, torch.tensor([[[0.10, 0.40]]], dtype=dtype))
@@ -43,104 +39,123 @@ def run_boolean_example():
     print(f"not A   = {not_a[0, 0].tolist()}   (expected [0.10, 0.40])")
     print(f"A AND B = {and_ab[0, 0].tolist()}   (expected [0.30, 0.90])")
     print(f"A OR B  = {or_ab[0, 0].tolist()}   (expected [0.70, 1.00])")
+    return not_a, and_ab, or_ab
 
 
-def _always_windows(p, a, b):
-    """[lower, upper] for every valid Always[a,b] window of 1-D tensor p.
-
-    Shape [n, 2], n = max(len(p) - b, 0) -- correct for any window or trace
-    length, including n == 0 when the window doesn't fit yet.
-    """
-    width = b - a + 1
-    shifted = p[a:]
-    if shifted.shape[0] < width:
-        return torch.empty(0, 2, dtype=p.dtype)
-    windows = shifted.unfold(0, width, 1)
-    lower = torch.clamp(windows.sum(dim=-1) - (width - 1), min=0.0)
-    upper = windows.amin(dim=-1)
-    return torch.stack([lower, upper], dim=-1)
+def _print_atomic_bounds(model, atomic_bounds):
+    print("Atomic predicate bounds")
+    for time, bounds in zip(model.time.tolist(), atomic_bounds[0].tolist()):
+        lower, upper = bounds
+        print(f"t={time}: [{lower:.4f}, {upper:.4f}]")
 
 
-def _eventually_windows(p, a, b):
-    """[lower, upper] for every valid Eventually[a,b] window of 1-D tensor p.
-
-    Shape [n, 2], n = max(len(p) - b, 0).
-    """
-    width = b - a + 1
-    shifted = p[a:]
-    if shifted.shape[0] < width:
-        return torch.empty(0, 2, dtype=p.dtype)
-    windows = shifted.unfold(0, width, 1)
-    lower = windows.amax(dim=-1)
-    upper = torch.clamp(windows.sum(dim=-1), max=1.0)
-    return torch.stack([lower, upper], dim=-1)
-
-
-def _print_windows(operator, result, available_steps):
-    if result.shape[1] == 0:
-        print(f"{operator}: no output yet -- needs {operator.b + 1} steps, "
-              f"only {available_steps} available")
-        return False
-    for k in range(result.shape[1]):
-        lower, upper = result[0, k].tolist()
-        print(f"{operator} at k={k}: [{lower:.4f}, {upper:.4f}]")
-    return True
-
-
-def run_always_example():
-    model = always_altitude_example()
-    predicate = Predicate("altitude >= 50 m")
-    source = OfflineSource({predicate: model.probability_bounds})
-
-    atomic = predicate(source)
-    always_op = Always(predicate, (0, 2))
-    result = always_op(source)
-
-    p = atomic[0, :, 0]
-    expected = _always_windows(p, always_op.a, always_op.b).unsqueeze(0)
-    torch.testing.assert_close(result, expected)
-
-    print(f"atomic probabilities: {p.tolist()}")
-    if not _print_windows(always_op, result, p.shape[0]):
+def _print_temporal_bounds(formula_label, interval, temporal_bounds, trace_length):
+    print(formula_label)
+    if temporal_bounds.shape[1] == 0:
+        print(
+            f"No complete temporal windows: interval [{interval[0]},{interval[1]}] "
+            f"needs at least {interval[1] + 1} time steps; trace has {trace_length}."
+        )
         return
-    print("The plotted altitude line is the belief mean, not a deterministic")
-    print("realized path. A mean above 50 m does not imply probability one")
-    print("because the Gaussian belief still assigns probability below 50 m.")
 
-    plot_temporal_example(model, atomic, result, str(always_op))
+    a, b = interval
+    for anchor, bounds in enumerate(temporal_bounds[0].tolist()):
+        lower, upper = bounds
+        window = f"[{anchor + a},{anchor + b}]"
+        print(f"k={anchor}, window={window}: [{lower:.4f}, {upper:.4f}]")
 
 
-def run_eventually_example():
-    model = eventually_altitude_example()
-    predicate = Predicate("altitude >= 55 m")
+def _print_temporal_interpretation(operator_name):
+    print("Atomic intervals bound the marginal predicate probability at each time.")
+    print("Temporal intervals bound the formula-satisfaction probability because")
+    print("dependence between different time events is not specified.")
+    influence = "low" if operator_name == "Always" else "high"
+    print(
+        f"For {operator_name}, a {influence} atomic bound affects every window "
+        "containing that time."
+    )
+
+
+def _run_temporal(
+    *,
+    model_factory,
+    operator_type,
+    threshold,
+    interval,
+    show,
+):
+    model = model_factory(threshold=threshold)
+    predicate = Predicate(f"altitude >= {float(threshold):g} m")
     source = OfflineSource({predicate: model.probability_bounds})
+    atomic_bounds = predicate(source)
+    temporal_operator = operator_type(predicate, interval)
+    temporal_bounds = temporal_operator(source)
+    operator_name = operator_type.__name__
+    formula_label = f"{operator_name}[{interval[0]},{interval[1]}]({predicate})"
 
-    atomic = predicate(source)
-    eventually_op = Eventually(predicate, (0, 2))
-    result = eventually_op(source)
+    _print_atomic_bounds(model, atomic_bounds)
+    _print_temporal_bounds(
+        formula_label,
+        interval,
+        temporal_bounds,
+        trace_length=model.time.shape[0],
+    )
+    _print_temporal_interpretation(operator_name)
 
-    p = atomic[0, :, 0]
-    expected = _eventually_windows(p, eventually_op.a, eventually_op.b).unsqueeze(0)
-    torch.testing.assert_close(result, expected)
-
-    print(f"atomic probabilities: {p.tolist()}")
-    if not _print_windows(eventually_op, result, p.shape[0]):
-        return
-    print("The belief mean crosses 55 m at t=2, but this does not make the")
-    print("event certain. The uncertain altitude can still be below 55 m.")
-
-    plot_temporal_example(model, atomic, result, str(eventually_op))
+    figure = plot_temporal_example(
+        model,
+        atomic_bounds,
+        temporal_bounds,
+        interval,
+        formula_label,
+        show=show,
+    )
+    return model, atomic_bounds, temporal_bounds, figure
 
 
-def main():
-    with skip_run("run", "Boolean operators") as check, check():
+def run_always_example(threshold, interval, show=True):
+    return _run_temporal(
+        model_factory=always_altitude_example,
+        operator_type=Always,
+        threshold=threshold,
+        interval=interval,
+        show=show,
+    )
+
+
+def run_eventually_example(threshold, interval, show=True):
+    return _run_temporal(
+        model_factory=eventually_altitude_example,
+        operator_type=Eventually,
+        threshold=threshold,
+        interval=interval,
+        show=show,
+    )
+
+
+def main(
+    *,
+    show=True,
+    run_boolean=RUN_BOOLEAN,
+    run_always=RUN_ALWAYS,
+    run_eventually=RUN_EVENTUALLY,
+):
+    with skip_run(run_boolean, "Boolean operators") as check, check():
         run_boolean_example()
 
-    with skip_run("run", "Always above 50 m") as check, check():
-        run_always_example()
+    with skip_run(run_always, "Always") as check, check():
+        run_always_example(
+            threshold=ALWAYS_THRESHOLD,
+            interval=ALWAYS_INTERVAL,
+            show=show,
+        )
 
-    with skip_run("run", "Eventually above 55 m") as check, check():
-        run_eventually_example()
+    with skip_run(run_eventually, "Eventually") as check, check():
+        run_eventually_example(
+            threshold=EVENTUALLY_THRESHOLD,
+            interval=EVENTUALLY_INTERVAL,
+            show=show,
+        )
 
 
 if __name__ == "__main__":

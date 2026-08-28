@@ -20,8 +20,6 @@ certified enclosure directly.
   steps.
 - `OfflineSource` — a complete `{predicate: Tensor[B, T, 2]}` trace per
   predicate, known up front.
-- `OnlineSource` — a source that grows one time step at a time via
-  `.append({predicate: Tensor[B, 2]})`, for streaming use.
 - `Predicate(name)` — an atomic formula; its bounds come directly from a
   `ProbabilitySource`.
 - `Not`, `And`, `Or` — pointwise Boolean composition (`~`, `&`, `|`) under
@@ -66,26 +64,62 @@ repository.
 
 ## Running the demonstration
 
-`src/main.py` is the single entry point for running the current examples:
-three fully independent experiments, each its own `run_*` function.
+`src/main.py` is the single entry point for the current offline examples:
+three fully independent experiments, each with its own `run_*` function.
 
 1. **Boolean operators** (`run_boolean_example`) — two fixed probability
    intervals, `A = [0.60, 0.90]` and `B = [0.70, 0.95]`, combined with `~`,
    `&`, `|` and checked against the hand-computed Fréchet result. Numerical
    only, no model, no plot.
-2. **Always** (`run_always_example`) — a three-step Gaussian altitude
-   belief (`mean=[52,53,54]m`, `std=2m`, threshold `50m`); the atomic
-   probability at each step is `P(Z_t >= 50) = Phi((mean_t - 50)/std_t)`,
-   not hand-authored; `Always[0,2]` is checked against
-   `[max(0, sum(p)-2), min(p)]` and plotted.
-3. **Eventually** (`run_eventually_example`) — its own three-step belief
-   (`mean=[52,54,56]m`, `std=1m`, threshold `55m`); `Eventually[0,2]` is
-   checked against `[max(p), min(1, sum(p))]` and plotted.
+2. **Always** (`run_always_example`) — a seven-step Gaussian altitude belief
+   with an ambiguous mean and known conditional standard deviation, evaluated
+   over a configurable bounded interval.
+3. **Eventually** (`run_eventually_example`) — a separate seven-step climbing
+   belief using the same atomic-to-temporal probability-bound pipeline.
 
-Each is toggled independently by flipping `"run"` / `"skip"` in the
-`skip_run(...)` calls inside `main()` (`src/utils.py`'s `skip_run`) — a
-skipped experiment builds nothing, evaluates nothing, and prints nothing.
-Edit `src/main.py` and flip a flag to run just one experiment.
+The editable configuration is grouped at the top of `src/main.py`:
+
+```python
+RUN_BOOLEAN = "run"
+RUN_ALWAYS = "run"
+RUN_EVENTUALLY = "run"
+
+ALWAYS_THRESHOLD = 50.0
+ALWAYS_INTERVAL = (0, 2)
+
+EVENTUALLY_THRESHOLD = 55.0
+EVENTUALLY_INTERVAL = (0, 2)
+```
+
+Set a `RUN_*` value to `"skip"` to omit that experiment through `skip_run`.
+Change an experiment's threshold or bounded integer interval in this same
+configuration block; its model, predicate, operator, output, and plot labels
+all use the configured values. A skipped experiment builds nothing, evaluates
+nothing, and prints nothing.
+
+For the temporal examples, the uncertain altitude follows
+
+```text
+Z_t | mu_t ~ Normal(mu_t, std_t^2),  mu_t in [mean_lower_t, mean_upper_t].
+```
+
+For the event `Z_t >= h`, monotonicity in the Gaussian mean gives atomic
+bounds derived with the normal CDF:
+
+```text
+p_lower_t = Phi((mean_lower_t - h) / std_t)
+p_upper_t = Phi((mean_upper_t - h) / std_t)
+```
+
+These bounds are computed from the belief, never hand-authored. Applying
+Always or Eventually then produces temporal probability bounds using Fréchet
+semantics because dependence between events at different times is unknown.
+The three plot panels expose this full progression: admissible Gaussian means,
+atomic lower/upper probabilities, and temporal lower/upper probabilities at
+every valid STL anchor.
+
+The examples in this commit evaluate complete traces through `OfflineSource`.
+Online monitoring is not part of this example pipeline.
 
 ```bash
 python src/main.py

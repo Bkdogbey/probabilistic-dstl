@@ -16,3 +16,6 @@ dev = ["pytest", "ruff", "matplotlib"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/pdstl/base.py" = ["RUF022"]
