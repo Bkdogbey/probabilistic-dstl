@@ -60,9 +60,34 @@ autograd (`.backward()`).
 pip install -e ".[dev]"
 ```
 
-This installs the package (`pdstl`) plus `pytest` and `ruff` for
-development. `import pdstl` then works from anywhere, not just this
+This installs the package (`pdstl`) plus `pytest`, `ruff`, and `matplotlib`
+for development. `import pdstl` then works from anywhere, not just this
 repository.
+
+## Running the demonstration
+
+`src/main.py` is the single entry point for running the current examples.
+It builds up one drone-altitude scenario in four steps:
+
+1. **Predicate** — a single physically meaningful predicate, `altitude >= 50m`.
+2. **Boolean** — combine two predicates (`altitude >= 50m`, `battery >= 20%`)
+   with `&`, `|`, `~`.
+3. **Always** — a bounded temporal operator alone: does the drone stay safe
+   throughout a window?
+4. **Always + Eventually** — the full mission ("stay safe and eventually
+   land"), checked against independently hand-computed references and
+   against an `OnlineSource` replay, then plotted.
+
+Each example is its own function, toggled independently by flipping
+`"run"` / `"skip"` in the `skip_run(...)` calls inside `main()` — the same
+mechanism as `src/utils.py`'s `skip_run`. Edit `src/main.py` and flip a flag
+to run just one example.
+
+```bash
+python src/main.py
+# or, equivalently:
+make demo
+```
 
 ## Example
 
@@ -78,9 +103,24 @@ always_safe(source)                          # hard, certified bound
 always_safe(source, smooth=True, beta=20.0)  # smooth surrogate for optimization
 ```
 
-See [`examples/basic.py`](examples/basic.py) for a complete walkthrough
-covering Boolean conjunction, a temporal operator, hard and smooth
-evaluation, and an `OnlineSource` append-and-reevaluate loop.
+## Project structure
+
+```text
+src/
+├── baselines/       # deterministic STL and comparison methods
+├── data/            # data loading and preprocessing
+├── datasets/        # experiment datasets
+├── features/        # feature and predicate-probability extraction
+├── models/          # example probability-bound inputs (temporal_examples.py)
+├── pdstl/           # the pdSTL core: sources, predicates, Boolean/temporal operators
+├── planning/        # trajectory optimization and receding-horizon control
+├── visualization/   # plotting for probability-bound traces (probability_bounds.py)
+└── main.py          # the single demonstration entry point
+```
+
+`baselines/`, `data/`, `datasets/`, `features/`, and `planning/` are
+currently empty extension points reserved for future work; only `pdstl/`,
+`models/`, `visualization/`, and `main.py` are implemented today.
 
 ## Testing
 

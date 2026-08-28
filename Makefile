@@ -1,4 +1,4 @@
-.PHONY: install test lint clean
+.PHONY: install test lint clean demo
 
 ## Install the package and development tools (pytest, ruff)
 install:
@@ -11,6 +11,10 @@ test:
 ## Check code style
 lint:
 	ruff check .
+
+## Run the pdSTL demonstration
+demo:
+	python src/main.py
 
 ## Remove compiled Python files and caches
 clean:
