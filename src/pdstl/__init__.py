@@ -40,6 +40,8 @@ from .operators import (
     Or,
     Predicate,
     TemporalOperator,
+    Until,
+    UntilState,
 )
 
 __all__ = [
@@ -54,5 +56,7 @@ __all__ = [
     "Predicate",
     "ProbabilitySource",
     "TemporalOperator",
+    "Until",
+    "UntilState",
     "validate_bounds",
 ]

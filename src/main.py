@@ -12,6 +12,7 @@ from experiments.streaming import (
     run_streaming_always_example,
     run_streaming_eventually_example,
 )
+from experiments.until import run_until_example
 from utils import load_config, skip_run
 
 DEFAULT_CONFIG = "configs/examples.yml"
@@ -63,6 +64,10 @@ def main(config_path=DEFAULT_CONFIG, *, show=None):
     mission = examples["mission"]
     with skip_run(_flag(mission), "Composed mission") as check, check():
         run_mission_example(_interval(mission), show=show)
+
+    until = examples["until"]
+    with skip_run(_flag(until), "Safe until goal") as check, check():
+        run_until_example(_interval(until), show=show)
 
     animation = examples["streaming_animation"]
     with skip_run(_flag(animation), "Streaming Always animation") as check, check():

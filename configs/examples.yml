@@ -32,6 +32,10 @@ experiments:
     run: true
     interval: [0, 2]
 
+  until:
+    run: true
+    interval: [1, 2]
+
   # Enable this alone for the clearest view of the recurrent window.
   streaming_animation:
     run: false

@@ -22,6 +22,7 @@ Two evaluation modes share one implementation:
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +36,8 @@ __all__ = [
     "Or",
     "Predicate",
     "TemporalOperator",
+    "Until",
+    "UntilState",
 ]
 
 
@@ -56,6 +59,20 @@ def _soft_max(x, beta, dim):
 def _soft_min(x, beta, dim):
     """Smooth min over `dim`: -logsumexp(-beta * x) / beta."""
     return -torch.logsumexp(-beta * x, dim=dim) / beta
+
+
+def _validate_interval(interval):
+    try:
+        a, b = interval
+    except (TypeError, ValueError):
+        raise TypeError(f"interval must contain two integer endpoints, got {interval!r}")
+    if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, int) or not isinstance(b, int):
+        raise TypeError(f"interval endpoints must be integers, got {interval!r}")
+    if a < 0:
+        raise ValueError(f"interval lower endpoint must be >= 0, got {interval!r}")
+    if a > b:
+        raise ValueError(f"interval must satisfy a <= b, got {interval!r}")
+    return a, b
 
 
 class Formula(torch.nn.Module):
@@ -197,17 +214,8 @@ class TemporalOperator(Formula, ABC):
 
     def __init__(self, child, interval):
         super().__init__()
-        a, b = interval
-        if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, int) or not isinstance(b, int):
-            raise TypeError(f"interval endpoints must be integers, got {interval!r}")
-        if a < 0:
-            raise ValueError(f"interval lower endpoint must be >= 0, got {interval!r}")
-        if a > b:
-            raise ValueError(f"interval must satisfy a <= b, got {interval!r}")
-
         self.child = child
-        self.a = a
-        self.b = b
+        self.a, self.b = _validate_interval(interval)
 
     @property
     def interval(self):
@@ -301,3 +309,166 @@ class Eventually(TemporalOperator):
 
     def __str__(self):
         return f"◇[{self.a},{self.b}]({self.child})"
+
+
+@dataclass(frozen=True)
+class UntilState:
+    """Raw recent left and right bounds retained by :class:`Until`."""
+
+    left: torch.Tensor
+    right: torch.Tensor
+
+
+class Until(Formula):
+    """Bounded strong until: ``left U[a,b] right``.
+
+    At anchor ``k``, the right event must occur at some ``k+j`` for
+    ``j in [a,b]``, while the left event holds at every time from ``k``
+    through ``k+j-1``. No temporal independence is assumed.
+    """
+
+    def __init__(self, left, right, interval):
+        super().__init__()
+        if not isinstance(left, Formula) or not isinstance(right, Formula):
+            raise TypeError("Until operands must be Formula instances")
+        self.left = left
+        self.right = right
+        self.a, self.b = _validate_interval(interval)
+
+    @property
+    def interval(self):
+        return (self.a, self.b)
+
+    @staticmethod
+    def _intersection(stacked, *, smooth, beta):
+        if stacked.shape[1] == 1:
+            return stacked[:, 0, :]
+        lower = stacked[..., 0]
+        upper = stacked[..., 1]
+        z = lower.sum(dim=1) - (stacked.shape[1] - 1)
+        if smooth:
+            lower_out = _soft_relu(z, beta)
+            upper_out = _soft_min(upper, beta, 1)
+        else:
+            lower_out = torch.clamp(z, min=0.0)
+            upper_out = upper.amin(dim=1)
+        return torch.stack((lower_out, upper_out), dim=-1)
+
+    @staticmethod
+    def _union(stacked, *, smooth, beta):
+        if stacked.shape[1] == 1:
+            return stacked[:, 0, :]
+        lower = stacked[..., 0]
+        upper = stacked[..., 1]
+        total = upper.sum(dim=1)
+        if smooth:
+            lower_out = _soft_max(lower, beta, 1)
+            upper_out = _soft_min(
+                torch.stack((torch.ones_like(total), total), dim=1), beta, 1
+            )
+        else:
+            lower_out = lower.amax(dim=1)
+            upper_out = torch.clamp(total, max=1.0)
+        return torch.stack((lower_out, upper_out), dim=-1)
+
+    def candidate_bounds(self, left_window, right_window, *, smooth=False, beta=20.0):
+        """Return the candidate interval for each possible right-event time."""
+        candidates = []
+        for offset in range(self.a, self.b + 1):
+            if offset == 0:
+                candidate = right_window[:, 0, :]
+            else:
+                operands = torch.cat(
+                    (left_window[:, :offset, :], right_window[:, offset : offset + 1, :]),
+                    dim=1,
+                )
+                candidate = self._intersection(operands, smooth=smooth, beta=beta)
+            candidates.append(candidate)
+
+        return torch.stack(candidates, dim=1)
+
+    def _reduce_windows(self, left_window, right_window, *, smooth, beta):
+        candidates = self.candidate_bounds(
+            left_window,
+            right_window,
+            smooth=smooth,
+            beta=beta,
+        )
+        result = self._union(candidates, smooth=smooth, beta=beta)
+
+        if self.a > 0 and candidates.shape[1] > 1:
+            common_prefix = self._intersection(
+                left_window[:, : self.a, :], smooth=smooth, beta=beta
+            )
+            if smooth:
+                upper = _soft_min(
+                    torch.stack((result[..., 1], common_prefix[..., 1]), dim=1),
+                    beta,
+                    1,
+                )
+            else:
+                upper = torch.minimum(result[..., 1], common_prefix[..., 1])
+            result = torch.stack((result[..., 0], upper), dim=-1)
+        return result
+
+    def forward(self, source, *, smooth=False, beta=20.0):
+        right_trace = self.right(source, smooth=smooth, beta=beta)
+        if self.b == 0:
+            return right_trace
+
+        left_trace = self.left(source, smooth=smooth, beta=beta)
+        output_count = max(
+            min(
+                left_trace.shape[1] - self.b + 1,
+                right_trace.shape[1] - self.b,
+            ),
+            0,
+        )
+        outputs = [
+            self._reduce_windows(
+                left_trace[:, anchor : anchor + self.b, :],
+                right_trace[:, anchor : anchor + self.b + 1, :],
+                smooth=smooth,
+                beta=beta,
+            )
+            for anchor in range(output_count)
+        ]
+        if not outputs:
+            return right_trace[:, :0, :]
+        return torch.stack(outputs, dim=1)
+
+    def step(
+        self,
+        left_bounds,
+        right_bounds,
+        state=None,
+        *,
+        smooth=False,
+        beta=20.0,
+    ):
+        """Advance both operands by one arrival and return an optional output."""
+        left = left_bounds.unsqueeze(1)
+        right = right_bounds.unsqueeze(1)
+        if state is not None:
+            left = torch.cat((state.left, left), dim=1)
+            right = torch.cat((state.right, right), dim=1)
+        new_state = UntilState(
+            left=left[:, -(self.b + 1) :, :],
+            right=right[:, -(self.b + 1) :, :],
+        )
+
+        if new_state.right.shape[1] < self.b + 1:
+            return None, new_state
+        if self.b == 0:
+            return new_state.right[:, -1, :], new_state
+
+        output = self._reduce_windows(
+            new_state.left[:, : self.b, :],
+            new_state.right,
+            smooth=smooth,
+            beta=beta,
+        )
+        return output, new_state
+
+    def __str__(self):
+        return f"({self.left}) U[{self.a},{self.b}] ({self.right})"

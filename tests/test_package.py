@@ -24,6 +24,8 @@ def test_public_symbols_are_importable():
         Predicate,
         ProbabilitySource,
         TemporalOperator,
+        Until,
+        UntilState,
         validate_bounds,
     )
 
@@ -52,7 +54,6 @@ def test_public_api_omits_obsolete_symbols():
         "STLFormula",
         "STL_Formula",
         "Negation",
-        "Until",
         "compile_formula",
         "compile_recurrent_formula",
         "TensorProbabilitySource",

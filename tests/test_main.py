@@ -120,6 +120,7 @@ def test_default_yaml_config_contains_each_independent_example():
         "streaming_always",
         "streaming_animation",
         "streaming_eventually",
+        "until",
     }
     assert config["experiments"]["always"]["interval"] == [0, 1]
     assert config["experiments"]["streaming_always"]["interval"] == [0, 2]
@@ -136,8 +137,10 @@ def test_real_main_pipeline_runs_default_yaml_examples(capsys):
         "Streaming Always",
         "Streaming Eventually",
         "Mission = Always",
+        "Until mission",
         "Online step() outputs match",
         "mission outputs match the offline graph",
+        "Streaming Until outputs match",
         "t=0",
         "k=0",
     ):
