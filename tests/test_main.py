@@ -9,7 +9,13 @@ from models.drone import always_altitude_example, eventually_altitude_example
 from pdstl import And, Always, Eventually, Not, OfflineSource, Or, Predicate
 
 import main as main_module
-from main import run_always_example, run_boolean_example, run_eventually_example
+from main import (
+    _always_windows,
+    _eventually_windows,
+    run_always_example,
+    run_boolean_example,
+    run_eventually_example,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +116,51 @@ def test_eventually_of_one_certain_event_is_one():
 
 
 # ---------------------------------------------------------------------------
+# General windowing (main.py must not assume a fixed window/trace length)
+# ---------------------------------------------------------------------------
+
+
+def test_always_windows_matches_the_real_operator_for_a_wider_window():
+    model = always_altitude_example()
+    predicate = Predicate("altitude >= 50 m")
+    source = OfflineSource({predicate: model.probability_bounds})
+    p = predicate(source)[0, :, 0]
+
+    op = Always(predicate, (0, 1))  # 2 anchors over this 3-step model
+    actual = op(source)
+    expected = _always_windows(p, op.a, op.b).unsqueeze(0)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (1, 2, 2)
+
+
+def test_eventually_windows_matches_the_real_operator_for_a_wider_window():
+    model = eventually_altitude_example()
+    predicate = Predicate("altitude >= 55 m")
+    source = OfflineSource({predicate: model.probability_bounds})
+    p = predicate(source)[0, :, 0]
+
+    op = Eventually(predicate, (0, 0))  # 3 anchors over this 3-step model
+    actual = op(source)
+    expected = _eventually_windows(p, op.a, op.b).unsqueeze(0)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (1, 3, 2)
+
+
+def test_always_windows_is_empty_when_the_window_exceeds_the_trace():
+    p = torch.tensor([0.9, 0.8, 0.7])
+
+    assert _always_windows(p, 0, 10).shape == (0, 2)
+
+
+def test_eventually_windows_is_empty_when_the_window_exceeds_the_trace():
+    p = torch.tensor([0.9, 0.8, 0.7])
+
+    assert _eventually_windows(p, 0, 10).shape == (0, 2)
+
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
@@ -133,12 +184,10 @@ def test_importing_main_has_no_side_effects(capsys):
     assert captured.out == ""
 
 
-def test_skipped_experiments_are_not_executed(monkeypatch):
-    called = []
-    monkeypatch.setattr(main_module, "run_boolean_example", lambda: called.append("boolean"))
-    monkeypatch.setattr(main_module, "run_always_example", lambda: called.append("always"))
-    monkeypatch.setattr(main_module, "run_eventually_example", lambda: called.append("eventually"))
-
+def test_skipped_experiments_are_not_executed(capsys):
     main_module.main()
 
-    assert called == ["boolean"]
+    output = capsys.readouterr().out
+
+    assert "A = [0.60, 0.90]" in output  # the Boolean block ran for real
+    assert "altitude" not in output  # Always/Eventually never printed or ran
