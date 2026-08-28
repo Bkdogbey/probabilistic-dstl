@@ -107,10 +107,21 @@ def test_real_main_pipeline_runs_all_examples(capsys):
         run_boolean="run",
         run_always="run",
         run_eventually="run",
+        run_sliding_always="run",
+        run_streaming_always="run",
+        run_streaming_eventually="run",
     )
 
     output = capsys.readouterr().out
-    for expected in ("A AND B", "Always", "Eventually", "t=0", "k=0"):
+    for expected in (
+        "A AND B",
+        "Offline sliding Always",
+        "Streaming Always",
+        "Streaming Eventually",
+        "Online step() outputs match",
+        "t=0",
+        "k=0",
+    ):
         assert expected in output
     plt.close("all")
 
@@ -130,5 +141,6 @@ def test_executable_entry_point_runs_real_pipeline(tmp_path):
     )
 
     assert "A AND B" in completed.stdout
-    assert "Always" in completed.stdout
-    assert "Eventually" in completed.stdout
+    assert "Offline sliding Always" in completed.stdout
+    assert "Streaming Always" in completed.stdout
+    assert "Streaming Eventually" in completed.stdout

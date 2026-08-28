@@ -64,8 +64,9 @@ repository.
 
 ## Running the demonstration
 
-`src/main.py` is the single entry point for the current offline examples:
-three fully independent experiments, each with its own `run_*` function.
+`src/main.py` is the single entry point for the selectable examples. The
+offline examples first verify the probability-bound semantics; the sliding
+and streaming examples then verify the bounded recurrent state.
 
 1. **Boolean operators** (`run_boolean_example`) — two fixed probability
    intervals, `A = [0.60, 0.90]` and `B = [0.70, 0.95]`, combined with `~`,
@@ -76,6 +77,14 @@ three fully independent experiments, each with its own `run_*` function.
    over a configurable bounded interval.
 3. **Eventually** (`run_eventually_example`) — a separate seven-step climbing
    belief using the same atomic-to-temporal probability-bound pipeline.
+4. **Offline sliding Always** — eleven supplied atomic intervals evaluated
+   over all complete `[0,5]` windows. A probability drop at `t=4` affects
+   every window containing it, and the output recovers when it expires.
+5. **Streaming Always** — the same trace is appended one time at a time. The
+   temporal state grows to six entries, shifts thereafter, and produces the
+   same bounds as the offline evaluation.
+6. **Streaming Eventually** — repeats the incremental check with the union
+   reduction used by Eventually.
 
 The editable configuration is grouped at the top of `src/main.py`:
 
@@ -83,12 +92,17 @@ The editable configuration is grouped at the top of `src/main.py`:
 RUN_BOOLEAN = "run"
 RUN_ALWAYS = "run"
 RUN_EVENTUALLY = "run"
+RUN_SLIDING_ALWAYS = "run"
+RUN_STREAMING_ALWAYS = "run"
+RUN_STREAMING_EVENTUALLY = "run"
 
 ALWAYS_THRESHOLD = 50.0
-ALWAYS_INTERVAL = (0, 2)
+ALWAYS_INTERVAL = (0, 1)
 
 EVENTUALLY_THRESHOLD = 55.0
-EVENTUALLY_INTERVAL = (0, 2)
+EVENTUALLY_INTERVAL = (0, 1)
+
+SLIDING_INTERVAL = (0, 5)
 ```
 
 Set a `RUN_*` value to `"skip"` to omit that experiment through `skip_run`.
@@ -118,8 +132,11 @@ The three plot panels expose this full progression: admissible Gaussian means,
 atomic lower/upper probabilities, and temporal lower/upper probabilities at
 every valid STL anchor.
 
-The examples in this commit evaluate complete traces through `OfflineSource`.
-Online monitoring is not part of this example pipeline.
+The streaming examples use `OnlineSource` as the growing input store and pass
+only the newest atomic interval through `TemporalOperator.step()`. For
+`[0,5]`, the first output becomes available at arrival `t=5`; the state then
+keeps the most recent six entries. The example compares every incremental
+output against the complete `OfflineSource` result.
 
 ```bash
 python src/main.py
@@ -148,17 +165,19 @@ src/
 ├── baselines/       # deterministic STL and comparison methods
 ├── data/            # data loading and preprocessing
 ├── datasets/        # experiment datasets
+├── experiments/     # offline and streaming example orchestration
 ├── features/        # feature and predicate-probability extraction
-├── models/          # example inputs: boolean.py (fixed intervals), drone.py (Gaussian beliefs)
+├── models/          # Boolean, Gaussian-belief, and streaming inputs
 ├── pdstl/           # the pdSTL core: sources, predicates, Boolean/temporal operators
 ├── planning/        # trajectory optimization and receding-horizon control
-├── visualization/   # plotting for one temporal-operator experiment (temporal.py)
+├── visualization/   # offline temporal and streaming-state plots
 └── main.py          # the single demonstration entry point
 ```
 
 `baselines/`, `data/`, `datasets/`, `features/`, and `planning/` are
-currently empty extension points reserved for future work; only `pdstl/`,
-`models/`, `visualization/`, and `main.py` are implemented today.
+currently empty extension points reserved for future work; `experiments/`,
+`pdstl/`, `models/`, `visualization/`, and `main.py` implement the current
+demonstrations.
 
 ## Testing
 
