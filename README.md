@@ -85,6 +85,9 @@ and streaming examples then verify the bounded recurrent state.
    same bounds as the offline evaluation.
 6. **Streaming Eventually** — repeats the incremental check with the union
    reduction used by Eventually.
+7. **Streaming Always animation** — reveals one arrival at a time, highlights
+   the retained and expired entries, writes out the current Fréchet calculation,
+   and adds each completed temporal bound to the output history.
 
 All experiment choices live in `configs/examples.yml`:
 
@@ -100,12 +103,23 @@ experiments:
   streaming_always:
     run: true
     interval: [0, 5]
+
+  streaming_animation:
+    run: false
+    interval: [0, 5]
+    frame_interval_ms: 900
+    repeat: true
 ```
 
 Set `run: false` to skip an experiment. Change its threshold or bounded
 integer interval in the same entry; every example has an independent interval.
 Set `show_plots: false` for a noninteractive run. A skipped experiment builds
 nothing, evaluates nothing, and prints no experiment results.
+
+For the clearest streaming view, set `streaming_animation.run: true` and set
+the other experiment `run` values to `false`. Each frame shows the newest
+atomic interval, the six retained entries, expired history, the current
+Always calculation, and the output available at that arrival time.
 
 For the temporal examples, the uncertain altitude follows
 

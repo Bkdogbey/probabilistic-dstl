@@ -117,10 +117,12 @@ def test_default_yaml_config_contains_each_independent_example():
         "eventually",
         "sliding_always",
         "streaming_always",
+        "streaming_animation",
         "streaming_eventually",
     }
     assert config["experiments"]["always"]["interval"] == [0, 1]
     assert config["experiments"]["streaming_always"]["interval"] == [0, 5]
+    assert config["experiments"]["streaming_animation"]["run"] is False
 
 
 def test_real_main_pipeline_runs_default_yaml_examples(capsys):

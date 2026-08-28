@@ -6,7 +6,11 @@ import torch
 
 from models.streaming import sliding_always_example, sliding_eventually_example
 from pdstl import Always, Eventually, OfflineSource, OnlineSource, Predicate
-from visualization.streaming import plot_sliding_windows, plot_streaming_updates
+from visualization.streaming import (
+    plot_sliding_windows,
+    plot_streaming_animation,
+    plot_streaming_updates,
+)
 
 
 @dataclass(frozen=True)
@@ -77,10 +81,17 @@ def run_sliding_always_example(interval=(0, 5), show=True):
     return trace, temporal_bounds, figure
 
 
-def _run_streaming(trace, operator_type, interval, show):
+def _evaluate_streaming(trace, operator_type, interval):
     predicate, operator, offline_bounds = _offline(trace, operator_type, interval)
     online_bounds, updates = _stream(trace, predicate, operator)
     torch.testing.assert_close(online_bounds, offline_bounds)
+    return operator, offline_bounds, online_bounds, updates
+
+
+def _run_streaming(trace, operator_type, interval, show):
+    operator, offline_bounds, online_bounds, updates = _evaluate_streaming(
+        trace, operator_type, interval
+    )
 
     print(f"Streaming {operator}")
     for update in updates:
@@ -119,3 +130,27 @@ def run_streaming_always_example(interval=(0, 5), show=True):
 def run_streaming_eventually_example(interval=(0, 5), show=True):
     """Stream the Eventually trace through one persistent temporal state."""
     return _run_streaming(sliding_eventually_example(), Eventually, interval, show)
+
+
+def run_streaming_always_animation(
+    interval=(0, 5),
+    frame_interval_ms=900,
+    repeat=True,
+    show=True,
+):
+    """Animate how an Always window fills, shifts, and emits bounds."""
+    trace = sliding_always_example()
+    operator, offline_bounds, online_bounds, updates = _evaluate_streaming(
+        trace, Always, interval
+    )
+    print(f"Animating {operator}: one frame per incoming interval.")
+    figure, movie = plot_streaming_animation(
+        trace,
+        updates,
+        interval,
+        f"Always[{interval[0]},{interval[1]}]({trace.predicate_name})",
+        frame_interval_ms=frame_interval_ms,
+        repeat=repeat,
+        show=show,
+    )
+    return trace, offline_bounds, online_bounds, updates, figure, movie

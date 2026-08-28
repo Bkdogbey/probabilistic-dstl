@@ -7,6 +7,7 @@ from experiments.offline import (
 )
 from experiments.streaming import (
     run_sliding_always_example,
+    run_streaming_always_animation,
     run_streaming_always_example,
     run_streaming_eventually_example,
 )
@@ -57,6 +58,15 @@ def main(config_path=DEFAULT_CONFIG, *, show=None):
         _flag(streaming_eventually), "Streaming Eventually"
     ) as check, check():
         run_streaming_eventually_example(_interval(streaming_eventually), show=show)
+
+    animation = examples["streaming_animation"]
+    with skip_run(_flag(animation), "Streaming Always animation") as check, check():
+        run_streaming_always_animation(
+            _interval(animation),
+            frame_interval_ms=animation["frame_interval_ms"],
+            repeat=animation["repeat"],
+            show=show,
+        )
 
 
 if __name__ == "__main__":

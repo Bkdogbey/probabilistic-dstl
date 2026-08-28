@@ -2,6 +2,7 @@
 
 import matplotlib.pyplot as plt
 import torch
+from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Patch
 
 
@@ -191,3 +192,121 @@ def plot_streaming_updates(
     if show:
         plt.show()
     return fig
+
+
+def plot_streaming_animation(
+    trace,
+    updates,
+    interval,
+    formula_label,
+    frame_interval_ms=900,
+    repeat=True,
+    show=True,
+):
+    """Animate arrivals, the retained window, and completed temporal bounds."""
+    a, b = interval
+    fig, (state_ax, output_ax) = plt.subplots(2, 1, figsize=(10, 7))
+
+    def draw_frame(arrival):
+        update = updates[arrival]
+        state_ax.clear()
+        output_ax.clear()
+
+        state_start = arrival - update.window_state.shape[1] + 1
+        for time, (lower, upper) in enumerate(
+            trace.bounds[0, : arrival + 1].tolist()
+        ):
+            if time == arrival:
+                color = "tab:orange"
+            elif time >= state_start:
+                color = "tab:blue"
+            else:
+                color = "lightgray"
+            state_ax.vlines(time, lower, upper, color=color, linewidth=8, alpha=0.8)
+            state_ax.scatter([time, time], [lower, upper], color=color, s=22)
+
+        if update.output is None:
+            status = (
+                f"Window filling: {update.window_state.shape[1]}/{b + 1} "
+                "entries received"
+            )
+        else:
+            anchor = arrival - b
+            active = update.window_state[:, a:, :]
+            lower_sum = active[..., 0].sum().item()
+            lower, upper = update.output[0].tolist()
+            operand_count = b - a + 1
+            status = (
+                f"k={anchor}, window=[{anchor + a},{anchor + b}]   "
+                f"lower=max(0, {lower_sum:.2f}-{operand_count - 1})={lower:.2f}   "
+                f"upper=min={upper:.2f}"
+            )
+
+        state_ax.set_title(status)
+        state_ax.set_ylabel("Atomic probability bounds")
+        state_ax.set_xlim(-0.5, len(trace.time) - 0.5)
+        state_ax.set_ylim(0, 1)
+        state_ax.set_xticks(range(len(trace.time)))
+        state_ax.grid(True, alpha=0.25)
+        state_ax.legend(
+            handles=[
+                Patch(color="tab:blue", label="retained window"),
+                Patch(color="tab:orange", label="new arrival"),
+                Patch(color="lightgray", label="expired"),
+            ],
+            loc="lower left",
+            ncol=3,
+        )
+
+        completed = [item for item in updates[: arrival + 1] if item.output is not None]
+        if completed:
+            arrival_times = [item.arrival for item in completed]
+            bounds = torch.stack([item.output[0] for item in completed])
+            lower = _as_numpy(bounds[:, 0])
+            upper = _as_numpy(bounds[:, 1])
+            output_ax.plot(
+                arrival_times,
+                lower,
+                color="tab:blue",
+                marker="o",
+                label="Always lower",
+            )
+            output_ax.plot(
+                arrival_times,
+                upper,
+                color="tab:orange",
+                linestyle="--",
+                marker="o",
+                label="Always upper",
+            )
+            output_ax.fill_between(
+                arrival_times,
+                lower,
+                upper,
+                color="tab:blue",
+                alpha=0.15,
+            )
+            output_ax.legend(loc="lower right")
+
+        output_ax.set_title(f"Output arrives at t = k + {b}")
+        output_ax.set_xlabel("Arrival time t")
+        output_ax.set_ylabel("Temporal probability bounds")
+        output_ax.set_xlim(b - 0.5, len(updates) - 0.5)
+        output_ax.set_ylim(0, 1)
+        output_ax.set_xticks(range(b, len(updates)))
+        output_ax.grid(True, alpha=0.25)
+        fig.suptitle(f"Streaming {formula_label}: arrival t={arrival}")
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+    draw_frame(0)
+    movie = FuncAnimation(
+        fig,
+        draw_frame,
+        frames=range(len(updates)),
+        interval=frame_interval_ms,
+        repeat=repeat,
+        blit=False,
+    )
+    if show:
+        plt.show()
+    return fig, movie
