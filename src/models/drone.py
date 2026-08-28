@@ -1,14 +1,6 @@
-"""A single illustrative drone-altitude scenario.
-
-9 discrete time steps. The altitude mean dips near/below 50m around t=2..4
-then climbs past 55m by t=6..8, so both Always(altitude >= 50m) and
-Eventually(altitude >= 55m) react visibly over the same trace.
-
-bounds_above_50 / bounds_above_55 are hand-authored [1, T, 2] probability
-bounds, not derived from altitude_mean/altitude_std by any formula -- pdSTL
-does not currently compute predicate probabilities from a Gaussian belief,
-so these stand in for whatever upstream estimator would normally supply
-them.
+"""Two standalone three-step Gaussian altitude beliefs, one per temporal
+operator experiment. Atomic probabilities come from the belief itself via
+the standard normal CDF (torch.special.ndtr), not hand-authored bounds.
 """
 
 from dataclasses import dataclass
@@ -16,56 +8,29 @@ from dataclasses import dataclass
 import torch
 
 
-@dataclass
-class DroneAltitudeExample:
-    time: torch.Tensor  # [T] step indices
-    altitude_mean: torch.Tensor  # [T] meters
-    altitude_std: torch.Tensor  # [T] meters, illustrative uncertainty envelope
-    bounds_above_50: torch.Tensor  # [1, T, 2] illustrative P(altitude >= 50m)
-    bounds_above_55: torch.Tensor  # [1, T, 2] illustrative P(altitude >= 55m)
+@dataclass(frozen=True)
+class AltitudeBelief:
+    time: torch.Tensor  # [T]
+    mean: torch.Tensor  # [T] meters
+    std: torch.Tensor  # [T] meters
+    threshold: float  # meters
+    probability_bounds: torch.Tensor  # [1, T, 2], degenerate [p, p]
 
 
-def drone_altitude_example(dtype=torch.float64):
-    time = torch.arange(9)
-    altitude_mean = torch.tensor(
-        [58, 56, 52, 48, 51, 54, 57, 60, 62], dtype=dtype
-    )
-    altitude_std = torch.tensor(
-        [1.5, 1.5, 2.0, 2.5, 2.0, 1.5, 1.2, 1.0, 1.0], dtype=dtype
-    )
-    bounds_above_50 = torch.tensor(
-        [
-            [0.95, 0.98],
-            [0.90, 0.96],
-            [0.55, 0.75],
-            [0.15, 0.35],
-            [0.45, 0.65],
-            [0.75, 0.88],
-            [0.88, 0.95],
-            [0.93, 0.97],
-            [0.94, 0.98],
-        ],
-        dtype=dtype,
-    ).unsqueeze(0)
-    bounds_above_55 = torch.tensor(
-        [
-            [0.75, 0.88],
-            [0.55, 0.70],
-            [0.10, 0.25],
-            [0.02, 0.08],
-            [0.08, 0.20],
-            [0.30, 0.48],
-            [0.60, 0.78],
-            [0.82, 0.92],
-            [0.88, 0.95],
-        ],
-        dtype=dtype,
-    ).unsqueeze(0)
+def _belief(mean, std, threshold, dtype):
+    mean = torch.tensor(mean, dtype=dtype)
+    std = torch.tensor(std, dtype=dtype)
+    time = torch.arange(mean.shape[0])
+    p = torch.special.ndtr((mean - threshold) / std)
+    probability_bounds = torch.stack([p, p], dim=-1).unsqueeze(0)
+    return AltitudeBelief(time, mean, std, threshold, probability_bounds)
 
-    return DroneAltitudeExample(
-        time=time,
-        altitude_mean=altitude_mean,
-        altitude_std=altitude_std,
-        bounds_above_50=bounds_above_50,
-        bounds_above_55=bounds_above_55,
-    )
+
+def always_altitude_example(dtype=torch.float64):
+    """Mean stays above 50m at every step; the belief still assigns risk below it."""
+    return _belief([52.0, 53.0, 54.0], [2.0, 2.0, 2.0], 50.0, dtype)
+
+
+def eventually_altitude_example(dtype=torch.float64):
+    """Mean crosses 55m only at t=2."""
+    return _belief([52.0, 54.0, 56.0], [1.0, 1.0, 1.0], 55.0, dtype)

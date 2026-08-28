@@ -1,119 +1,129 @@
-"""Tests for src/main.py: the drone-altitude pdSTL pipeline.
-
-Hand-computed references live here, not in main.py.
-"""
+"""Tests for src/main.py: the three independent pdSTL experiments."""
 
 import importlib
 
 import torch
 
+from models.boolean import boolean_example
+from models.drone import always_altitude_example, eventually_altitude_example
+from pdstl import And, Always, Eventually, Not, OfflineSource, Or, Predicate
+
 import main as main_module
-from main import run_pipeline
+from main import run_always_example, run_boolean_example, run_eventually_example
 
 
-def _always_reference(window):
-    lowers = [lower for lower, _ in window]
-    uppers = [upper for _, upper in window]
-    return [max(0.0, sum(lowers) - (len(window) - 1)), min(uppers)]
+# ---------------------------------------------------------------------------
+# Boolean
+# ---------------------------------------------------------------------------
 
 
-def _eventually_reference(window):
-    lowers = [lower for lower, _ in window]
-    uppers = [upper for _, upper in window]
-    return [max(lowers), min(1.0, sum(uppers))]
+def test_predicate_a_returns_its_supplied_bounds():
+    bounds_a, bounds_b = boolean_example()
+    a, b = Predicate("A"), Predicate("B")
+    source = OfflineSource({a: bounds_a, b: bounds_b})
+
+    torch.testing.assert_close(a(source), bounds_a)
 
 
-def _windows(rows, a, b):
-    return [rows[k + a : k + b + 1] for k in range(len(rows) - b)]
+def test_predicate_b_returns_its_supplied_bounds():
+    bounds_a, bounds_b = boolean_example()
+    a, b = Predicate("A"), Predicate("B")
+    source = OfflineSource({a: bounds_a, b: bounds_b})
+
+    torch.testing.assert_close(b(source), bounds_b)
 
 
-def test_predicate_returns_supplied_bounds_unchanged():
-    result = run_pipeline()
-    model = result["model"]
+def test_not_a():
+    bounds_a, bounds_b = boolean_example()
+    a, b = Predicate("A"), Predicate("B")
+    source = OfflineSource({a: bounds_a, b: bounds_b})
 
-    assert torch.equal(result["bounds_50"], model.bounds_above_50)
-    assert torch.equal(result["bounds_55"], model.bounds_above_55)
-
-
-def test_not_uses_one_minus_upper_one_minus_lower():
-    result = run_pipeline()
-    bounds = result["bounds_50"]
-
-    torch.testing.assert_close(result["not_above_50"][..., 0], 1 - bounds[..., 1])
-    torch.testing.assert_close(result["not_above_50"][..., 1], 1 - bounds[..., 0])
+    torch.testing.assert_close(Not(a)(source), torch.tensor([[[0.10, 0.40]]], dtype=bounds_a.dtype))
 
 
-def test_and_uses_frechet_intersection():
-    result = run_pipeline()
-    l1, u1 = result["bounds_50"][..., 0], result["bounds_50"][..., 1]
-    l2, u2 = result["bounds_55"][..., 0], result["bounds_55"][..., 1]
+def test_a_and_b():
+    bounds_a, bounds_b = boolean_example()
+    a, b = Predicate("A"), Predicate("B")
+    source = OfflineSource({a: bounds_a, b: bounds_b})
 
-    torch.testing.assert_close(result["and_bounds"][..., 0], torch.clamp(l1 + l2 - 1, min=0.0))
-    torch.testing.assert_close(result["and_bounds"][..., 1], torch.minimum(u1, u2))
-
-
-def test_or_uses_frechet_union():
-    result = run_pipeline()
-    l1, u1 = result["bounds_50"][..., 0], result["bounds_50"][..., 1]
-    l2, u2 = result["bounds_55"][..., 0], result["bounds_55"][..., 1]
-
-    torch.testing.assert_close(result["or_bounds"][..., 0], torch.maximum(l1, l2))
-    torch.testing.assert_close(result["or_bounds"][..., 1], torch.clamp(u1 + u2, max=1.0))
+    torch.testing.assert_close(And(a, b)(source), torch.tensor([[[0.30, 0.90]]], dtype=bounds_a.dtype))
 
 
-def test_every_always_window_matches_hand_calculation():
-    result = run_pipeline()
-    actual = result["always_bounds"][0]
-    rows = result["bounds_50"][0].tolist()
+def test_a_or_b():
+    bounds_a, bounds_b = boolean_example()
+    a, b = Predicate("A"), Predicate("B")
+    source = OfflineSource({a: bounds_a, b: bounds_b})
 
-    expected = torch.tensor([_always_reference(w) for w in _windows(rows, 0, 2)], dtype=actual.dtype)
-    torch.testing.assert_close(actual, expected)
-
-
-def test_every_eventually_window_matches_hand_calculation():
-    result = run_pipeline()
-    actual = result["eventually_bounds"][0]
-    rows = result["bounds_55"][0].tolist()
-
-    expected = torch.tensor([_eventually_reference(w) for w in _windows(rows, 0, 2)], dtype=actual.dtype)
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(Or(a, b)(source), torch.tensor([[[0.70, 1.00]]], dtype=bounds_a.dtype))
 
 
-def test_window_state_length_sequence_is_one_two_three_three():
-    result = run_pipeline()
-    always_above_50 = result["always_above_50"]
-
-    window_state = None
-    lengths = []
-    for current_bounds in result["bounds_50"].unbind(dim=1):
-        _, window_state = always_above_50.step(current_bounds, window_state)
-        lengths.append(window_state.shape[1])
-
-    assert lengths[:5] == [1, 2, 3, 3, 3]
+# ---------------------------------------------------------------------------
+# Always
+# ---------------------------------------------------------------------------
 
 
-def test_state_after_fourth_input_holds_x1_x2_x3():
-    result = run_pipeline()
-    always_above_50 = result["always_above_50"]
-    bounds = result["bounds_50"]
+def test_always_matches_the_explicit_hand_calculation():
+    model = always_altitude_example()
+    predicate = Predicate("altitude >= 50 m")
+    source = OfflineSource({predicate: model.probability_bounds})
 
-    window_state = None
-    for current_bounds in bounds[:, :4, :].unbind(dim=1):
-        _, window_state = always_above_50.step(current_bounds, window_state)
+    p = predicate(source)[0, :, 0]
+    expected = torch.stack([torch.clamp(p.sum() - 2, min=0.0), p.amin()]).reshape(1, 1, 2)
 
-    torch.testing.assert_close(window_state, bounds[:, 1:4, :])
-
-
-def test_incremental_always_equals_offline_always():
-    result = run_pipeline()
-
-    torch.testing.assert_close(result["always_incremental"], result["always_bounds"])
+    torch.testing.assert_close(Always(predicate, (0, 2))(source), expected)
 
 
-def test_incremental_eventually_equals_offline_eventually():
-    result = run_pipeline()
+def test_always_of_three_certain_events_is_one():
+    predicate = Predicate("certain")
+    bounds = torch.tensor([[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]])
+    source = OfflineSource({predicate: bounds})
 
-    torch.testing.assert_close(result["eventually_incremental"], result["eventually_bounds"])
+    result = Always(predicate, (0, 2))(source)
+
+    torch.testing.assert_close(result, torch.tensor([[[1.0, 1.0]]]))
+
+
+# ---------------------------------------------------------------------------
+# Eventually
+# ---------------------------------------------------------------------------
+
+
+def test_eventually_matches_the_explicit_hand_calculation():
+    model = eventually_altitude_example()
+    predicate = Predicate("altitude >= 55 m")
+    source = OfflineSource({predicate: model.probability_bounds})
+
+    p = predicate(source)[0, :, 0]
+    expected = torch.stack([p.amax(), torch.clamp(p.sum(), max=1.0)]).reshape(1, 1, 2)
+
+    torch.testing.assert_close(Eventually(predicate, (0, 2))(source), expected)
+
+
+def test_eventually_of_one_certain_event_is_one():
+    predicate = Predicate("certain-once")
+    bounds = torch.tensor([[[0.0, 0.0], [1.0, 1.0], [0.0, 0.0]]])
+    source = OfflineSource({predicate: bounds})
+
+    result = Eventually(predicate, (0, 2))(source)
+
+    torch.testing.assert_close(result, torch.tensor([[[1.0, 1.0]]]))
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+
+def test_run_boolean_example_runs_independently():
+    run_boolean_example()
+
+
+def test_run_always_example_runs_independently():
+    run_always_example()
+
+
+def test_run_eventually_example_runs_independently():
+    run_eventually_example()
 
 
 def test_importing_main_has_no_side_effects(capsys):
@@ -121,3 +131,14 @@ def test_importing_main_has_no_side_effects(capsys):
 
     captured = capsys.readouterr()
     assert captured.out == ""
+
+
+def test_skipped_experiments_are_not_executed(monkeypatch):
+    called = []
+    monkeypatch.setattr(main_module, "run_boolean_example", lambda: called.append("boolean"))
+    monkeypatch.setattr(main_module, "run_always_example", lambda: called.append("always"))
+    monkeypatch.setattr(main_module, "run_eventually_example", lambda: called.append("eventually"))
+
+    main_module.main()
+
+    assert called == ["boolean"]

@@ -66,22 +66,26 @@ repository.
 
 ## Running the demonstration
 
-`src/main.py` is the single entry point for running the current examples.
-It builds up one drone-altitude scenario in four steps:
+`src/main.py` is the single entry point for running the current examples:
+three fully independent experiments, each its own `run_*` function.
 
-1. **Predicate** — a single physically meaningful predicate, `altitude >= 50m`.
-2. **Boolean** — combine two predicates (`altitude >= 50m`, `battery >= 20%`)
-   with `&`, `|`, `~`.
-3. **Always** — a bounded temporal operator alone: does the drone stay safe
-   throughout a window?
-4. **Always + Eventually** — the full mission ("stay safe and eventually
-   land"), checked against independently hand-computed references and
-   against an `OnlineSource` replay, then plotted.
+1. **Boolean operators** (`run_boolean_example`) — two fixed probability
+   intervals, `A = [0.60, 0.90]` and `B = [0.70, 0.95]`, combined with `~`,
+   `&`, `|` and checked against the hand-computed Fréchet result. Numerical
+   only, no model, no plot.
+2. **Always** (`run_always_example`) — a three-step Gaussian altitude
+   belief (`mean=[52,53,54]m`, `std=2m`, threshold `50m`); the atomic
+   probability at each step is `P(Z_t >= 50) = Phi((mean_t - 50)/std_t)`,
+   not hand-authored; `Always[0,2]` is checked against
+   `[max(0, sum(p)-2), min(p)]` and plotted.
+3. **Eventually** (`run_eventually_example`) — its own three-step belief
+   (`mean=[52,54,56]m`, `std=1m`, threshold `55m`); `Eventually[0,2]` is
+   checked against `[max(p), min(1, sum(p))]` and plotted.
 
-Each example is its own function, toggled independently by flipping
-`"run"` / `"skip"` in the `skip_run(...)` calls inside `main()` — the same
-mechanism as `src/utils.py`'s `skip_run`. Edit `src/main.py` and flip a flag
-to run just one example.
+Each is toggled independently by flipping `"run"` / `"skip"` in the
+`skip_run(...)` calls inside `main()` (`src/utils.py`'s `skip_run`) — a
+skipped experiment builds nothing, evaluates nothing, and prints nothing.
+Edit `src/main.py` and flip a flag to run just one experiment.
 
 ```bash
 python src/main.py
@@ -111,10 +115,10 @@ src/
 ├── data/            # data loading and preprocessing
 ├── datasets/        # experiment datasets
 ├── features/        # feature and predicate-probability extraction
-├── models/          # example probability-bound inputs (temporal_examples.py)
+├── models/          # example inputs: boolean.py (fixed intervals), drone.py (Gaussian beliefs)
 ├── pdstl/           # the pdSTL core: sources, predicates, Boolean/temporal operators
 ├── planning/        # trajectory optimization and receding-horizon control
-├── visualization/   # plotting for probability-bound traces (probability_bounds.py)
+├── visualization/   # plotting for one temporal-operator experiment (temporal.py)
 └── main.py          # the single demonstration entry point
 ```
 
