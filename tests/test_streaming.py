@@ -123,10 +123,10 @@ def test_streaming_figures_show_every_completed_output():
 
 
 def test_streaming_animation_contains_state_and_output_panels():
-    *_, figure, movie = run_streaming_always_animation((0, 5), show=False)
+    *_, figure, movie = run_streaming_always_animation(show=False)
 
     assert len(figure.axes) == 2
-    assert "Window filling: 1/6" in figure.axes[0].get_title()
+    assert "Window filling: 1/3" in figure.axes[0].get_title()
     assert movie.event_source.interval == 900
     movie._draw_was_started = True
     plt.close(figure)

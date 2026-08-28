@@ -78,10 +78,11 @@ and streaming examples then verify the bounded recurrent state.
 3. **Eventually** (`run_eventually_example`) — a separate seven-step climbing
    belief using the same atomic-to-temporal probability-bound pipeline.
 4. **Offline sliding Always** — eleven supplied atomic intervals evaluated
-   over all complete `[0,5]` windows. A probability drop at `t=4` affects
-   every window containing it, and the output recovers when it expires.
+   over all complete `[0,2]` windows. A probability drop at `t=4` affects
+   every three-entry window containing it, and the output recovers when it
+   expires.
 5. **Streaming Always** — the same trace is appended one time at a time. The
-   temporal state grows to six entries, shifts thereafter, and produces the
+   temporal state grows to three entries, shifts thereafter, and produces the
    same bounds as the offline evaluation.
 6. **Streaming Eventually** — repeats the incremental check with the union
    reduction used by Eventually.
@@ -102,11 +103,11 @@ experiments:
 
   streaming_always:
     run: true
-    interval: [0, 5]
+    interval: [0, 2]
 
   streaming_animation:
     run: false
-    interval: [0, 5]
+    interval: [0, 2]
     frame_interval_ms: 900
     repeat: true
 ```
@@ -118,7 +119,7 @@ nothing, evaluates nothing, and prints no experiment results.
 
 For the clearest streaming view, set `streaming_animation.run: true` and set
 the other experiment `run` values to `false`. Each frame shows the newest
-atomic interval, the six retained entries, expired history, the current
+atomic interval, the three retained entries, expired history, the current
 Always calculation, and the output available at that arrival time.
 
 For the temporal examples, the uncertain altitude follows
@@ -144,8 +145,8 @@ every valid STL anchor.
 
 The streaming examples use `OnlineSource` as the growing input store and pass
 only the newest atomic interval through `TemporalOperator.step()`. For
-`[0,5]`, the first output becomes available at arrival `t=5`; the state then
-keeps the most recent six entries. The example compares every incremental
+`[0,2]`, the first output becomes available at arrival `t=2`; the state then
+keeps the most recent three entries. The example compares every incremental
 output against the complete `OfflineSource` result.
 
 ```bash

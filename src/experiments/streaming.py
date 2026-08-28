@@ -65,7 +65,7 @@ def _print_sliding_results(operator, temporal_bounds):
         )
 
 
-def run_sliding_always_example(interval=(0, 5), show=True):
+def run_sliding_always_example(interval=(0, 2), show=True):
     """Evaluate all offline windows of the 11-step Always trace."""
     trace = sliding_always_example()
     _, operator, temporal_bounds = _offline(trace, Always, interval)
@@ -122,18 +122,18 @@ def _run_streaming(trace, operator_type, interval, show):
     return trace, offline_bounds, online_bounds, updates, figure
 
 
-def run_streaming_always_example(interval=(0, 5), show=True):
+def run_streaming_always_example(interval=(0, 2), show=True):
     """Stream the Always trace through one persistent temporal state."""
     return _run_streaming(sliding_always_example(), Always, interval, show)
 
 
-def run_streaming_eventually_example(interval=(0, 5), show=True):
+def run_streaming_eventually_example(interval=(0, 2), show=True):
     """Stream the Eventually trace through one persistent temporal state."""
     return _run_streaming(sliding_eventually_example(), Eventually, interval, show)
 
 
 def run_streaming_always_animation(
-    interval=(0, 5),
+    interval=(0, 2),
     frame_interval_ms=900,
     repeat=True,
     show=True,

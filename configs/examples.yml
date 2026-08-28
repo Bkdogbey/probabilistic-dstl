@@ -18,19 +18,19 @@ experiments:
 
   sliding_always:
     run: true
-    interval: [0, 5]
+    interval: [0, 2]
 
   streaming_always:
     run: true
-    interval: [0, 5]
+    interval: [0, 2]
 
   streaming_eventually:
     run: true
-    interval: [0, 5]
+    interval: [0, 2]
 
   # Enable this alone for the clearest view of the recurrent window.
   streaming_animation:
     run: false
-    interval: [0, 5]
+    interval: [0, 2]
     frame_interval_ms: 900
     repeat: true
