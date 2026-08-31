@@ -91,7 +91,7 @@ and streaming examples then verify the bounded recurrent state.
    temporal branches followed by a stateless conjunction. The two evaluations
    must agree at every anchor.
 8. **Safe Until goal** — evaluates `safe U[1,2] goal`. Each possible goal time
-   forms a candidate requiring safety at every preceding step; candidate
+   forms a candidate requiring safety through the goal step; candidate
    intervals are unioned and checked in both offline and streaming modes.
 9. **Streaming Always animation** — reveals one arrival at a time, highlights
    the retained and expired entries, writes out the current Fréchet calculation,
@@ -171,11 +171,13 @@ safe U[a,b] goal
 ```
 
 the goal must occur at some offset `j` in `[a,b]`, while safety holds at every
-offset from `0` through `j-1`. The implementation builds one candidate event
+offset from `0` through `j`, including the goal time. This is the overlapping
+Until convention used by STLCG. The implementation builds one candidate event
 for each possible `j`, applies the finite-intersection Fréchet bounds within
 each candidate, and then applies the finite-union bounds across candidates.
-When `a > 0`, every candidate shares the safety prefix from `0` through `a-1`,
-so that common prefix also tightens the final upper bound. The streaming cell
+Every candidate shares the safety prefix from `0` through `a`, so that common
+prefix also tightens the final upper bound when there is more than one
+candidate. The streaming cell
 retains named left and right windows and produces the same result as offline
 evaluation once the right edge `b` has arrived.
 

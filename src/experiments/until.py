@@ -29,7 +29,7 @@ def _offline(trace, interval):
     for anchor in range(bounds.shape[1]):
         candidates.append(
             formula.candidate_bounds(
-                trace.safe_bounds[:, anchor : anchor + formula.b, :],
+                trace.safe_bounds[:, anchor : anchor + formula.b + 1, :],
                 trace.goal_bounds[:, anchor : anchor + formula.b + 1, :],
             )
         )
@@ -86,7 +86,7 @@ def _print_results(formula, candidate_bounds, until_bounds):
 
 
 def run_until_example(interval=(1, 2), show=True):
-    """Evaluate ``safe U[1,2] goal`` offline and one arrival at a time."""
+    """Evaluate overlapping ``safe U[1,2] goal`` offline and online."""
     trace = mission_example()
     safe, goal, formula, offline_bounds, candidates = _offline(trace, interval)
     online_bounds, updates = _stream(trace, safe, goal, formula)

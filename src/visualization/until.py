@@ -47,7 +47,7 @@ def plot_until_example(
             colors[index % len(colors)],
         )
     axes[1].set_title(
-        "Candidate Cj: goal at k+j AND safe at every preceding step"
+        "Candidate Cj: goal at k+j AND safe through the goal step"
     )
 
     _plot_pair(axes[2], anchors, offline_bounds, "offline Until", "purple")

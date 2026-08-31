@@ -324,7 +324,8 @@ class Until(Formula):
 
     At anchor ``k``, the right event must occur at some ``k+j`` for
     ``j in [a,b]``, while the left event holds at every time from ``k``
-    through ``k+j-1``. No temporal independence is assumed.
+    through ``k+j``, including the right-event time. This is the overlapping
+    convention used by STLCG. No temporal independence is assumed.
     """
 
     def __init__(self, left, right, interval):
@@ -375,14 +376,14 @@ class Until(Formula):
         """Return the candidate interval for each possible right-event time."""
         candidates = []
         for offset in range(self.a, self.b + 1):
-            if offset == 0:
-                candidate = right_window[:, 0, :]
-            else:
-                operands = torch.cat(
-                    (left_window[:, :offset, :], right_window[:, offset : offset + 1, :]),
-                    dim=1,
-                )
-                candidate = self._intersection(operands, smooth=smooth, beta=beta)
+            operands = torch.cat(
+                (
+                    left_window[:, : offset + 1, :],
+                    right_window[:, offset : offset + 1, :],
+                ),
+                dim=1,
+            )
+            candidate = self._intersection(operands, smooth=smooth, beta=beta)
             candidates.append(candidate)
 
         return torch.stack(candidates, dim=1)
@@ -396,9 +397,9 @@ class Until(Formula):
         )
         result = self._union(candidates, smooth=smooth, beta=beta)
 
-        if self.a > 0 and candidates.shape[1] > 1:
+        if candidates.shape[1] > 1:
             common_prefix = self._intersection(
-                left_window[:, : self.a, :], smooth=smooth, beta=beta
+                left_window[:, : self.a + 1, :], smooth=smooth, beta=beta
             )
             if smooth:
                 upper = _soft_min(
@@ -413,20 +414,17 @@ class Until(Formula):
 
     def forward(self, source, *, smooth=False, beta=20.0):
         right_trace = self.right(source, smooth=smooth, beta=beta)
-        if self.b == 0:
-            return right_trace
-
         left_trace = self.left(source, smooth=smooth, beta=beta)
         output_count = max(
             min(
-                left_trace.shape[1] - self.b + 1,
+                left_trace.shape[1] - self.b,
                 right_trace.shape[1] - self.b,
             ),
             0,
         )
         outputs = [
             self._reduce_windows(
-                left_trace[:, anchor : anchor + self.b, :],
+                left_trace[:, anchor : anchor + self.b + 1, :],
                 right_trace[:, anchor : anchor + self.b + 1, :],
                 smooth=smooth,
                 beta=beta,
@@ -459,11 +457,9 @@ class Until(Formula):
 
         if new_state.right.shape[1] < self.b + 1:
             return None, new_state
-        if self.b == 0:
-            return new_state.right[:, -1, :], new_state
 
         output = self._reduce_windows(
-            new_state.left[:, : self.b, :],
+            new_state.left,
             new_state.right,
             smooth=smooth,
             beta=beta,
