@@ -64,78 +64,56 @@ repository.
 
 ## Running the demonstration
 
-`src/main.py` is the single entry point for the selectable examples. The
-offline examples first verify the probability-bound semantics; the sliding
-and streaming examples then verify the bounded recurrent state.
+`src/main.py` is the single entry point and contains exactly four independent
+demonstration blocks:
 
-1. **Boolean operators** (`run_boolean_example`) — two fixed probability
-   intervals, `A = [0.60, 0.90]` and `B = [0.70, 0.95]`, combined with `~`,
-   `&`, `|` and checked against the hand-computed Fréchet result. Numerical
-   only, no model, no plot.
-2. **Always** (`run_always_example`) — a seven-step Gaussian altitude belief
-   with an ambiguous mean and known conditional standard deviation, evaluated
-   over a configurable bounded interval.
-3. **Eventually** (`run_eventually_example`) — a separate seven-step climbing
-   belief using the same atomic-to-temporal probability-bound pipeline.
-4. **Offline sliding Always** — eleven supplied atomic intervals evaluated
-   over all complete `[0,2]` windows. A probability drop at `t=4` affects
-   every three-entry window containing it, and the output recovers when it
-   expires.
-5. **Streaming Always** — the same trace is appended one time at a time. The
-   temporal state grows to three entries, shifts thereafter, and produces the
-   same bounds as the offline evaluation.
-6. **Streaming Eventually** — repeats the incremental check with the union
-   reduction used by Eventually.
-7. **Composed mission** — evaluates `Always[0,2](safe) AND
-   Eventually[0,2](goal)` as one offline formula graph and as two recurrent
-   temporal branches followed by a stateless conjunction. The two evaluations
-   must agree at every anchor.
-8. **Safe Until goal** — evaluates `safe U[1,2] goal`. Each possible goal time
+1. **Boolean probability bounds** (`run_boolean_example`) — two fixed
+   probability intervals, `A = [0.60, 0.90]` and `B = [0.70, 0.95]`, combined
+   with `~`, `&`, `|` and checked against the hand-computed Fréchet result.
+   Numerical only, no model, no plot.
+2. **Offline temporal operators** (`run_always_example` and
+   `run_eventually_example`) — evaluates separate seven-step Gaussian altitude
+   beliefs with configurable thresholds and bounded intervals.
+3. **Streaming bounded monitor** (`run_streaming_always_example` or
+   `run_streaming_always_animation`) — streams Always through one persistent
+   temporal state and verifies every online output against the offline result.
+   Animation is an option of this example, not a separate experiment.
+4. **Safe Until goal** (`run_until_example`) — evaluates `safe U[1,2] goal`.
+   Each possible goal time
    forms a candidate requiring safety through the goal step; candidate
    intervals are unioned and checked in both offline and streaming modes.
-9. **Streaming Always animation** — reveals one arrival at a time, highlights
-   the retained and expired entries, writes out the current Fréchet calculation,
-   and adds each completed temporal bound to the output history.
 
-All experiment choices live in `configs/examples.yml`:
+Choose which demonstrations run by changing each literal `"run"` or `"skip"`
+flag in `src/main.py`. The shipped default runs only the Boolean demonstration.
+`configs/examples.yml` contains numerical and presentation parameters only:
 
 ```yaml
 show_plots: true
 
 experiments:
-  always:
-    run: true
-    threshold: 50.0
-    interval: [0, 1]
+  offline_temporal:
+    always:
+      threshold: 50.0
+      interval: [0, 1]
+    eventually:
+      threshold: 55.0
+      interval: [0, 1]
 
-  streaming_always:
-    run: true
+  streaming:
     interval: [0, 2]
-
-  mission:
-    run: true
-    interval: [0, 2]
-
-  until:
-    run: true
-    interval: [1, 2]
-
-  streaming_animation:
-    run: false
-    interval: [0, 2]
+    animate: true
     frame_interval_ms: 900
     repeat: true
+
+  until:
+    interval: [1, 2]
 ```
 
-Set `run: false` to skip an experiment. Change its threshold or bounded
-integer interval in the same entry; every example has an independent interval.
-Set `show_plots: false` for a noninteractive run. A skipped experiment builds
-nothing, evaluates nothing, and prints no experiment results.
-
-For the clearest streaming view, set `streaming_animation.run: true` and set
-the other experiment `run` values to `false`. Each frame shows the newest
-atomic interval, the three retained entries, expired history, the current
-Always calculation, and the output available at that arrival time.
+Set `show_plots: false` for a noninteractive run. For the streaming block,
+`animate: true` selects the existing animation runner and `animate: false`
+selects the static runner; both use the same interval and verify online results
+against the complete offline trace. A skipped block builds and evaluates
+nothing.
 
 For the temporal examples, the uncertain altitude follows
 
@@ -216,7 +194,7 @@ src/
 ├── visualization/   # offline, streaming-state, mission, and Until plots
 └── main.py          # the single demonstration entry point
 configs/
-└── examples.yml     # run switches, thresholds, intervals, and plotting
+└── examples.yml     # thresholds, intervals, animation, and plotting
 ```
 
 `baselines/`, `data/`, `datasets/`, `features/`, and `planning/` are

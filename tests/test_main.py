@@ -8,7 +8,6 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
-import yaml
 
 import main as main_module
 from main import (
@@ -108,60 +107,60 @@ def test_importing_main_has_no_execution_side_effects(capsys):
     assert captured.err == ""
 
 
-def test_default_yaml_config_contains_each_independent_example():
+def test_default_yaml_config_contains_parameters_for_three_configured_examples():
     config = load_config(DEFAULT_CONFIG)
 
     assert set(config["experiments"]) == {
-        "boolean",
-        "always",
-        "eventually",
-        "mission",
-        "sliding_always",
-        "streaming_always",
-        "streaming_animation",
-        "streaming_eventually",
+        "offline_temporal",
+        "streaming",
         "until",
     }
-    assert config["experiments"]["always"]["interval"] == [0, 1]
-    assert config["experiments"]["streaming_always"]["interval"] == [0, 2]
-    assert config["experiments"]["streaming_animation"]["run"] is False
+    offline = config["experiments"]["offline_temporal"]
+    assert set(offline) == {"always", "eventually"}
+    assert offline["always"] == {"threshold": 50.0, "interval": [0, 1]}
+    assert offline["eventually"] == {"threshold": 55.0, "interval": [0, 1]}
+    assert isinstance(offline["always"]["threshold"], float)
+    assert isinstance(offline["eventually"]["threshold"], float)
+    assert all(isinstance(value, int) for value in offline["always"]["interval"])
+    assert all(
+        isinstance(value, int) for value in offline["eventually"]["interval"]
+    )
+
+    streaming = config["experiments"]["streaming"]
+    assert streaming == {
+        "interval": [0, 2],
+        "animate": True,
+        "frame_interval_ms": 900,
+        "repeat": True,
+    }
+    assert isinstance(streaming["animate"], bool)
+    assert isinstance(streaming["frame_interval_ms"], int)
+    assert isinstance(streaming["repeat"], bool)
+    assert all(isinstance(value, int) for value in streaming["interval"])
+    assert config["experiments"]["until"] == {"interval": [1, 2]}
+    assert all(
+        isinstance(value, int)
+        for value in config["experiments"]["until"]["interval"]
+    )
 
 
 def test_real_main_pipeline_runs_default_yaml_examples(capsys):
     main_module.main(show=False)
 
-    output = capsys.readouterr().out
-    for expected in (
-        "A AND B",
-        "Offline sliding Always",
-        "Streaming Always",
-        "Streaming Eventually",
-        "Mission = Always",
-        "Until mission",
+    captured = capsys.readouterr()
+    assert "A AND B" in captured.out
+    for skipped_result in (
+        "Always[0,1](altitude_at_least_50)",
+        "Eventually[0,1](altitude_at_least_55)",
         "Online step() outputs match",
-        "mission outputs match the offline graph",
+        "Animating Always",
+        "Until mission",
         "Streaming Until outputs match",
-        "t=0",
-        "k=0",
     ):
-        assert expected in output
+        assert skipped_result not in captured.out
+    assert captured.err.count("Skipping the block") == 3
+    assert plt.get_fignums() == []
     plt.close("all")
-
-
-def test_yaml_config_can_select_one_example(tmp_path, capsys):
-    config = load_config(DEFAULT_CONFIG)
-    for settings in config["experiments"].values():
-        settings["run"] = False
-    config["experiments"]["boolean"]["run"] = True
-    config_path = tmp_path / "examples.yml"
-    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-
-    main_module.main(config_path, show=False)
-
-    output = capsys.readouterr().out
-    assert "A AND B" in output
-    assert "Offline Always" not in output
-    assert "Streaming Always" not in output
 
 
 def test_executable_entry_point_runs_real_pipeline(tmp_path):
@@ -179,6 +178,7 @@ def test_executable_entry_point_runs_real_pipeline(tmp_path):
     )
 
     assert "A AND B" in completed.stdout
-    assert "Offline sliding Always" in completed.stdout
-    assert "Streaming Always" in completed.stdout
-    assert "Streaming Eventually" in completed.stdout
+    assert "Always[0,1](altitude_at_least_50)" not in completed.stdout
+    assert "Online step() outputs match" not in completed.stdout
+    assert "Until mission" not in completed.stdout
+    assert completed.stderr.count("Skipping the block") == 3

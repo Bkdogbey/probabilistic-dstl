@@ -1,16 +1,13 @@
 """Single entry point for the selectable pdSTL examples."""
 
-from experiments.mission import run_mission_example
 from experiments.offline import (
     run_always_example,
     run_boolean_example,
     run_eventually_example,
 )
 from experiments.streaming import (
-    run_sliding_always_example,
     run_streaming_always_animation,
     run_streaming_always_example,
-    run_streaming_eventually_example,
 )
 from experiments.until import run_until_example
 from utils import load_config, skip_run
@@ -28,54 +25,39 @@ def main(config_path=DEFAULT_CONFIG, *, show=None):
     examples = config["experiments"]
     show = config["show_plots"] if show is None else show
 
-
-# Boolean example
-    with skip_run("run", "Boolean operators") as check, check():
+    # 1. Boolean probability bounds
+    with skip_run("run", "Boolean probability bounds") as check, check():
         run_boolean_example()
 
-# Always Example
-    always = examples["always"]
-    with skip_run("run", "Offline Always") as check, check():
+    # 2. Offline temporal operators
+    with skip_run("skip", "Offline temporal operators") as check, check():
+        offline = examples["offline_temporal"]
+        always = offline["always"]
         run_always_example(always["threshold"], _interval(always), show=show)
-
-    eventually = examples["eventually"]
-    with skip_run("run", "Offline Eventually") as check, check():
+        eventually = offline["eventually"]
         run_eventually_example(
             eventually["threshold"],
             _interval(eventually),
             show=show,
         )
 
-# Sliding Always Example
-    sliding = examples["sliding_always"]
-    with skip_run("run", "Offline sliding Always") as check, check():
-        run_sliding_always_example(_interval(sliding), show=show)
-        
+    # 3. Streaming bounded monitor
+    with skip_run("skip", "Streaming bounded monitor") as check, check():
+        streaming = examples["streaming"]
+        if streaming["animate"]:
+            run_streaming_always_animation(
+                _interval(streaming),
+                frame_interval_ms=streaming["frame_interval_ms"],
+                repeat=streaming["repeat"],
+                show=show,
+            )
+        else:
+            run_streaming_always_example(_interval(streaming), show=show)
 
-    streaming_always = examples["streaming_always"]
-    with skip_run("run", "Streaming Always") as check, check():
-        run_streaming_always_example(_interval(streaming_always), show=show)
-
-    streaming_eventually = examples["streaming_eventually"]
-    with skip_run("run", "Streaming Eventually") as check, check():
-        run_streaming_eventually_example(_interval(streaming_eventually), show=show)
-
-    mission = examples["mission"]
-    with skip_run("run", "Composed mission") as check, check():
-        run_mission_example(_interval(mission), show=show)
-
-    until = examples["until"]
-    with skip_run("run", "Safe until goal") as check, check():
+    # 4. Safe Until goal
+    with skip_run("skip", "Safe Until goal") as check, check():
+        until = examples["until"]
         run_until_example(_interval(until), show=show)
-
-    animation = examples["streaming_animation"]
-    with skip_run("skip", "Streaming Always animation") as check, check():
-        run_streaming_always_animation(
-            _interval(animation),
-            frame_interval_ms=animation["frame_interval_ms"],
-            repeat=animation["repeat"],
-            show=show,
-        )
 
 
 if __name__ == "__main__":

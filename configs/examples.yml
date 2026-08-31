@@ -3,32 +3,19 @@ show_plots: true
 
 # Which examples run is chosen in src/main.py (skip_run flags), not here.
 experiments:
-  boolean: {}
+  offline_temporal:
+    always:
+      threshold: 50.0
+      interval: [0, 1]
+    eventually:
+      threshold: 55.0
+      interval: [0, 1]
 
-  always:
-    threshold: 50.0
-    interval: [0, 1]
-
-  eventually:
-    threshold: 55.0
-    interval: [0, 1]
-
-  sliding_always:
+  streaming:
     interval: [0, 2]
-
-  streaming_always:
-    interval: [0, 2]
-
-  streaming_eventually:
-    interval: [0, 2]
-
-  mission:
-    interval: [0, 2]
+    animate: true
+    frame_interval_ms: 900
+    repeat: true
 
   until:
     interval: [1, 2]
-
-  streaming_animation:
-    interval: [0, 2]
-    frame_interval_ms: 900
-    repeat: true
