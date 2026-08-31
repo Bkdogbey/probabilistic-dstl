@@ -1,44 +1,34 @@
 # Plot windows when an experiment finishes.
 show_plots: true
 
-# Each example is independent. Set run to false to skip it.
+# Which examples run is chosen in src/main.py (skip_run flags), not here.
 experiments:
-  boolean:
-    run: true
+  boolean: {}
 
   always:
-    run: true
     threshold: 50.0
     interval: [0, 1]
 
   eventually:
-    run: true
     threshold: 55.0
     interval: [0, 1]
 
   sliding_always:
-    run: true
     interval: [0, 2]
 
   streaming_always:
-    run: true
     interval: [0, 2]
 
   streaming_eventually:
-    run: true
     interval: [0, 2]
 
   mission:
-    run: true
     interval: [0, 2]
 
   until:
-    run: true
     interval: [1, 2]
 
-  # Enable this alone for the clearest view of the recurrent window.
   streaming_animation:
-    run: false
     interval: [0, 2]
     frame_interval_ms: 900
     repeat: true
