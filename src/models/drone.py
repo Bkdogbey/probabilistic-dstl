@@ -1,9 +1,4 @@
 """Gaussian altitude beliefs used by the offline temporal examples.
-
-``mean_lower`` and ``mean_upper`` describe ambiguity in the conditional
-Gaussian mean. ``std`` is the known conditional Gaussian standard deviation.
-The atomic probability bounds are derived from those quantities; they are
-never assigned by hand.
 """
 
 from dataclasses import dataclass

@@ -9,16 +9,13 @@ Two evaluation modes share one implementation:
 
 ``smooth=False`` (the default)
     Hard Frechet semantics. The output is a valid probability interval:
-    0 <= lower <= upper <= 1. This is what monitoring and final certification
-    must use.
+    0 <= lower <= upper <= 1. 
 
 ``smooth=True``
     A differentiable surrogate for optimization only. The min/max/clamp
     reductions are replaced by softplus and log-sum-exp with temperature
     ``beta``, so gradients reach the probability source even where the hard
-    reduction is flat. The result is *not* a certified bound; it approaches
-    the hard result as ``beta`` increases. Rerun with ``smooth=False`` after
-    optimization.
+    reduction is flat. 
 """
 
 from abc import ABC, abstractmethod
@@ -39,11 +36,6 @@ __all__ = [
     "Until",
     "UntilState",
 ]
-
-
-# --- Numerical primitives ---------------------------------------------------
-# Stable tensor building blocks, not semantics. Each operator writes its own
-# Frechet equations out in full and calls these only for the reduction itself.
 
 
 def _soft_relu(x, beta):
