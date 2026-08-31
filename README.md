@@ -159,11 +159,6 @@ Hard mode is the current monitoring semantics and returns the implemented
 Fréchet enclosure. Smooth mode replaces hard reductions with softplus and
 log-sum-exp operations so gradients can propagate through more branches.
 
-The smooth result is not a probability guarantee and may not remain a valid
-interval in [0,1]. It is an experimental optimization surrogate. Any future
-optimized result must be reevaluated with the hard semantics before it is
-reported. End-to-end control optimization is not implemented on this branch
-yet.
 
 ## Project structure
 
