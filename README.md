@@ -1,93 +1,104 @@
 # Probabilistic dSTL (pdSTL)
 
-pdSTL evaluates discrete-time Signal Temporal Logic formulas over
-**probability bounds** rather than deterministic signals or point
-probabilities. Every predicate, at every time step, is a tensor
-`[lower, upper]` with `0 <= lower <= upper <= 1` — an enclosure of the true
-satisfaction probability, not the probability itself. An exact probability
-`p` is just the degenerate interval `[p, p]`.
+**pdSTL** is a PyTorch implementation of bounded-time Signal Temporal Logic
+over probability intervals. Instead of requiring a deterministic state signal,
+the current monitor accepts lower and upper bounds on the probability that
+each atomic predicate is satisfied:
 
-Because the joint dependence between predicates is generally unknown, Boolean
-and temporal composition use **Fréchet bounds**: the tightest enclosure
-valid for *any* dependence structure between the combined events, with no
-independence assumption. Hard evaluation (the default) returns this
-certified enclosure directly.
+~~~text
+[lower, upper], where 0 <= lower <= upper <= 1.
+~~~
 
-## Core API
+An exact probability p is represented by [p, p]. Boolean and temporal
+operators combine these intervals with Fréchet bounds, so the hard semantics
+do not introduce an independence assumption when dependence between events is
+unknown.
 
-- `ProbabilitySource` — the abstract input contract: `bounds(predicate, time)`
-  returns `Tensor[B, 2]`, `len(source)` returns the number of available time
-  steps.
-- `OfflineSource` — a complete `{predicate: Tensor[B, T, 2]}` trace per
-  predicate, known up front.
-- `Predicate(name)` — an atomic formula; its bounds come directly from a
-  `ProbabilitySource`.
-- `Not`, `And`, `Or` — pointwise Boolean composition (`~`, `&`, `|`) under
-  Fréchet bounds.
-- `Always(child, (a, b))`, `Eventually(child, (a, b))` — bounded temporal
-  operators over a fixed discrete window, also under Fréchet bounds.
+This RA_L branch is under active development. Its present scope is the
+probability-bound monitoring graph: atomic inputs, Boolean operators, bounded
+temporal operators, and matching offline and streaming evaluation. Trajectory
+optimization has not yet been added to this branch.
 
-Every formula is a `torch.nn.Module`. Calling it on a source —
-`formula(source)` — returns `Tensor[B, T, 2]`.
+## What is implemented
 
-## Hard vs. smooth evaluation
+- A small ProbabilitySource interface for externally computed atomic
+  satisfaction-probability bounds.
+- Complete offline traces through OfflineSource.
+- Incremental inputs through OnlineSource.
+- Boolean Not, And, and Or using Fréchet bounds.
+- Bounded Always, Eventually, and strong Until.
+- One temporal step mechanism shared by offline and streaming evaluation.
+- Standard torch.nn.Module formula composition.
+- Hard probability-bound semantics for monitoring and reporting.
+- An experimental smooth mode for studying gradient-based optimization.
 
-```python
-formula(source)                          # hard (default): certified bound
-formula(source, smooth=True, beta=20.0)  # smooth: optimization surrogate
-```
+The core does not require a particular state distribution. The included drone
+example uses an ambiguous Gaussian altitude belief, while the streaming
+examples supply probability intervals directly.
 
-- **Hard** (`smooth=False`, the default) computes the exact Fréchet
-  reduction. This is the number to report or monitor: it is a valid
-  probability interval.
-- **Smooth** (`smooth=True`) replaces the hard `min`/`max`/clamp reductions
-  with `softplus`/`logsumexp` so gradients reach the probability source even
-  where the hard reduction is flat. **It is not a certified probability
-  bound** — it is a differentiable surrogate for use inside an optimization
-  loop, and it only approaches the hard result as `beta` increases. Always
-  rerun with `smooth=False` to get the number you actually report.
+## Quickstart
 
-Because every operator is a standard `torch.nn.Module` built from
-differentiable tensor operations, gradients flow through smooth evaluation
-back to the tensors supplied by the `ProbabilitySource` via ordinary PyTorch
-autograd (`.backward()`).
-
-## Installation
-
-```bash
+~~~bash
+git clone https://github.com/Bkdogbey/probabilistic-dstl.git
+cd probabilistic-dstl
+git switch RA_L
 pip install -e ".[dev]"
-```
+python src/main.py
+~~~
 
-This installs the package (`pdstl`) plus `pytest`, `ruff`, and `matplotlib`
-for development. `import pdstl` then works from anywhere, not just this
-repository.
+The package requires Python 3.10 or newer. Runtime dependencies are PyTorch
+and PyYAML; the development installation also includes pytest, Ruff, and
+Matplotlib.
 
-## Running the demonstration
+## Basic use
 
-`src/main.py` is the single entry point and contains exactly four independent
-demonstration blocks:
+~~~python
+import torch
 
-1. **Boolean probability bounds** (`run_boolean_example`) — two fixed
-   probability intervals, `A = [0.60, 0.90]` and `B = [0.70, 0.95]`, combined
-   with `~`, `&`, `|` and checked against the hand-computed Fréchet result.
-   Numerical only, no model, no plot.
-2. **Offline temporal operators** (`run_always_example` and
-   `run_eventually_example`) — evaluates separate seven-step Gaussian altitude
-   beliefs with configurable thresholds and bounded intervals.
-3. **Streaming bounded monitor** (`run_streaming_always_example` or
-   `run_streaming_always_animation`) — streams Always through one persistent
-   temporal state and verifies every online output against the offline result.
-   Animation is an option of this example, not a separate experiment.
-4. **Safe Until goal** (`run_until_example`) — evaluates `safe U[1,2] goal`.
-   Each possible goal time
-   forms a candidate requiring safety through the goal step; candidate
-   intervals are unioned and checked in both offline and streaming modes.
+from pdstl import Always, OfflineSource, Predicate
 
-Choose which demonstrations run by changing each literal `"run"` or `"skip"`
-flag in `src/main.py`. The shipped default runs only the Boolean demonstration.
-`configs/examples.yml` contains numerical and presentation parameters only:
+safe = Predicate("safe altitude")
+atomic_bounds = torch.tensor(
+    [[[0.90, 0.95], [0.85, 0.90], [0.80, 0.90]]]
+)
+source = OfflineSource({safe: atomic_bounds})
 
-```yaml
+formula = Always(safe, (0, 2))
+temporal_bounds = formula(source)
+~~~
+
+temporal_bounds has shape [batch, valid_anchors, 2]. Its last dimension
+contains the lower and upper satisfaction-probability bounds.
+
+## Demonstrations
+
+src/main.py is the single demonstration entry point. It contains four
+independent skip_run blocks:
+
+| # | Demonstration | Purpose |
+|---:|---|---|
+| 1 | Boolean probability bounds | Verifies Not, And, and Or against hand calculations. |
+| 2 | Offline temporal operators | Converts Gaussian altitude beliefs into atomic bounds and evaluates Always and Eventually. |
+| 3 | Streaming bounded monitor | Shows an Always window filling and sliding, then checks each online output against offline evaluation. |
+| 4 | Safe Until goal | Builds and unions the candidate events for bounded strong Until, offline and online. |
+
+Choose what runs by editing the literal flag beside each block in
+src/main.py:
+
+~~~python
+with skip_run("run", "Boolean probability bounds") as check, check():
+    run_boolean_example()
+
+with skip_run("skip", "Offline temporal operators") as check, check():
+    ...
+~~~
+
+The shipped default runs only the Boolean example. Change "skip" to "run"
+for the experiment you want to inspect.
+
+configs/examples.yml contains experiment parameters only:
+
+~~~yaml
 show_plots: true
 
 experiments:
@@ -107,105 +118,99 @@ experiments:
 
   until:
     interval: [1, 2]
-```
+~~~
 
-Set `show_plots: false` for a noninteractive run. For the streaming block,
-`animate: true` selects the existing animation runner and `animate: false`
-selects the static runner; both use the same interval and verify online results
-against the complete offline trace. A skipped block builds and evaluates
-nothing.
+Set show_plots to false for a noninteractive run. In the streaming example,
+animate: true selects the animation and animate: false selects the static
+view. Both paths verify the streaming outputs against the complete offline
+result.
 
-For the temporal examples, the uncertain altitude follows
+## Mechanism
 
-```text
-Z_t | mu_t ~ Normal(mu_t, std_t^2),  mu_t in [mean_lower_t, mean_upper_t].
-```
+At time t, a probability source supplies [p_lower_t, p_upper_t] for the event
+that an atomic predicate is satisfied. A Predicate retrieves that interval,
+and the formula graph propagates it through Boolean and temporal operators.
 
-For the event `Z_t >= h`, monotonicity in the Gaussian mean gives atomic
-bounds derived with the normal CDF:
+For example, Always(child, (a, b)) evaluates every complete window with the
+finite-intersection Fréchet bounds
 
-```text
-p_lower_t = Phi((mean_lower_t - h) / std_t)
-p_upper_t = Phi((mean_upper_t - h) / std_t)
-```
+~~~text
+lower = max(0, sum(child_lower) - (window_size - 1))
+upper = min(child_upper)
+~~~
 
-These bounds are computed from the belief, never hand-authored. Applying
-Always or Eventually then produces temporal probability bounds using Fréchet
-semantics because dependence between events at different times is unknown.
-The three plot panels expose this full progression: admissible Gaussian means,
-atomic lower/upper probabilities, and temporal lower/upper probabilities at
-every valid STL anchor.
+The streaming temporal state retains the most recent b + 1 atomic intervals
+so that expired entries can leave a sliding window. Offline evaluation unrolls
+the same step transition over a complete trace; it is not a separate
+semantics.
 
-The streaming examples use `OnlineSource` as the growing input store and pass
-only the newest atomic interval through `TemporalOperator.step()`. For
-`[0,2]`, the first output becomes available at arrival `t=2`; the state then
-keeps the most recent three entries. The example compares every incremental
-output against the complete `OfflineSource` result.
+See [docs/mechanism.md](docs/mechanism.md) for the complete mathematical and
+architectural walkthrough, including tensor shapes, Boolean propagation,
+temporal windows, recurrent state, and current limitations.
 
-For bounded strong Until,
+## Hard and smooth modes
 
-```text
-safe U[a,b] goal
-```
+~~~python
+hard_bounds = formula(source)
+smooth_score = formula(source, smooth=True, beta=20.0)
+~~~
 
-the goal must occur at some offset `j` in `[a,b]`, while safety holds at every
-offset from `0` through `j`, including the goal time. This is the overlapping
-Until convention used by STLCG. The implementation builds one candidate event
-for each possible `j`, applies the finite-intersection Fréchet bounds within
-each candidate, and then applies the finite-union bounds across candidates.
-Every candidate shares the safety prefix from `0` through `a`, so that common
-prefix also tightens the final upper bound when there is more than one
-candidate. The streaming cell
-retains named left and right windows and produces the same result as offline
-evaluation once the right edge `b` has arrived.
+Hard mode is the current monitoring semantics and returns the implemented
+Fréchet enclosure. Smooth mode replaces hard reductions with softplus and
+log-sum-exp operations so gradients can propagate through more branches.
 
-```bash
-python src/main.py
-# or, equivalently:
-make demo
-```
-
-## Example
-
-```python
-import torch
-from pdstl import Always, OfflineSource, Predicate
-
-safe = Predicate("safe")
-source = OfflineSource({safe: torch.tensor([[0.9, 0.95], [0.85, 0.9], [0.8, 0.9]]).unsqueeze(0)})
-
-always_safe = Always(safe, (0, 2))
-always_safe(source)                          # hard, certified bound
-always_safe(source, smooth=True, beta=20.0)  # smooth surrogate for optimization
-```
+The smooth result is not a probability guarantee and may not remain a valid
+interval in [0,1]. It is an experimental optimization surrogate. Any future
+optimized result must be reevaluated with the hard semantics before it is
+reported. End-to-end control optimization is not implemented on this branch
+yet.
 
 ## Project structure
 
-```text
+~~~text
 src/
-├── baselines/       # deterministic STL and comparison methods
-├── data/            # data loading and preprocessing
-├── datasets/        # experiment datasets
-├── experiments/     # offline and streaming example orchestration
-├── features/        # feature and predicate-probability extraction
-├── models/          # Boolean, Gaussian-belief, and streaming inputs
-├── pdstl/           # the pdSTL core: sources, predicates, Boolean/temporal operators
-├── planning/        # trajectory optimization and receding-horizon control
-├── visualization/   # offline, streaming-state, mission, and Until plots
-└── main.py          # the single demonstration entry point
+├── pdstl/          # Probability sources and STL formula operators
+├── models/         # Gaussian-belief and supplied probability traces
+├── experiments/    # Offline, streaming, composed, and Until runners
+├── visualization/  # Temporal plots and streaming animation
+└── main.py         # Four selectable demonstrations
 configs/
-└── examples.yml     # thresholds, intervals, animation, and plotting
-```
+└── examples.yml    # Thresholds, intervals, and display settings
+docs/
+└── mechanism.md    # Mathematical and architectural walkthrough
+tests/              # Semantics, gradients, examples, and online/offline checks
+~~~
 
-`baselines/`, `data/`, `datasets/`, `features/`, and `planning/` are
-currently empty extension points reserved for future work; `experiments/`,
-`pdstl/`, `models/`, `visualization/`, and `main.py` implement the current
-demonstrations.
+Some top-level source directories remain as placeholders for later planning,
+data, feature, and baseline work. They are not part of the implemented
+pipeline described above.
 
 ## Testing
 
-```bash
+~~~bash
 make test
-# or
+make lint
+~~~
+
+or directly:
+
+~~~bash
 pytest -q
-```
+ruff check .
+~~~
+
+## Development status
+
+The next stage is to validate the differentiable path end to end:
+
+~~~text
+controls -> dynamics -> belief -> atomic bounds -> smooth pdSTL score -> loss
+~~~
+
+The optimization objective, control model, and planner will be added only
+after the smooth operator behavior has been selected and verified against the
+hard probability bounds.
+
+## License
+
+This project is released under the MIT License.

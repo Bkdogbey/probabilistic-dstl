@@ -1,4 +1,4 @@
-"""Tests for the three real offline example pipelines in src/main.py."""
+"""Tests for the selectable demonstration pipelines in src/main.py."""
 
 import importlib
 import os
@@ -144,7 +144,7 @@ def test_default_yaml_config_contains_parameters_for_three_configured_examples()
     )
 
 
-def test_real_main_pipeline_runs_default_yaml_examples(capsys):
+def test_real_main_pipeline_uses_shipped_run_skip_selection(capsys):
     main_module.main(show=False)
 
     captured = capsys.readouterr()
