@@ -1,4 +1,4 @@
-"""Single entry point for the selectable pdSTL examples."""
+
 
 from experiments.offline import (
     run_always_example,
@@ -14,51 +14,48 @@ from utils import load_config, skip_run
 
 DEFAULT_CONFIG = "configs/examples.yml"
 
+config = load_config(DEFAULT_CONFIG)
+examples = config["experiments"]
+show = config["show_plots"]
 
-def _interval(settings):
-    return tuple(settings["interval"])
+# 1. Boolean probability bounds
+with skip_run("run", "Boolean probability bounds") as check, check():
+    run_boolean_example()
 
+# 2. Offline Always operator
+with skip_run("run", "Offline Always operator") as check, check():
+    always = examples["offline_temporal"]["always"]
+    run_always_example(
+        always["threshold"],
+        tuple(always["interval"]),
+        show=show,
+    )
 
-def main(config_path=DEFAULT_CONFIG, *, show=None):
-    """Run examples selected below. Set each skip_run flag to "run" or "skip"."""
-    config = load_config(config_path)
-    examples = config["experiments"]
-    show = config["show_plots"] if show is None else show
+# 3. Offline Eventually operator
+with skip_run("run", "Offline Eventually operator") as check, check():
+    eventually = examples["offline_temporal"]["eventually"]
+    run_eventually_example(
+        eventually["threshold"],
+        tuple(eventually["interval"]),
+        show=show,
+    )
 
-    # 1. Boolean probability bounds
-    with skip_run("run", "Boolean probability bounds") as check, check():
-        run_boolean_example()
+# 4. Streaming bounded monitor
+with skip_run("skip", "Streaming bounded monitor") as check, check():
+    streaming = examples["streaming"]
+    interval = tuple(streaming["interval"])
 
-    # 2. Offline temporal operators
-    with skip_run("skip", "Offline temporal operators") as check, check():
-        offline = examples["offline_temporal"]
-        always = offline["always"]
-        run_always_example(always["threshold"], _interval(always), show=show)
-        eventually = offline["eventually"]
-        run_eventually_example(
-            eventually["threshold"],
-            _interval(eventually),
+    if streaming["animate"]:
+        run_streaming_always_animation(
+            interval,
+            frame_interval_ms=streaming["frame_interval_ms"],
+            repeat=streaming["repeat"],
             show=show,
         )
+    else:
+        run_streaming_always_example(interval, show=show)
 
-    # 3. Streaming bounded monitor
-    with skip_run("skip", "Streaming bounded monitor") as check, check():
-        streaming = examples["streaming"]
-        if streaming["animate"]:
-            run_streaming_always_animation(
-                _interval(streaming),
-                frame_interval_ms=streaming["frame_interval_ms"],
-                repeat=streaming["repeat"],
-                show=show,
-            )
-        else:
-            run_streaming_always_example(_interval(streaming), show=show)
-
-    # 4. Safe Until goal
-    with skip_run("skip", "Safe Until goal") as check, check():
-        until = examples["until"]
-        run_until_example(_interval(until), show=show)
-
-
-if __name__ == "__main__":
-    main()
+# 5. Safe Until goal
+with skip_run("run", "Safe Until goal") as check, check():
+    until = examples["until"]
+    run_until_example(tuple(until["interval"]), show=show)

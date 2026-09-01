@@ -441,10 +441,11 @@ python src/main.py
 
 `src/main.py` uses literal `"run"` and `"skip"` flags to select the
 demonstrations. `configs/examples.yml` contains their numerical and display
-parameters. The four top-level demonstrations are:
+parameters. The five top-level demonstrations are:
 
 - Boolean hand calculations;
-- Gaussian-belief `Always` and `Eventually` in one offline block;
+- Gaussian-belief `Always` evaluation;
+- Gaussian-belief `Eventually` evaluation;
 - a static or animated streaming `Always` monitor;
 - offline and streaming `Until`.
 

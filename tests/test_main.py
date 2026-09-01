@@ -1,6 +1,5 @@
-"""Tests for the selectable demonstration pipelines in src/main.py."""
+"""Tests for the demonstration runners and the src/main.py pipeline."""
 
-import importlib
 import os
 import subprocess
 import sys
@@ -9,9 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 
-import main as main_module
-from main import (
-    DEFAULT_CONFIG,
+from experiments.offline import (
     run_always_example,
     run_boolean_example,
     run_eventually_example,
@@ -19,6 +16,7 @@ from main import (
 from utils import load_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = "configs/examples.yml"
 
 
 def _always_hand_calculation(atomic_bounds, interval):
@@ -99,14 +97,6 @@ def test_eventually_nonzero_lower_endpoint_changes_output_count(capsys):
     plt.close(figure)
 
 
-def test_importing_main_has_no_execution_side_effects(capsys):
-    importlib.reload(main_module)
-
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == ""
-
-
 def test_default_yaml_config_contains_parameters_for_three_configured_examples():
     config = load_config(DEFAULT_CONFIG)
 
@@ -144,25 +134,6 @@ def test_default_yaml_config_contains_parameters_for_three_configured_examples()
     )
 
 
-def test_real_main_pipeline_uses_shipped_run_skip_selection(capsys):
-    main_module.main(show=False)
-
-    captured = capsys.readouterr()
-    assert "A AND B" in captured.out
-    for skipped_result in (
-        "Always[0,1](altitude_at_least_50)",
-        "Eventually[0,1](altitude_at_least_55)",
-        "Online step() outputs match",
-        "Animating Always",
-        "Until mission",
-        "Streaming Until outputs match",
-    ):
-        assert skipped_result not in captured.out
-    assert captured.err.count("Skipping the block") == 3
-    assert plt.get_fignums() == []
-    plt.close("all")
-
-
 def test_executable_entry_point_runs_real_pipeline(tmp_path):
     environment = os.environ.copy()
     environment["MPLBACKEND"] = "Agg"
@@ -181,4 +152,4 @@ def test_executable_entry_point_runs_real_pipeline(tmp_path):
     assert "Always[0,1](altitude_at_least_50)" not in completed.stdout
     assert "Online step() outputs match" not in completed.stdout
     assert "Until mission" not in completed.stdout
-    assert completed.stderr.count("Skipping the block") == 3
+    assert completed.stderr.count("Skipping the block") == 4

@@ -72,15 +72,16 @@ contains the lower and upper satisfaction-probability bounds.
 
 ## Demonstrations
 
-src/main.py is the single demonstration entry point. It contains four
+src/main.py is the single demonstration entry point. It contains five
 independent skip_run blocks:
 
 | # | Demonstration | Purpose |
 |---:|---|---|
 | 1 | Boolean probability bounds | Verifies Not, And, and Or against hand calculations. |
-| 2 | Offline temporal operators | Converts Gaussian altitude beliefs into atomic bounds and evaluates Always and Eventually. |
-| 3 | Streaming bounded monitor | Shows an Always window filling and sliding, then checks each online output against offline evaluation. |
-| 4 | Safe Until goal | Builds and unions the candidate events for bounded strong Until, offline and online. |
+| 2 | Offline Always operator | Converts Gaussian altitude beliefs into atomic bounds and evaluates Always. |
+| 3 | Offline Eventually operator | Converts Gaussian altitude beliefs into atomic bounds and evaluates Eventually. |
+| 4 | Streaming bounded monitor | Shows an Always window filling and sliding, then checks each online output against offline evaluation. |
+| 5 | Safe Until goal | Builds and unions the candidate events for bounded strong Until, offline and online. |
 
 Choose what runs by editing the literal flag beside each block in
 src/main.py:
@@ -89,7 +90,10 @@ src/main.py:
 with skip_run("run", "Boolean probability bounds") as check, check():
     run_boolean_example()
 
-with skip_run("skip", "Offline temporal operators") as check, check():
+with skip_run("skip", "Offline Always operator") as check, check():
+    ...
+
+with skip_run("skip", "Offline Eventually operator") as check, check():
     ...
 ~~~
 
