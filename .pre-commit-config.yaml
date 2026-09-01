@@ -1,7 +1,7 @@
 # .pre-commit-config.yaml
 repos:
-  - repo: https://github.com/charliermarsh/ruff-pre-commit
-    rev: v0.1.8 # use latest stable
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
     hooks:
       - id: ruff
 
