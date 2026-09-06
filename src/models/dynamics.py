@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 from pdstl.base import Belief
@@ -5,7 +7,7 @@ from pdstl.base import Belief
 
 def normal_cdf(z):
     """Cumulative distribution function for standard normal distribution"""
-    return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
+    return 0.5 * (1 + torch.erf(z / math.sqrt(2.0)))
 
 
 def constant_input(t):
@@ -87,7 +89,17 @@ def piecewise_signal(n_steps=7):
 
 
 class GaussianBelief(Belief):
+    """Legacy Gaussian state-bound adapter, retained for existing scripts.
+
+    confidence_level is a nonnegative standard-deviation multiplier, not a
+    statistical confidence guarantee or a set of uncertain Gaussian parameters.
+    """
+
     def __init__(self, mean, var, confidence_level=2.0):
+        if not torch.isfinite(mean).all() or not torch.isfinite(var).all() or (var < 0).any():
+            raise ValueError("Gaussian mean/variance must be finite and variance nonnegative")
+        if not math.isfinite(confidence_level) or confidence_level < 0:
+            raise ValueError("confidence_level must be a finite nonnegative multiplier")
         self.mean = mean
         self.var = var
         self.confidence_level = confidence_level
@@ -98,16 +110,22 @@ class GaussianBelief(Belief):
 
     def lower_bound(self):
         """Conservative lower bound: μ - k*σ"""
-        std = torch.sqrt(self.var)
+        std = self._std()
         return self.mean - self.confidence_level * std
 
     def upper_bound(self):
         """Conservative upper bound: μ + k*σ"""
-        std = torch.sqrt(self.var)
+        std = self._std()
         return self.mean + self.confidence_level * std
 
     def probability_of(self, residual):
         """Probability that residual >= 0"""
-        std = torch.sqrt(self.var)
-        z = residual / (std)
-        return normal_cdf(z)
+        positive = self.var > 0
+        std = torch.sqrt(torch.where(positive, self.var, torch.ones_like(self.var)))
+        probability = normal_cdf(residual / std)
+        return torch.where(positive, probability, (residual >= 0).to(probability.dtype))
+
+    def _std(self):
+        positive = self.var > 0
+        safe_std = torch.sqrt(torch.where(positive, self.var, torch.ones_like(self.var)))
+        return torch.where(positive, safe_std, torch.zeros_like(safe_std))

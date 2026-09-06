@@ -1,3 +1,9 @@
+"""Legacy scalar Gaussian reference utility, not a stochastic predictor.
+
+This NumPy/SciPy helper is outside the differentiable core. It requires the
+optional examples dependencies. New providers should supply tensors to Predicate.
+"""
+
 import numpy as np
 from scipy.stats import norm
 

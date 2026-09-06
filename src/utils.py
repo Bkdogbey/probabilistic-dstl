@@ -122,8 +122,15 @@ def create_belief_trajectory(mean_trace, var_trace, confidence_level=1.0):
     from models.dynamics import GaussianBelief
     from pdstl.base import BeliefTrajectory
 
-    mean = torch.tensor(mean_trace, dtype=torch.float32).reshape(1, -1, 1)
-    var = torch.tensor(var_trace, dtype=torch.float32).reshape(1, -1, 1)
+    # Preserve graph/device/dtype when the caller supplies differentiable tensors.
+    mean = torch.as_tensor(mean_trace)
+    if not mean.is_floating_point():
+        mean = mean.to(torch.get_default_dtype())
+    var = torch.as_tensor(var_trace, dtype=mean.dtype, device=mean.device)
+    if mean.ndim != 1 or var.shape != mean.shape or mean.numel() == 0:
+        raise ValueError("mean_trace and var_trace must be matching nonempty 1D arrays")
+    mean = mean.reshape(1, -1, 1)
+    var = var.reshape(1, -1, 1)
     beliefs = [
         GaussianBelief(mean[:, i:i+1, :], var[:, i:i+1, :], confidence_level=confidence_level)
         for i in range(len(mean_trace))
