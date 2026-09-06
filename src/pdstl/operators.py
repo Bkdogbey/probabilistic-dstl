@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 
+from pdstl.base import check_probability_bounds
+
 
 class STL_Formula(torch.nn.Module):
     """
@@ -71,99 +73,74 @@ class Maxish(torch.nn.Module):
             return x.max(dim=dim, keepdim=keepdim)[0]
 
 
-class GreaterThan(STL_Formula):
+class Predicate(STL_Formula):
     """
-    Predicate: x >= threshold
-    Returns conservative probability intervals [lower, upper].
+    Atomic predicate: names an event and assembles its trace over time.
 
-    Lower bound: Pessimistic
-    Upper bound: Optimistic
+    The predicate states the requirement; the belief at each step evaluates it
+    under its own uncertainty model (see pdstl.base.Belief). Subclasses add
+    whatever describes their event -- a comparison adds dim/threshold/sense --
+    and never inspect the belief's internals.
+
+    A bare Predicate("name") carries only an identity, which is what a provider
+    of already-computed probability intervals keys on.
     """
 
-    def __init__(self, threshold):
-        super(GreaterThan, self).__init__()
-        self.threshold = threshold
+    def __init__(self, name=None):
+        super().__init__()
+        self.name = name
 
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        probs_lower = []
-        probs_upper = []
+    def robustness_trace(self, belief_trajectory, validate=True, **kwargs):
+        """
+        Args:
+           belief_trajectory: BeliefTrajectory object
+           validate: check the assembled bounds are well-formed. Pass False in
+              an inner optimisation loop, where the host sync is not worth it.
 
-        for t in range(len(belief_trajectory)):
-            belief = belief_trajectory[t]
+        Returns:
+           [B,T,2] probability bounds, [..., 0] lower and [..., 1] upper.
+        """
+        bounds = [
+            belief_trajectory[t].probability_bounds(self)  # each [B,2]
+            for t in range(len(belief_trajectory))
+        ]
+        trace = torch.stack(bounds, dim=1)  # [B,T,2]
 
-            # LOWER BOUND:
+        if validate:
+            check_probability_bounds(trace, self)
 
-            lower_bound = belief.lower_bound()  # μ - k*σ
-            residual_lower = lower_bound - self.threshold
-            prob_lower = belief.probability_of(residual_lower)
-
-            # UPPER BOUND: Optimistic assumption
-
-            upper_bound = belief.upper_bound() 
-            residual_upper = upper_bound - self.threshold
-            prob_upper = belief.probability_of(residual_upper)
-
-            probs_lower.append(prob_lower)
-            probs_upper.append(prob_upper)
-
-        # Stack along time dimension
-        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
-        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
-
-        # Remove the D dimension (assuming D=1 for scalar signals)
-        if lower_tensor.shape[2] == 1:
-            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
-            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
-
-        # Return as [lower, upper] bounds
-        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
+        return trace
 
     def __str__(self):
-        return f"x >= {self.threshold}"
+        return self.name if self.name is not None else type(self).__name__
 
 
-class LessThan(STL_Formula):
+class GreaterThan(Predicate):
     """
-    Predicate: x <= threshold
-    Returns conservative probability intervals [lower, upper].
+    Predicate: x[dim] >= threshold
+
+    The interval returned per step is whatever the belief's uncertainty model
+    yields for this event; it is not constructed here. Equal endpoints mean an
+    exactly known probability.
     """
 
-    def __init__(self, threshold):
-        super(LessThan, self).__init__()
+    def __init__(self, threshold, dim=0, name=None):
+        super().__init__(name=name if name is not None else f"x[{dim}] >= {threshold}")
         self.threshold = threshold
+        self.dim = dim
+        self.sense = ">="
 
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        probs_lower = []
-        probs_upper = []
 
-        for t in range(len(belief_trajectory)):
-            belief = belief_trajectory[t]
+class LessThan(Predicate):
+    """
+    Predicate: x[dim] <= threshold
+    """
 
-            # LOWER BOUND: Pessimistic assumption
-            upper_bound = belief.upper_bound()  # μ + k*σ
-            residual_lower = self.threshold - upper_bound
-            prob_lower = belief.probability_of(residual_lower)
-
-            # UPPER BOUND: Optimistic assumption
-            lower_bound = belief.lower_bound()  # μ - k*σ
-            residual_upper = self.threshold - lower_bound
-            prob_upper = belief.probability_of(residual_upper)
-
-            probs_lower.append(prob_lower)
-            probs_upper.append(prob_upper)
-
-        # Stack along time dimension
-        lower_tensor = torch.cat(probs_lower, dim=1)  # [B, T, D]
-        upper_tensor = torch.cat(probs_upper, dim=1)  # [B, T, D]
-
-        if lower_tensor.shape[2] == 1:
-            lower_tensor = lower_tensor.squeeze(2)  # [B, T]
-            upper_tensor = upper_tensor.squeeze(2)  # [B, T]
-
-        return torch.stack([lower_tensor, upper_tensor], dim=-1)  # [B, T, 2]
-
-    def __str__(self):
-        return f"x <= {self.threshold}"
+    def __init__(self, threshold, dim=0, name=None):
+        super().__init__(name=name if name is not None else f"x[{dim}] <= {threshold}")
+        self.threshold = threshold
+        self.dim = dim
+        self.sense = "<="
 
 
 class Negation(STL_Formula):

@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 from pdstl.base import Belief
@@ -5,7 +7,7 @@ from pdstl.base import Belief
 
 def normal_cdf(z):
     """Cumulative distribution function for standard normal distribution"""
-    return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
+    return 0.5 * (1 + torch.erf(z / math.sqrt(2.0)))
 
 
 def constant_input(t):
@@ -87,13 +89,35 @@ def piecewise_signal(n_steps=7):
 
 
 class GaussianBelief(Belief):
+    """Gaussian belief over the state at one prediction step.
+
+    mean : [B, D]
+    var  : [B, D] per-component variances, or [B, D, D] covariance.
+
+    What the returned interval means
+    -------------------------------
+    For the projected component s = x[dim] ~ N(m, v) and the event {s >= c},
+    write z = (m - c) / sqrt(v). With k = confidence_level this returns
+
+        lower = Phi(z - k)      upper = Phi(z + k)      (exact would be Phi(z))
+
+    which is exactly the range of the event probability as the mean varies over
+    |m' - m| <= k * sqrt(v) with the variance held fixed -- an ambiguity set of
+    means, k standard deviations wide. It is NOT a confidence interval and NOT
+    uncertainty about the variance, so a state range of mean +/- k*sigma does
+    not on its own justify it: the ambiguity set is the modelling assumption
+    being asserted here.
+
+    k = 0 collapses this to the exact probability as a singleton interval.
+    """
+
     def __init__(self, mean, var, confidence_level=2.0):
         self.mean = mean
         self.var = var
         self.confidence_level = confidence_level
 
     def value(self):
-        """Return mean (representative state)"""
+        """Return mean (representative state), [B, D]"""
         return self.mean
 
     def lower_bound(self):
@@ -107,7 +131,55 @@ class GaussianBelief(Belief):
         return self.mean + self.confidence_level * std
 
     def probability_of(self, residual):
-        """Probability that residual >= 0"""
+        """Probability that residual >= 0, for a residual scaled by this belief's σ.
+
+        Gaussian-specific helper. Not part of the Belief contract: predicates go
+        through probability_bounds(), which states the event explicitly instead
+        of relying on the caller to build a residual with the right convention.
+        """
         std = torch.sqrt(self.var)
         z = residual / (std)
         return normal_cdf(z)
+
+    def _project(self, dim):
+        """Mean and variance of the scalar component x[dim], each [B]."""
+        m = self.mean[..., dim]
+        if self.var.ndim == self.mean.ndim + 1:  # [B, D, D] covariance
+            v = self.var[..., dim, dim]
+        else:  # [B, D] per-component variances
+            v = self.var[..., dim]
+        if v.shape != m.shape:
+            # [B, D] and [D, D] are indistinguishable by rank alone when B == D,
+            # so catch the disagreement here rather than letting it broadcast
+            # into a zero variance and a non-finite probability.
+            raise ValueError(
+                f"GaussianBelief: mean {tuple(self.mean.shape)} and var "
+                f"{tuple(self.var.shape)} disagree; expected mean [B, D] with var "
+                f"[B, D] or [B, D, D]."
+            )
+        return m, v
+
+    def probability_bounds(self, predicate):
+        """Lower/upper probability of the predicate's event, [B, 2]."""
+        sense = getattr(predicate, "sense", None)
+        if sense not in (">=", "<="):
+            raise ValueError(
+                f"GaussianBelief evaluates comparison predicates (sense '>=' or "
+                f"'<='); it cannot evaluate {predicate!r}."
+            )
+
+        m, v = self._project(predicate.dim)
+        std = torch.sqrt(v)
+        # Keep the threshold on the belief's own dtype/device so gradients,
+        # precision and placement all follow the incoming tensors.
+        c = torch.as_tensor(predicate.threshold, dtype=m.dtype, device=m.device)
+        k = self.confidence_level
+
+        if sense == ">=":
+            lower = normal_cdf(((m - k * std) - c) / std)
+            upper = normal_cdf(((m + k * std) - c) / std)
+        else:
+            lower = normal_cdf((c - (m + k * std)) / std)
+            upper = normal_cdf((c - (m - k * std)) / std)
+
+        return torch.stack([lower, upper], dim=-1)  # [B, 2]

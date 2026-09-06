@@ -44,7 +44,7 @@ class DetSTL_Formula(nn.Module):
         raise NotImplementedError
 
     def _extract_mean(self, belief_trajectory):
-        means = [b.mean_full for b in belief_trajectory]
+        means = [b.value() for b in belief_trajectory]
         return torch.stack(means, dim=1)  # [B, T+1, D]
 
     def forward(self, belief_trajectory, scale=-1, **kwargs):

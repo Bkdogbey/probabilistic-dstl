@@ -1,13 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from models.dynamics import GaussianBelief
 from pdstl.base import BeliefTrajectory, Belief
 from utils import load_config
 from planning import log_utils
 
 
 class TorchGaussianBelief(Belief):
-    """Wrapper to allow STL operators to access the tensor trace directly."""
+    """Wrapper to allow STL operators to access the tensor trace directly.
+
+    The planning predicates in planning.environment read mean_full/var_full and
+    build their own region probabilities. probability_bounds() additionally lets
+    the generic comparison predicates evaluate against this belief, returning
+    the exact probability as equal endpoints -- the same convention those
+    planning predicates already use.
+    """
 
     def __init__(self, mean_full, var_full):
         self.mean_full = mean_full  # [Batch, Dim]
@@ -16,10 +24,10 @@ class TorchGaussianBelief(Belief):
     def value(self):
         return self.mean_full
 
-    def probability_of(self, residual):
-        raise NotImplementedError(
-            "TorchGaussianBelief is designed for custom predicates that access mean/var directly."
-        )
+    def probability_bounds(self, predicate):
+        """Exact probability of the predicate's event, [Batch, 2], lower == upper."""
+        belief = GaussianBelief(self.mean_full, self.var_full, confidence_level=0.0)
+        return belief.probability_bounds(predicate)
 
 
 class Planner:
