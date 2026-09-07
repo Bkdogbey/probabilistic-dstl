@@ -28,7 +28,7 @@ class DetSTL_Formula(nn.Module):
     Base class for deterministic stlcg-style STL formulas.
 
     External interface (forward time):
-      Input:  BeliefTrajectory (list of beliefs with .mean_full [B, D])
+      Input:  BeliefTrajectory (list of beliefs with .mean [B, D])
       Output: [B, T+1, 1] robustness trace, forward time
 
     Internal interface (robustness_trace):

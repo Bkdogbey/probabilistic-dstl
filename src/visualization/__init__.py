@@ -20,3 +20,5 @@ from visualization.robustness import (
     plot_case as plot_case,
     plot_synthesis as plot_synthesis,
 )
+
+from visualization.temporal import plot_temporal_example as plot_temporal_example

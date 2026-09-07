@@ -1,168 +1,181 @@
-import math
-
-import numpy as np
 import torch
-from pdstl.base import Belief
+import torch.nn as nn
 
 
-def normal_cdf(z):
-    """Cumulative distribution function for standard normal distribution"""
-    return 0.5 * (1 + torch.erf(z / math.sqrt(2.0)))
-
-
-def constant_input(t):
-    """Control input function u(t)."""
-    return -0.5
-
-
-def sinusoidial_input(t):
-    """A sinusoidal control input function u(t)."""
-    return 15 * np.sin(1 * np.pi * t)
-
-
-def noisy_stock_input(t):
-    """A noisy stock price-like input function u(t)."""
-    np.random.seed(int(t * 100) % 10000)
-    drift = 0.01 * t
-    noise = 50.0 * np.random.randn()
-    jitter = 0.2 * np.random.randn()
-    return drift + noise + jitter
-
-
-def piecewise_input(t):
+class Dynamics(nn.Module):
     """
-    Piecewise constant input for STL verification.
-    """
-    if t < 2:
-        return 0.0
-    elif t < 4:
-        return 20.0
-    elif t < 6:
-        return -25.0
-    elif t < 8:
-        return 30.0
-    else:
-        return -5.0
-
-
-def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
-    """Propagate the belief state (mu, P) through one time step."""
-    mean_trace = np.zeros(len(t))
-    var_trace = np.zeros(len(t))
-
-    mean_trace[0] = mu
-    var_trace[0] = P
-    Q = g**2 + q  # combined process noise covariance
-    for i in range(1, len(t)):
-        dt = t[i] - t[i - 1]
-        u = control_func(t[i - 1])  # control input at time t[i-1]
-
-        Phi = np.exp(a * dt)
-        int_u = dt * b * u  # integral of b*u from t[i-1] to t[i]
-        mean_trace[i] = Phi * mean_trace[i - 1] + int_u
-
-        # Variance update
-        var_trace[i] = (Phi**2) * var_trace[i - 1] + Q * dt
-    return mean_trace, var_trace
-
-
-def piecewise_signal(n_steps=7):
-    """
-    Discrete piecewise constant signal for STL verification.
-    """
-    t = np.arange(n_steps, dtype=float)
-
-    default_values = [
-        (45, 4),
-        (55, 4),
-        (60, 4),
-        (48, 4),
-        (42, 9),
-        (58, 4),
-        (52, 4),
-    ]
-
-    mean_trace = np.array([s[0] for s in default_values], dtype=float)
-    var_trace = np.array([s[1] for s in default_values], dtype=float)
-
-    return t, mean_trace, var_trace
-
-
-class GaussianBelief(Belief):
-    """Gaussian belief over the state at one prediction step.
-
-    mean : [B, D]
-    var  : [B, D] per-component variances, or [B, D, D] covariance.
-
-    A known mean and covariance determines an affine event probability exactly,
-    so the bounds come back as [p, p].
+    Base class for system dynamics.
+    Handles control bounding and common initialization.
     """
 
-    def __init__(self, mean, var):
-        self.mean = mean
-        self.var = var
+    def __init__(self, dt, u_max, device="cpu"):
+        super().__init__()
+        self.dt = dt
+        self.u_max = u_max
+        self.device = device
 
-    def value(self):
-        """Return mean (representative state), [B, D]"""
-        return self.mean
+    def bound_control(self, v):
+        """
+        Applies smooth squashing to keep control within [-u_max, u_max].
+        v: Unconstrained optimization variable (the 'knobs' for the optimizer)
+        u: Physical control input applied to the robot
+        """
+        return self.u_max * torch.tanh(v)
 
-    def _project(self, predicate):
-        """Mean and variance of the scalar w·x named by the predicate, each [B]."""
-        full_cov = self.var.ndim == self.mean.ndim + 1  # [B, D, D] vs [B, D]
-        w = getattr(predicate, "weights", None)
+    def step(self, x, P, u):
+        """
+        Propagates state x and covariance P one step forward with control u.
+        x: [Dim]
+        P: [Dim, Dim]
+        u: [Control Dim]
+        Returns: (x_next, P_next)
+        """
+        raise NotImplementedError
 
-        if w is None:  # axis-aligned event, w = e_dim
-            i = predicate.dim
-            m = self.mean[..., i]
-            v = self.var[..., i, i] if full_cov else self.var[..., i]
-        else:
-            w = torch.as_tensor(w, dtype=self.mean.dtype, device=self.mean.device)
-            m = (self.mean * w).sum(-1)
-            if full_cov:
-                v = torch.einsum("...i,...ij,...j->...", w, self.var, w)  # wᵀΣw
-            else:
-                # A per-component variance carries no cross terms; that
-                # representation is itself the independence assumption.
-                v = (self.var * w**2).sum(-1)
+    def forward(self, v_sequence, x0_mean, x0_cov):
+        raise NotImplementedError
 
-        if v.shape != m.shape:
-            # [B, D] and [D, D] have the same rank when B == D, so catch the
-            # disagreement here instead of letting it broadcast.
-            raise ValueError(
-                f"GaussianBelief: mean {tuple(self.mean.shape)} and var "
-                f"{tuple(self.var.shape)} disagree; expected mean [B, D] with var "
-                f"[B, D] or [B, D, D]."
-            )
-        return m, v
 
-    def probability_bounds(self, predicate):
-        """Exact probability of the predicate's event as [p, p], shape [B, 2]."""
-        sense = getattr(predicate, "sense", None)
-        if sense not in (">=", "<="):
-            raise ValueError(
-                f"GaussianBelief evaluates comparison predicates (sense '>=' or "
-                f"'<='); it cannot evaluate {predicate}."
-            )
+class SingleIntegrator(Dynamics):
+    """
+    Standard Position-Velocity model defined in the PDF.
 
-        m, v = self._project(predicate)
-        if bool((v < 0).any()):
-            raise ValueError(
-                "GaussianBelief: negative projected variance; the covariance is "
-                "not positive semi-definite."
-            )
+    State:   [x, y]
+    Control: [vx, vy]
+    """
 
-        # Keep the threshold on the belief's own dtype/device so precision,
-        # placement and autograd all follow the incoming tensors.
-        c = torch.as_tensor(predicate.threshold, dtype=m.dtype, device=m.device)
-        margin = (m - c) if sense == ">=" else (c - m)
+    def __init__(self, dt=0.2, u_max=1.0, q_std=0.05, device="cpu"):
+        super().__init__(dt, u_max, device)
 
-        # Zero variance is a deterministic, inclusive comparison. Evaluate the
-        # CDF on a safe variance so the unused branch cannot send NaN backward.
-        positive = v > 0
-        v_safe = torch.where(positive, v, torch.ones_like(v))
-        p = torch.where(
-            positive,
-            normal_cdf(margin / torch.sqrt(v_safe)),
-            (margin >= 0).to(m.dtype),
+        # Process Noise Covariance Q (Additive)
+        # We assume diagonal noise for simplicity: Q = diag(q_std^2)
+        self.Q = torch.eye(2, device=self.device) * q_std**2
+
+    def step(self, x, P, u):
+        # x_next = x + u * dt
+        # P_next = P + Q
+        return x + u * self.dt, P + self.Q
+
+    def forward(self, v_sequence, x0_mean, x0_cov):
+        """
+        Rolls out the trajectory from t=0 to T.
+
+        Args:
+            v_sequence: Tensor [T, 2] (Unconstrained controls)
+            x0_mean:    Tensor [2]    (Initial position)
+            x0_cov:     Tensor [2, 2] (Initial uncertainty)
+
+        Returns:
+            mean_stack: [1, T+1, 2]
+            cov_stack:  [1, T+1, 2, 2]
+        """
+        T = v_sequence.shape[0]
+
+        # Storage for the trajectory
+        means = [x0_mean]
+        covs = [x0_cov]
+
+        curr_mu = x0_mean
+        curr_sigma = x0_cov
+
+        for t in range(T):
+            # 1. Squash the optimization variable to get physical control
+            u = self.bound_control(v_sequence[t])
+
+            # 2. Update Mean (Differentiable)
+            curr_mu = curr_mu + u * self.dt
+
+            # 3. Update Covariance (Open Loop Uncertainty Growth)
+            curr_sigma = curr_sigma + self.Q
+
+            means.append(curr_mu)
+            covs.append(curr_sigma)
+
+        # Stack results into tensors
+        # Output shape: [Batch=1, Time, Dim]
+        mean_stack = torch.stack(means).unsqueeze(0)
+        cov_stack = torch.stack(covs).unsqueeze(0)
+
+        return mean_stack, cov_stack
+
+
+class DoubleIntegrator(Dynamics):
+    """
+    Alternative Physics-based model (Acceleration control).
+
+    State:   [px, py, vx, vy]
+    Control: [ax, ay]
+    """
+
+    def __init__(self, dt=0.2, u_max=1.0, q_std=0.02, device="cpu"):
+        super().__init__(dt, u_max, device)
+
+        # State Transition Matrix A
+        self.A = torch.tensor(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            device=device,
         )
-        return torch.stack([p, p], dim=-1)  # [B, 2]
+
+        # Control Matrix B
+        self.B = torch.tensor(
+            [[0.5 * dt**2, 0.0], [0.0, 0.5 * dt**2], [dt, 0.0], [0.0, dt]],
+            device=device,
+        )
+
+        # Process Noise Q
+        self.Q = torch.eye(4, device=device) * q_std**2
+
+    def step(self, x, P, u):
+        # x_next = A x + B u
+        # P_next = A P A^T + Q
+        x_next = self.A @ x + self.B @ u
+        P_next = self.A @ P @ self.A.t() + self.Q
+        return x_next, P_next
+
+    def forward(self, v_sequence, x0_mean, x0_cov):
+        T = v_sequence.shape[0]
+        means = [x0_mean]
+        covs = [x0_cov]
+
+        curr_mu = x0_mean
+        curr_sigma = x0_cov
+
+        for t in range(T):
+            # 1. Bound Control
+            u = self.bound_control(v_sequence[t])
+
+            # 2. Update Mean
+            curr_mu = self.A @ curr_mu + self.B @ u
+
+            # 3. Update Covariance (Full Linear Update)
+            curr_sigma = self.A @ curr_sigma @ self.A.t() + self.Q
+
+            means.append(curr_mu)
+            covs.append(curr_sigma)
+
+        mean_stack = torch.stack(means).unsqueeze(0)
+        cov_stack = torch.stack(covs).unsqueeze(0)
+
+        return mean_stack, cov_stack
+
+
+def _altitude_trace(values, dtype):
+    mean = torch.tensor(values, dtype=dtype)
+    time = torch.arange(len(values), dtype=dtype)
+    variance = torch.full_like(mean, 1.5**2)
+    return time, mean, variance
+
+
+def always_altitude_example(dtype=torch.float64):
+    """Seven predictions with a dip below 50 m; return time, mean, variance."""
+    return _altitude_trace([54, 53, 52, 51, 49, 52, 54], dtype)
+
+
+def eventually_altitude_example(dtype=torch.float64):
+    """Seven predictions rising through 55 m; return time, mean, variance."""
+    return _altitude_trace([50, 51, 53, 54, 56, 57, 58], dtype)

@@ -125,7 +125,7 @@ def create_belief_trajectory(mean_trace, var_trace, dtype=None, device=None):
     -------
     BeliefTrajectory
     """
-    from models.dynamics import GaussianBelief
+    from models.beliefs import GaussianBelief
     from pdstl.base import BeliefTrajectory
 
     dtype = torch.float32 if dtype is None else dtype

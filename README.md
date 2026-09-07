@@ -1,157 +1,111 @@
-# Probabilistic dSTL
+# Probabilistic differentiable STL
 
-> *"I am 94.7% sure the robot won't crash. Probably."*
+pdSTL evaluates stochastic robustness intervals for Signal Temporal Logic over
+belief trajectories. This branch uses Gaussian state beliefs for the introductory
+examples and a general per-predicate interval input contract.
 
-**pdSTL** is a Python library for evaluating and optimizing [Signal Temporal Logic (STL)](https://en.wikipedia.org/wiki/Signal_temporal_logic) specifications over **probabilistic (Gaussian belief) trajectories** — because the real world is uncertain and your specs shouldn't pretend otherwise.
+## Run the monitoring examples
 
-Instead of asking *"does the robot always stay in the lane?"*, pdSTL asks the more honest question: ***"what is the probability that the robot always stays in the lane?"***
-
----
-
-## What is this?
-
-STL lets you write temporal requirements like:
-
-```
-□[1s, 5s] (x ≥ 50)      # "x must always be ≥ 50 between 1 and 5 seconds"
-◇[0, 10] (goal reached)  # "reach the goal within 10 seconds"
-```
-
-Classical STL checks these against **deterministic** signals. But real robots live in an uncertain world — sensors are noisy, dynamics are approximate, wind exists.
-
-**pdSTL** propagates Gaussian uncertainty through STL operators, giving you a **satisfaction probability** for every spec at every timestep. You can then use that probability as an objective to optimize trajectories that are *robustly safe* under uncertainty.
-
----
-
-## Features
-
-- **Probabilistic STL evaluation** — compute P(spec satisfied) for Gaussian belief trajectories
-- **Gradient-based motion planning** — maximize satisfaction probability via PyTorch autograd
-- **MPC (Receding Horizon)** — roll the planner forward in real time
-- **Lane change scenarios** — dodge moving obstacles while staying in the lane, stochastically
-- **Pluggable belief system** — bring your own `Belief` subclass; Gaussian is just the default
-
----
-
-## Quickstart
+With PyTorch, NumPy, SciPy, Matplotlib and PyYAML installed, run from the project root:
 
 ```bash
-# 1. Clone and install
-git clone https://github.com/iHuman-Lab/probabilistic-dstl
-cd probabilistic-dstl
-pip install -e .
-
-# 2. Run the example cases (non-interactive; plots land in outputs/)
-python src/main.py --all
-python src/main.py --case corridor   # one case
-python src/main.py --case mpc        # MPC consistency check
-python src/main.py --list            # available cases
+python src/main.py
 ```
 
-### Evaluate a spec over a belief trajectory
+`src/main.py` is a direct execution script with numbered `skip_run("run", ...)`
+and `skip_run("skip", ...)` blocks, following the RA_L layout. Always and
+Eventually run by default. Select experiments by editing these flags; there is
+no main() wrapper or command-line dispatcher. Importing main executes its blocks;
+import reusable modules from experiments, models or pdstl instead.
+
+Set `show_plots: false` in `configs/stl_demos.yaml` for noninteractive execution.
+Thresholds and integer step windows live in that same configuration. The
+seven-point altitude fixtures have one-second spacing and standard deviation 1.5 m:
+
+| Example | Mean altitude (m) | Threshold | Window |
+| --- | --- | --- | --- |
+| Always | 54, 53, 52, 51, 49, 52, 54 | 50 m | [0,1] |
+| Eventually | 50, 51, 53, 54, 56, 57, 58 | 55 m | [0,1] |
+
+Each runner prints atomic probabilities and complete temporal windows, and returns
+`(time, mean, variance, atomic_trace, temporal_trace, figure)`. One shared visualizer
+shows the state uncertainty, atomic probabilities and stochastic robustness.
+`show=False` returns the figure without displaying it. Save and close it explicitly
+when needed; monitoring does not save files automatically.
+
+## Input and output
+
+`Belief.probability_bounds(predicate)` returns `[B,2]` lower/upper endpoints.
+`BeliefTrajectory` stores steps; predicates assemble `[B,T,2]` traces. Temporal
+outputs are `[B,K,2]`, with K complete-window origins. Seven input points give six
+origins for [0,1] and five for [1,2]. Output timestamps refer to origins, not window
+starts. Insufficient input for one complete origin raises an error.
 
 ```python
-import numpy as np
-from models.dynamics import linear_system, sinusoidial_input
+from models.dynamics import always_altitude_example
 from pdstl.operators import Always, GreaterThan
-from utils import create_belief_trajectory, to_steps
+from utils import create_belief_trajectory
 
-t = np.linspace(0, 10, 100)
-mean, var = linear_system(a=0.01, b=1.0, g=2.0, q=2.5,
-                          mu=50.0, P=0.15, t=t,
-                          control_func=sinusoidial_input)
-
-beliefs = create_belief_trajectory(mean, var)
-
-phi  = GreaterThan(threshold=50.0)
-spec = Always(phi, interval=to_steps([1, 2], t))
-
-trace = spec(beliefs)   # [B, K, 2] stochastic robustness interval
-
-# `trace` holds only origins whose window is complete, so K < len(t): a
-# bounded operator over [a, b] consumes b steps of lookahead. Endpoints are
-# [lower, upper]; the Gaussian atom's own values are exact probabilities.
+time, mean, variance = always_altitude_example()
+beliefs = create_belief_trajectory(mean, variance, dtype=mean.dtype)
+intervals = Always(GreaterThan(50.0), interval=[1, 2])(beliefs, scale=-1)
+# [1,5,2], evaluated at origins 0 through 4
 ```
 
----
+Use `PYTHONPATH=src` for this snippet. `models.beliefs.GaussianBelief` serves both
+monitoring and planning. Its Gaussian affine probabilities are [p,p]; variance is
+state uncertainty, not probability-interval width. `ProbabilityBelief` supports
+already-computed intervals keyed by event name.
 
-## Examples
+Boolean operators use Fréchet bounds; Always/Eventually apply endpointwise temporal
+min/max. Temporal values are stochastic robustness, not general enclosures of
+whole-trajectory satisfaction probability. Until uses an inclusive left prefix.
+`scale <= 0` evaluates the defining equations. `scale > 0` uses the existing smooth
+approximations, which can leave [0,1] or cross; report directly reevaluated robustness.
 
-Five Gaussian single-integrator cases share one runner
-([src/planning/examples.py](src/planning/examples.py)); parameters and the model
-assumptions live in [configs/scenarios/examples.yaml](configs/scenarios/examples.yaml).
+## Planning and organization
 
-| Case | Specification | Purpose |
-|---|---|---|
-| `always` | □[1,H](x ≥ c) | Raise the least favourable future atom probability |
-| `eventually` | ◇[a,b](x ≥ c) | Reach a target inside a window |
-| `corridor` | □[1,H](x ≥ c₁ ∧ x ≤ c₂) | Boolean interval composition inside a temporal operator |
-| `until` | (x ≤ cs) U[a,b] (x ≥ cg) | Inclusive witness with the required left prefix |
-| `nested` | ◇[a,b](□[0,d](x ≥ c)) | Arrival then persistence; nested lookahead |
-
-`python src/main.py --all` runs all five. The planning scenarios (single-shot,
-MPC, lane change) live in [src/planning/runners.py](src/planning/runners.py) and
-are invoked explicitly; nothing here starts them automatically.
-
-**Interpreting the output.** The temporal output is a *stochastic robustness*
-interval, not a whole-trajectory satisfaction probability. Only the Gaussian
-atom values are probabilities. Plots show mean ± σ as a **state uncertainty
-band** — not a probability interval and not a guaranteed tube. A formula trace
-covers only origins with a complete window, so its series is shorter than the
-state trace and the remainder is shown as absent rather than padded. Under a
-positive smoothing `scale` the optimiser's score is an approximation that may
-leave [0,1]; reported intervals always come from a direct (`scale ≤ 0`)
-re-evaluation of the same formula.
-
----
-
-## Project Structure
-
-```
+```text
 src/
-├── pdstl/          # Core: Belief base classes, STL operators, propagation
-├── models/         # Dynamical systems (linear, double integrator, etc.)
-├── planning/       # Gradient-based planner, MPC runner, environments
-├── visualization/  # Robustness plots, animations, live MPC callbacks
-├── baselines/      # Deterministic STL baseline for comparison
-└── main.py         # Named-case entry point
-configs/            # YAML configs for scenarios and hyperparameters
-outputs/            # Generated plots (git-ignored)
-saved_data/         # Cached optimization results (git-ignored, regenerable)
+  main.py                  Direct experiment selection
+  pdstl/                   Belief contract and operators
+  models/beliefs.py        Shared Gaussian event probabilities
+  models/dynamics.py       Integrators and altitude fixtures
+  experiments/offline.py   Always/Eventually monitoring
+  experiments/planning.py  Scenario runners
+  planning/                Planner, environment, existing synthesis examples
+  visualization/           Shared temporal and planning plots
+configs/                   Monitoring and scenario parameters
+outputs/                   Ignored generated results
 ```
 
----
+Single-shot, MPC, and lane-change scenarios remain in skipped main.py blocks.
+Normal/aggressive lane change share `run_lane_change(config_path=...)`.
+`show=False` disables their presentation and live callbacks. New scenario caches
+and animations go to outputs/, created only when saving. Old saved_data/*.pt
+caches are ignored and are loaded only through an explicit load_from path.
 
-## Device Configuration
+The newer five optimization cases remain available through
+`planning.examples.run_case` and `run_all`, with their configuration in
+`configs/scenarios/examples.yaml`. Their visualization and tests were retained
+when restoring the monitoring script. They are not launched by default.
 
-The library defaults to **CPU** (some machines expose CUDA even when it can't initialize). To use a GPU:
+This restoration preserves the newer planner implementation and the core equations.
+Auxiliary geometry objectives, geometric probability approximations and MPC belief
+assumptions still need separate review. Passing integration tests does not establish
+closed-loop probabilistic guarantees.
+
+## Verification
+
+With pytest installed:
 
 ```bash
-PDSTL_DEVICE=cuda python src/main.py --all
-# or
-PDSTL_USE_CUDA=1 python src/main.py --all
+PYTHONPATH=src MPLBACKEND=Agg python -m pytest -q
 ```
 
----
-
-## Requirements
-
-- Python 3.8+
-- PyTorch (for autograd-based planning)
-- NumPy, PyYAML, python-dotenv
-
-```bash
-pip install -r requirements.txt
-```
-
----
-
-## Citation
-
-If this library is useful in your research, please consider citing the associated work (details forthcoming).
-
----
+CPU is the default. `PDSTL_DEVICE=cuda` opts planning into an available CUDA device.
+Packaging/dependency metadata remain due for a separate cleanup.
 
 ## License
 
-MIT — do whatever you want, but don't blame us if the robot crashes. (We did say *probabilistic*.)
+MIT. See LICENSE.

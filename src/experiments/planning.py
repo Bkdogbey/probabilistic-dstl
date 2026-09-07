@@ -1,20 +1,22 @@
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from utils import get_device, load_config
 from planning import log_utils
-from planning.dynamics import DoubleIntegrator, SingleIntegrator
+from models.dynamics import DoubleIntegrator, SingleIntegrator
 from planning.environment import Environment
 from planning.planner import Planner
 from visualization.animation import animate_results
-from visualization.live_plots import make_mpc_live_callback, make_lane_change_live_callback
+from visualization.live_plots import (
+    make_mpc_live_callback,
+    make_lane_change_live_callback,
+)
 from visualization.planning import visualize_lane_change, visualize_results
 
-RESULTS_DIR = "saved_data"
-if not os.path.exists(RESULTS_DIR):
-    os.makedirs(RESULTS_DIR)
+RESULTS_DIR = Path(__file__).resolve().parents[2] / "outputs"
 
 
 def load_scenario_config(cfg_path):
@@ -69,7 +71,9 @@ def build_dynamics(cfg, device):
             q_std=cfg["q_std"],
             device=device,
         )
-    return SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
+    return SingleIntegrator(
+        dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device
+    )
 
 
 def check_collision(mean_trace, env, r_robot=1.0, moving_obs_dist=2.25):
@@ -102,7 +106,9 @@ def check_collision(mean_trace, env, r_robot=1.0, moving_obs_dist=2.25):
                 if dist < min_sep:
                     min_sep = dist
                 if dist < moving_obs_dist:
-                    log_utils.log_collision_event(t, "Moving obstacle", f"dist={dist:.2f}")
+                    log_utils.log_collision_event(
+                        t, "Moving obstacle", f"dist={dist:.2f}"
+                    )
                     is_safe = False
 
     log_utils.log_safety(is_safe, min_sep)
@@ -124,14 +130,24 @@ def _normalise_result(data):
         result["history"] = result["loss_trace"]
     result.setdefault("p_sat_trace", [result.get("best_p", 0.0)])
     result.setdefault("all_plans", [])
-    result.setdefault("best_p", max(result["p_sat_trace"]) if result["p_sat_trace"] else 0.0)
+    result.setdefault(
+        "best_p", max(result["p_sat_trace"]) if result["p_sat_trace"] else 0.0
+    )
     result.setdefault("mode", "loaded")
     result.setdefault("stopped_reason", None)
     return result
 
 
-def _load_or_solve(cfg, planner_cfg, env, *, horizon, load_from=None, force_run=False,
-                   make_callback=None):
+def _load_or_solve(
+    cfg,
+    planner_cfg,
+    env,
+    *,
+    horizon,
+    load_from=None,
+    force_run=False,
+    make_callback=None,
+):
     result_path = _scenario_result_path(cfg, load_from)
     if not force_run and result_path and os.path.exists(result_path):
         log_utils.log_load(result_path)
@@ -146,6 +162,7 @@ def _load_or_solve(cfg, planner_cfg, env, *, horizon, load_from=None, force_run=
     result = planner.solve(x0_mean, x0_cov, step_callback=step_callback)
 
     if result_path:
+        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(result, result_path)
         log_utils.log_save(result_path)
     return result
@@ -156,12 +173,26 @@ def _clip_env_to_result(env, result):
         env.clip_moving_obstacles(result["mean_trace"].shape[1])
 
 
+def _animation_path(filename):
+    if filename is None:
+        return None
+    path = RESULTS_DIR / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
-def run_single_shot(max_iterations=1000, load_from=None, force_run=False):
+
+def run_single_shot(
+    max_iterations=1000,
+    load_from=None,
+    force_run=False,
+    *,
+    config_path="configs/scenarios/single_shot.yaml",
+    show=True,
+):
     device = get_device()
     log_utils.log_device(device)
 
-    cfg, planner_cfg = load_scenario_config("configs/scenarios/single_shot.yaml")
+    cfg, planner_cfg = load_scenario_config(config_path)
 
     T = cfg["T"]
 
@@ -172,33 +203,42 @@ def run_single_shot(max_iterations=1000, load_from=None, force_run=False):
     result = _load_or_solve(
         cfg, planner_cfg, env, horizon=T, load_from=load_from, force_run=force_run
     )
-    log_utils._log.info(f"Done. Final P(Sat): {result['best_p']:.4f}")
+    log_utils._log.info(f"Done. Final stochastic robustness: {result['best_p']:.4f}")
 
-    visualize_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        result["u_trace"],
-        env,
-        result["loss_trace"],
-    )
+    if show:
+        visualize_results(
+            result["mean_trace"],
+            result["cov_trace"],
+            result["u_trace"],
+            env,
+            result["loss_trace"],
+        )
 
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        env,
-        filename=anim["filename"],
-        step=anim["step"],
-        title=anim["title"],
-        bounds=anim["bounds"],
-    )
+        anim = cfg["animation"]
+        animate_results(
+            result["mean_trace"],
+            result["cov_trace"],
+            env,
+            filename=_animation_path(anim["filename"]),
+            step=anim["step"],
+            title=anim["title"],
+            bounds=anim["bounds"],
+        )
+
+    return result
 
 
-def run_mpc(load_from=None, force_run=False):
+def run_mpc(
+    load_from=None,
+    force_run=False,
+    *,
+    config_path="configs/scenarios/mpc.yaml",
+    show=True,
+):
     device = get_device()
     log_utils.log_device(device)
 
-    cfg, planner_cfg = load_scenario_config("configs/scenarios/mpc.yaml")
+    cfg, planner_cfg = load_scenario_config(config_path)
 
     H = cfg["H"]
     planner_cfg = {**planner_cfg, "MAX_STEPS": cfg["MAX_STEPS"]}
@@ -207,32 +247,45 @@ def run_mpc(load_from=None, force_run=False):
 
     log_utils._log.info(f"Starting MPC execution (horizon={H})...")
     result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=H, load_from=load_from, force_run=force_run,
-        make_callback=make_mpc_live_callback,
-    )
-
-    visualize_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        result["u_trace"],
+        cfg,
+        planner_cfg,
         env,
-        history=result["loss_trace"],
-        p_sat_trace=result["p_sat_trace"],
+        horizon=H,
+        load_from=load_from,
+        force_run=force_run,
+        make_callback=make_mpc_live_callback if show else None,
     )
 
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"], result["cov_trace"], env,
-        filename=anim["filename"], plan_traces=result["all_plans"],
-        step=anim["step"], title=anim["title"], bounds=anim.get("bounds"),
-    )
+    if show:
+        visualize_results(
+            result["mean_trace"],
+            result["cov_trace"],
+            result["u_trace"],
+            env,
+            history=result["loss_trace"],
+            p_sat_trace=result["p_sat_trace"],
+        )
+
+        anim = cfg["animation"]
+        animate_results(
+            result["mean_trace"],
+            result["cov_trace"],
+            env,
+            filename=_animation_path(anim["filename"]),
+            plan_traces=result["all_plans"],
+            step=anim["step"],
+            title=anim["title"],
+            bounds=anim.get("bounds"),
+        )
+
+    return result
 
 
-def _run_lane_change_scenario(cfg_path):
+def run_lane_change(config_path="configs/scenarios/lane_change.yaml", *, show=True):
     device = get_device()
     log_utils.log_device(device)
 
-    cfg, planner_cfg = load_scenario_config(cfg_path)
+    cfg, planner_cfg = load_scenario_config(config_path)
     label = cfg.get("label", "")
 
     H = cfg["H"]
@@ -243,40 +296,46 @@ def _run_lane_change_scenario(cfg_path):
     env = build_environment(cfg, device)
     planner_cfg = {**planner_cfg, "T_SIM": cfg["T_SIM"], "mpc_mode": "lane_change"}
     result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=H, load_from=None, force_run=True,
-        make_callback=make_lane_change_live_callback,
+        cfg,
+        planner_cfg,
+        env,
+        horizon=H,
+        load_from=None,
+        force_run=True,
+        make_callback=make_lane_change_live_callback if show else None,
     )
     _clip_env_to_result(env, result)
 
     check_collision(
-        result["mean_trace"], env,
+        result["mean_trace"],
+        env,
         r_robot=planner_cfg["r_robot"],
         moving_obs_dist=planner_cfg["moving_obs_dist"],
     )
 
-    visualize_lane_change(
-        result["mean_trace"],
-        result["cov_trace"],
-        result["u_trace"],
-        env,
-        p_sat_trace=result["p_sat_trace"],
-        dt=dt,
-        robot_dims=env.robot_dims,
-        xlim=env.plot_xlim,
-    )
+    if show:
+        visualize_lane_change(
+            result["mean_trace"],
+            result["cov_trace"],
+            result["u_trace"],
+            env,
+            p_sat_trace=result["p_sat_trace"],
+            dt=dt,
+            robot_dims=env.robot_dims,
+            xlim=env.plot_xlim,
+        )
 
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"], result["cov_trace"], env,
-        filename=anim["filename"], plan_traces=result["all_plans"],
-        step=anim["step"], robot_dims=env.robot_dims,
-        title=anim["title"], bounds=anim.get("bounds"),
-    )
+        anim = cfg["animation"]
+        animate_results(
+            result["mean_trace"],
+            result["cov_trace"],
+            env,
+            filename=_animation_path(anim["filename"]),
+            plan_traces=result["all_plans"],
+            step=anim["step"],
+            robot_dims=env.robot_dims,
+            title=anim["title"],
+            bounds=anim.get("bounds"),
+        )
 
-
-def run_lane_change():
-    _run_lane_change_scenario("configs/scenarios/lane_change.yaml")
-
-
-def run_lane_change_aggressive():
-    _run_lane_change_scenario("configs/scenarios/lane_change_aggressive.yaml")
+    return result

@@ -21,8 +21,9 @@ from pdstl.operators import (
     Until,
 )
 from planning import log_utils
-from planning.dynamics import SingleIntegrator
-from planning.planner import Planner, TorchGaussianBelief
+from models.dynamics import SingleIntegrator
+from planning.planner import Planner
+from models.beliefs import GaussianBelief
 from utils import get_device, load_config
 from visualization.robustness import plot_case, plot_synthesis
 
@@ -123,7 +124,7 @@ def belief_trajectory(mean_trace, cov_trace):
     """Wrap a predicted mean/covariance rollout as one belief per step."""
     return BeliefTrajectory(
         [
-            TorchGaussianBelief(mean_trace[:, t, :], cov_trace[:, t])
+            GaussianBelief(mean_trace[:, t, :], cov_trace[:, t])
             for t in range(mean_trace.shape[1])
         ]
     )
