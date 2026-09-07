@@ -41,8 +41,11 @@ git clone https://github.com/iHuman-Lab/probabilistic-dstl
 cd probabilistic-dstl
 pip install -e .
 
-# 2. Run the demos (toggle skip/run flags in src/main.py)
-python src/main.py
+# 2. Run the example cases (non-interactive; plots land in outputs/)
+python src/main.py --all
+python src/main.py --case corridor   # one case
+python src/main.py --case mpc        # MPC consistency check
+python src/main.py --list            # available cases
 ```
 
 ### Evaluate a spec over a belief trajectory
@@ -63,23 +66,42 @@ beliefs = create_belief_trajectory(mean, var)
 phi  = GreaterThan(threshold=50.0)
 spec = Always(phi, interval=to_steps([1, 2], t))
 
-p_sat = spec(beliefs)   # probability of satisfaction at each timestep
+trace = spec(beliefs)   # [B, K, 2] stochastic robustness interval
+
+# `trace` holds only origins whose window is complete, so K < len(t): a
+# bounded operator over [a, b] consumes b steps of lookahead. Endpoints are
+# [lower, upper]; the Gaussian atom's own values are exact probabilities.
 ```
 
 ---
 
 ## Examples
 
-| # | Scenario | Description |
-|---|----------|-------------|
-| 1 | Always operator | Evaluate □[1,2](x ≥ 50) on a linear stochastic system |
-| 2 | Piecewise signal | Same spec, but on a discrete piecewise signal |
-| 3 | Single-shot planning | Optimize a full trajectory satisfying an STL spec |
-| 4 | MPC receding horizon | Re-plan every step as the robot moves |
-| 5 | Lane change | Merge lanes while a car moves into your path |
-| 6 | Aggressive lane change | Same, but faster (and scarier) |
+Five Gaussian single-integrator cases share one runner
+([src/planning/examples.py](src/planning/examples.py)); parameters and the model
+assumptions live in [configs/scenarios/examples.yaml](configs/scenarios/examples.yaml).
 
-Toggle which examples run by changing `"skip"` → `"run"` in [src/main.py](src/main.py).
+| Case | Specification | Purpose |
+|---|---|---|
+| `always` | □[1,H](x ≥ c) | Raise the least favourable future atom probability |
+| `eventually` | ◇[a,b](x ≥ c) | Reach a target inside a window |
+| `corridor` | □[1,H](x ≥ c₁ ∧ x ≤ c₂) | Boolean interval composition inside a temporal operator |
+| `until` | (x ≤ cs) U[a,b] (x ≥ cg) | Inclusive witness with the required left prefix |
+| `nested` | ◇[a,b](□[0,d](x ≥ c)) | Arrival then persistence; nested lookahead |
+
+`python src/main.py --all` runs all five. The planning scenarios (single-shot,
+MPC, lane change) live in [src/planning/runners.py](src/planning/runners.py) and
+are invoked explicitly; nothing here starts them automatically.
+
+**Interpreting the output.** The temporal output is a *stochastic robustness*
+interval, not a whole-trajectory satisfaction probability. Only the Gaussian
+atom values are probabilities. Plots show mean ± σ as a **state uncertainty
+band** — not a probability interval and not a guaranteed tube. A formula trace
+covers only origins with a complete window, so its series is shorter than the
+state trace and the remainder is shown as absent rather than padded. Under a
+positive smoothing `scale` the optimiser's score is an approximation that may
+leave [0,1]; reported intervals always come from a direct (`scale ≤ 0`)
+re-evaluation of the same formula.
 
 ---
 
@@ -92,10 +114,10 @@ src/
 ├── planning/       # Gradient-based planner, MPC runner, environments
 ├── visualization/  # Robustness plots, animations, live MPC callbacks
 ├── baselines/      # Deterministic STL baseline for comparison
-└── main.py         # Demo entry point
+└── main.py         # Named-case entry point
 configs/            # YAML configs for scenarios and hyperparameters
-data/               # Video recordings of hardware experiments
-saved_data/         # Cached optimization results (.pt files)
+outputs/            # Generated plots (git-ignored)
+saved_data/         # Cached optimization results (git-ignored, regenerable)
 ```
 
 ---
@@ -105,9 +127,9 @@ saved_data/         # Cached optimization results (.pt files)
 The library defaults to **CPU** (some machines expose CUDA even when it can't initialize). To use a GPU:
 
 ```bash
-PDSTL_DEVICE=cuda python src/main.py
+PDSTL_DEVICE=cuda python src/main.py --all
 # or
-PDSTL_USE_CUDA=1 python src/main.py
+PDSTL_USE_CUDA=1 python src/main.py --all
 ```
 
 ---

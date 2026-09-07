@@ -1,0 +1,76 @@
+# Shared configuration for the five pdSTL example cases (src/planning/examples.py).
+#
+# Model assumptions, stated explicitly:
+#   - Single integrator, state [x, y], control [vx, vy], x_{t+1} = x_t + u_t * dt.
+#   - Additive independent Gaussian process noise, Q = I * q_std^2 per step, so the
+#     covariance propagates as P_{t+1} = P_t + Q. This matches the mean/covariance
+#     propagation in planning/dynamics.py SingleIntegrator.
+#   - The demonstrations constrain the x coordinate only (dim: 0); y is unconstrained.
+#   - Windows below are integer step indices. Physical time is step * dt, applied
+#     only when plotting.
+
+dynamics: single_integrator
+H: 8              # Planning horizon in steps; predictions cover steps 0..H
+dt: 0.2           # Time step [s]
+u_max: 1.0        # Maximum control magnitude [m/s]
+q_std: 0.05       # Process noise standard deviation per step
+
+x0_mean: [0.0, 0.0]
+x0_cov_scale: 0.01   # Initial covariance is I * x0_cov_scale
+
+dim: 0            # State component the predicates constrain
+seed: 0           # Fixed seed for the control initialisation
+
+# --- Case parameters -------------------------------------------------------
+# Thresholds are chosen so the initial lower robustness sits away from both 0
+# and 1, and so the specification is reachable within H steps (max displacement
+# per step is u_max * dt = 0.2).
+cases:
+  always:
+    threshold: 0.05
+    interval: [1, 8]
+  eventually:
+    threshold: 0.75
+    interval: [2, 6]
+  corridor:
+    # The upper wall is deliberately tight enough to bind: without it the
+    # optimiser drives x to ~0.47, so a loose wall would make this case
+    # numerically identical to `always`.
+    lower_threshold: 0.05
+    upper_threshold: 0.6
+    interval: [1, 8]
+  until:
+    safe_threshold: 1.2     # left operand: x <= safe_threshold
+    goal_threshold: 0.6     # right operand: x >= goal_threshold (< safe_threshold)
+    interval: [0, 6]
+  nested:
+    threshold: 0.5
+    inner_interval: [0, 2]  # d = 2
+    outer_interval: [0, 6]  # b = 6, so lookahead b + d = 8 = H
+
+# --- Planner overrides (merged on top of configs/planning.yaml) ------------
+# The heuristic shaping terms are disabled here: these cases optimise the
+# specification itself plus simple control regularisation.
+planner:
+  w_u: 0.05
+  w_du: 0.05
+  w_phi: 1.0
+  w_dist: 0.0
+  w_obs: 0.0
+  w_visit: 0.0
+  lr: 0.05
+  max_iters: 300
+  min_iters: 20
+  alpha: 0.99      # Early-stop threshold on lower stochastic robustness
+  loss_tol: 1.0e-6
+  scale: 10.0      # Positive: smooth reductions during optimisation
+
+# --- MPC consistency check (section 4) ------------------------------------
+# Reuses the Eventually form with its own reachable task, so progress is easy
+# to inspect: reach x >= threshold by step `interval[1]`, an absolute deadline
+# fixed at the first plan and decremented thereafter.
+mpc:
+  form: eventually
+  threshold: 0.4
+  interval: [1, 5]   # Absolute window in steps from the first plan
+  steps: 6           # Replanning steps to simulate

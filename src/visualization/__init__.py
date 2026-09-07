@@ -17,6 +17,6 @@ from visualization.live_plots import (
 )
 from visualization.animation import animate_results as animate_results
 from visualization.robustness import (
-    plot_stl_formula_bounds as plot_stl_formula_bounds,
-    plot_piecewise_stl as plot_piecewise_stl,
+    plot_case as plot_case,
+    plot_synthesis as plot_synthesis,
 )

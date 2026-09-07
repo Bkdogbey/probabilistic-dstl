@@ -103,27 +103,49 @@ class Planner:
             loss = loss + torch.sum(min_dist_sq)
         return loss
 
-    def _compute_loss(self, mean_trace, u_seq, p_all, loss_fn):
-        """Compute the total weighted objective J."""
+    def _compute_loss(self, mean_trace, u_seq, robustness):
+        """Total weighted objective J.
+
+        `robustness` is the lower stochastic robustness at the evaluation
+        origin. It enters negated rather than through a logarithm: under a
+        positive smoothing scale the score is an approximation that is not
+        confined to [0, 1], so log() has no valid domain here.
+        """
         loss_u = torch.sum(u_seq ** 2)
         u_diff = u_seq[1:] - u_seq[:-1]
         loss_du = torch.sum(u_diff ** 2) + torch.sum(u_seq[0] ** 2)
-        loss_phi = loss_fn(p_all) if loss_fn is not None else -torch.log(p_all + 1e-4)
+        loss_phi = -robustness
 
-        return (
+        J = (
             self.cfg["w_u"]     * loss_u
             + self.cfg["w_du"]  * loss_du
             + self.cfg["w_phi"] * loss_phi
-            + self.cfg["w_dist"] * self._goal_dist_loss(mean_trace)
-            + self.cfg["w_obs"]  * self._obs_repulsion_loss(mean_trace)
-            + self.cfg["w_visit"] * self._visit_loss(mean_trace)
         )
+
+        # The environment-shaping heuristics are optional. Skipping them at zero
+        # weight keeps the objective the specification plus control
+        # regularisation, and lets a case run without an Environment at all.
+        shaping = (
+            ("w_dist", self._goal_dist_loss),
+            ("w_obs", self._obs_repulsion_loss),
+            ("w_visit", self._visit_loss),
+        )
+        for key, term in shaping:
+            weight = self.cfg[key]
+            if weight:
+                J = J + weight * term(mean_trace)
+        return J
 
     def _optimize_window(
         self, x0_mean, x0_cov, *, env=None, verbose=True,
-        spec=None, init_guess=None, loss_fn=None,
+        spec=None, init_guess=None,
     ):
         """Run gradient-descent optimisation for one planning window.
+
+        Returns the best iterate: controls, predicted mean/covariance, its lower
+        stochastic robustness and the objective history. Controls, predictions
+        and score all come from the same candidate, so a smaller total loss
+        alone never selects an iterate.
 
         Parameters
         ----------
@@ -137,9 +159,10 @@ class Planner:
         v_params = self._init_controls(init_guess)
         optimizer = optim.Adam([v_params], lr=self.cfg["lr"])
         phi = spec if spec is not None else self.env.get_specification(self.T)
+        scale = self.cfg["scale"]
 
-        best_u, best_mean, best_cov = None, None, None
-        best_p = -float("inf")
+        best = None  # (robustness, u, mean, cov, objective) of one iterate
+        best_r = -float("inf")
         history = []
         prev_loss = float("inf")
         converged_iters = 0
@@ -159,26 +182,33 @@ class Planner:
             ]
             traj = BeliefTrajectory(beliefs)
 
-            stl_trace = phi(traj)
-            p_all = stl_trace[0, 0, 0]
+            stl_trace = phi(traj, scale=scale)
+            robustness = stl_trace[0, 0, 0]
 
-            J = self._compute_loss(mean_trace, u_seq, p_all, loss_fn)
+            J = self._compute_loss(mean_trace, u_seq, robustness)
             J.backward()
             optimizer.step()
 
-            current_p = p_all.item()
+            # Snapshot before the step is applied, so every recorded quantity
+            # belongs to the candidate that was actually scored.
+            current_r = robustness.item()
             history.append(J.item())
 
-            if current_p > best_p:
-                best_p = current_p
-                best_u = u_seq.detach().clone()
-                best_mean = mean_trace.detach().clone()
-                best_cov = cov_trace.detach().clone()
+            if current_r > best_r:
+                best_r = current_r
+                best = (
+                    u_seq.detach().clone(),
+                    mean_trace.detach().clone(),
+                    cov_trace.detach().clone(),
+                    J.item(),
+                )
 
-            if loss_fn is None and current_p >= self.cfg["alpha"]:
+            if current_r >= self.cfg["alpha"]:
                 converged_iters += 1
                 if converged_iters >= self.cfg["converge_patience"]:
-                    log_utils._log.info(f"Converged at iter {k}. P(Sat): {current_p:.4f}")
+                    log_utils._log.info(
+                        f"Converged at iter {k}. Lower robustness: {current_r:.4f}"
+                    )
                     break
             else:
                 converged_iters = 0
@@ -192,13 +222,14 @@ class Planner:
             if verbose and k % 50 == 0:
                 log_utils._log.info(
                     f"Iter {k:03d} | Loss: {J.item():.4f} | "
-                    f"P(Sat): {current_p:.4f} | Best: {best_p:.4f}"
+                    f"Lower robustness: {current_r:.4f} | Best: {best_r:.4f}"
                 )
 
         if env is not None:
             self.env = saved_env
 
-        return best_mean, best_cov, best_u, best_p, history
+        best_u, best_mean, best_cov, self.best_objective = best
+        return best_mean, best_cov, best_u, best_r, history
 
     def _step_with_noise(self, curr_mean, curr_cov, u):
         pred_mean, next_cov = self.dyn.step(curr_mean, curr_cov, u)

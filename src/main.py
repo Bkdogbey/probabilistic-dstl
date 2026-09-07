@@ -1,95 +1,66 @@
-import numpy as np
+"""Entry point for the pdSTL example cases.
 
-from models.dynamics import linear_system, piecewise_signal, sinusoidial_input
-from pdstl.operators import Always, GreaterThan
-from planning.runners import (
-    run_lane_change,
-    run_lane_change_aggressive,
-    run_mpc,
-    run_single_shot,
-)
-from utils import create_belief_trajectory, load_config, skip_run, to_steps
-from visualization.robustness import plot_piecewise_stl, plot_stl_formula_bounds
+    python src/main.py --all                # the five cases, non-interactive
+    python src/main.py --case corridor      # one case
+    python src/main.py --case mpc           # MPC consistency check
+    python src/main.py --list               # show the available cases
 
-_demos = load_config("configs/stl_demos.yaml")
+Plots are written to outputs/. Nothing here starts the lane-change or other
+planning scenarios; those live in planning/runners.py and are invoked
+explicitly.
+"""
 
-# =============================================================================
-# EXAMPLE 1: Always Operator
-# =============================================================================
+import argparse
+import sys
 
-with skip_run("skip", "Example 1: Always") as check, check():
-    d = _demos["example1"]
-    t = np.linspace(0, d["t_end"], d["n_steps"])
-    mean, var = linear_system(
-        a=d["a"], b=d["b"], g=d["g"], q=d["q"],
-        mu=d["mu"], P=d["P"], t=t, control_func=sinusoidial_input,
+import matplotlib
+
+from planning.examples import CASES, OUTPUT_DIR, run_all, run_case, run_mpc_check
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--all", action="store_true", help="run the five cases")
+    group.add_argument(
+        "--case",
+        metavar="NAME",
+        help=f"run one of: {', '.join(sorted(CASES))}, mpc",
     )
+    group.add_argument("--list", action="store_true", help="list available cases")
+    parser.add_argument("--show", action="store_true", help="display plots")
+    parser.add_argument("--no-save", action="store_true", help="do not write plots")
+    return parser
 
-    beliefs = create_belief_trajectory(mean, var)
-    interval_steps = to_steps(d["interval_sec"], t)
 
-    phi = GreaterThan(d["threshold"])
-    spec = Always(phi, interval=interval_steps)
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
-    pred_trace = phi(beliefs)
-    oper_trace = spec(beliefs)
+    if args.list:
+        for name in sorted(CASES):
+            print(name)
+        print("mpc")
+        return 0
 
-    plot_stl_formula_bounds(
-        t, oper_trace,
-        mean_trace=mean, var_trace=var, predicate_trace=pred_trace,
-        thresholds=d["threshold"],
-        formula_str=f"□[{d['interval_sec'][0]}, {d['interval_sec'][1]}](x ≥ {d['threshold']})",
-        interval=interval_steps, operator_type="always",
-    )
+    if not args.show:
+        matplotlib.use("Agg")  # non-interactive runs need no display
 
-# =============================================================================
-# EXAMPLE 2: Discrete Piecewise Signal
-# =============================================================================
+    save = not args.no_save
 
-with skip_run("skip", "Example 2: Piecewise") as check, check():
-    d = _demos["example2"]
-    t, mean, var = piecewise_signal()
+    if args.all:
+        run_all(show=args.show, save=save)
+    elif args.case == "mpc":
+        run_mpc_check()
+    elif args.case in CASES:
+        run_case(args.case, show=args.show, save=save)
+    else:
+        print(f"unknown case {args.case!r}; try --list", file=sys.stderr)
+        return 2
 
-    beliefs = create_belief_trajectory(mean, var)
+    if save:
+        print(f"\nPlots written to {OUTPUT_DIR}/")
+    return 0
 
-    phi = GreaterThan(d["threshold"])
-    spec_always = Always(phi, interval=d["interval_steps"])
 
-    pred_trace = phi(beliefs)
-    always_trace = spec_always(beliefs)
-
-    plot_piecewise_stl(
-        t, always_trace,
-        mean_trace=mean, var_trace=var, predicate_trace=pred_trace,
-        thresholds=d["threshold"],
-        formula_str=f"□[{d['interval_steps'][0]}, {d['interval_steps'][1]}](x ≥ {d['threshold']})",
-        interval=d["interval_steps"], operator_type="always",
-    )
-
-# =============================================================================
-# EXAMPLE 3: Single Shot Motion Planning
-# =============================================================================
-
-with skip_run("skip", "Example 3: Single Shot Motion Planning") as check, check():
-    run_single_shot(max_iterations=500, force_run=True)
-
-# =============================================================================
-# EXAMPLE 4: MPC Receding Horizon Motion Planning
-# =============================================================================
-
-with skip_run("skip", "Example 4: MPC Receding Horizon") as check, check():
-    run_mpc()
-
-# =============================================================================
-# EXAMPLE 5: Lane Change with Moving Obstacle
-# =============================================================================
-
-with skip_run("run", "Example 5: Lane Change") as check, check():
-    run_lane_change()
-
-# =============================================================================
-# EXAMPLE 6: Aggressive Lane Change
-# =============================================================================
-
-with skip_run("run", "Example 6: Aggressive Lane Change") as check, check():
-    run_lane_change_aggressive()
+if __name__ == "__main__":
+    raise SystemExit(main())
