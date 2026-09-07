@@ -106,9 +106,7 @@ def to_steps(interval_sec, t):
     return [a, b]
 
 
-def create_belief_trajectory(
-    mean_trace, var_trace, confidence_level=1.0, dtype=None, device=None
-):
+def create_belief_trajectory(mean_trace, var_trace, dtype=None, device=None):
     """Wrap mean/variance arrays into a BeliefTrajectory of GaussianBeliefs.
 
     Each element holds the belief at one prediction step, shaped [batch, dim]
@@ -118,8 +116,6 @@ def create_belief_trajectory(
     ----------
     mean_trace : array-like, shape (T,)
     var_trace  : array-like, shape (T,)
-    confidence_level : float
-        Mean-ambiguity radius in standard deviations; see GaussianBelief.
     dtype : torch.dtype, optional
         Defaults to torch.float32.
     device : torch.device, optional
@@ -138,7 +134,6 @@ def create_belief_trajectory(
     mean = torch.as_tensor(mean_trace, dtype=dtype, device=device).reshape(1, -1, 1)
     var = torch.as_tensor(var_trace, dtype=dtype, device=device).reshape(1, -1, 1)
     beliefs = [
-        GaussianBelief(mean[:, i, :], var[:, i, :], confidence_level=confidence_level)
-        for i in range(len(mean_trace))
+        GaussianBelief(mean[:, i, :], var[:, i, :]) for i in range(len(mean_trace))
     ]
     return BeliefTrajectory(beliefs)

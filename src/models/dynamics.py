@@ -94,64 +94,40 @@ class GaussianBelief(Belief):
     mean : [B, D]
     var  : [B, D] per-component variances, or [B, D, D] covariance.
 
-    What the returned interval means
-    -------------------------------
-    For the projected component s = x[dim] ~ N(m, v) and the event {s >= c},
-    write z = (m - c) / sqrt(v). With k = confidence_level this returns
-
-        lower = Phi(z - k)      upper = Phi(z + k)      (exact would be Phi(z))
-
-    which is exactly the range of the event probability as the mean varies over
-    |m' - m| <= k * sqrt(v) with the variance held fixed -- an ambiguity set of
-    means, k standard deviations wide. It is NOT a confidence interval and NOT
-    uncertainty about the variance, so a state range of mean +/- k*sigma does
-    not on its own justify it: the ambiguity set is the modelling assumption
-    being asserted here.
-
-    k = 0 collapses this to the exact probability as a singleton interval.
+    A known mean and covariance determines an affine event probability exactly,
+    so the bounds come back as [p, p].
     """
 
-    def __init__(self, mean, var, confidence_level=2.0):
+    def __init__(self, mean, var):
         self.mean = mean
         self.var = var
-        self.confidence_level = confidence_level
 
     def value(self):
         """Return mean (representative state), [B, D]"""
         return self.mean
 
-    def lower_bound(self):
-        """Conservative lower bound: μ - k*σ"""
-        std = torch.sqrt(self.var)
-        return self.mean - self.confidence_level * std
+    def _project(self, predicate):
+        """Mean and variance of the scalar w·x named by the predicate, each [B]."""
+        full_cov = self.var.ndim == self.mean.ndim + 1  # [B, D, D] vs [B, D]
+        w = getattr(predicate, "weights", None)
 
-    def upper_bound(self):
-        """Conservative upper bound: μ + k*σ"""
-        std = torch.sqrt(self.var)
-        return self.mean + self.confidence_level * std
+        if w is None:  # axis-aligned event, w = e_dim
+            i = predicate.dim
+            m = self.mean[..., i]
+            v = self.var[..., i, i] if full_cov else self.var[..., i]
+        else:
+            w = torch.as_tensor(w, dtype=self.mean.dtype, device=self.mean.device)
+            m = (self.mean * w).sum(-1)
+            if full_cov:
+                v = torch.einsum("...i,...ij,...j->...", w, self.var, w)  # wᵀΣw
+            else:
+                # A per-component variance carries no cross terms; that
+                # representation is itself the independence assumption.
+                v = (self.var * w**2).sum(-1)
 
-    def probability_of(self, residual):
-        """Probability that residual >= 0, for a residual scaled by this belief's σ.
-
-        Gaussian-specific helper. Not part of the Belief contract: predicates go
-        through probability_bounds(), which states the event explicitly instead
-        of relying on the caller to build a residual with the right convention.
-        """
-        std = torch.sqrt(self.var)
-        z = residual / (std)
-        return normal_cdf(z)
-
-    def _project(self, dim):
-        """Mean and variance of the scalar component x[dim], each [B]."""
-        m = self.mean[..., dim]
-        if self.var.ndim == self.mean.ndim + 1:  # [B, D, D] covariance
-            v = self.var[..., dim, dim]
-        else:  # [B, D] per-component variances
-            v = self.var[..., dim]
         if v.shape != m.shape:
-            # [B, D] and [D, D] are indistinguishable by rank alone when B == D,
-            # so catch the disagreement here rather than letting it broadcast
-            # into a zero variance and a non-finite probability.
+            # [B, D] and [D, D] have the same rank when B == D, so catch the
+            # disagreement here instead of letting it broadcast.
             raise ValueError(
                 f"GaussianBelief: mean {tuple(self.mean.shape)} and var "
                 f"{tuple(self.var.shape)} disagree; expected mean [B, D] with var "
@@ -160,26 +136,33 @@ class GaussianBelief(Belief):
         return m, v
 
     def probability_bounds(self, predicate):
-        """Lower/upper probability of the predicate's event, [B, 2]."""
+        """Exact probability of the predicate's event as [p, p], shape [B, 2]."""
         sense = getattr(predicate, "sense", None)
         if sense not in (">=", "<="):
             raise ValueError(
                 f"GaussianBelief evaluates comparison predicates (sense '>=' or "
-                f"'<='); it cannot evaluate {predicate!r}."
+                f"'<='); it cannot evaluate {predicate}."
             )
 
-        m, v = self._project(predicate.dim)
-        std = torch.sqrt(v)
-        # Keep the threshold on the belief's own dtype/device so gradients,
-        # precision and placement all follow the incoming tensors.
+        m, v = self._project(predicate)
+        if bool((v < 0).any()):
+            raise ValueError(
+                "GaussianBelief: negative projected variance; the covariance is "
+                "not positive semi-definite."
+            )
+
+        # Keep the threshold on the belief's own dtype/device so precision,
+        # placement and autograd all follow the incoming tensors.
         c = torch.as_tensor(predicate.threshold, dtype=m.dtype, device=m.device)
-        k = self.confidence_level
+        margin = (m - c) if sense == ">=" else (c - m)
 
-        if sense == ">=":
-            lower = normal_cdf(((m - k * std) - c) / std)
-            upper = normal_cdf(((m + k * std) - c) / std)
-        else:
-            lower = normal_cdf((c - (m + k * std)) / std)
-            upper = normal_cdf((c - (m - k * std)) / std)
-
-        return torch.stack([lower, upper], dim=-1)  # [B, 2]
+        # Zero variance is a deterministic, inclusive comparison. Evaluate the
+        # CDF on a safe variance so the unused branch cannot send NaN backward.
+        positive = v > 0
+        v_safe = torch.where(positive, v, torch.ones_like(v))
+        p = torch.where(
+            positive,
+            normal_cdf(margin / torch.sqrt(v_safe)),
+            (margin >= 0).to(m.dtype),
+        )
+        return torch.stack([p, p], dim=-1)  # [B, 2]

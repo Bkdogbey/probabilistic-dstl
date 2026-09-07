@@ -14,16 +14,22 @@ class STL_Formula(torch.nn.Module):
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         """
-        Compute robustness trace for belief trajectory.
+        Compute the probability-bound trace for a belief trajectory.
 
         Args:
            belief_trajectory: BeliefTrajectory object
-           scale: smoothing parameter (scale > 0 for smooth, <= 0 for exact)
+           scale: smoothing parameter (scale > 0 for smooth, <= 0 for direct).
+              Smooth outputs are approximations and may leave [0,1] or cross;
+              evaluate directly for reported intervals.
            keepdim: keep dimensions
 
         Returns:
-           [B,T,2] probability bounds on robustness trace where
-           [..., 0] is lower bound and [..., 1] is upper bound
+           [B,N,2] where [..., 0] is the lower and [..., 1] the upper bound.
+
+        Traces are indexed from origin 0 and contain only origins whose window
+        is complete, so N shrinks by an operator's lookahead: N = T for an atom,
+        T - b for a bounded [a,b] temporal operator, and the shortest child's
+        length for a Boolean operator.
         """
         raise NotImplementedError("robustness_trace not yet implemented")
 
@@ -115,38 +121,58 @@ class Predicate(STL_Formula):
         return self.name if self.name is not None else type(self).__name__
 
 
+def _event_name(sense, threshold, dim, weights):
+    lhs = f"x[{dim}]" if weights is None else f"{list(weights)}·x"
+    return f"{lhs} {sense} {threshold}"
+
+
 class GreaterThan(Predicate):
     """
-    Predicate: x[dim] >= threshold
+    Predicate: x[dim] >= threshold, or weights·x >= threshold if weights given.
 
-    The interval returned per step is whatever the belief's uncertainty model
-    yields for this event; it is not constructed here. Equal endpoints mean an
-    exactly known probability.
+    The belief evaluates the event; nothing is constructed here.
     """
 
-    def __init__(self, threshold, dim=0, name=None):
-        super().__init__(name=name if name is not None else f"x[{dim}] >= {threshold}")
+    def __init__(self, threshold, dim=0, weights=None, name=None):
+        if name is None:
+            name = _event_name(">=", threshold, dim, weights)
+        super().__init__(name=name)
         self.threshold = threshold
         self.dim = dim
+        self.weights = weights
         self.sense = ">="
 
 
 class LessThan(Predicate):
     """
-    Predicate: x[dim] <= threshold
+    Predicate: x[dim] <= threshold, or weights·x <= threshold if weights given.
     """
 
-    def __init__(self, threshold, dim=0, name=None):
-        super().__init__(name=name if name is not None else f"x[{dim}] <= {threshold}")
+    def __init__(self, threshold, dim=0, weights=None, name=None):
+        if name is None:
+            name = _event_name("<=", threshold, dim, weights)
+        super().__init__(name=name)
         self.threshold = threshold
         self.dim = dim
+        self.weights = weights
         self.sense = "<="
+
+
+def _align(*traces):
+    """Truncate origin-aligned traces to their common number of valid origins."""
+    n = min(t.shape[1] for t in traces)
+    return tuple(t[:, :n] for t in traces)
+
+
+def _reduce(op, terms, scale):
+    """Endpointwise Minish/Maxish over `terms`, honouring the scale convention."""
+    return op(torch.stack(terms, dim=-1), scale, dim=-1, keepdim=False)
 
 
 class Negation(STL_Formula):
     """
     Negation: ¬ϕ
-    For StoRI: Swaps and complements bounds
+    [L, U] -> [1 - U, 1 - L]
     """
 
     def __init__(self, subformula):
@@ -170,8 +196,8 @@ class Negation(STL_Formula):
 class And(STL_Formula):
     """
     Conjunction: ϕ₁ ∧ ϕ₂
-    Uses Frechet bounds element-wise:
-      lower = max(l1 + l2 - 1, 0)
+    Fréchet bounds element-wise:
+      lower = max(0, l1 + l2 - 1)
       upper = min(u1, u2)
     """
 
@@ -179,6 +205,8 @@ class And(STL_Formula):
         super(And, self).__init__()
         self.subformula1 = subformula1
         self.subformula2 = subformula2
+        self.min_op = Minish()
+        self.max_op = Maxish()
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         trace1 = self.subformula1(
@@ -187,17 +215,16 @@ class And(STL_Formula):
         trace2 = self.subformula2(
             belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
         )
-        # Both: [B,T,2]
-        l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
-        l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
+        trace1, trace2 = _align(trace1, trace2)
+        l1, u1 = trace1[..., 0], trace1[..., 1]
+        l2, u2 = trace2[..., 0], trace2[..., 1]
 
-        # Product lower bound: P(A ∩ B) ≥ P(A)·P(B) under independence.
-        # Valid when sub-formulas constrain independent spatial regions (goal vs obstacles).
-        # Tighter than Fréchet (max(l1+l2-1,0)) and gives better gradients for optimisation.
-        lower = l1 * l2
-        upper = torch.minimum(u1, u2)
-
-        return torch.cat([lower, upper], dim=-1)
+        # P(A ∩ B) ≥ max(0, P(A) + P(B) - 1) holds for any dependence. The
+        # product bound would need independence, which sub-formulas over a
+        # shared state do not have.
+        lower = _reduce(self.max_op, [l1 + l2 - 1.0, torch.zeros_like(l1)], scale)
+        upper = _reduce(self.min_op, [u1, u2], scale)
+        return torch.stack([lower, upper], dim=-1)
 
     def __str__(self):
         return f"({self.subformula1}) ∧ ({self.subformula2})"
@@ -215,6 +242,8 @@ class Or(STL_Formula):
         super(Or, self).__init__()
         self.subformula1 = subformula1
         self.subformula2 = subformula2
+        self.min_op = Minish()
+        self.max_op = Maxish()
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         trace1 = self.subformula1(
@@ -223,14 +252,13 @@ class Or(STL_Formula):
         trace2 = self.subformula2(
             belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
         )
-        # Both: [B,T,2]
-        l1, u1 = trace1[..., 0:1], trace1[..., 1:2]
-        l2, u2 = trace2[..., 0:1], trace2[..., 1:2]
+        trace1, trace2 = _align(trace1, trace2)
+        l1, u1 = trace1[..., 0], trace1[..., 1]
+        l2, u2 = trace2[..., 0], trace2[..., 1]
 
-        lower = torch.maximum(l1, l2)
-        upper = torch.minimum(u1 + u2, torch.ones_like(u1))
-
-        return torch.cat([lower, upper], dim=-1)
+        lower = _reduce(self.max_op, [l1, l2], scale)
+        upper = _reduce(self.min_op, [u1 + u2, torch.ones_like(u1)], scale)
+        return torch.stack([lower, upper], dim=-1)
 
     def __str__(self):
         return f"({self.subformula1}) ∨ ({self.subformula2})"
@@ -268,45 +296,55 @@ class Temporal_Operator(STL_Formula):
         self.interval = interval
         self._interval = [0, np.inf] if self.interval is None else self.interval
 
-        # RNN memory length in time
-        if not self.interval:
+        a, b = self._interval
+        self._unbounded = np.isinf(b)
+        # An unbounded interval starting at 0 is the same window as no interval
+        # at all: everything from the origin to the end of the available trace.
+        self._suffix = self.interval is None or (self._unbounded and int(a) == 0)
+
+        if self._suffix:
             self.rnn_dim = 1
+        elif self._unbounded:
+            self.rnn_dim = int(a)
         else:
-            # approximate memory length; for bounded interval use window length
-            a, b = self._interval
-            if np.isinf(b):
-                self.rnn_dim = int(max(1, a))
-            else:
-                self.rnn_dim = int(b + 1)
+            self.rnn_dim = int(b) + 1
 
         # Operation set by subclass (Minish or Maxish)
         self.operation = None
 
-        # Shift matrices (for sliding window)
-        self.M = (
-            torch.tensor(np.diag(np.ones(self.rnn_dim - 1), k=1))
-            .requires_grad_(False)
-            .float()
+        # Shift register: M drops the oldest slot, b writes the newest one.
+        self.register_buffer(
+            "M", torch.tensor(np.diag(np.ones(self.rnn_dim - 1), k=1)).float()
         )
-        self.b = torch.zeros(self.rnn_dim).unsqueeze(-1).requires_grad_(False).float()
-        self.b[-1] = 1.0
+        b_vec = torch.zeros(self.rnn_dim, 1)
+        b_vec[-1] = 1.0
+        self.register_buffer("b", b_vec)
+
+    @property
+    def lookahead(self):
+        """Steps of future beyond the origin that one evaluation needs.
+
+        A suffix window needs none: it covers whatever trace remains.
+        """
+        a, b = self._interval
+        if self._suffix:
+            return 0
+        return int(a) if self._unbounded else int(b)
 
     def _initialize_rnn_cell(self, x):
         """
         Initialize hidden state.
-        x: [B,T,2]
-        Returns: h0 with same shape structure
-        """
-        if x.is_cuda:
-            self.M = self.M.cuda()
-            self.b = self.b.cuda()
+        x: [B,T,2] reversed trace
+        Returns: (h0, count)
 
-        # Padding with first value - automatically handles bounds dimension
+        The register is pre-filled with the first reversed value. Every output
+        it reaches is dropped by robustness_trace, so the fill never appears in
+        a returned trace.
+        """
         h0 = x[:, :1, :].expand(-1, self.rnn_dim, -1).clone()  # [B,rnn_dim,2]
         count = 0.0
 
-        # Special case for [a, inf)
-        if (self._interval[1] == np.inf) and (self._interval[0] > 0):
+        if self._unbounded and not self._suffix:  # [a, inf), a > 0
             d0 = x[:, :1, :]
             return ((d0, h0), count)
 
@@ -320,18 +358,22 @@ class Temporal_Operator(STL_Formula):
         """
         batch, rnn_dim, bounds = h0.shape
 
+        # Runtime state follows the input, not the buffer's stored dtype/device.
+        M = self.M.to(dtype=h0.dtype, device=h0.device)
+        b = self.b.to(dtype=h0.dtype, device=h0.device)
+
         # Treat (batch, bounds) as batch dimension for matmul
         h0_reshaped = h0.permute(0, 2, 1)  # [B,2,rnn_dim]
 
         h0_flat = h0_reshaped.reshape(-1, rnn_dim)  # [B*2,rnn_dim]
 
         # Shift
-        shifted_flat = torch.matmul(h0_flat, self.M.t())  # [B*2,rnn_dim]
+        shifted_flat = torch.matmul(h0_flat, M.t())  # [B*2,rnn_dim]
         shifted = shifted_flat.reshape(batch, bounds, rnn_dim)
         shifted = shifted.permute(0, 2, 1)  # [B,rnn_dim,2]
 
         # Add new value into last position
-        b_broadcast = self.b.view(1, -1, 1)  # [1,rnn_dim,1]
+        b_broadcast = b.view(1, -1, 1)  # [1,rnn_dim,1]
         x_broadcast = x.squeeze(1).unsqueeze(1)  # [B,1,2]
 
         return shifted + b_broadcast * x_broadcast
@@ -356,10 +398,17 @@ class Temporal_Operator(STL_Formula):
         trace = self.subformula(
             belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
         )
-        # FORWARD-LOOKING
-        trace_reversed = torch.flip(trace, dims=[1])
-        output_reversed = self._run_cell(trace_reversed, scale=scale)
-        return torch.flip(output_reversed, dims=[1])
+        n_valid = trace.shape[1] - self.lookahead
+        if n_valid <= 0:
+            raise ValueError(
+                f"{self}: one evaluation origin needs {self.lookahead + 1} steps, "
+                f"child trace has {trace.shape[1]}"
+            )
+
+        # Evaluate backwards so each origin sees its own future, then drop the
+        # origins whose window runs past the end of the trace.
+        output_reversed = self._run_cell(torch.flip(trace, dims=[1]), scale=scale)
+        return torch.flip(output_reversed[:, self.lookahead :], dims=[1])
 
 
 class Always(Temporal_Operator):
@@ -382,25 +431,27 @@ class Always(Temporal_Operator):
         if self.operation is None:
             raise Exception("Operation not initialized")
 
-        # CASE 1: Global Always (no interval)
-        if self.interval is None:
+        # CASE 1: suffix window [t, end of trace]
+        if self._suffix:
             # h0: [B,rnn_dim,2], x: [B,1,2]
             input_ = torch.cat([h0, x], dim=1)  # [B,rnn_dim+1,2]
             output = self.operation(input_, scale, dim=1, keepdim=True)  # [B,1,2]
             state = (output, None)
 
-        # CASE 2: Unbounded future [a, inf)
-        elif (self._interval[1] == np.inf) and (self._interval[0] > 0):
+        # CASE 2: unbounded future [a, inf), a > 0
+        elif self._unbounded:
             d0, h0 = h0  # unpack tuple state
             dh = torch.cat([d0, h0[:, :1, :]], dim=1)  # [B,2,2]
             output = self.operation(dh, scale, dim=1, keepdim=True)
             new_h0 = self._apply_shift(h0, x)
             state = ((output, new_h0), None)
 
-        # CASE 3: Bounded interval [a,b]
+        # CASE 3: bounded interval [a,b]
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
+            # Slot rnn_dim-1-k holds the value k steps ahead, so offsets a..b
+            # are the leading b-a+1 slots.
             window = new_h0[:, : b - a + 1, :]
             output = self.operation(window, scale, dim=1, keepdim=True)
             state = (new_h0, None)
@@ -434,21 +485,21 @@ class Eventually(Temporal_Operator):
         if self.operation is None:
             raise Exception("Operation not initialized")
 
-        # Case 1: Global Eventually
-        if self.interval is None:
+        # Case 1: suffix window [t, end of trace]
+        if self._suffix:
             input_ = torch.cat([h0, x], dim=1)
             output = self.operation(input_, scale, dim=1, keepdim=True)
             state = (output, None)
 
-        # Case 2: Unbounded future [a, inf)
-        elif (self._interval[1] == np.inf) and (self._interval[0] > 0):
+        # Case 2: unbounded future [a, inf), a > 0
+        elif self._unbounded:
             d0, h0 = h0
             dh = torch.cat([d0, h0[:, :1, :]], dim=1)
             output = self.operation(dh, scale, dim=1, keepdim=True)
             new_h0 = self._apply_shift(h0, x)
             state = ((output, new_h0), None)
 
-        # Case 3: Bounded interval [a,b]
+        # Case 3: bounded interval [a,b]
         else:
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
@@ -467,6 +518,10 @@ class Eventually(Temporal_Operator):
 class Until(STL_Formula):
     """
     ϕ U_I ψ : Until operator
+
+    Inclusive convention: ϕ must hold from the evaluation origin through the
+    witness time τ itself, not merely up to τ-1, so U_[0,0] combines both
+    operands at the current time.
     """
 
     def __init__(self, left, right, interval=None):
@@ -479,64 +534,55 @@ class Until(STL_Formula):
         self.min_op = Minish()
         self.max_op = Maxish()
 
+    @property
+    def lookahead(self):
+        """Steps of future beyond the origin that one evaluation needs."""
+        a, b = self._interval
+        return int(a) if np.isinf(b) else int(b)
+
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         # ϕ and ψ traces: [B,T,2]
         phi = self.left(belief_trajectory, scale=scale, keepdim=True, **kwargs)
         psi = self.right(belief_trajectory, scale=scale, keepdim=True, **kwargs)
+        phi, psi = _align(phi, psi)
 
-        B, T, _ = phi.shape
-        a, b = self._interval
-        a = int(a)
-        if np.isinf(b):
-            b = T - 1
-        else:
-            b = int(b)
+        T = phi.shape[1]
+        a = int(self._interval[0])
+        b = T - 1 if np.isinf(self._interval[1]) else int(self._interval[1])
 
-        device = phi.device
-        dtype = phi.dtype
+        n_valid = T - self.lookahead
+        if n_valid <= 0:
+            raise ValueError(
+                f"{self}: one evaluation origin needs {self.lookahead + 1} steps, "
+                f"child traces have {T}"
+            )
 
-        results = []  # list of [B,2], one per t
-
-        for t in range(T):
-            start = t + a
-            end = min(t + b, T - 1)
-
-            # If the interval is empty for this t, probability of satisfaction is 0
-            if start > end:
-                results.append(torch.zeros(B, 2, device=device, dtype=dtype))
-                continue
-
-            tau_vals = []  # candidate values for each τ
-
-            for tau in range(start, end + 1):
-                # min_{k ∈ [t, τ)} ϕ(k)
-                if tau == t:
-                    # Empty prefix: ϕ vacuously holds with probability 1
-                    min_phi = torch.ones_like(phi[:, 0, :])  # [B,2]
-                else:
-                    phi_segment = phi[:, t:tau, :]  # [B,τ-t,2]
-                    # min over time dim=1
-                    min_phi = self.min_op(
-                        phi_segment, scale, dim=1, keepdim=False
-                    )  # [B,2]
-
-                # ψ(τ)
+        results = []  # list of [B,2], one per origin
+        for t in range(n_valid):
+            candidates = []
+            for tau in range(t + a, min(t + b, T - 1) + 1):
+                # Inclusive convention: ϕ must hold from the origin t through
+                # the witness τ itself, so the prefix slice ends at τ+1.
+                prefix = self.min_op(
+                    phi[:, t : tau + 1, :], scale, dim=1, keepdim=False
+                )  # [B,2]
                 psi_tau = psi[:, tau, :]  # [B,2]
 
-                # min(ψ(τ), min_prefix_ϕ)
-                pair = torch.stack([min_phi, psi_tau], dim=1)  # [B,2,2]
-                val_tau = self.min_op(pair, scale, dim=1, keepdim=False)  # [B,2]
+                lower = _reduce(
+                    self.max_op,
+                    [prefix[..., 0] + psi_tau[..., 0] - 1.0, torch.zeros_like(prefix[..., 0])],
+                    scale,
+                )
+                upper = _reduce(self.min_op, [prefix[..., 1], psi_tau[..., 1]], scale)
+                candidates.append(torch.stack([lower, upper], dim=-1))  # [B,2]
 
-                tau_vals.append(val_tau.unsqueeze(1))  # [B,1,2]
-
-            # max over τ ∈ [t+a, t+b]
-            tau_tensor = torch.cat(tau_vals, dim=1)  # [B,τ_count,2]
-            best = self.max_op(tau_tensor, scale, dim=1, keepdim=False)  # [B,2]
-
+            # best witness in [t+a, t+b]
+            best = self.max_op(
+                torch.stack(candidates, dim=1), scale, dim=1, keepdim=False
+            )  # [B,2]
             results.append(best)
 
-        out = torch.stack(results, dim=1)  # [B,T,2]
-        return out
+        return torch.stack(results, dim=1)  # [B,n_valid,2]
 
     def __str__(self):
         return f"({self.left}) U_{self._interval} ({self.right})"

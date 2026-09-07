@@ -26,8 +26,9 @@ class TorchGaussianBelief(Belief):
 
     def probability_bounds(self, predicate):
         """Exact probability of the predicate's event, [Batch, 2], lower == upper."""
-        belief = GaussianBelief(self.mean_full, self.var_full, confidence_level=0.0)
-        return belief.probability_bounds(predicate)
+        return GaussianBelief(self.mean_full, self.var_full).probability_bounds(
+            predicate
+        )
 
 
 class Planner:
