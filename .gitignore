@@ -114,5 +114,10 @@ ENV/
 # Data folder
 data/*
 
+# Generated run outputs (plots from src/main.py)
+outputs/
 
-
+# Cached optimizer results; regenerable by re-running the scenario.
+# Untracked so a stale cache cannot arrive with a fresh checkout and be
+# loaded by planning.runners._load_or_solve as if it were a new result.
+saved_data/
