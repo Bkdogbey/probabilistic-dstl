@@ -1,4 +1,4 @@
-"""Offline examples pass supplied probability bounds straight through pdSTL."""
+"""Offline examples drive pdSTL from an upstream scalar state model."""
 
 import ast
 import os
@@ -11,12 +11,13 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pytest
-import torch
+from scipy.special import ndtr
 import yaml
 
 import models.dynamics
-from pdstl.base import create_probability_belief_trajectory
+from models.dynamics import create_gaussian_belief_trajectory, piecewise_signal
 from pdstl.operators import Always, Eventually, GreaterThan
 from utils import to_steps
 from visualization.temporal import plot_temporal_example
@@ -24,165 +25,172 @@ from visualization.temporal import plot_temporal_example
 
 ROOT = Path(__file__).resolve().parents[1]
 
+EXAMPLES = ("always", "eventually", "nested", "piecewise")
+
 
 def _config():
     return yaml.safe_load((ROOT / "configs/examples.yaml").read_text())
 
 
-def _beliefs(config):
-    """Build the example trajectory exactly as main.py does."""
-    predicate = GreaterThan(config["threshold"])
-    beliefs = create_probability_belief_trajectory(
-        predicate, config["probability_bounds"]
-    )
-    return predicate, beliefs
-
-
-def _expected(rows, dtype):
-    return torch.tensor(rows, dtype=dtype)
-
-
-# ---------------------------------------------------------------------------
-# The atomic trace is exactly what the configuration supplied
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("name", ["always", "eventually", "nested"])
-def test_atomic_trace_equals_the_configured_probability_bounds(name):
+def _example(name):
+    """Build one example's state trace, predicate, and beliefs as main.py does."""
     config = _config()[name]
-    predicate, beliefs = _beliefs(config)
+    time, mean, variance = piecewise_signal(config["values"])
+    predicate = GreaterThan(config["threshold"])
+    beliefs = create_gaussian_belief_trajectory(
+        mean, variance, sigma_multiplier=config["sigma_multiplier"]
+    )
+    return config, (time, mean, variance), predicate, beliefs
+
+
+def _expected_atomic(config, mean, variance):
+    """The sigma-displaced Gaussian CDF the belief is supposed to produce."""
+    sigma = np.sqrt(variance)
+    displacement = config["sigma_multiplier"] * sigma
+    threshold = config["threshold"]
+    return np.stack(
+        (
+            ndtr((mean - displacement - threshold) / sigma),
+            ndtr((mean + displacement - threshold) / sigma),
+        ),
+        axis=-1,
+    )
+
+
+def _reduce(trace, interval, reduction):
+    """Endpointwise window reduction at every complete evaluation origin."""
+    a, b = interval
+    return np.array(
+        [
+            reduction(trace[origin + a : origin + b + 1], axis=0)
+            for origin in range(len(trace) - b)
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# The atomic bounds come from the state model, not from the file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", EXAMPLES)
+def test_atomic_bounds_are_derived_from_the_configured_state_model(name):
+    config, (_, mean, variance), predicate, beliefs = _example(name)
 
     atomic = predicate(beliefs)
 
-    expected = _expected(config["probability_bounds"], atomic.dtype)
-    torch.testing.assert_close(atomic[0], expected)
-    assert atomic.shape == (1, len(config["probability_bounds"]), 2)
+    np.testing.assert_allclose(
+        atomic[0].numpy(), _expected_atomic(config, mean, variance), atol=1e-12
+    )
+    assert atomic.shape == (1, len(config["values"]), 2)
+
+
+@pytest.mark.parametrize("name", EXAMPLES)
+def test_every_example_plots_the_state_trace_above_its_bounds(name):
+    config, (_, mean, variance), predicate, beliefs = _example(name)
+    sigma = config["sigma_multiplier"] * np.sqrt(variance)
+
+    if name == "nested":
+        inner = Always(predicate, interval=config["always_interval_steps"])
+        formula = Eventually(inner, interval=config["eventually_interval_steps"])
+        extra = {"inner_label": str(inner), "inner_trace": inner(beliefs, scale=-1)}
+    else:
+        formula = Always(predicate, interval=config["interval_steps"])
+        extra = {}
+
+    figure = plot_temporal_example(
+        str(predicate),
+        predicate(beliefs),
+        str(formula),
+        formula(beliefs, scale=-1),
+        mean=mean,
+        sigma=sigma,
+        threshold=config["threshold"],
+        show=False,
+        **extra,
+    )
+
+    assert len(figure.axes) == (4 if name == "nested" else 3)
+    assert figure.axes[0].get_ylabel() == "state"
+    assert figure.axes[1].get_ylabel() == "probability bounds"
+    assert figure.axes[-1].get_ylabel() == "pdSTL stochastic robustness"
+    figure.canvas.draw()
+    plt.close(figure)
 
 
 # ---------------------------------------------------------------------------
-# Temporal operators over the configured bounds
+# Temporal operators over the derived bounds
 # ---------------------------------------------------------------------------
 
 
 def test_always_applies_the_endpointwise_minimum():
-    config = _config()["always"]
-    predicate, beliefs = _beliefs(config)
-    formula = Always(predicate, interval=config["interval_steps"])
+    config, (_, mean, variance), predicate, beliefs = _example("always")
+    interval = config["interval_steps"]
 
-    atomic = predicate(beliefs)
-    temporal = formula(beliefs, scale=-1)
+    temporal = Always(predicate, interval=interval)(beliefs, scale=-1)
 
-    torch.testing.assert_close(
-        temporal[0],
-        _expected(
-            [
-                [0.70, 0.90],
-                [0.40, 0.75],
-                [0.20, 0.55],
-                [0.20, 0.55],
-                [0.20, 0.55],
-                [0.75, 0.90],
-            ],
-            temporal.dtype,
-        ),
-    )
+    expected = _reduce(_expected_atomic(config, mean, variance), interval, np.min)
+    np.testing.assert_allclose(temporal[0].numpy(), expected, atol=1e-12)
     assert temporal.shape == (1, 6, 2)
-
-    figure = plot_temporal_example(
-        str(predicate), atomic, str(formula), temporal, show=False
+    # The window covering the sub-threshold dip is pinned by its worst step.
+    np.testing.assert_allclose(
+        temporal[0, 2].numpy(), [0.02275013, 0.5], atol=1e-8
     )
-    assert len(figure.axes) == 2
-    figure.canvas.draw()
-    plt.close(figure)
 
 
 def test_eventually_applies_the_endpointwise_maximum():
-    config = _config()["eventually"]
-    predicate, beliefs = _beliefs(config)
-    formula = Eventually(predicate, interval=config["interval_steps"])
+    config, (_, mean, variance), predicate, beliefs = _example("eventually")
+    interval = config["interval_steps"]
 
-    atomic = predicate(beliefs)
-    temporal = formula(beliefs, scale=-1)
+    temporal = Eventually(predicate, interval=interval)(beliefs, scale=-1)
 
-    torch.testing.assert_close(
-        temporal[0],
-        _expected(
-            [
-                [0.20, 0.40],
-                [0.45, 0.70],
-                [0.45, 0.70],
-                [0.80, 0.95],
-                [0.80, 0.95],
-                [0.25, 0.45],
-            ],
-            temporal.dtype,
-        ),
-    )
+    expected = _reduce(_expected_atomic(config, mean, variance), interval, np.max)
+    np.testing.assert_allclose(temporal[0].numpy(), expected, atol=1e-12)
     assert temporal.shape == (1, 6, 2)
-
-    figure = plot_temporal_example(
-        str(predicate), atomic, str(formula), temporal, show=False
+    # The window reaching the above-threshold peak takes that step's bounds.
+    np.testing.assert_allclose(
+        temporal[0, 3].numpy(), [0.84134475, 0.9986501], atol=1e-8
     )
-    assert len(figure.axes) == 2
-    figure.canvas.draw()
-    plt.close(figure)
 
 
 def test_nested_eventually_always_matches_hand_computation():
-    config = _config()["nested"]
-    predicate, beliefs = _beliefs(config)
-    inner = Always(predicate, interval=config["always_interval_steps"])
-    formula = Eventually(inner, interval=config["eventually_interval_steps"])
+    config, (_, mean, variance), predicate, beliefs = _example("nested")
+    always_interval = config["always_interval_steps"]
+    eventually_interval = config["eventually_interval_steps"]
 
-    atomic = predicate(beliefs)
+    inner = Always(predicate, interval=always_interval)
+    formula = Eventually(inner, interval=eventually_interval)
     inner_trace = inner(beliefs, scale=-1)
     temporal = formula(beliefs, scale=-1)
 
-    torch.testing.assert_close(
-        inner_trace[0],
-        _expected(
-            [
-                [0.20, 0.40],
-                [0.70, 0.90],
-                [0.30, 0.50],
-                [0.30, 0.50],
-                [0.60, 0.80],
-            ],
-            inner_trace.dtype,
-        ),
-    )
-    torch.testing.assert_close(
-        temporal[0],
-        _expected(
-            [[0.70, 0.90], [0.70, 0.90], [0.30, 0.50], [0.60, 0.80]],
-            temporal.dtype,
-        ),
-    )
+    atomic = _expected_atomic(config, mean, variance)
+    expected_inner = _reduce(atomic, always_interval, np.min)
+    expected_outer = _reduce(expected_inner, eventually_interval, np.max)
+
+    np.testing.assert_allclose(inner_trace[0].numpy(), expected_inner, atol=1e-12)
+    np.testing.assert_allclose(temporal[0].numpy(), expected_outer, atol=1e-12)
     assert inner_trace.shape == (1, 5, 2)
     assert temporal.shape == (1, 4, 2)
 
-    figure = plot_temporal_example(
-        str(predicate),
-        atomic,
-        str(formula),
-        temporal,
-        inner_label=str(inner),
-        inner_trace=inner_trace,
-        show=False,
-    )
-    assert len(figure.axes) == 3
-    figure.canvas.draw()
-    plt.close(figure)
-
 
 def test_only_complete_temporal_windows_are_returned():
-    config = _config()["always"]
-    predicate, beliefs = _beliefs(config)
-    steps = len(config["probability_bounds"])
+    config, _, predicate, beliefs = _example("always")
+    steps = len(config["values"])
 
     for interval in ([0, 1], [0, 2], [1, 3]):
         temporal = Always(predicate, interval=interval)(beliefs, scale=-1)
         assert temporal.shape == (1, steps - interval[1], 2)
+
+
+def test_state_panel_rejects_a_mean_that_does_not_span_the_atomic_trace():
+    _, _, predicate, beliefs = _example("always")
+    atomic = predicate(beliefs)
+
+    with pytest.raises(ValueError, match="match each other and the atomic trace"):
+        plot_temporal_example(
+            str(predicate), atomic, "label", atomic,
+            mean=np.zeros(3), sigma=np.ones(3), threshold=0.5, show=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -210,25 +218,18 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
 
 def test_examples_configuration_holds_only_numerical_example_data():
     config = _config()
-    assert set(config) == {"show_plots", "always", "eventually", "nested"}
-    assert set(config["always"]) == {
-        "threshold",
-        "interval_steps",
-        "probability_bounds",
-    }
-    assert set(config["eventually"]) == {
-        "threshold",
-        "interval_steps",
-        "probability_bounds",
-    }
-    assert set(config["nested"]) == {
-        "threshold",
+    assert set(config) == {"show_plots", *EXAMPLES}
+
+    shared = {"threshold", "sigma_multiplier", "values"}
+    assert set(config["always"]) == shared | {"interval_steps"}
+    assert set(config["eventually"]) == shared | {"interval_steps"}
+    assert set(config["piecewise"]) == shared | {"interval_steps"}
+    assert set(config["nested"]) == shared | {
         "always_interval_steps",
         "eventually_interval_steps",
-        "probability_bounds",
     }
-    for name in ("always", "eventually", "nested"):
-        assert all(len(pair) == 2 for pair in config[name]["probability_bounds"])
+    for name in EXAMPLES:
+        assert all(len(pair) == 2 for pair in config[name]["values"])
 
 
 def test_offline_module_and_signal_dispatcher_remain_absent():
@@ -260,7 +261,7 @@ def _main_blocks(source):
     return re.findall(r'with skip_run\("(run|skip)", "(\w+)"\)', source)
 
 
-def test_main_is_direct_and_holds_three_literal_skip_run_blocks():
+def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
     source = (ROOT / "src/main.py").read_text()
     tree = ast.parse(source)
 
@@ -268,6 +269,7 @@ def test_main_is_direct_and_holds_three_literal_skip_run_blocks():
         "Always",
         "Eventually",
         "Nested",
+        "Piecewise",
     ]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
@@ -275,7 +277,10 @@ def test_main_is_direct_and_holds_three_literal_skip_run_blocks():
     assert not any(isinstance(node, ast.If) for node in tree.body)
 
 
-@pytest.mark.parametrize("flags", [("run", "run", "run"), ("run", "skip", "run")])
+@pytest.mark.parametrize(
+    "flags",
+    [("run", "run", "run", "run"), ("run", "skip", "run", "skip")],
+)
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
     source = (ROOT / "src/main.py").read_text()
     for (_, name), flag in zip(_main_blocks(source), flags):

@@ -61,6 +61,35 @@ def _plot_interval(ax, trace, title, ylabel):
     ax.grid(alpha=0.25)
 
 
+def _plot_state(ax, mean, sigma, threshold, title):
+    """Draw the upstream mean trace, its uncertainty band, and the threshold."""
+    time = np.arange(len(mean))
+    lower, upper = mean - sigma, mean + sigma
+    ax.fill_between(
+        time, lower, upper, step="post", color=LOWER_COLOR, alpha=0.12,
+        label="uncertainty band",
+    )
+    ax.step(
+        time, lower, where="post", color=LOWER_COLOR, linewidth=1.5, alpha=0.8
+    )
+    ax.step(
+        time, upper, where="post", color=UPPER_COLOR, linewidth=1.5,
+        linestyle="--", alpha=0.8,
+    )
+    ax.step(
+        time, mean, where="post", marker="o", markersize=5, color="black",
+        linewidth=2.0, label="mean",
+    )
+    ax.axhline(
+        threshold, color="tab:red", linewidth=1.4, linestyle=":", label="threshold"
+    )
+    ax.set_title(title)
+    ax.set_ylabel("state")
+    ax.margins(y=0.28)  # headroom so the legend clears the band
+    ax.legend(loc="upper left", fontsize=9, ncol=3)
+    ax.grid(alpha=0.25)
+
+
 def print_temporal_results(title, atomic_trace, temporal_trace, inner_trace=None):
     """Print every endpoint pair of each trace."""
     traces = [(ATOMIC_YLABEL, atomic_trace)]
@@ -83,12 +112,17 @@ def plot_temporal_example(
     temporal_trace,
     inner_label=None,
     inner_trace=None,
+    mean=None,
+    sigma=None,
+    threshold=None,
     show=True,
 ):
-    """Plot supplied probability bounds and the temporal outputs above them.
+    """Plot the probability bounds and the temporal outputs above them.
 
-    Every trace is drawn only at its valid evaluation origins; the panels share
-    one x-axis so shorter temporal traces end early instead of being stretched.
+    When an upstream state model supplied ``mean``/``sigma``, a state panel is
+    drawn on top so the signal driving the bounds is visible. Every trace is
+    drawn only at its valid evaluation origins; the panels share one x-axis so
+    shorter temporal traces end early instead of being stretched.
     """
     atomic = _trace(atomic_trace, "atomic_trace")
     panels = [(f"Atomic probability bounds: {atomic_label}", atomic, ATOMIC_YLABEL)]
@@ -106,13 +140,24 @@ def plot_temporal_example(
         if len(trace) > len(atomic):
             raise ValueError(f"{title} has more origins than the atomic trace")
 
+    has_state = mean is not None
+    if has_state:
+        mean, sigma = _numpy(mean), _numpy(sigma)
+        if mean.shape != sigma.shape or len(mean) != len(atomic):
+            raise ValueError("mean and sigma must match each other and the atomic trace")
+
+    panel_count = len(panels) + has_state
     fig, axes = plt.subplots(
-        len(panels),
+        panel_count,
         1,
-        figsize=(9, 2.7 * len(panels)),
+        figsize=(9, 2.7 * panel_count),
         layout="constrained",
         sharex=True,
     )
+
+    if has_state:
+        _plot_state(axes[0], mean, sigma, threshold, "Upstream state prediction")
+        axes = axes[1:]
 
     for ax, (title, trace, ylabel) in zip(axes, panels):
         _plot_interval(ax, trace, title, ylabel)
