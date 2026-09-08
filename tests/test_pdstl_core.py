@@ -11,6 +11,7 @@ from pdstl.base import (
     BeliefTrajectory,
     OnlineBeliefTrajectory,
     ProbabilityBelief,
+    create_probability_belief_trajectory,
 )
 from pdstl.operators import (
     Always,
@@ -709,3 +710,55 @@ def test_control_to_mean_to_formula_is_differentiable():
     assert u.grad is not None
     assert torch.isfinite(u.grad).all()
     assert u.grad.abs().sum() > 0
+
+
+# --- 9. Supplied probability-bound trajectories -----------------------------
+
+
+def test_supplied_bounds_factory_keys_every_step_by_the_predicate_event():
+    predicate = GreaterThan(50.0)
+    bounds = [[0.2, 0.4], [0.6, 0.8], [0.5, 0.9]]
+
+    traj = create_probability_belief_trajectory(predicate, bounds)
+
+    assert len(traj) == 3
+    assert set(traj[0].bounds) == {predicate.name}
+    torch.testing.assert_close(
+        predicate(traj)[0], torch.tensor(bounds, dtype=torch.float32)
+    )
+
+
+@pytest.mark.parametrize(
+    "bounds,message",
+    [
+        ([0.2, 0.4], r"\[T, 2\]"),
+        ([[0.2, 0.4, 0.6]], r"\[T, 2\]"),
+        (np.zeros((0, 2)), "at least one step"),
+        ([[float("nan"), 0.4]], "malformed"),
+        ([[0.5, 1.5]], "malformed"),
+        ([[0.8, 0.3]], "malformed"),
+        ([[-0.2, 0.4]], "malformed"),
+    ],
+)
+def test_supplied_bounds_factory_rejects_malformed_input(bounds, message):
+    with pytest.raises(ValueError, match=message):
+        create_probability_belief_trajectory(GreaterThan(50.0), bounds)
+
+
+def test_supplied_bounds_factory_preserves_dtype_device_and_gradients():
+    predicate = GreaterThan(50.0)
+    bounds = torch.tensor(
+        [[0.2, 0.4], [0.6, 0.8], [0.5, 0.9]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    traj = create_probability_belief_trajectory(predicate, bounds)
+    temporal = Always(predicate, interval=[0, 1])(traj, scale=-1)
+
+    assert temporal.dtype == torch.float64
+    assert temporal.device == bounds.device
+    temporal.sum().backward()
+    assert bounds.grad is not None
+    assert torch.isfinite(bounds.grad).all()
+    assert bounds.grad.abs().sum() > 0

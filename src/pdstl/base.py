@@ -98,6 +98,29 @@ class ProbabilityBelief(Belief):
         return super().value() if self._value is None else self._value
 
 
+def create_probability_belief_trajectory(predicate, bounds, dtype=None, device=None):
+    """Build a trajectory from a supplied ``[T, 2]`` probability-bound trace.
+
+    Column 0 is the lower and column 1 the upper probability of the predicate's
+    event. Tensors are passed through rather than copied, so gradients survive.
+    """
+    bounds = torch.as_tensor(bounds, dtype=dtype, device=device)
+    if bounds.ndim != 2 or bounds.shape[-1] != 2:
+        raise ValueError(
+            f"probability bounds must have shape [T, 2], got {tuple(bounds.shape)}"
+        )
+    if bounds.shape[0] < 1:
+        raise ValueError("probability bounds must cover at least one step")
+    check_probability_bounds(bounds.unsqueeze(0), predicate)
+
+    return BeliefTrajectory(
+        [
+            ProbabilityBelief({predicate.name: bounds[t : t + 1]})
+            for t in range(bounds.shape[0])
+        ]
+    )
+
+
 def check_probability_bounds(trace, predicate=None):
     """Reject malformed bounds: non-finite, unordered, or outside [0, 1].
 

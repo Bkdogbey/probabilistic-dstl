@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -162,6 +163,40 @@ class DoubleIntegrator(Dynamics):
         cov_stack = torch.stack(covs).unsqueeze(0)
 
         return mean_stack, cov_stack
+
+
+# Offline scalar model
+
+
+def sinusoidal_input(t):
+    """Sinusoidal scalar control used by the original pdSTL example."""
+    return 15.0 * np.sin(np.pi * t)
+
+
+def linear_system(a, b, g, q, mu, P, t, control_func):
+    """Propagate the scalar Gaussian model used in the offline examples."""
+    t = np.asarray(t, dtype=float)
+    mean_trace = np.zeros(len(t), dtype=float)
+    var_trace = np.zeros(len(t), dtype=float)
+    mean_trace[0], var_trace[0] = mu, P
+    process_variance = g**2 + q
+
+    for i in range(1, len(t)):
+        dt = t[i] - t[i - 1]
+        transition = np.exp(a * dt)
+        mean_trace[i] = transition * mean_trace[i - 1] + dt * b * control_func(t[i - 1])
+        var_trace[i] = transition**2 * var_trace[i - 1] + process_variance * dt
+    return mean_trace, var_trace
+
+
+def piecewise_signal(values=None):
+    """Return a configurable discrete scalar mean/variance signal."""
+    if values is None:
+        values = ((45, 4), (55, 4), (60, 4), (48, 4), (42, 9), (58, 4), (52, 4))
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError("piecewise values must have shape [T, 2] as (mean, variance)")
+    return np.arange(len(values), dtype=float), values[:, 0], values[:, 1]
 
 
 # Bounded-state belief
