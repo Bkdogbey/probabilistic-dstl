@@ -57,7 +57,7 @@ def single_iteration_time(T, device, n_warmup=3, n_trials=10):
         # --- Wrap for STL evaluation ---
         beliefs = [
             GaussianBelief(
-                mean_trace[:, t, :], cov_trace[:, t], confidence_level=0.0
+                mean_trace[:, t, :], cov_trace[:, t], sigma_multiplier=0.0
             )
             for t in range(T + 1)
         ]

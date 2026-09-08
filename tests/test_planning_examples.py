@@ -106,7 +106,7 @@ def test_until_matches_inclusive_prefix_reference(setup):
         best = 0.0
         for tau in range(t + a, t + b + 1):
             prefix = left[t : tau + 1].min()  # inclusive of the witness
-            best = max(best, max(0.0, prefix + right[tau] - 1.0))
+            best = max(best, min(prefix, right[tau]))  # endpointwise, not Frechet
         ref.append(best)
 
     np.testing.assert_allclose(got, ref, atol=1e-6)

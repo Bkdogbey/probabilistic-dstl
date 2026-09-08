@@ -7,11 +7,11 @@ import torch.nn as nn
 from pdstl.base import Belief, BeliefTrajectory
 
 
+# Controlled dynamics
+
+
 class Dynamics(nn.Module):
-    """
-    Base class for system dynamics.
-    Handles control bounding and common initialization.
-    """
+    """Base class for controlled dynamics."""
 
     def __init__(self, dt, u_max, device="cpu"):
         super().__init__()
@@ -20,11 +20,7 @@ class Dynamics(nn.Module):
         self.device = device
 
     def bound_control(self, v):
-        """
-        Applies smooth squashing to keep control within [-u_max, u_max].
-        v: Unconstrained optimization variable (the 'knobs' for the optimizer)
-        u: Physical control input applied to the robot
-        """
+        """Smoothly bound an unconstrained control to ``[-u_max, u_max]``."""
         return self.u_max * torch.tanh(v)
 
     def step(self, x, P, u):
@@ -169,17 +165,15 @@ class DoubleIntegrator(Dynamics):
         return mean_stack, cov_stack
 
 
-def constant_input(t):
-    """Constant scalar control used by the introductory linear model."""
-    return -0.5
+# Offline scalar model
 
 
-def sinusoidial_input(t):
+def sinusoidal_input(t):
     """Sinusoidal scalar control used by the original pdSTL example."""
     return 15.0 * np.sin(np.pi * t)
 
 
-def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
+def linear_system(a, b, g, q, mu, P, t, control_func):
     """Propagate the scalar Gaussian model used in the offline examples."""
     t = np.asarray(t, dtype=float)
     mean_trace = np.zeros(len(t), dtype=float)
@@ -205,85 +199,126 @@ def piecewise_signal(values=None):
     return np.arange(len(values), dtype=float), values[:, 0], values[:, 1]
 
 
-def normal_cdf(z):
-    """Standard Gaussian CDF, preserving tensor dtype, device, and gradients."""
-    return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+def create_signal_trace(config):
+    """Create ``(time, mean, variance)`` from a signal configuration."""
+    signal_type = config.get("type")
+
+    if signal_type == "linear":
+        if config.get("control") != "sinusoidal":
+            raise ValueError("linear signal control must be 'sinusoidal'")
+        parameters = config["parameters"]
+        time = np.linspace(0.0, parameters["t_end"], parameters["n_steps"])
+        mean, variance = linear_system(
+            **{
+                name: parameters[name]
+                for name in ("a", "b", "g", "q", "mu", "P")
+            },
+            t=time,
+            control_func=sinusoidal_input,
+        )
+        return time, mean, variance
+
+    if signal_type == "piecewise":
+        return piecewise_signal(config["values"])
+
+    raise ValueError("signal type must be 'linear' or 'piecewise'")
+
+
+# Gaussian belief
 
 
 class GaussianBelief(Belief):
-    """One Gaussian state belief that evaluates affine comparison predicates."""
+    """Gaussian belief with sigma-displaced probability endpoints."""
 
-    def __init__(self, mean, var, confidence_level=1.0):
-        confidence_level = float(confidence_level)
-        if not math.isfinite(confidence_level) or confidence_level < 0:
-            raise ValueError("confidence_level must be finite and non-negative")
+    def __init__(self, mean, variance, sigma_multiplier):
+        sigma_multiplier = float(sigma_multiplier)
+        if not math.isfinite(sigma_multiplier) or sigma_multiplier < 0:
+            raise ValueError("sigma_multiplier must be finite and non-negative")
         self.mean = mean
-        self.var = var
-        self.confidence_level = confidence_level
+        self.var = variance
+        self.sigma_multiplier = sigma_multiplier
+        self._validate_shapes()
+
+    def _validate_shapes(self):
+        if not torch.is_tensor(self.mean) or self.mean.ndim != 2:
+            raise ValueError("GaussianBelief mean must have shape [B,D]")
+        if not torch.is_tensor(self.var):
+            raise ValueError("GaussianBelief variance must be a tensor")
+
+        batch, state_dim = self.mean.shape
+        if self.var.ndim == 2:
+            if self.var.shape != self.mean.shape:
+                raise ValueError(
+                    "GaussianBelief diagonal variance must match mean shape [B,D]"
+                )
+            component_variance = self.var
+        elif self.var.ndim == 3:
+            if self.var.shape[0] != batch:
+                raise ValueError(
+                    "GaussianBelief mean and covariance batch dimensions differ"
+                )
+            if self.var.shape[1] != self.var.shape[2]:
+                raise ValueError("GaussianBelief covariance matrices must be square")
+            if self.var.shape[1] != state_dim:
+                raise ValueError(
+                    "GaussianBelief covariance state dimension must match mean"
+                )
+            component_variance = self.var.diagonal(dim1=-2, dim2=-1)
+        else:
+            raise ValueError("GaussianBelief variance must be [B,D] or [B,D,D]")
+
+        if bool((component_variance < 0).any()):
+            raise ValueError("GaussianBelief variance must be non-negative")
 
     def value(self):
         return self.mean
 
     def _component_variance(self):
-        if self.var.ndim == self.mean.ndim:
+        if self.var.ndim == 2:
             return self.var
-        if self.var.ndim == self.mean.ndim + 1:
-            return self.var.diagonal(dim1=-2, dim2=-1)
-        raise ValueError("GaussianBelief variance must be [B,D] or [B,D,D]")
+        return self.var.diagonal(dim1=-2, dim2=-1)
 
     def lower_bound(self):
-        return self.mean - self.confidence_level * torch.sqrt(self._component_variance())
+        return self.mean - self.sigma_multiplier * torch.sqrt(
+            self._component_variance()
+        )
 
     def upper_bound(self):
-        return self.mean + self.confidence_level * torch.sqrt(self._component_variance())
+        return self.mean + self.sigma_multiplier * torch.sqrt(
+            self._component_variance()
+        )
 
     def _project(self, predicate):
-        if self.mean.ndim != 2:
-            raise ValueError("GaussianBelief mean must have shape [B,D]")
         full_covariance = self.var.ndim == 3
-        if self.var.shape[0] != self.mean.shape[0]:
-            raise ValueError("GaussianBelief mean and variance batch dimensions differ")
-        weights = getattr(predicate, "weights", None)
-        if weights is None:
-            dim = getattr(predicate, "dim", 0)
-            if not 0 <= dim < self.mean.shape[1]:
-                raise ValueError(f"predicate dimension {dim} is outside the state")
-            mean = self.mean[:, dim]
-            variance = self.var[:, dim, dim] if full_covariance else self.var[:, dim]
-        else:
-            weights = torch.as_tensor(weights, dtype=self.mean.dtype, device=self.mean.device)
-            if weights.ndim != 1 or len(weights) != self.mean.shape[1]:
-                raise ValueError("predicate weights must have one value per state dimension")
-            mean = (self.mean * weights).sum(dim=-1)
-            variance = (
-                torch.einsum("i,bij,j->b", weights, self.var, weights)
-                if full_covariance
-                else (self.var * weights.square()).sum(dim=-1)
-            )
-        if variance.shape != mean.shape:
-            raise ValueError("GaussianBelief mean and variance shapes are incompatible")
-        if bool((variance < 0).any()):
-            raise ValueError("GaussianBelief has a negative projected variance")
+        dim = getattr(predicate, "dim", 0)
+        if not isinstance(dim, int) or not 0 <= dim < self.mean.shape[1]:
+            raise ValueError(f"predicate dimension {dim} is outside the state")
+        mean = self.mean[:, dim]
+        variance = self.var[:, dim, dim] if full_covariance else self.var[:, dim]
         return mean, variance
 
     def probability_bounds(self, predicate):
-        """Return endpoint probabilities for an inclusive affine comparison, [B,2]."""
+        """Return an inclusive comparison probability interval, shaped [B,2]."""
         sense = getattr(predicate, "sense", None)
         if sense not in (">=", "<="):
             raise ValueError(f"GaussianBelief cannot evaluate {predicate}")
         mean, variance = self._project(predicate)
-        threshold = torch.as_tensor(predicate.threshold, dtype=mean.dtype, device=mean.device)
+        threshold = torch.as_tensor(
+            predicate.threshold, dtype=mean.dtype, device=mean.device
+        )
         positive = variance > 0
-        sigma = torch.sqrt(torch.where(positive, variance, torch.ones_like(variance)))
-        lower_state = mean - self.confidence_level * sigma
-        upper_state = mean + self.confidence_level * sigma
+        sigma = torch.sqrt(variance)
+        safe_sigma = torch.where(positive, sigma, torch.ones_like(sigma))
+        displacement = self.sigma_multiplier * sigma
+        lower_state = mean - displacement
+        upper_state = mean + displacement
         if sense == ">=":
-            lower = normal_cdf((lower_state - threshold) / sigma)
-            upper = normal_cdf((upper_state - threshold) / sigma)
+            lower = torch.special.ndtr((lower_state - threshold) / safe_sigma)
+            upper = torch.special.ndtr((upper_state - threshold) / safe_sigma)
             deterministic = mean >= threshold
         else:
-            lower = normal_cdf((threshold - upper_state) / sigma)
-            upper = normal_cdf((threshold - lower_state) / sigma)
+            lower = torch.special.ndtr((threshold - upper_state) / safe_sigma)
+            upper = torch.special.ndtr((threshold - lower_state) / safe_sigma)
             deterministic = mean <= threshold
         lower = torch.where(positive, lower, deterministic.to(mean.dtype))
         upper = torch.where(positive, upper, deterministic.to(mean.dtype))
@@ -291,32 +326,50 @@ class GaussianBelief(Belief):
 
 
 def create_gaussian_belief_trajectory(
-    mean_trace, var_trace, confidence_level=1.0, dtype=None, device=None
+    mean_trace, variance_trace, sigma_multiplier, dtype=None, device=None
 ):
-    """Convert scalar/vector Gaussian traces into the generic BeliefTrajectory."""
-    if dtype is None:
-        dtype = mean_trace.dtype if torch.is_tensor(mean_trace) else torch.float32
-    if device is None and torch.is_tensor(mean_trace):
-        device = mean_trace.device
+    """Build a trajectory from scalar, vector, or batched Gaussian traces."""
     mean = torch.as_tensor(mean_trace, dtype=dtype, device=device)
-    variance = torch.as_tensor(var_trace, dtype=dtype, device=device)
+    variance = torch.as_tensor(variance_trace, dtype=dtype, device=device)
 
     if mean.ndim == 1:
-        mean, variance = mean.unsqueeze(-1), variance.unsqueeze(-1)
+        if variance.shape != mean.shape:
+            raise ValueError("scalar trace variance must exactly match mean shape [T]")
+        mean = mean.unsqueeze(-1)
+        variance = variance.unsqueeze(-1)
     if mean.ndim == 2:
-        if variance.ndim not in (2, 3) or variance.shape[0] != mean.shape[0]:
-            raise ValueError("trace variance must match [T,D] or be [T,D,D]")
+        diagonal = variance.ndim == 2 and variance.shape == mean.shape
+        covariance = variance.ndim == 3 and variance.shape == (
+            mean.shape[0],
+            mean.shape[1],
+            mean.shape[1],
+        )
+        if not (diagonal or covariance):
+            raise ValueError(
+                "vector trace variance must exactly match [T,D] or [T,D,D]"
+            )
         beliefs = [
-            GaussianBelief(mean[t : t + 1], variance[t : t + 1], confidence_level)
+            GaussianBelief(
+                mean[t : t + 1], variance[t : t + 1], sigma_multiplier
+            )
             for t in range(mean.shape[0])
         ]
     elif mean.ndim == 3:
-        if variance.ndim not in (3, 4) or variance.shape[:2] != mean.shape[:2]:
-            raise ValueError("batched trace variance must match [B,T,D] or be [B,T,D,D]")
+        diagonal = variance.ndim == 3 and variance.shape == mean.shape
+        covariance = variance.ndim == 4 and variance.shape == (
+            mean.shape[0],
+            mean.shape[1],
+            mean.shape[2],
+            mean.shape[2],
+        )
+        if not (diagonal or covariance):
+            raise ValueError(
+                "batched trace variance must exactly match [B,T,D] or [B,T,D,D]"
+            )
         beliefs = [
-            GaussianBelief(mean[:, t], variance[:, t], confidence_level)
+            GaussianBelief(mean[:, t], variance[:, t], sigma_multiplier)
             for t in range(mean.shape[1])
         ]
     else:
-        raise ValueError("mean trace must have shape [T,D] or [B,T,D]")
+        raise ValueError("mean trace must have shape [T], [T,D], or [B,T,D]")
     return BeliefTrajectory(beliefs)

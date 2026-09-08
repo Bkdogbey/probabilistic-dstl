@@ -49,7 +49,7 @@ def test_rollout_matches_step_and_linear_prediction(model_type, dimension):
 def test_planning_extracts_the_same_gaussian_beliefs():
     mean = torch.tensor([[1.0, 2.0]])
     covariance = torch.tensor([[[0.5, 0.2], [0.2, 0.8]]])
-    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance)] * 2)
+    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance, 0.0)] * 2)
     extracted_mean, extracted_covariance = extract_trajectory_stats(
         trajectory, diagonal_only=False
     )

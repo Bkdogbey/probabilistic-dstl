@@ -5,6 +5,8 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 import yaml
+
+
 def get_device():
     """Return the configured torch device.
 
@@ -75,7 +77,7 @@ def skip_run(flag, f):
 class ColorPrint:
     @staticmethod
     def print_skip(message, end="\n"):
-        sys.stderr.write("\x1b[88m" + message.strip() + "\x1b[0m" + end)
+        sys.stderr.write("\x1b[33m" + message.strip() + "\x1b[0m" + end)
         sys.stderr.flush()
 
     @staticmethod
@@ -85,20 +87,30 @@ class ColorPrint:
 
 
 def to_steps(interval_sec, t):
-    """Convert a time interval [a, b] in seconds to integer step indices.
+    """Map a continuous interval to its nearest discrete grid indices.
 
     Parameters
     ----------
     interval_sec : list of two numbers
         Interval bounds in seconds. The second bound may be np.inf.
     t : array-like
-        Time vector (uniformly spaced).
+        Strictly increasing, uniformly spaced time vector with at least two
+        samples. Interval seconds are rounded to the nearest grid indices.
 
     Returns
     -------
     [a_step, b_step] : list
     """
-    dt = float(t[1] - t[0])
+    t = np.asarray(t)
+    if t.ndim != 1 or len(t) < 2:
+        raise ValueError("time vector must be one-dimensional with at least two samples")
+    differences = np.diff(t)
+    if not np.all(differences > 0):
+        raise ValueError("time vector must be strictly increasing")
+    if not np.allclose(differences, differences[0]):
+        raise ValueError("time vector must be uniformly spaced")
+
+    dt = float(differences[0])
     a = int(round(interval_sec[0] / dt))
     b = np.inf if np.isinf(interval_sec[1]) else int(round(interval_sec[1] / dt))
     return [a, b]

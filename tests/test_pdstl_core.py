@@ -41,12 +41,17 @@ def scalar(values, event="p"):
     return supplied(*[{event: (v, v)} for v in values])
 
 
-def gaussian(mean, var, confidence_level=0.0):
+def gaussian(mean, var, sigma_multiplier=0.0):
     """Trajectory of Gaussian steps from [T, D] mean and [T, D] or [T, D, D] var."""
     mean = torch.as_tensor(mean, dtype=torch.float64)
     var = torch.as_tensor(var, dtype=torch.float64)
     return BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], var[t : t + 1], confidence_level) for t in range(len(mean))]
+        [
+            GaussianBelief(
+                mean[t : t + 1], var[t : t + 1], sigma_multiplier
+            )
+            for t in range(len(mean))
+        ]
     )
 
 
@@ -56,7 +61,7 @@ def interval_gaussian(mean, var, k):
     var = torch.as_tensor(var, dtype=torch.float64)
     return BeliefTrajectory(
         [
-            GaussianBelief(mean[t : t + 1], var[t : t + 1], confidence_level=k)
+            GaussianBelief(mean[t : t + 1], var[t : t + 1], sigma_multiplier=k)
             for t in range(len(mean))
         ]
     )
@@ -97,30 +102,41 @@ def test_zero_variance_is_an_inclusive_deterministic_comparison(m, c, expect_ge)
 
 
 def test_negative_variance_is_rejected():
-    traj = gaussian([[1.0]], [[-2.0]])
-
-    with pytest.raises(ValueError, match="negative projected variance"):
-        GreaterThan(0.0)(traj)
+    with pytest.raises(ValueError, match="variance must be non-negative"):
+        gaussian([[1.0]], [[-2.0]])
 
 
-def test_affine_event_uses_the_full_covariance():
-    # Strongly correlated components: assuming independence changes the answer.
-    mu = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
-    cov = torch.tensor([[[4.0, 3.0], [3.0, 9.0]]], dtype=torch.float64)
-    w = [1.0, -1.0]
-    traj = BeliefTrajectory([GaussianBelief(mu, cov, confidence_level=0.0)])
+def test_full_covariance_selects_the_requested_marginal():
+    mean = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
+    covariance = torch.tensor([[[4.0, 3.0], [3.0, 9.0]]], dtype=torch.float64)
+    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance, 0.0)])
 
-    got = GreaterThan(0.0, weights=w)(traj)[0, 0, 0].item()
+    got = GreaterThan(0.0, dim=1)(trajectory)[0, 0, 0].item()
 
-    w_t = torch.tensor(w, dtype=torch.float64)
-    m = (mu[0] * w_t).sum().item()
-    v = (w_t @ cov[0] @ w_t).item()  # 4 - 2*3 + 9 = 7
-    assert v == pytest.approx(7.0)
-    assert got == pytest.approx(1.0 - norm.cdf((0.0 - m) / np.sqrt(v)), abs=1e-9)
+    assert got == pytest.approx(norm.cdf(2.0 / 3.0), abs=1e-9)
 
-    # the independence-assuming value differs, so the test would catch it
-    v_diag = (w_t**2 * torch.diagonal(cov[0])).sum().item()  # 4 + 9 = 13
-    assert got != pytest.approx(1.0 - norm.cdf((0.0 - m) / np.sqrt(v_diag)), abs=1e-6)
+
+@pytest.mark.parametrize(
+    "mean,variance,message",
+    [
+        (torch.zeros(2), torch.ones(2), r"mean must have shape \[B,D\]"),
+        (torch.zeros(2, 2), torch.ones(3, 2), "diagonal variance"),
+        (torch.zeros(2, 2), torch.ones(2, 2, 3), "square"),
+        (torch.zeros(2, 2), torch.ones(2, 3, 3), "state dimension"),
+    ],
+)
+def test_gaussian_belief_rejects_invalid_shapes(mean, variance, message):
+    with pytest.raises(ValueError, match=message):
+        GaussianBelief(mean, variance, sigma_multiplier=0.0)
+
+
+def test_gaussian_belief_rejects_an_invalid_predicate_dimension():
+    trajectory = BeliefTrajectory(
+        [GaussianBelief(torch.zeros(1, 2), torch.ones(1, 2), 0.0)]
+    )
+
+    with pytest.raises(ValueError, match="dimension 2 is outside"):
+        GreaterThan(0.0, dim=2)(trajectory)
 
 
 def test_unsupported_event_fails_clearly():
@@ -205,8 +221,8 @@ def test_zero_variance_stays_deterministic_at_any_k(k, m, c, expect_ge):
 
 @pytest.mark.parametrize("k", [-1.0, float("inf"), float("nan")])
 def test_invalid_k_is_rejected(k):
-    with pytest.raises(ValueError, match="confidence_level must be finite and non-negative"):
-        GaussianBelief(torch.zeros(1, 1), torch.ones(1, 1), confidence_level=k)
+    with pytest.raises(ValueError, match="sigma_multiplier must be finite and non-negative"):
+        GaussianBelief(torch.zeros(1, 1), torch.ones(1, 1), sigma_multiplier=k)
 
 
 def test_bounds_are_well_formed_through_a_temporal_formula():
@@ -227,7 +243,7 @@ def test_gradients_reach_the_mean_through_an_interval_belief():
     var = torch.full((3, 1), 4.0, dtype=torch.float64)
     traj = BeliefTrajectory(
         [
-            GaussianBelief(mean[t : t + 1], var[t : t + 1], confidence_level=2.0)
+            GaussianBelief(mean[t : t + 1], var[t : t + 1], sigma_multiplier=2.0)
             for t in range(3)
         ]
     )
@@ -328,23 +344,122 @@ def test_implies_is_negation_then_or():
     torch.testing.assert_close(Implies(a, b)(traj), Or(Negation(a), b)(traj))
 
 
+def test_boolean_bounds_are_unchanged_by_scale():
+    traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
+    a, b = Predicate("a"), Predicate("b")
+
+    for spec in (And(a, b), Or(a, b), Implies(a, b), Negation(a)):
+        torch.testing.assert_close(spec(traj, scale=5.0), spec(traj, scale=-1))
+
+
+def test_pointwise_flag_tracks_the_formula_kind():
+    a, b = Predicate("a"), Predicate("b")
+    windowed = Always(a, interval=[0, 1])
+
+    assert a.is_pointwise
+    assert Negation(a).is_pointwise
+    assert And(a, b).is_pointwise
+    assert Implies(a, b).is_pointwise
+
+    assert not windowed.is_pointwise
+    assert not Until(a, b).is_pointwise
+
+
+def test_boolean_over_temporal_is_rejected_at_construction():
+    a, b = Predicate("a"), Predicate("b")
+    windowed = Always(a, interval=[0, 1])
+
+    for build in (
+        lambda: And(windowed, b),
+        lambda: Or(a, windowed),
+        lambda: Implies(windowed, b),
+        lambda: Implies(a, windowed),
+        lambda: Negation(windowed),
+    ):
+        with pytest.raises(ValueError, match="only accepts pointwise"):
+            build()
+
+
 # --- 4. Always / Eventually ------------------------------------------------
 
 
 @pytest.mark.parametrize("interval", [[0, 1], [1, 2], [2, 3]])
 def test_always_and_eventually_match_direct_window_reductions(interval):
+    # Distinct lower and upper values, so each endpoint is reduced on its own.
     rng = np.random.default_rng(0)
-    values = rng.uniform(0, 1, size=9).tolist()
-    traj = scalar(values)
+    lows = rng.uniform(0.0, 0.5, size=9).tolist()
+    highs = rng.uniform(0.5, 1.0, size=9).tolist()
+    traj = supplied(*[{"p": (lo, hi)} for lo, hi in zip(lows, highs)])
     a, b = interval
-    n = len(values) - b
+    n = len(lows) - b
 
-    got_min = Always(Predicate("p"), interval=interval)(traj)[0, :, 0].tolist()
-    got_max = Eventually(Predicate("p"), interval=interval)(traj)[0, :, 0].tolist()
+    got_min = Always(Predicate("p"), interval=interval)(traj)[0].tolist()
+    got_max = Eventually(Predicate("p"), interval=interval)(traj)[0].tolist()
 
-    assert len(got_min) == n
-    np.testing.assert_allclose(got_min, [min(values[t + a : t + b + 1]) for t in range(n)])
-    np.testing.assert_allclose(got_max, [max(values[t + a : t + b + 1]) for t in range(n)])
+    assert len(got_min) == n and len(got_max) == n
+    np.testing.assert_allclose(
+        got_min,
+        [
+            [min(lows[t + a : t + b + 1]), min(highs[t + a : t + b + 1])]
+            for t in range(n)
+        ],
+    )
+    np.testing.assert_allclose(
+        got_max,
+        [
+            [max(lows[t + a : t + b + 1]), max(highs[t + a : t + b + 1])]
+            for t in range(n)
+        ],
+    )
+
+
+def test_smooth_temporal_output_is_differentiable():
+    p = torch.tensor([[0.2, 0.8]], requires_grad=True)
+    values = [p, p * 0.5, p * 0.75, p * 0.9]
+    traj = BeliefTrajectory([ProbabilityBelief({"p": v}) for v in values])
+
+    Always(Predicate("p"), interval=[0, 2])(traj, scale=3.0)[0, 0, 0].backward()
+
+    assert p.grad is not None
+    assert torch.isfinite(p.grad).all()
+    assert p.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    "operator,smooth_reduce",
+    [
+        (
+            Always,
+            lambda window, scale: -torch.logsumexp(-window * scale, dim=0)
+            / scale,
+        ),
+        (
+            Eventually,
+            lambda window, scale: torch.logsumexp(window * scale, dim=0) / scale,
+        ),
+    ],
+)
+def test_smooth_always_and_eventually_match_their_endpointwise_surrogates(
+    operator, smooth_reduce
+):
+    rows = [
+        {"p": (0.2, 0.7)},
+        {"p": (0.5, 0.8)},
+        {"p": (0.1, 0.9)},
+        {"p": (0.6, 0.95)},
+    ]
+    trajectory = supplied(*rows)
+    pointwise = Predicate("p")(trajectory)[0]
+    scale = 3.0
+
+    got = operator(Predicate("p"), interval=[0, 2])(
+        trajectory, scale=scale
+    )[0]
+    expected = torch.stack(
+        [smooth_reduce(pointwise[t : t + 3], scale) for t in range(2)]
+    )
+
+    torch.testing.assert_close(got, expected)
 
 
 def test_nested_temporal_lookahead_composes():
@@ -358,6 +473,22 @@ def test_nested_temporal_lookahead_composes():
     inner = [max(values[t : t + 3]) for t in range(len(values) - 2)]
     assert len(got) == n
     np.testing.assert_allclose(got, [min(inner[t : t + 4]) for t in range(n)])
+
+
+def test_nested_eventually_of_always_composes():
+    values = [0.9, 0.2, 0.7, 0.4, 0.6, 0.8, 0.3, 0.5]
+    traj = scalar(values)
+
+    spec = Eventually(Always(Predicate("p"), interval=[0, 1]), interval=[0, 2])
+    trace = spec(traj)
+
+    # lookahead adds: the inner window costs 1 step, the outer 2 more
+    n = len(values) - 1 - 2
+    assert trace.shape == (1, n, 2)
+    inner = [min(values[t : t + 2]) for t in range(len(values) - 1)]
+    np.testing.assert_allclose(
+        trace[0, :, 0].tolist(), [max(inner[t : t + 3]) for t in range(n)]
+    )
 
 
 def test_suffix_windows_cover_whatever_trace_remains():
@@ -394,22 +525,75 @@ def until_reference(left, right, a, b):
         hi = min(t + (T - 1 if not np.isfinite(b) else b), T - 1)
         for tau in range(t + a, hi + 1):
             prefix = min(left[t : tau + 1])  # inclusive of tau
-            cand = max(0.0, prefix + right[tau] - 1.0)
+            cand = min(prefix, right[tau])
             best = cand if best is None else max(best, cand)
         out.append(best)
     return out
 
 
+UNTIL_LEFT = [0.9, 0.8, 0.4, 0.7, 0.95, 0.6]
+UNTIL_RIGHT = [0.1, 0.3, 0.9, 0.2, 0.5, 0.85]
+
+
+def until_trajectory():
+    return supplied(
+        *[{"l": (lo, lo), "r": (hi, hi)} for lo, hi in zip(UNTIL_LEFT, UNTIL_RIGHT)]
+    )
+
+
 @pytest.mark.parametrize("interval", [[0, 0], [0, 1], [1, 2]])
 def test_until_matches_the_inclusive_reference(interval):
-    left = [0.9, 0.8, 0.4, 0.7, 0.95, 0.6]
-    right = [0.1, 0.3, 0.9, 0.2, 0.5, 0.85]
-    traj = supplied(*[{"l": (l, l), "r": (r, r)} for l, r in zip(left, right)])
-
-    got = Until(Predicate("l"), Predicate("r"), interval=interval)(traj)[0, :, 0]
+    got = Until(Predicate("l"), Predicate("r"), interval=interval)(until_trajectory())
 
     np.testing.assert_allclose(
-        got.tolist(), until_reference(left, right, *interval), atol=1e-6
+        got[0, :, 0].tolist(),
+        until_reference(UNTIL_LEFT, UNTIL_RIGHT, *interval),
+        atol=1e-6,
+    )
+
+
+def test_until_smooth_approaches_the_exact_reduction():
+    spec = Until(Predicate("l"), Predicate("r"), interval=[0, 2])
+    traj = until_trajectory()
+
+    exact = spec(traj, scale=-1)
+    smooth = spec(traj, scale=400.0)
+
+    torch.testing.assert_close(smooth, exact, atol=5e-2, rtol=0)
+    assert not torch.equal(smooth, exact)  # a surrogate, not the same tensor
+
+
+def test_until_reduces_both_endpoints_with_the_exact_and_smooth_max_min():
+    trajectory = supplied(
+        {"l": (0.7, 0.9), "r": (0.1, 0.3)},
+        {"l": (0.4, 0.8), "r": (0.6, 0.75)},
+        {"l": (0.8, 0.95), "r": (0.5, 0.85)},
+    )
+    formula = Until(Predicate("l"), Predicate("r"), interval=[0, 2])
+
+    exact = formula(trajectory, scale=-1)[0, 0]
+    torch.testing.assert_close(exact, torch.tensor([0.4, 0.8]))
+
+    left = Predicate("l")(trajectory)[0]
+    right = Predicate("r")(trajectory)[0]
+    scale = 4.0
+    candidates = []
+    for witness in range(3):
+        prefix = -torch.logsumexp(
+            -left[: witness + 1] * scale, dim=0
+        ) / scale
+        candidates.append(
+            -torch.logsumexp(
+                -torch.stack((prefix, right[witness])) * scale, dim=0
+            )
+            / scale
+        )
+    expected_smooth = torch.logsumexp(
+        torch.stack(candidates) * scale, dim=0
+    ) / scale
+
+    torch.testing.assert_close(
+        formula(trajectory, scale=scale)[0, 0], expected_smooth
     )
 
 
@@ -418,7 +602,8 @@ def test_until_at_zero_zero_combines_both_operands_now():
 
     lower, upper = Until(Predicate("l"), Predicate("r"), interval=[0, 0])(traj)[0, 0]
 
-    assert lower.item() == pytest.approx(max(0.0, 0.9 + 0.4 - 1.0))  # Frechet
+    # endpointwise min of prefix and witness, not a Frechet conjunction
+    assert lower.item() == pytest.approx(min(0.9, 0.4))
     assert upper.item() == pytest.approx(min(0.9, 0.4))
 
 
@@ -434,18 +619,18 @@ def test_insufficient_prediction_length_is_rejected():
         Until(Predicate("p"), Predicate("p"), interval=[0, 3])(traj)
 
 
-def test_boolean_operators_align_to_the_shortest_child():
-    values = [0.9, 0.2, 0.7, 0.4, 0.6]
-    traj = scalar(values)
-    atom = Predicate("p")  # length 5
-    windowed = Always(atom, interval=[0, 2])  # length 3
+def test_temporal_operator_accepts_a_nested_pointwise_boolean():
+    traj = supplied(
+        {"a": (0.7, 0.8), "b": (0.6, 0.9)},
+        {"a": (0.9, 0.95), "b": (0.8, 0.85)},
+        {"a": (0.5, 0.7), "b": (0.7, 0.9)},
+    )
+    pointwise = And(Predicate("a"), Or(Predicate("a"), Predicate("b")))
 
-    combined = And(windowed, atom)(traj)
+    trace = Always(pointwise, interval=[0, 1])(traj)
 
-    assert combined.shape[1] == 3
-    # origin 0 of each child really is origin 0 of the conjunction
-    expected = max(0.0, min(values[0:3]) + values[0] - 1.0)
-    assert combined[0, 0, 0].item() == pytest.approx(expected)
+    assert trace.shape == (1, 2, 2)
+    torch.testing.assert_close(trace[0, 0], torch.tensor([0.4, 0.8]))
 
 
 # --- 7. dtype, device and gradients ----------------------------------------
@@ -456,7 +641,7 @@ def test_dtype_is_preserved_through_a_temporal_formula(dtype):
     mean = torch.tensor([[45.0], [55.0], [60.0]], dtype=dtype)
     var = torch.full((3, 1), 4.0, dtype=dtype)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], var[t : t + 1]) for t in range(3)]
+        [GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0) for t in range(3)]
     )
 
     assert Always(GreaterThan(50.0), interval=[0, 1])(traj).dtype == dtype
@@ -466,9 +651,11 @@ def test_gradients_reach_the_mean_through_a_composed_formula():
     mean = torch.tensor([[45.0], [55.0], [60.0], [48.0]], requires_grad=True)
     var = torch.full((4, 1), 4.0)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], var[t : t + 1]) for t in range(4)]
+        [GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0) for t in range(4)]
     )
-    spec = And(Always(GreaterThan(50.0), interval=[0, 1]), LessThan(70.0))
+    spec = Always(
+        And(GreaterThan(50.0), LessThan(70.0)), interval=[0, 1]
+    )
 
     spec(traj)[0, 0, 0].backward()
 
@@ -480,7 +667,10 @@ def test_smooth_formula_passes_a_finite_difference_gradcheck():
     def f(mean):
         var = torch.full_like(mean, 4.0)
         traj = BeliefTrajectory(
-            [GaussianBelief(mean[t : t + 1], var[t : t + 1]) for t in range(len(mean))]
+            [
+                GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0)
+                for t in range(len(mean))
+            ]
         )
         spec = Always(GreaterThan(50.0), interval=[0, 1])
         return spec(traj, scale=2.0)[0, 0, 0]
@@ -507,7 +697,10 @@ def test_control_to_mean_to_formula_is_differentiable():
     mean = torch.cumsum(u, dim=0).unsqueeze(-1)  # [T, 1]
     var = torch.full_like(mean, 0.25)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], var[t : t + 1]) for t in range(len(u))]
+        [
+            GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0)
+            for t in range(len(u))
+        ]
     )
     spec = Eventually(GreaterThan(2.5), interval=[0, 2])
 

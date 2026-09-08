@@ -125,7 +125,7 @@ def belief_trajectory(mean_trace, cov_trace):
     return BeliefTrajectory(
         [
             GaussianBelief(
-                mean_trace[:, t, :], cov_trace[:, t], confidence_level=0.0
+                mean_trace[:, t, :], cov_trace[:, t], sigma_multiplier=0.0
             )
             for t in range(mean_trace.shape[1])
         ]

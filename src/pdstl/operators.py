@@ -5,32 +5,18 @@ from pdstl.base import check_probability_bounds
 
 
 class STL_Formula(torch.nn.Module):
-    """
-    Base class for Probabilistic STL formulas.
-    """
+    """Base formula for pointwise probabilities and temporal robustness."""
 
     def __init__(self):
         super(STL_Formula, self).__init__()
 
+    @property
+    def is_pointwise(self) -> bool:
+        """Return whether the formula produces pointwise probabilities."""
+        return False
+
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        """
-        Compute the probability-bound trace for a belief trajectory.
-
-        Args:
-           belief_trajectory: BeliefTrajectory object
-           scale: smoothing parameter (scale > 0 for smooth, <= 0 for direct).
-              Smooth outputs are approximations and may leave [0,1] or cross;
-              evaluate directly for reported intervals.
-           keepdim: keep dimensions
-
-        Returns:
-           [B,N,2] where [..., 0] is the lower and [..., 1] the upper bound.
-
-        Traces are indexed from origin 0 and contain only origins whose window
-        is complete, so N shrinks by an operator's lookahead: N = T for an atom,
-        T - b for a bounded [a,b] temporal operator, and the shortest child's
-        length for a Boolean operator.
-        """
+        """Return ``[B,N,2]`` endpoints at complete evaluation origins."""
         raise NotImplementedError("robustness_trace not yet implemented")
 
     def forward(self, belief_trajectory, **kwargs):
@@ -54,12 +40,10 @@ class STL_Formula(torch.nn.Module):
 
 
 class Minish(torch.nn.Module):
-    """Compute minimum (exact or smooth) over specified dimension"""
+    """Compute an exact or smooth temporal minimum."""
 
     def forward(self, x, scale, dim=1, keepdim=True):
-        """
-        The bounds dimension [..., 2] is automatically processed element-wise.
-        """
+        """Reduce ``x`` along ``dim`` without mixing interval endpoints."""
         if scale > 0:
             return -torch.logsumexp(-x * scale, dim=dim, keepdim=keepdim) / scale
         else:
@@ -67,12 +51,10 @@ class Minish(torch.nn.Module):
 
 
 class Maxish(torch.nn.Module):
-    """Compute maximum (exact or smooth) over specified dimension"""
+    """Compute an exact or smooth temporal maximum."""
 
     def forward(self, x, scale, dim=1, keepdim=True):
-        """
-        The bounds dimension [..., 2] is automatically processed element-wise.
-        """
+        """Reduce ``x`` along ``dim`` without mixing interval endpoints."""
         if scale > 0:
             return torch.logsumexp(x * scale, dim=dim, keepdim=keepdim) / scale
         else:
@@ -80,32 +62,18 @@ class Maxish(torch.nn.Module):
 
 
 class Predicate(STL_Formula):
-    """
-    Atomic predicate: names an event and assembles its trace over time.
-
-    The predicate states the requirement; the belief at each step evaluates it
-    under its own uncertainty model (see pdstl.base.Belief). Subclasses add
-    whatever describes their event -- a comparison adds dim/threshold/sense --
-    and never inspect the belief's internals.
-
-    A bare Predicate("name") carries only an identity, which is what a provider
-    of already-computed probability intervals keys on.
-    """
+    """Atomic event evaluated independently by each belief."""
 
     def __init__(self, name=None):
         super().__init__()
         self.name = name
 
-    def robustness_trace(self, belief_trajectory, validate=True, **kwargs):
-        """
-        Args:
-           belief_trajectory: BeliefTrajectory object
-           validate: check the assembled bounds are well-formed. Pass False in
-              an inner optimisation loop, where the host sync is not worth it.
+    @property
+    def is_pointwise(self):
+        return True
 
-        Returns:
-           [B,T,2] probability bounds, [..., 0] lower and [..., 1] upper.
-        """
+    def robustness_trace(self, belief_trajectory, validate=True, **kwargs):
+        """Return the pointwise probability interval trace ``[B,T,2]``."""
         bounds = [
             belief_trajectory[t].probability_bounds(self)  # each [B,2]
             for t in range(len(belief_trajectory))
@@ -121,40 +89,31 @@ class Predicate(STL_Formula):
         return self.name if self.name is not None else type(self).__name__
 
 
-def _event_name(sense, threshold, dim, weights):
-    lhs = f"x[{dim}]" if weights is None else f"{list(weights)}·x"
-    return f"{lhs} {sense} {threshold}"
+def _event_name(sense, threshold, dim):
+    return f"x[{dim}] {sense} {threshold}"
 
 
 class GreaterThan(Predicate):
-    """
-    Predicate: x[dim] >= threshold, or weights·x >= threshold if weights given.
+    """Predicate ``x[dim] >= threshold``."""
 
-    The belief evaluates the event; nothing is constructed here.
-    """
-
-    def __init__(self, threshold, dim=0, weights=None, name=None):
+    def __init__(self, threshold, dim=0, name=None):
         if name is None:
-            name = _event_name(">=", threshold, dim, weights)
+            name = _event_name(">=", threshold, dim)
         super().__init__(name=name)
         self.threshold = threshold
         self.dim = dim
-        self.weights = weights
         self.sense = ">="
 
 
 class LessThan(Predicate):
-    """
-    Predicate: x[dim] <= threshold, or weights·x <= threshold if weights given.
-    """
+    """Predicate ``x[dim] <= threshold``."""
 
-    def __init__(self, threshold, dim=0, weights=None, name=None):
+    def __init__(self, threshold, dim=0, name=None):
         if name is None:
-            name = _event_name("<=", threshold, dim, weights)
+            name = _event_name("<=", threshold, dim)
         super().__init__(name=name)
         self.threshold = threshold
         self.dim = dim
-        self.weights = weights
         self.sense = "<="
 
 
@@ -164,20 +123,32 @@ def _align(*traces):
     return tuple(t[:, :n] for t in traces)
 
 
-def _reduce(op, terms, scale):
-    """Endpointwise Minish/Maxish over `terms`, honouring the scale convention."""
-    return op(torch.stack(terms, dim=-1), scale, dim=-1, keepdim=False)
+def _require_pointwise(operator, *subformulas):
+    """Reject Boolean composition of temporal robustness intervals."""
+    for subformula in subformulas:
+        if not subformula.is_pointwise:
+            raise ValueError(
+                f"{operator} only accepts pointwise event formulas; "
+                f"got temporal formula {subformula}"
+            )
 
 
 class Negation(STL_Formula):
     """
     Negation: ¬ϕ
     [L, U] -> [1 - U, 1 - L]
+
+    Exact complement of a pointwise probability interval; never smoothed.
     """
 
     def __init__(self, subformula):
         super(Negation, self).__init__()
+        _require_pointwise("Negation", subformula)
         self.subformula = subformula
+
+    @property
+    def is_pointwise(self) -> bool:
+        return True
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         trace = self.subformula(
@@ -196,17 +167,23 @@ class Negation(STL_Formula):
 class And(STL_Formula):
     """
     Conjunction: ϕ₁ ∧ ϕ₂
-    Fréchet bounds element-wise:
+
+    Exact and never smoothed; `scale` is only forwarded to the sub-formulas.
+
+    Both sub-formulas must be pointwise. Exact Fréchet probability bounds:
       lower = max(0, l1 + l2 - 1)
       upper = min(u1, u2)
     """
 
     def __init__(self, subformula1, subformula2):
         super(And, self).__init__()
+        _require_pointwise("And", subformula1, subformula2)
         self.subformula1 = subformula1
         self.subformula2 = subformula2
-        self.min_op = Minish()
-        self.max_op = Maxish()
+
+    @property
+    def is_pointwise(self) -> bool:
+        return True
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         trace1 = self.subformula1(
@@ -219,11 +196,9 @@ class And(STL_Formula):
         l1, u1 = trace1[..., 0], trace1[..., 1]
         l2, u2 = trace2[..., 0], trace2[..., 1]
 
-        # P(A ∩ B) ≥ max(0, P(A) + P(B) - 1) holds for any dependence. The
-        # product bound would need independence, which sub-formulas over a
-        # shared state do not have.
-        lower = _reduce(self.max_op, [l1 + l2 - 1.0, torch.zeros_like(l1)], scale)
-        upper = _reduce(self.min_op, [u1, u2], scale)
+        # P(A ∩ B) ≥ max(0, P(A) + P(B) - 1) for any dependence.
+        lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
+        upper = torch.minimum(u1, u2)
         return torch.stack([lower, upper], dim=-1)
 
     def __str__(self):
@@ -233,17 +208,23 @@ class And(STL_Formula):
 class Or(STL_Formula):
     """
     Disjunction: ϕ₁ ∨ ϕ₂
-    Uses Frechet bounds element-wise:
+
+    Exact and never smoothed; `scale` is only forwarded to the sub-formulas.
+
+    Both sub-formulas must be pointwise. Exact Fréchet/Boole bounds:
       lower = max(l1, l2)
-      upper = min(u1 + u2, 1)
+      upper = min(1, u1 + u2)
     """
 
     def __init__(self, subformula1, subformula2):
         super(Or, self).__init__()
+        _require_pointwise("Or", subformula1, subformula2)
         self.subformula1 = subformula1
         self.subformula2 = subformula2
-        self.min_op = Minish()
-        self.max_op = Maxish()
+
+    @property
+    def is_pointwise(self) -> bool:
+        return True
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         trace1 = self.subformula1(
@@ -256,8 +237,8 @@ class Or(STL_Formula):
         l1, u1 = trace1[..., 0], trace1[..., 1]
         l2, u2 = trace2[..., 0], trace2[..., 1]
 
-        lower = _reduce(self.max_op, [l1, l2], scale)
-        upper = _reduce(self.min_op, [u1 + u2, torch.ones_like(u1)], scale)
+        lower = torch.maximum(l1, l2)
+        upper = torch.clamp(u1 + u2, max=1.0)
         return torch.stack([lower, upper], dim=-1)
 
     def __str__(self):
@@ -267,7 +248,7 @@ class Or(STL_Formula):
 class Implies(STL_Formula):
     """
     Implication: ϕ₁ ⇒ ϕ₂
-    Defined as: ¬ϕ₁ ∨ ϕ₂
+    Defined as: ¬ϕ₁ ∨ ϕ₂, so it inherits Or's exact, unsmoothed bounds.
     """
 
     def __init__(self, subformula1, subformula2):
@@ -275,6 +256,10 @@ class Implies(STL_Formula):
         self.subformula1 = subformula1
         self.subformula2 = subformula2
         self.equivalent = Or(Negation(subformula1), subformula2)
+
+    @property
+    def is_pointwise(self) -> bool:
+        return True
 
     def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
         return self.equivalent(
@@ -286,8 +271,9 @@ class Implies(STL_Formula):
 
 
 class Temporal_Operator(STL_Formula):
-    """
-    Base class for temporal operators.
+    """Base endpointwise temporal reduction.
+
+    Positive scales produce optimization surrogates, not reportable intervals.
     """
 
     def __init__(self, subformula, interval=None):
@@ -412,10 +398,7 @@ class Temporal_Operator(STL_Formula):
 
 
 class Always(Temporal_Operator):
-    """
-    □_I ϕ: Always operator
-    Computes min over time interval.
-    """
+    """Endpointwise temporal minimum over a future window."""
 
     def __init__(self, subformula, interval=None):
         super(Always, self).__init__(subformula=subformula, interval=interval)
@@ -465,11 +448,7 @@ class Always(Temporal_Operator):
 
 
 class Eventually(Temporal_Operator):
-    """
-    Eventually operator: ♢_I ϕ
-    Computes max over time interval.
-    The bounds dimension is processed automatically.
-    """
+    """Endpointwise temporal maximum over a future window."""
 
     def __init__(self, subformula, interval=None):
         super(Eventually, self).__init__(subformula=subformula, interval=interval)
@@ -516,13 +495,7 @@ class Eventually(Temporal_Operator):
 
 
 class Until(STL_Formula):
-    """
-    ϕ U_I ψ : Until operator
-
-    Inclusive convention: ϕ must hold from the evaluation origin through the
-    witness time τ itself, not merely up to τ-1, so U_[0,0] combines both
-    operands at the current time.
-    """
+    """Endpointwise max-min Until with an inclusive left prefix."""
 
     def __init__(self, left, right, interval=None):
         super(Until, self).__init__()
@@ -568,13 +541,16 @@ class Until(STL_Formula):
                 )  # [B,2]
                 psi_tau = psi[:, tau, :]  # [B,2]
 
-                lower = _reduce(
-                    self.max_op,
-                    [prefix[..., 0] + psi_tau[..., 0] - 1.0, torch.zeros_like(prefix[..., 0])],
-                    scale,
-                )
-                upper = _reduce(self.min_op, [prefix[..., 1], psi_tau[..., 1]], scale)
-                candidates.append(torch.stack([lower, upper], dim=-1))  # [B,2]
+                # Both must hold at this witness: endpointwise min, the same
+                # reduction Always takes over a window.
+                candidates.append(
+                    self.min_op(
+                        torch.stack([prefix, psi_tau], dim=1),
+                        scale,
+                        dim=1,
+                        keepdim=False,
+                    )
+                )  # [B,2]
 
             # best witness in [t+a, t+b]
             best = self.max_op(
