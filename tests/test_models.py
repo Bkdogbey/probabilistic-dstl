@@ -1,8 +1,14 @@
 """Controlled dynamics and the shared Gaussian belief boundary."""
 
+import numpy as np
 import pytest
 import torch
-from models.dynamics import DoubleIntegrator, GaussianBelief, SingleIntegrator
+from models.dynamics import (
+    DoubleIntegrator,
+    GaussianBelief,
+    SingleIntegrator,
+    create_gaussian_belief_trajectory,
+)
 from pdstl.base import BeliefTrajectory
 from pdstl.operators import GreaterThan
 from planning.environment import Environment, extract_trajectory_stats
@@ -82,3 +88,42 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     assert 0 <= score <= 1
     assert len(history) == 1
     assert torch.isfinite(torch.tensor(history)).all()
+
+
+def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():
+    scalar_mean = np.array([1.0, 2.0], dtype=np.float64)
+    scalar = create_gaussian_belief_trajectory(
+        scalar_mean, np.array([0.25, 1.0]), sigma_multiplier=1.5
+    )
+    assert scalar[0].mean.shape == (1, 1)
+    assert scalar[0].mean.dtype == torch.float64
+
+    vector = create_gaussian_belief_trajectory(
+        np.zeros((3, 2)), np.ones((3, 2, 2)), sigma_multiplier=1.0
+    )
+    assert len(vector) == 3 and vector[0].var.shape == (1, 2, 2)
+
+    mean = torch.zeros(2, 3, 2, dtype=torch.float64, requires_grad=True)
+    variance = torch.ones(2, 3, 2, dtype=torch.float64)
+    batched = create_gaussian_belief_trajectory(
+        mean, variance, sigma_multiplier=0.0
+    )
+    assert len(batched) == 3 and batched[0].mean.shape == (2, 2)
+    assert batched[0].mean.device == mean.device
+    GreaterThan(0.0)(batched).sum().backward()
+    assert mean.grad is not None and torch.isfinite(mean.grad).all()
+
+
+@pytest.mark.parametrize(
+    "mean,variance",
+    [
+        (np.zeros(3), np.zeros((3, 1))),
+        (np.zeros((3, 2)), np.zeros((3, 3))),
+        (np.zeros((3, 2)), np.zeros((3, 2, 3))),
+        (np.zeros((2, 3, 2)), np.zeros((2, 3, 3))),
+        (np.zeros((2, 3, 2)), np.zeros((2, 3, 2, 3))),
+    ],
+)
+def test_gaussian_trajectory_factory_rejects_inexact_shapes(mean, variance):
+    with pytest.raises(ValueError, match="exactly match"):
+        create_gaussian_belief_trajectory(mean, variance, sigma_multiplier=1.0)

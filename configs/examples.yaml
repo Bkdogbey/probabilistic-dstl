@@ -1,48 +1,23 @@
 show_plots: true
 
 always:
-  signal: &continuous_signal
-    type: linear
-    control: sinusoidal
-    parameters:
-      a: 0.01
-      b: 1.0
-      g: 2.0
-      q: 2.5
-      mu: 50.0
-      P: 0.15
-      t_end: 10.0
-      n_steps: 100
-  sigma_multiplier: 1.0
   threshold: 50.0
-  formula:
-    operator: always
-    interval_sec: [1.0, 2.0]
+  interval_steps: [0, 2]
+  signal:
+    lower: [52.0, 51.0, 53.0, 49.0, 48.0, 54.0, 55.0, 56.0]
+    upper: [55.0, 54.0, 56.0, 52.0, 49.0, 57.0, 58.0, 59.0]
 
 eventually:
-  signal: *continuous_signal
-  sigma_multiplier: 1.0
-  threshold: 55.0
-  formula:
-    operator: eventually
-    interval_sec: [0.0, 1.0]
+  threshold: 50.0
+  interval_steps: [0, 1]
+  signal:
+    lower: [45.0, 46.0, 49.0, 47.0, 52.0, 44.0, 43.0]
+    upper: [48.0, 49.0, 53.0, 49.0, 55.0, 48.0, 47.0]
 
 nested:
-  signal:
-    type: piecewise
-    values:
-      - [45.0, 4.0]
-      - [55.0, 4.0]
-      - [60.0, 4.0]
-      - [48.0, 4.0]
-      - [42.0, 9.0]
-      - [58.0, 4.0]
-      - [52.0, 4.0]
-  sigma_multiplier: 1.0
   threshold: 50.0
-  formula:
-    operator: eventually
-    interval_steps: [0, 1]
-    child:
-      operator: always
-      interval_steps: [0, 1]
+  always_interval_steps: [0, 1]
+  eventually_interval_steps: [0, 1]
+  signal:
+    lower: [45.0, 52.0, 53.0, 46.0, 49.0, 54.0]
+    upper: [48.0, 55.0, 56.0, 49.0, 53.0, 57.0]

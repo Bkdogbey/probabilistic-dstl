@@ -1,6 +1,5 @@
 import math
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -165,63 +164,80 @@ class DoubleIntegrator(Dynamics):
         return mean_stack, cov_stack
 
 
-# Offline scalar model
+# Bounded-state belief
 
 
-def sinusoidal_input(t):
-    """Sinusoidal scalar control used by the original pdSTL example."""
-    return 15.0 * np.sin(np.pi * t)
+class IntervalBelief(Belief):
+    """State belief defined only by lower and upper bounds."""
 
+    def __init__(self, lower, upper):
+        self.lower = torch.as_tensor(lower)
+        self.upper = torch.as_tensor(upper)
+        self._validate()
 
-def linear_system(a, b, g, q, mu, P, t, control_func):
-    """Propagate the scalar Gaussian model used in the offline examples."""
-    t = np.asarray(t, dtype=float)
-    mean_trace = np.zeros(len(t), dtype=float)
-    var_trace = np.zeros(len(t), dtype=float)
-    mean_trace[0], var_trace[0] = mu, P
-    process_variance = g**2 + q
+    def _validate(self):
+        if self.lower.shape != self.upper.shape:
+            raise ValueError("IntervalBelief bounds must have matching shapes")
+        if self.lower.ndim != 2:
+            raise ValueError("IntervalBelief bounds must have shape [B,D]")
+        if not bool(torch.isfinite(self.lower).all()):
+            raise ValueError("IntervalBelief lower bounds must be finite")
+        if not bool(torch.isfinite(self.upper).all()):
+            raise ValueError("IntervalBelief upper bounds must be finite")
+        if bool((self.lower > self.upper).any()):
+            raise ValueError("IntervalBelief requires lower <= upper")
 
-    for i in range(1, len(t)):
-        dt = t[i] - t[i - 1]
-        transition = np.exp(a * dt)
-        mean_trace[i] = transition * mean_trace[i - 1] + dt * b * control_func(t[i - 1])
-        var_trace[i] = transition**2 * var_trace[i - 1] + process_variance * dt
-    return mean_trace, var_trace
+    def value(self):
+        return (self.lower + self.upper) / 2
 
+    def probability_bounds(self, predicate):
+        """Return distribution-free bounds for an inclusive comparison."""
+        sense = getattr(predicate, "sense", None)
+        if sense not in (">=", "<="):
+            raise ValueError(f"IntervalBelief cannot evaluate {predicate}")
 
-def piecewise_signal(values=None):
-    """Return a configurable discrete scalar mean/variance signal."""
-    if values is None:
-        values = ((45, 4), (55, 4), (60, 4), (48, 4), (42, 9), (58, 4), (52, 4))
-    values = np.asarray(values, dtype=float)
-    if values.ndim != 2 or values.shape[1] != 2:
-        raise ValueError("piecewise values must have shape [T, 2] as (mean, variance)")
-    return np.arange(len(values), dtype=float), values[:, 0], values[:, 1]
+        dim = getattr(predicate, "dim", 0)
+        if not isinstance(dim, int) or not 0 <= dim < self.lower.shape[1]:
+            raise ValueError(f"predicate dimension {dim} is outside the state")
 
-
-def create_signal_trace(config):
-    """Create ``(time, mean, variance)`` from a signal configuration."""
-    signal_type = config.get("type")
-
-    if signal_type == "linear":
-        if config.get("control") != "sinusoidal":
-            raise ValueError("linear signal control must be 'sinusoidal'")
-        parameters = config["parameters"]
-        time = np.linspace(0.0, parameters["t_end"], parameters["n_steps"])
-        mean, variance = linear_system(
-            **{
-                name: parameters[name]
-                for name in ("a", "b", "g", "q", "mu", "P")
-            },
-            t=time,
-            control_func=sinusoidal_input,
+        lower = self.lower[:, dim]
+        upper = self.upper[:, dim]
+        threshold = torch.as_tensor(
+            predicate.threshold, dtype=lower.dtype, device=lower.device
         )
-        return time, mean, variance
 
-    if signal_type == "piecewise":
-        return piecewise_signal(config["values"])
+        if sense == ">=":
+            guaranteed = lower >= threshold
+            possible = upper >= threshold
+        else:
+            guaranteed = upper <= threshold
+            possible = lower <= threshold
 
-    raise ValueError("signal type must be 'linear' or 'piecewise'")
+        return torch.stack(
+            (guaranteed.to(lower.dtype), possible.to(lower.dtype)), dim=-1
+        )
+
+
+def create_interval_belief_trajectory(
+    lower_trace, upper_trace, dtype=None, device=None
+):
+    """Build a scalar interval trajectory from matching ``[T]`` traces."""
+    lower = torch.as_tensor(lower_trace, dtype=dtype, device=device)
+    upper = torch.as_tensor(
+        upper_trace, dtype=lower.dtype, device=lower.device
+    )
+
+    if lower.ndim != 1 or upper.ndim != 1:
+        raise ValueError("interval traces must have shape [T]")
+    if lower.shape != upper.shape:
+        raise ValueError("interval traces must have matching shapes")
+
+    return BeliefTrajectory(
+        [
+            IntervalBelief(lower[t : t + 1, None], upper[t : t + 1, None])
+            for t in range(len(lower))
+        ]
+    )
 
 
 # Gaussian belief

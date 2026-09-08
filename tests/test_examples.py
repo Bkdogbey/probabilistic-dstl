@@ -1,7 +1,6 @@
 """Offline examples exercise the same belief-to-pdSTL pipeline as main.py."""
 
 import ast
-from copy import deepcopy
 import os
 from pathlib import Path
 import subprocess
@@ -13,18 +12,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
-from scipy.special import ndtr
 import torch
 import yaml
 
-from offline import evaluate_offline_example
-from models.dynamics import (
-    create_gaussian_belief_trajectory,
-    create_signal_trace,
-)
-from pdstl.operators import Always, GreaterThan
+from models.dynamics import IntervalBelief, create_interval_belief_trajectory
+from pdstl.operators import Always, Eventually, GreaterThan, LessThan
 from utils import to_steps
-from visualization.temporal import plot_temporal_example
+from visualization.temporal import plot_temporal_example, print_temporal_results
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,162 +28,215 @@ def _config():
     return yaml.safe_load((ROOT / "configs/examples.yaml").read_text())
 
 
-def _continuous(name):
-    return evaluate_offline_example(name.title(), _config()[name])
+# ---------------------------------------------------------------------------
+# IntervalBelief input validation
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name,reduction", [("always", np.min), ("eventually", np.max)])
-def test_continuous_examples_match_endpointwise_cdf_reductions(name, reduction):
-    result = _continuous(name)
-    sigma = np.sqrt(result.variance)
-    z = (result.mean - result.predicate.threshold) / sigma
-    lower = ndtr(z - result.sigma_multiplier)
-    upper = ndtr(z + result.sigma_multiplier)
-    a, b = result.formula.interval
-    expected = np.array(
-        [
-            [
-                reduction(lower[i + a : i + b + 1]),
-                reduction(upper[i + a : i + b + 1]),
-            ]
-            for i in range(len(result.time) - b)
-        ]
-    )
-
-    np.testing.assert_allclose(
-        result.atomic_trace[0].numpy(),
-        np.stack((lower, upper), axis=-1),
-        atol=1e-12,
-    )
-    np.testing.assert_allclose(
-        result.temporal_trace[0].numpy(), expected, atol=1e-12
-    )
-    assert result.temporal_trace.shape == (1, len(result.time) - b, 2)
-
-    figure = plot_temporal_example(result, show=False)
-    assert len(figure.axes) == 3
-    assert "pdSTL stochastic robustness" == figure.axes[-1].get_ylabel()
-    figure.canvas.draw()
-    plt.close(figure)
+def test_interval_belief_rejects_mismatched_shapes():
+    with pytest.raises(ValueError, match="matching shapes"):
+        IntervalBelief(torch.zeros(1, 2), torch.zeros(1, 3))
 
 
-def test_continuous_examples_retain_representative_outputs():
-    always = _continuous("always")
-    eventually = _continuous("eventually")
-
-    assert always.atomic_trace.shape == (1, 100, 2)
-    assert always.temporal_trace.shape == (1, 80, 2)
-    np.testing.assert_allclose(
-        always.atomic_trace[0, 0].numpy(),
-        [0.1586552539, 0.8413447461],
-        atol=1e-10,
-    )
-    np.testing.assert_allclose(
-        always.temporal_trace[0, 0].numpy(),
-        [0.2397146171, 0.9019562671],
-        atol=1e-10,
-    )
-
-    assert eventually.atomic_trace.shape == (1, 100, 2)
-    assert eventually.temporal_trace.shape == (1, 90, 2)
-    np.testing.assert_allclose(
-        eventually.temporal_trace[0, 0].numpy(),
-        [0.8250194548, 0.9983304600],
-        atol=1e-10,
-    )
+def test_interval_belief_rejects_non_2d():
+    with pytest.raises(ValueError, match=r"\[B,D\]"):
+        IntervalBelief(torch.zeros(3), torch.zeros(3))
 
 
-def test_piecewise_always_remains_a_focused_unit_example():
-    example = _config()["nested"]
-    _, mean, variance = create_signal_trace(example["signal"])
-    beliefs = create_gaussian_belief_trajectory(
-        mean, variance, sigma_multiplier=example["sigma_multiplier"]
-    )
-    predicate = GreaterThan(example["threshold"])
-    interval = example["formula"]["child"]["interval_steps"]
-    formula = Always(predicate, interval=interval)
-    atomic = predicate(beliefs)[0].numpy()
-    got = formula(beliefs)[0].numpy()
-
-    expected = np.minimum(atomic[:-1], atomic[1:])
-    np.testing.assert_allclose(got, expected)
+def test_interval_belief_rejects_non_finite():
+    with pytest.raises(ValueError, match="finite"):
+        IntervalBelief(torch.tensor([[float("nan")]]), torch.tensor([[1.0]]))
 
 
-def test_nested_example_values_length_and_four_panel_plot():
-    result = evaluate_offline_example("Nested", _config()["nested"])
-    atomic = result.atomic_trace
-    inner = result.inner_trace
-    temporal = result.temporal_trace
-
-    expected_inner = np.minimum(atomic[0, :-1].numpy(), atomic[0, 1:].numpy())
-    expected_final = np.maximum(expected_inner[:-1], expected_inner[1:])
-    np.testing.assert_allclose(inner[0].numpy(), expected_inner)
-    np.testing.assert_allclose(temporal[0].numpy(), expected_final)
-    assert atomic.shape == (1, 7, 2)
-    assert inner.shape == (1, 6, 2)
-    assert temporal.shape == (1, 5, 2)
-
-    figure = plot_temporal_example(result, show=False)
-    assert len(figure.axes) == 4
-    assert figure.axes[2].lines[0].get_xdata().tolist() == result.time[:6].tolist()
-    assert figure.axes[3].lines[0].get_xdata().tolist() == result.time[:5].tolist()
-    figure.canvas.draw()
-    plt.close(figure)
+def test_interval_belief_rejects_lower_greater_than_upper():
+    with pytest.raises(ValueError, match="lower <= upper"):
+        IntervalBelief(torch.tensor([[2.0]]), torch.tensor([[1.0]]))
 
 
-def test_signal_selection_is_independent_of_the_formula():
-    config = _config()
-
-    always_piecewise = deepcopy(config["always"])
-    always_piecewise["signal"] = config["nested"]["signal"]
-    piecewise_result = evaluate_offline_example("Always", always_piecewise)
-    assert piecewise_result.signal_type == "piecewise"
-    assert piecewise_result.temporal_trace.shape == (1, 5, 2)
-
-    nested_linear = deepcopy(config["nested"])
-    nested_linear["signal"] = config["always"]["signal"]
-    linear_result = evaluate_offline_example("Nested", nested_linear)
-    assert linear_result.signal_type == "linear"
-    assert linear_result.temporal_trace.shape == (1, 98, 2)
+def test_interval_belief_rejects_invalid_predicate_dimension():
+    belief = IntervalBelief(torch.zeros(1, 1), torch.ones(1, 1))
+    predicate = GreaterThan(0.5, dim=5)
+    with pytest.raises(ValueError, match="outside the state"):
+        belief.probability_bounds(predicate)
 
 
-def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():
-    scalar_mean = np.array([1.0, 2.0], dtype=np.float64)
-    scalar = create_gaussian_belief_trajectory(
-        scalar_mean, np.array([0.25, 1.0]), sigma_multiplier=1.5
-    )
-    assert scalar[0].mean.shape == (1, 1)
-    assert scalar[0].mean.dtype == torch.float64
-
-    vector = create_gaussian_belief_trajectory(
-        np.zeros((3, 2)), np.ones((3, 2, 2)), sigma_multiplier=1.0
-    )
-    assert len(vector) == 3 and vector[0].var.shape == (1, 2, 2)
-
-    mean = torch.zeros(2, 3, 2, dtype=torch.float64, requires_grad=True)
-    variance = torch.ones(2, 3, 2, dtype=torch.float64)
-    batched = create_gaussian_belief_trajectory(
-        mean, variance, sigma_multiplier=0.0
-    )
-    assert len(batched) == 3 and batched[0].mean.shape == (2, 2)
-    assert batched[0].mean.device == mean.device
-    GreaterThan(0.0)(batched).sum().backward()
-    assert mean.grad is not None and torch.isfinite(mean.grad).all()
+# ---------------------------------------------------------------------------
+# Inclusive threshold semantics for GreaterThan / LessThan
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "mean,variance",
+    "lower,upper,expected",
     [
-        (np.zeros(3), np.zeros((3, 1))),
-        (np.zeros((3, 2)), np.zeros((3, 3))),
-        (np.zeros((3, 2)), np.zeros((3, 2, 3))),
-        (np.zeros((2, 3, 2)), np.zeros((2, 3, 3))),
-        (np.zeros((2, 3, 2)), np.zeros((2, 3, 2, 3))),
+        (5.0, 5.0, [1.0, 1.0]),  # x_lower == threshold -> guaranteed
+        (6.0, 8.0, [1.0, 1.0]),  # entirely above -> guaranteed
+        (3.0, 5.0, [0.0, 1.0]),  # x_upper == threshold -> not violated
+        (3.0, 7.0, [0.0, 1.0]),  # crossing
+        (1.0, 4.9, [0.0, 0.0]),  # entirely below -> violated
     ],
 )
-def test_gaussian_trajectory_factory_rejects_inexact_shapes(mean, variance):
-    with pytest.raises(ValueError, match="exactly match"):
-        create_gaussian_belief_trajectory(mean, variance, sigma_multiplier=1.0)
+def test_greater_than_inclusive_bounds(lower, upper, expected):
+    belief = IntervalBelief(torch.tensor([[lower]]), torch.tensor([[upper]]))
+    got = belief.probability_bounds(GreaterThan(5.0))
+    torch.testing.assert_close(got[0], torch.tensor(expected))
+
+
+@pytest.mark.parametrize(
+    "lower,upper,expected",
+    [
+        (5.0, 5.0, [1.0, 1.0]),  # x_upper == threshold -> guaranteed
+        (1.0, 4.0, [1.0, 1.0]),  # entirely below -> guaranteed
+        (5.0, 7.0, [0.0, 1.0]),  # x_lower == threshold -> not violated
+        (3.0, 7.0, [0.0, 1.0]),  # crossing
+        (5.1, 8.0, [0.0, 0.0]),  # entirely above -> violated
+    ],
+)
+def test_less_than_inclusive_bounds(lower, upper, expected):
+    belief = IntervalBelief(torch.tensor([[lower]]), torch.tensor([[upper]]))
+    got = belief.probability_bounds(LessThan(5.0))
+    torch.testing.assert_close(got[0], torch.tensor(expected))
+
+
+# ---------------------------------------------------------------------------
+# create_interval_belief_trajectory
+# ---------------------------------------------------------------------------
+
+
+def test_interval_trajectory_factory_builds_one_belief_per_step():
+    trajectory = create_interval_belief_trajectory([1.0, 2.0, 3.0], [1.5, 2.5, 3.5])
+    assert len(trajectory) == 3
+    assert trajectory[0].lower.shape == (1, 1)
+    assert trajectory[0].upper.shape == (1, 1)
+
+
+def test_interval_trajectory_factory_rejects_mismatched_traces():
+    with pytest.raises(ValueError, match="matching shapes"):
+        create_interval_belief_trajectory([1.0, 2.0], [1.0, 2.0, 3.0])
+
+
+# ---------------------------------------------------------------------------
+# Configured examples: hand-computed atomic/temporal traces
+# ---------------------------------------------------------------------------
+
+
+def test_always_example_matches_hand_computed_traces():
+    config = _config()["always"]
+    lower, upper = config["signal"]["lower"], config["signal"]["upper"]
+    time = np.arange(len(lower))
+    beliefs = create_interval_belief_trajectory(lower, upper)
+    predicate = GreaterThan(config["threshold"])
+    formula = Always(predicate, interval=config["interval_steps"])
+
+    atomic = predicate(beliefs)
+    temporal = formula(beliefs, scale=-1)
+
+    expected_atomic = torch.tensor(
+        [[1, 1], [1, 1], [1, 1], [0, 1], [0, 0], [1, 1], [1, 1], [1, 1]],
+        dtype=atomic.dtype,
+    )
+    expected_temporal = torch.tensor(
+        [[1, 1], [0, 1], [0, 0], [0, 0], [0, 0], [1, 1]], dtype=temporal.dtype
+    )
+
+    torch.testing.assert_close(atomic[0], expected_atomic)
+    torch.testing.assert_close(temporal[0], expected_temporal)
+    assert atomic.shape == (1, 8, 2)
+    assert temporal.shape == (1, 6, 2)
+
+    figure = plot_temporal_example(
+        "Always", time, lower, upper, config["threshold"], atomic, temporal,
+        show=False,
+    )
+    assert len(figure.axes) == 3
+    assert figure.axes[-1].get_ylabel() == "pdSTL stochastic robustness"
+    figure.canvas.draw()
+    plt.close(figure)
+
+
+def test_eventually_example_matches_hand_computed_traces():
+    config = _config()["eventually"]
+    lower, upper = config["signal"]["lower"], config["signal"]["upper"]
+    time = np.arange(len(lower))
+    beliefs = create_interval_belief_trajectory(lower, upper)
+    predicate = GreaterThan(config["threshold"])
+    formula = Eventually(predicate, interval=config["interval_steps"])
+
+    atomic = predicate(beliefs)
+    temporal = formula(beliefs, scale=-1)
+
+    expected_atomic = torch.tensor(
+        [[0, 0], [0, 0], [0, 1], [0, 0], [1, 1], [0, 0], [0, 0]],
+        dtype=atomic.dtype,
+    )
+    expected_temporal = torch.tensor(
+        [[0, 0], [0, 1], [0, 1], [1, 1], [1, 1], [0, 0]], dtype=temporal.dtype
+    )
+
+    torch.testing.assert_close(atomic[0], expected_atomic)
+    torch.testing.assert_close(temporal[0], expected_temporal)
+    assert atomic.shape == (1, 7, 2)
+    assert temporal.shape == (1, 6, 2)
+
+    figure = plot_temporal_example(
+        "Eventually", time, lower, upper, config["threshold"], atomic, temporal,
+        show=False,
+    )
+    assert len(figure.axes) == 3
+    assert figure.axes[-1].get_ylabel() == "pdSTL stochastic robustness"
+    figure.canvas.draw()
+    plt.close(figure)
+
+
+def test_nested_example_matches_hand_computed_traces():
+    config = _config()["nested"]
+    lower, upper = config["signal"]["lower"], config["signal"]["upper"]
+    time = np.arange(len(lower))
+    beliefs = create_interval_belief_trajectory(lower, upper)
+    predicate = GreaterThan(config["threshold"])
+    inner_formula = Always(predicate, interval=config["always_interval_steps"])
+    formula = Eventually(inner_formula, interval=config["eventually_interval_steps"])
+
+    atomic = predicate(beliefs)
+    inner = inner_formula(beliefs, scale=-1)
+    temporal = formula(beliefs, scale=-1)
+
+    expected_atomic = torch.tensor(
+        [[0, 0], [1, 1], [1, 1], [0, 0], [0, 1], [1, 1]], dtype=atomic.dtype
+    )
+    expected_inner = torch.tensor(
+        [[0, 0], [1, 1], [0, 0], [0, 0], [0, 1]], dtype=inner.dtype
+    )
+    expected_temporal = torch.tensor(
+        [[1, 1], [1, 1], [0, 0], [0, 1]], dtype=temporal.dtype
+    )
+
+    torch.testing.assert_close(atomic[0], expected_atomic)
+    torch.testing.assert_close(inner[0], expected_inner)
+    torch.testing.assert_close(temporal[0], expected_temporal)
+    assert atomic.shape == (1, 6, 2)
+    assert inner.shape == (1, 5, 2)
+    assert temporal.shape == (1, 4, 2)
+
+    figure = plot_temporal_example(
+        "Nested",
+        time,
+        lower,
+        upper,
+        config["threshold"],
+        atomic,
+        temporal,
+        inner_trace=inner,
+        show=False,
+    )
+    assert len(figure.axes) == 4
+    assert figure.axes[-1].get_ylabel() == "pdSTL stochastic robustness"
+    figure.canvas.draw()
+    plt.close(figure)
+
+
+# ---------------------------------------------------------------------------
+# to_steps stays valid, unrelated utility code
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -205,18 +252,33 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
         to_steps([0.0, 1.0], time)
 
 
+# ---------------------------------------------------------------------------
+# Structural / hygiene tests
+# ---------------------------------------------------------------------------
+
+
 def test_examples_configuration_contains_only_the_three_blocks():
     config = _config()
     assert set(config) == {"show_plots", "always", "eventually", "nested"}
-    assert all("enabled" not in config[name] for name in config if name != "show_plots")
-    assert config["always"]["signal"]["type"] == "linear"
-    assert config["eventually"]["signal"]["type"] == "linear"
-    assert config["nested"]["signal"]["type"] == "piecewise"
+    assert set(config["always"]) == {"threshold", "interval_steps", "signal"}
+    assert set(config["eventually"]) == {"threshold", "interval_steps", "signal"}
+    assert set(config["nested"]) == {
+        "threshold",
+        "always_interval_steps",
+        "eventually_interval_steps",
+        "signal",
+    }
+    for name in ("always", "eventually", "nested"):
+        assert set(config[name]["signal"]) == {"lower", "upper"}
+
+
+def test_offline_module_has_been_removed():
+    assert not (ROOT / "src/offline.py").exists()
 
 
 def test_reusable_modules_do_not_run_examples_or_eagerly_import_planning():
     code = (
-        "import sys; import models.dynamics; import offline; "
+        "import sys; import models.dynamics; "
         "assert 'visualization.planning' not in sys.modules; "
         "assert 'visualization.live_plots' not in sys.modules; "
         "assert 'visualization.animation' not in sys.modules"
@@ -237,7 +299,9 @@ def test_main_is_direct_and_runs_exactly_three_literal_blocks(tmp_path):
     source = (ROOT / "src/main.py").read_text()
     tree = ast.parse(source)
     assert source.count('with skip_run("run",') == 3
-    assert not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body)
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
+    )
     assert not any(isinstance(node, ast.If) for node in tree.body)
 
     config = _config()
@@ -261,4 +325,3 @@ def test_main_is_direct_and_runs_exactly_three_literal_blocks(tmp_path):
     assert "\nAlways\n" in result.stdout
     assert "\nEventually\n" in result.stdout
     assert "\nNested\n" in result.stdout
-    assert "Piecewise Always" not in result.stdout
