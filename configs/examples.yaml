@@ -1,0 +1,35 @@
+# Offline temporal-operator examples. Planning settings intentionally live elsewhere.
+show_plots: true
+
+always:
+  model: &original_linear_model
+    a: 0.01
+    b: 1.0
+    g: 2.0
+    q: 2.5
+    mu: 50.0
+    P: 0.15
+    t_end: 10.0
+    n_steps: 100
+  confidence_level: 1.0
+  threshold: 50.0
+  interval_sec: [1.0, 2.0]
+
+piecewise_always:
+  signal:
+    - [45.0, 4.0]
+    - [55.0, 4.0]
+    - [60.0, 4.0]
+    - [48.0, 4.0]
+    - [42.0, 9.0]
+    - [58.0, 4.0]
+    - [52.0, 4.0]
+  confidence_level: 1.0
+  threshold: 50.0
+  interval_steps: [1, 2]
+
+eventually:
+  model: *original_linear_model
+  confidence_level: 1.0
+  threshold: 55.0
+  interval_sec: [0.0, 1.0]

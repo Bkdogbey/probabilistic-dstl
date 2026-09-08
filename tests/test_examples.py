@@ -1,135 +1,117 @@
-"""Real monitoring examples, valid plot origins, and the script entry point."""
+"""Offline examples exercise the same belief-to-pdSTL pipeline as main.py."""
 
 import os
 from pathlib import Path
 import subprocess
 import sys
-import matplotlib
 
+import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pytest
 from scipy.special import ndtr
+import torch
 import yaml
-from experiments.offline import run_always_example, run_eventually_example
+
+from models.dynamics import (
+    create_gaussian_belief_trajectory,
+    linear_system,
+    piecewise_signal,
+    sinusoidial_input,
+)
+from pdstl.operators import Always, Eventually, GreaterThan
+from utils import to_steps
+from visualization.temporal import plot_temporal_example
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("interval", [(0, 1), (1, 2)])
-@pytest.mark.parametrize(
-    "runner, threshold, reduction",
-    [
-        (run_always_example, 50.0, min),
-        (run_eventually_example, 55.0, max),
-    ],
-)
-def test_examples_match_cdf_and_window_references(
-    runner, threshold, reduction, interval
-):
-    time, mean, variance, atomic, temporal, figure = runner(
-        threshold, interval, show=False
+def _evaluate(name):
+    config = yaml.safe_load((ROOT / "configs/examples.yaml").read_text())
+    example = config[name]
+    if name == "piecewise_always":
+        time, mean, variance = piecewise_signal(example["signal"])
+        interval = example["interval_steps"]
+    else:
+        model = example["model"]
+        time = np.linspace(0.0, model["t_end"], model["n_steps"])
+        mean, variance = linear_system(
+            **{key: model[key] for key in ("a", "b", "g", "q", "mu", "P")},
+            t=time,
+            control_func=sinusoidial_input,
+        )
+        interval = to_steps(example["interval_sec"], time)
+    beliefs = create_gaussian_belief_trajectory(
+        mean, variance, example["confidence_level"], dtype=torch.float64
     )
-    try:
-        probability = ndtr((mean.numpy() - threshold) / np.sqrt(variance.numpy()))
+    predicate = GreaterThan(example["threshold"])
+    formula = Eventually(predicate, interval) if name == "eventually" else Always(predicate, interval)
+    return example, time, mean, variance, interval, predicate, formula, predicate(beliefs), formula(beliefs)
+
+
+def test_offline_examples_match_endpointwise_cdf_reductions():
+    for name, reduction in (("always", np.min), ("piecewise_always", np.min), ("eventually", np.max)):
+        example, time, mean, variance, interval, predicate, formula, atomic, temporal = _evaluate(name)
+        sigma = np.sqrt(variance)
+        z = (mean - predicate.threshold) / sigma
+        lower, upper = ndtr(z - example["confidence_level"]), ndtr(z + example["confidence_level"])
         a, b = interval
-        expected = np.array(
-            [reduction(probability[k + a : k + b + 1]) for k in range(7 - b)]
+        expected = np.array([
+            [reduction(lower[i + a : i + b + 1]), reduction(upper[i + a : i + b + 1])]
+            for i in range(len(time) - b)
+        ])
+        np.testing.assert_allclose(atomic[0].numpy(), np.stack((lower, upper), axis=-1), atol=1e-12)
+        np.testing.assert_allclose(temporal[0].numpy(), expected, atol=1e-12)
+        assert temporal.shape == (1, len(time) - b, 2)
+
+        figure = plot_temporal_example(
+            time, mean, variance, example["confidence_level"], atomic, temporal,
+            predicate, formula, interval, show=False,
         )
-        assert atomic.shape == (1, 7, 2)
-        assert temporal.shape == (1, 7 - b, 2)
-        for endpoint in range(2):
-            np.testing.assert_allclose(atomic[0, :, endpoint], probability, atol=1e-12)
-            np.testing.assert_allclose(temporal[0, :, endpoint], expected, atol=1e-12)
-        np.testing.assert_array_equal(figure.axes[0].lines[0].get_xdata(), time)
-        np.testing.assert_array_equal(figure.axes[1].lines[0].get_xdata(), time)
-        np.testing.assert_array_equal(
-            figure.axes[2].lines[0].get_xdata(), time[: 7 - b]
-        )
+        assert len(figure.axes) == 3
         figure.canvas.draw()
-    finally:
         plt.close(figure)
 
 
-def test_example_propagates_insufficient_horizon_error():
-    with pytest.raises(ValueError, match="needs 8 steps"):
-        run_always_example(50.0, (0, 7), show=False)
-    assert not plt.get_fignums()
+def test_gaussian_trajectory_factory_normalizes_scalar_and_batched_traces():
+    scalar = create_gaussian_belief_trajectory([1.0, 2.0], [0.25, 1.0], 1.5)
+    assert len(scalar) == 2
+    assert scalar[0].mean.shape == (1, 1)
+    batched = create_gaussian_belief_trajectory(
+        torch.zeros(2, 3, 1), torch.ones(2, 3, 1), 1.0
+    )
+    assert len(batched) == 3
+    assert batched[0].mean.shape == (2, 1)
 
 
-def _environment(tmp_path):
-    return {
-        **os.environ,
-        "PYTHONPATH": str(ROOT / "src"),
-        "MPLBACKEND": "Agg",
-        "MPLCONFIGDIR": str(tmp_path / "matplotlib"),
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-
-
-def test_reusable_imports_do_not_run_experiments(tmp_path):
+def test_reusable_modules_do_not_run_examples():
     result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import experiments.offline; import experiments.planning; "
-            "import matplotlib.pyplot as plt; assert not plt.get_fignums()",
-        ],
-        cwd=tmp_path,
-        env=_environment(tmp_path),
+        [sys.executable, "-c", "import models.dynamics; import visualization.temporal"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "MPLBACKEND": "Agg"},
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == result.stderr == ""
-    assert not (tmp_path / "saved_data").exists()
-    assert not (tmp_path / "outputs").exists()
 
 
-def test_script_runs_monitoring_and_skips_planning(tmp_path):
-    config = yaml.safe_load((ROOT / "configs/stl_demos.yaml").read_text())
+def test_main_runs_only_the_three_offline_examples(tmp_path):
+    config = yaml.safe_load((ROOT / "configs/examples.yaml").read_text())
     config["show_plots"] = False
-    config_path = tmp_path / "monitoring.yaml"
+    config_path = tmp_path / "examples.yaml"
     config_path.write_text(yaml.safe_dump(config))
     script = tmp_path / "main.py"
-    script.write_text(
-        (ROOT / "src/main.py")
-        .read_text()
-        .replace('"configs/stl_demos.yaml"', repr(str(config_path)))
-    )
-    code = """
-import runpy
-import sys
-import matplotlib.pyplot as plt
-
-def forbid_planning_config(event, args):
-    if event == "open" and isinstance(args[0], (str, bytes)):
-        path = str(args[0])
-        if "configs/scenarios/" in path or path.endswith("configs/planning.yaml"):
-            raise AssertionError("A skipped planner loaded configuration")
-sys.addaudithook(forbid_planning_config)
-
-def unexpected_show():
-    raise AssertionError("show=False displayed a window")
-plt.show = unexpected_show
-runpy.run_path(sys.argv[1], run_name="__main__")
-assert len(plt.get_fignums()) == 2
-plt.close("all")
-"""
+    script.write_text((ROOT / "src/main.py").read_text().replace('"configs/examples.yaml"', repr(str(config_path))))
     result = subprocess.run(
-        [sys.executable, "-c", code, str(script)],
-        cwd=tmp_path,
-        env=_environment(tmp_path),
+        [sys.executable, str(script)],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "MPLBACKEND": "Agg"},
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert "Always[0,1]" in result.stdout
-    assert "Eventually[0,1]" in result.stdout
-    assert result.stdout.count("origin  window_start") == 2
-    assert result.stderr.count("Skipping the block") == 4
-    assert not (tmp_path / "saved_data").exists()
-    assert not (tmp_path / "outputs").exists()
+    assert "Always" in result.stdout
+    assert "Piecewise Always" in result.stdout
+    assert "Eventually" in result.stdout

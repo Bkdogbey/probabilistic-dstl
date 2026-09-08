@@ -2,8 +2,7 @@
 
 import pytest
 import torch
-from models.beliefs import GaussianBelief
-from models.dynamics import SingleIntegrator, DoubleIntegrator
+from models.dynamics import DoubleIntegrator, GaussianBelief, SingleIntegrator
 from pdstl.base import BeliefTrajectory
 from pdstl.operators import GreaterThan
 from planning.environment import Environment, extract_trajectory_stats

@@ -1,0 +1,52 @@
+# Configuration for the deferred optimisation examples in src/planning/examples.py.
+
+dynamics: single_integrator
+H: 8
+dt: 0.2
+u_max: 1.0
+q_std: 0.05
+
+x0_mean: [0.0, 0.0]
+x0_cov_scale: 0.01
+dim: 0
+seed: 0
+
+cases:
+  always:
+    threshold: 0.05
+    interval: [1, 8]
+  eventually:
+    threshold: 0.75
+    interval: [2, 6]
+  corridor:
+    lower_threshold: 0.05
+    upper_threshold: 0.6
+    interval: [1, 8]
+  until:
+    safe_threshold: 1.2
+    goal_threshold: 0.6
+    interval: [0, 6]
+  nested:
+    threshold: 0.5
+    inner_interval: [0, 2]
+    outer_interval: [0, 6]
+
+planner:
+  w_u: 0.05
+  w_du: 0.05
+  w_phi: 1.0
+  w_dist: 0.0
+  w_obs: 0.0
+  w_visit: 0.0
+  lr: 0.05
+  max_iters: 300
+  min_iters: 20
+  alpha: 0.99
+  loss_tol: 1.0e-6
+  scale: 10.0
+
+mpc:
+  form: eventually
+  threshold: 0.4
+  interval: [1, 5]
+  steps: 6

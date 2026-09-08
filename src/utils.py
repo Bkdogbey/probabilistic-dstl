@@ -5,8 +5,6 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 import yaml
-
-
 def get_device():
     """Return the configured torch device.
 
@@ -104,36 +102,3 @@ def to_steps(interval_sec, t):
     a = int(round(interval_sec[0] / dt))
     b = np.inf if np.isinf(interval_sec[1]) else int(round(interval_sec[1] / dt))
     return [a, b]
-
-
-def create_belief_trajectory(mean_trace, var_trace, dtype=None, device=None):
-    """Wrap mean/variance arrays into a BeliefTrajectory of GaussianBeliefs.
-
-    Each element holds the belief at one prediction step, shaped [batch, dim]
-    per the convention in pdstl.base.
-
-    Parameters
-    ----------
-    mean_trace : array-like, shape (T,)
-    var_trace  : array-like, shape (T,)
-    dtype : torch.dtype, optional
-        Defaults to torch.float32.
-    device : torch.device, optional
-        Defaults to get_device().
-
-    Returns
-    -------
-    BeliefTrajectory
-    """
-    from models.beliefs import GaussianBelief
-    from pdstl.base import BeliefTrajectory
-
-    dtype = torch.float32 if dtype is None else dtype
-    device = get_device() if device is None else device
-
-    mean = torch.as_tensor(mean_trace, dtype=dtype, device=device).reshape(1, -1, 1)
-    var = torch.as_tensor(var_trace, dtype=dtype, device=device).reshape(1, -1, 1)
-    beliefs = [
-        GaussianBelief(mean[:, i, :], var[:, i, :]) for i in range(len(mean_trace))
-    ]
-    return BeliefTrajectory(beliefs)

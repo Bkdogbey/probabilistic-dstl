@@ -23,7 +23,7 @@ from pdstl.operators import (
 from planning import log_utils
 from models.dynamics import SingleIntegrator
 from planning.planner import Planner
-from models.beliefs import GaussianBelief
+from models.dynamics import GaussianBelief
 from utils import get_device, load_config
 from visualization.robustness import plot_case, plot_synthesis
 
@@ -108,7 +108,7 @@ CASES = {
 
 def load_examples_config():
     """Example parameters merged with the planner defaults."""
-    cfg = load_config("configs/scenarios/examples.yaml")
+    cfg = load_config("configs/scenarios/planning_examples.yaml")
     planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
     return cfg, planner_cfg
 
@@ -124,7 +124,9 @@ def belief_trajectory(mean_trace, cov_trace):
     """Wrap a predicted mean/covariance rollout as one belief per step."""
     return BeliefTrajectory(
         [
-            GaussianBelief(mean_trace[:, t, :], cov_trace[:, t])
+            GaussianBelief(
+                mean_trace[:, t, :], cov_trace[:, t], confidence_level=0.0
+            )
             for t in range(mean_trace.shape[1])
         ]
     )
