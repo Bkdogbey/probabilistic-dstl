@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models.dynamics import GaussianBelief
-from pdstl.base import BeliefTrajectory
+from models.dynamics import create_gaussian_belief_trajectory
 from utils import load_config
 from planning import log_utils
 
@@ -152,13 +151,9 @@ class Planner:
             mean_trace, cov_trace = self.dyn(v_params, x0_mean, x0_cov)
             u_seq = self.dyn.bound_control(v_params)
 
-            beliefs = [
-                GaussianBelief(
-                    mean_trace[:, t, :], cov_trace[:, t], sigma_multiplier=0.0
-                )
-                for t in range(self.T + 1)
-            ]
-            traj = BeliefTrajectory(beliefs)
+            traj = create_gaussian_belief_trajectory(
+                mean_trace[0], mean_trace[0], cov_trace[0]
+            )
 
             stl_trace = phi(traj, scale=scale)
             robustness = stl_trace[0, 0, 0]

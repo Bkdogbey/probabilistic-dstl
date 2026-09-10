@@ -6,16 +6,12 @@ import torch
 from models.dynamics import (
     DoubleIntegrator,
     GaussianBelief,
-    IntervalBelief,
     SingleIntegrator,
     create_gaussian_belief_trajectory,
-    create_interval_belief_trajectory,
-    linear_system,
     piecewise_signal,
-    sinusoidal_input,
 )
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import GreaterThan, LessThan
+from pdstl.operators import GreaterThan
 from planning.environment import Environment, extract_trajectory_stats
 from planning.planner import Planner
 
@@ -57,10 +53,75 @@ def test_rollout_matches_step_and_linear_prediction(model_type, dimension):
     assert parameters.grad.abs().sum() > 0
 
 
+def test_step_enclosure_matches_hand_computation_when_a_is_non_negative():
+    model = SingleIntegrator(dt=0.5, u_max=1.0, q_std=0.1)
+    lower, upper = torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0])
+    cov = torch.eye(2) * 0.2
+    u = torch.tensor([0.4, -0.2])
+    d_lower, d_upper = torch.tensor([-0.1, -0.1]), torch.tensor([0.1, 0.1])
+
+    next_lower, next_upper, next_cov = model.step_enclosure(
+        lower, upper, cov, u, d_lower, d_upper
+    )
+
+    # A = I is entirely non-negative, so A+ = I, A- = 0: no bound swapping.
+    torch.testing.assert_close(next_lower, lower + model.dt * u + d_lower)
+    torch.testing.assert_close(next_upper, upper + model.dt * u + d_upper)
+    torch.testing.assert_close(next_cov, cov + model.Q)
+
+
+def test_step_enclosure_swaps_bounds_where_a_is_negative():
+    """A negative A entry must pull from the *other* bound (A- @ U for L, A- @
+    L for U), or the propagated interval would stop being a valid enclosure."""
+    model = SingleIntegrator(dt=1.0, u_max=1.0, q_std=0.0)
+    model.A = torch.tensor([[1.0, -1.0], [0.0, 1.0]])  # reassigns the buffer
+    zero = torch.zeros(2)
+
+    lower, upper = torch.tensor([0.0, 2.0]), torch.tensor([1.0, 3.0])
+    next_lower, next_upper, _ = model.step_enclosure(
+        lower, upper, torch.zeros(2, 2), zero, zero, zero
+    )
+
+    # row 0 = [1, -1]: A+ row = [1, 0], A- row = [0, -1]
+    #   L0' = 1*lower[0] + (-1)*upper[1] = 0 - 3 = -3
+    #   U0' = 1*upper[0] + (-1)*lower[1] = 1 - 2 = -1
+    torch.testing.assert_close(next_lower[0], torch.tensor(-3.0))
+    torch.testing.assert_close(next_upper[0], torch.tensor(-1.0))
+    assert (next_lower <= next_upper).all()
+
+
+def test_rollout_enclosure_accumulates_covariance_with_no_dt_factor_and_reaches_gradients():
+    model = SingleIntegrator(dt=0.3, u_max=1.0, q_std=0.1)
+    v = torch.zeros(4, 2, requires_grad=True)
+    lower0, upper0 = torch.tensor([0.0, 0.0]), torch.tensor([0.2, 0.2])
+
+    lower, upper, cov = model.rollout_enclosure(v, lower0, upper0, torch.zeros(2, 2))
+
+    assert lower.shape == upper.shape == (1, 5, 2)
+    assert cov.shape == (1, 5, 2, 2)
+    # Q is a per-step covariance: four steps accumulate exactly 4*Q, no dt scaling.
+    torch.testing.assert_close(cov[0, -1], 4 * model.Q)
+
+    (lower.sum() + upper.sum()).backward()
+    assert v.grad is not None and torch.isfinite(v.grad).all()
+
+
+def test_rollout_enclosure_defaults_the_offset_to_zero():
+    model = SingleIntegrator(dt=0.3, u_max=1.0, q_std=0.0)
+    v = torch.zeros(2, 2)
+    lower0 = upper0 = torch.tensor([1.0, 1.0])  # collapsed, zero control
+
+    lower, upper, _ = model.rollout_enclosure(v, lower0, upper0, torch.zeros(2, 2))
+
+    torch.testing.assert_close(lower, upper)
+    torch.testing.assert_close(lower[0, 0], lower0)
+    torch.testing.assert_close(lower[0, -1], lower0)
+
+
 def test_planning_extracts_the_same_gaussian_beliefs():
     mean = torch.tensor([[1.0, 2.0]])
     covariance = torch.tensor([[[0.5, 0.2], [0.2, 0.8]]])
-    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance, 0.0)] * 2)
+    trajectory = BeliefTrajectory([GaussianBelief(mean, mean, covariance)] * 2)
     extracted_mean, extracted_covariance = extract_trajectory_stats(
         trajectory, diagonal_only=False
     )
@@ -96,128 +157,36 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
 
 
 def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():
-    scalar_mean = np.array([1.0, 2.0], dtype=np.float64)
+    scalar_lower = np.array([1.0, 2.0], dtype=np.float64)
     scalar = create_gaussian_belief_trajectory(
-        scalar_mean, np.array([0.25, 1.0]), sigma_multiplier=1.5
+        scalar_lower, scalar_lower + 1.0, np.array([0.25, 1.0])
     )
-    assert scalar[0].mean.shape == (1, 1)
-    assert scalar[0].mean.dtype == torch.float64
+    assert scalar[0].lower.shape == (1, 1)
+    assert scalar[0].lower.dtype == torch.float64
 
     vector = create_gaussian_belief_trajectory(
-        np.zeros((3, 2)), np.ones((3, 2, 2)), sigma_multiplier=1.0
+        np.zeros((3, 2)), np.ones((3, 2)), np.ones((3, 2, 2))
     )
-    assert len(vector) == 3 and vector[0].var.shape == (1, 2, 2)
+    assert len(vector) == 3 and vector[0].covariance.shape == (1, 2, 2)
 
-    mean = torch.zeros(2, 3, 2, dtype=torch.float64, requires_grad=True)
-    variance = torch.ones(2, 3, 2, dtype=torch.float64)
-    batched = create_gaussian_belief_trajectory(
-        mean, variance, sigma_multiplier=0.0
-    )
-    assert len(batched) == 3 and batched[0].mean.shape == (2, 2)
-    assert batched[0].mean.device == mean.device
-    GreaterThan(0.0)(batched).sum().backward()
-    assert mean.grad is not None and torch.isfinite(mean.grad).all()
+    lower = torch.zeros(3, 2, dtype=torch.float64, requires_grad=True)
+    trajectory = create_gaussian_belief_trajectory(lower, lower + 1.0, torch.ones(3, 2))
+    assert len(trajectory) == 3 and trajectory[0].lower.shape == (1, 2)
+    assert trajectory[0].lower.device == lower.device
+    GreaterThan(0.0)(trajectory).sum().backward()
+    assert lower.grad is not None and torch.isfinite(lower.grad).all()
 
 
 @pytest.mark.parametrize(
-    "mean,variance",
+    "lower,upper,covariance,message",
     [
-        (np.zeros(3), np.zeros((3, 1))),
-        (np.zeros((3, 2)), np.zeros((3, 3))),
-        (np.zeros((3, 2)), np.zeros((3, 2, 3))),
-        (np.zeros((2, 3, 2)), np.zeros((2, 3, 3))),
-        (np.zeros((2, 3, 2)), np.zeros((2, 3, 2, 3))),
+        (np.zeros(3), np.zeros(2), np.zeros(3), "matching shape"),
+        (np.zeros((3, 2)), np.zeros((3, 2)), np.zeros((2, 2)), "same number of steps"),
     ],
 )
-def test_gaussian_trajectory_factory_rejects_inexact_shapes(mean, variance):
-    with pytest.raises(ValueError, match="exactly match"):
-        create_gaussian_belief_trajectory(mean, variance, sigma_multiplier=1.0)
-
-
-# Bounded-state belief: an alternative upstream source, unused by the examples
-
-
-@pytest.mark.parametrize(
-    "lower,upper,message",
-    [
-        (torch.zeros(1, 2), torch.zeros(1, 3), "matching shapes"),
-        (torch.zeros(3), torch.zeros(3), r"\[B,D\]"),
-        (torch.tensor([[float("nan")]]), torch.tensor([[1.0]]), "finite"),
-        (torch.tensor([[2.0]]), torch.tensor([[1.0]]), "lower <= upper"),
-    ],
-)
-def test_interval_belief_rejects_malformed_bounds(lower, upper, message):
+def test_gaussian_trajectory_factory_rejects_mismatched_shapes(lower, upper, covariance, message):
     with pytest.raises(ValueError, match=message):
-        IntervalBelief(lower, upper)
-
-
-def test_interval_belief_rejects_invalid_predicate_dimension():
-    belief = IntervalBelief(torch.zeros(1, 1), torch.ones(1, 1))
-    with pytest.raises(ValueError, match="outside the state"):
-        belief.probability_bounds(GreaterThan(0.5, dim=5))
-
-
-@pytest.mark.parametrize(
-    "lower,upper,expected",
-    [
-        (5.0, 5.0, [1.0, 1.0]),  # x_lower == threshold -> guaranteed
-        (6.0, 8.0, [1.0, 1.0]),  # entirely above -> guaranteed
-        (3.0, 5.0, [0.0, 1.0]),  # x_upper == threshold -> not violated
-        (3.0, 7.0, [0.0, 1.0]),  # crossing
-        (1.0, 4.9, [0.0, 0.0]),  # entirely below -> violated
-    ],
-)
-def test_interval_belief_greater_than_is_inclusive(lower, upper, expected):
-    belief = IntervalBelief(torch.tensor([[lower]]), torch.tensor([[upper]]))
-    got = belief.probability_bounds(GreaterThan(5.0))
-    torch.testing.assert_close(got[0], torch.tensor(expected))
-
-
-@pytest.mark.parametrize(
-    "lower,upper,expected",
-    [
-        (5.0, 5.0, [1.0, 1.0]),  # x_upper == threshold -> guaranteed
-        (1.0, 4.0, [1.0, 1.0]),  # entirely below -> guaranteed
-        (5.0, 7.0, [0.0, 1.0]),  # x_lower == threshold -> not violated
-        (3.0, 7.0, [0.0, 1.0]),  # crossing
-        (5.1, 8.0, [0.0, 0.0]),  # entirely above -> violated
-    ],
-)
-def test_interval_belief_less_than_is_inclusive(lower, upper, expected):
-    belief = IntervalBelief(torch.tensor([[lower]]), torch.tensor([[upper]]))
-    got = belief.probability_bounds(LessThan(5.0))
-    torch.testing.assert_close(got[0], torch.tensor(expected))
-
-
-def test_interval_trajectory_factory_builds_one_belief_per_step():
-    trajectory = create_interval_belief_trajectory([1.0, 2.0, 3.0], [1.5, 2.5, 3.5])
-    assert len(trajectory) == 3
-    assert trajectory[0].lower.shape == (1, 1)
-    assert trajectory[0].upper.shape == (1, 1)
-
-
-def test_interval_trajectory_factory_rejects_mismatched_traces():
-    with pytest.raises(ValueError, match="matching shapes"):
-        create_interval_belief_trajectory([1.0, 2.0], [1.0, 2.0, 3.0])
-
-
-# Generated scalar signals: alternative upstream sources for Gaussian beliefs
-
-
-def test_sinusoidal_input_is_a_scalar_control():
-    np.testing.assert_allclose(sinusoidal_input(np.array([0.0, 0.5])), [0.0, 15.0])
-
-
-def test_linear_system_propagates_mean_and_variance():
-    time = np.linspace(0.0, 1.0, 5)
-    mean, variance = linear_system(
-        a=0.01, b=1.0, g=2.0, q=2.5, mu=50.0, P=0.15, t=time,
-        control_func=sinusoidal_input,
-    )
-    assert mean.shape == variance.shape == time.shape
-    assert mean[0] == 50.0 and variance[0] == 0.15
-    assert np.all(np.diff(variance) > 0)
-    assert np.isfinite(mean).all()
+        create_gaussian_belief_trajectory(lower, upper, covariance)
 
 
 def test_piecewise_signal_returns_time_mean_and_variance():

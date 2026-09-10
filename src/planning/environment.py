@@ -13,6 +13,9 @@ def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
     Parameters
     ----------
     belief_trajectory : list of GaussianBelief
+        Beliefs are read through their generic ``value()``/``covariance``
+        surface only, not their enclosure bounds -- this stays an exact-Gaussian
+        (collapsed-enclosure) helper for the predicates below.
     diagonal_only : bool
         If True, extract only the diagonal of full covariance matrices,
         returning var of shape [Batch, Time, Dim].
@@ -26,11 +29,11 @@ def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
     """
     means, vars_ = [], []
     for belief in belief_trajectory:
-        means.append(belief.mean)
-        if diagonal_only and belief.var.ndim > 2:
-            vars_.append(torch.diagonal(belief.var, dim1=-2, dim2=-1))
+        means.append(belief.value())
+        if diagonal_only and belief.covariance.ndim > 2:
+            vars_.append(torch.diagonal(belief.covariance, dim1=-2, dim2=-1))
         else:
-            vars_.append(belief.var)
+            vars_.append(belief.covariance)
     return torch.stack(means, dim=1), torch.stack(vars_, dim=1)
 
 

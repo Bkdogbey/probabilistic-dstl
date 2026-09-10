@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,10 +6,18 @@ from pdstl.base import Belief, BeliefTrajectory
 
 
 # Controlled dynamics
+#
+# Dynamics defines one linear step, one control convention, and one rollout;
+# concrete models only set A, B, Q. The same step also propagates a state
+# enclosure [L, U] instead of a point mean -- see step_enclosure.
 
 
 class Dynamics(nn.Module):
-    """Base class for controlled dynamics."""
+    """Linear controlled dynamics: x' = A x + B u,  P' = A P A^T + Q.
+
+    Subclasses register ``A``, ``B``, ``Q`` as buffers in ``__init__``. ``Q``
+    is the process noise added over one discrete step (no ``dt`` factor).
+    """
 
     def __init__(self, dt, u_max, device="cpu"):
         super().__init__()
@@ -20,173 +26,116 @@ class Dynamics(nn.Module):
         self.device = device
 
     def bound_control(self, v):
-        """Smoothly bound an unconstrained control to ``[-u_max, u_max]``."""
+        """Smoothly bound an unconstrained control to ``[-u_max, u_max]``.
+
+        The one control convention: every physical control, inside a rollout
+        or read externally for a cost, goes through this.
+        """
         return self.u_max * torch.tanh(v)
 
     def step(self, x, P, u):
-        """
-        Propagates state x and covariance P one step forward with control u.
-        x: [Dim]
-        P: [Dim, Dim]
-        u: [Control Dim]
-        Returns: (x_next, P_next)
-        """
-        raise NotImplementedError
-
-    def forward(self, v_sequence, x0_mean, x0_cov):
-        raise NotImplementedError
-
-
-class SingleIntegrator(Dynamics):
-    """
-    Standard Position-Velocity model defined in the PDF.
-
-    State:   [x, y]
-    Control: [vx, vy]
-    """
-
-    def __init__(self, dt=0.2, u_max=1.0, q_std=0.05, device="cpu"):
-        super().__init__(dt, u_max, device)
-
-        # Process Noise Covariance Q (Additive)
-        # We assume diagonal noise for simplicity: Q = diag(q_std^2)
-        self.Q = torch.eye(2, device=self.device) * q_std**2
-
-    def step(self, x, P, u):
-        # x_next = x + u * dt
-        # P_next = P + Q
-        return x + u * self.dt, P + self.Q
-
-    def forward(self, v_sequence, x0_mean, x0_cov):
-        """
-        Rolls out the trajectory from t=0 to T.
-
-        Args:
-            v_sequence: Tensor [T, 2] (Unconstrained controls)
-            x0_mean:    Tensor [2]    (Initial position)
-            x0_cov:     Tensor [2, 2] (Initial uncertainty)
-
-        Returns:
-            mean_stack: [1, T+1, 2]
-            cov_stack:  [1, T+1, 2, 2]
-        """
-        T = v_sequence.shape[0]
-
-        # Storage for the trajectory
-        means = [x0_mean]
-        covs = [x0_cov]
-
-        curr_mu = x0_mean
-        curr_sigma = x0_cov
-
-        for t in range(T):
-            # 1. Squash the optimization variable to get physical control
-            u = self.bound_control(v_sequence[t])
-
-            # 2. Update Mean (Differentiable)
-            curr_mu = curr_mu + u * self.dt
-
-            # 3. Update Covariance (Open Loop Uncertainty Growth)
-            curr_sigma = curr_sigma + self.Q
-
-            means.append(curr_mu)
-            covs.append(curr_sigma)
-
-        # Stack results into tensors
-        # Output shape: [Batch=1, Time, Dim]
-        mean_stack = torch.stack(means).unsqueeze(0)
-        cov_stack = torch.stack(covs).unsqueeze(0)
-
-        return mean_stack, cov_stack
-
-
-class DoubleIntegrator(Dynamics):
-    """
-    Alternative Physics-based model (Acceleration control).
-
-    State:   [px, py, vx, vy]
-    Control: [ax, ay]
-    """
-
-    def __init__(self, dt=0.2, u_max=1.0, q_std=0.02, device="cpu"):
-        super().__init__(dt, u_max, device)
-
-        # State Transition Matrix A
-        self.A = torch.tensor(
-            [
-                [1.0, 0.0, dt, 0.0],
-                [0.0, 1.0, 0.0, dt],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            device=device,
-        )
-
-        # Control Matrix B
-        self.B = torch.tensor(
-            [[0.5 * dt**2, 0.0], [0.0, 0.5 * dt**2], [dt, 0.0], [0.0, dt]],
-            device=device,
-        )
-
-        # Process Noise Q
-        self.Q = torch.eye(4, device=device) * q_std**2
-
-    def step(self, x, P, u):
-        # x_next = A x + B u
-        # P_next = A P A^T + Q
+        """One step of the mean/covariance. x: [D], P: [D,D], u: [control dim]."""
         x_next = self.A @ x + self.B @ u
         P_next = self.A @ P @ self.A.t() + self.Q
         return x_next, P_next
 
     def forward(self, v_sequence, x0_mean, x0_cov):
-        T = v_sequence.shape[0]
-        means = [x0_mean]
-        covs = [x0_cov]
+        """Roll out mean and covariance for an unconstrained control sequence.
 
-        curr_mu = x0_mean
-        curr_sigma = x0_cov
+        v_sequence: [T, control dim]   x0_mean: [D]   x0_cov: [D,D]
+        Returns mean [1,T+1,D], covariance [1,T+1,D,D].
+        """
+        means, covs = [x0_mean], [x0_cov]
+        for v in v_sequence:
+            mean, cov = self.step(means[-1], covs[-1], self.bound_control(v))
+            means.append(mean)
+            covs.append(cov)
+        return torch.stack(means).unsqueeze(0), torch.stack(covs).unsqueeze(0)
 
-        for t in range(T):
-            # 1. Bound Control
-            u = self.bound_control(v_sequence[t])
+    def step_enclosure(self, lower, upper, cov, u, d_lower, d_upper):
+        """One step of a state enclosure [lower, upper] plus covariance.
 
-            # 2. Update Mean
-            curr_mu = self.A @ curr_mu + self.B @ u
+        A is split into its non-negative and non-positive parts so the bound
+        propagation stays sound under any sign of A's entries:
 
-            # 3. Update Covariance (Full Linear Update)
-            curr_sigma = self.A @ curr_sigma @ self.A.t() + self.Q
+            L' = A+ L + A- U + B u + d_lower
+            U' = A- L + A+ U + B u + d_upper
+            P' = A P A^T + Q
 
-            means.append(curr_mu)
-            covs.append(curr_sigma)
+        d_lower, d_upper bound an unknown deterministic offset for this step.
+        lower, upper: [D]   cov: [D,D]   u: [control dim]
+        """
+        A_pos, A_neg = self.A.clamp(min=0), self.A.clamp(max=0)
+        Bu = self.B @ u
+        next_lower = A_pos @ lower + A_neg @ upper + Bu + d_lower
+        next_upper = A_neg @ lower + A_pos @ upper + Bu + d_upper
+        next_cov = self.A @ cov @ self.A.t() + self.Q
+        return next_lower, next_upper, next_cov
 
-        mean_stack = torch.stack(means).unsqueeze(0)
-        cov_stack = torch.stack(covs).unsqueeze(0)
+    def rollout_enclosure(self, v_sequence, lower0, upper0, cov0, d_lower=None, d_upper=None):
+        """Roll out an enclosure and covariance for an unconstrained control sequence.
 
-        return mean_stack, cov_stack
+        d_lower, d_upper: [D], default zero (no unknown offset).
+        Returns lower [1,T+1,D], upper [1,T+1,D], covariance [1,T+1,D,D].
+        """
+        if d_lower is None:
+            d_lower = torch.zeros_like(lower0)
+        if d_upper is None:
+            d_upper = torch.zeros_like(upper0)
+
+        lowers, uppers, covs = [lower0], [upper0], [cov0]
+        for v in v_sequence:
+            lower, upper, cov = self.step_enclosure(
+                lowers[-1], uppers[-1], covs[-1], self.bound_control(v), d_lower, d_upper
+            )
+            lowers.append(lower)
+            uppers.append(upper)
+            covs.append(cov)
+        return (
+            torch.stack(lowers).unsqueeze(0),
+            torch.stack(uppers).unsqueeze(0),
+            torch.stack(covs).unsqueeze(0),
+        )
+
+
+class SingleIntegrator(Dynamics):
+    """Position-velocity model. State: [x, y]. Control: [vx, vy]."""
+
+    def __init__(self, dt=0.2, u_max=1.0, q_std=0.05, device="cpu"):
+        super().__init__(dt, u_max, device)
+        self.register_buffer("A", torch.eye(2, device=device))
+        self.register_buffer("B", dt * torch.eye(2, device=device))
+        self.register_buffer("Q", torch.eye(2, device=device) * q_std**2)
+
+
+class DoubleIntegrator(Dynamics):
+    """Acceleration-controlled model. State: [px, py, vx, vy]. Control: [ax, ay]."""
+
+    def __init__(self, dt=0.2, u_max=1.0, q_std=0.02, device="cpu"):
+        super().__init__(dt, u_max, device)
+        self.register_buffer(
+            "A",
+            torch.tensor(
+                [
+                    [1.0, 0.0, dt, 0.0],
+                    [0.0, 1.0, 0.0, dt],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                device=device,
+            ),
+        )
+        self.register_buffer(
+            "B",
+            torch.tensor(
+                [[0.5 * dt**2, 0.0], [0.0, 0.5 * dt**2], [dt, 0.0], [0.0, dt]],
+                device=device,
+            ),
+        )
+        self.register_buffer("Q", torch.eye(4, device=device) * q_std**2)
 
 
 # Offline scalar model
-
-
-def sinusoidal_input(t):
-    """Sinusoidal scalar control used by the original pdSTL example."""
-    return 15.0 * np.sin(np.pi * t)
-
-
-def linear_system(a, b, g, q, mu, P, t, control_func):
-    """Propagate the scalar Gaussian model used in the offline examples."""
-    t = np.asarray(t, dtype=float)
-    mean_trace = np.zeros(len(t), dtype=float)
-    var_trace = np.zeros(len(t), dtype=float)
-    mean_trace[0], var_trace[0] = mu, P
-    process_variance = g**2 + q
-
-    for i in range(1, len(t)):
-        dt = t[i] - t[i - 1]
-        transition = np.exp(a * dt)
-        mean_trace[i] = transition * mean_trace[i - 1] + dt * b * control_func(t[i - 1])
-        var_trace[i] = transition**2 * var_trace[i - 1] + process_variance * dt
-    return mean_trace, var_trace
 
 
 def piecewise_signal(values=None):
@@ -199,228 +148,129 @@ def piecewise_signal(values=None):
     return np.arange(len(values), dtype=float), values[:, 0], values[:, 1]
 
 
-# Bounded-state belief
+# Gaussian belief
+#
+#   X = x* + E,   x* in [lower, upper],   E ~ N(0, covariance)
+#
+# The location enclosure and the residual covariance are separate,
+# independently supplied uncertainties -- one is never derived from the other.
 
 
-class IntervalBelief(Belief):
-    """State belief defined only by lower and upper bounds."""
+class GaussianBelief(Belief):
+    """A location known only within [lower, upper], plus Gaussian residual noise.
 
-    def __init__(self, lower, upper):
-        self.lower = torch.as_tensor(lower)
-        self.upper = torch.as_tensor(upper)
-        self._validate()
+    lower, upper : [B, D]
+        Admissible bounds on the location, supplied directly.
+    covariance : [B, D] (diagonal) or [B, D, D] (full)
+        Covariance of the residual. Only its diagonal is used; see _project.
+    """
 
-    def _validate(self):
-        if self.lower.shape != self.upper.shape:
-            raise ValueError("IntervalBelief bounds must have matching shapes")
-        if self.lower.ndim != 2:
-            raise ValueError("IntervalBelief bounds must have shape [B,D]")
-        if not bool(torch.isfinite(self.lower).all()):
-            raise ValueError("IntervalBelief lower bounds must be finite")
-        if not bool(torch.isfinite(self.upper).all()):
-            raise ValueError("IntervalBelief upper bounds must be finite")
+    def __init__(self, lower, upper, covariance):
+        self.lower = lower
+        self.upper = upper
+        self.covariance = covariance
+        self._validate_shapes()
+
+    def _validate_shapes(self):
+        if not torch.is_tensor(self.lower) or self.lower.ndim != 2:
+            raise ValueError("GaussianBelief lower must have shape [B,D]")
+        if not torch.is_tensor(self.upper) or self.upper.shape != self.lower.shape:
+            raise ValueError("GaussianBelief upper must match lower's shape")
         if bool((self.lower > self.upper).any()):
-            raise ValueError("IntervalBelief requires lower <= upper")
+            raise ValueError("GaussianBelief requires lower <= upper")
+
+        batch, state_dim = self.lower.shape
+        if not torch.is_tensor(self.covariance):
+            raise ValueError("GaussianBelief covariance must be a tensor")
+        if self.covariance.ndim == 2:
+            if self.covariance.shape != self.lower.shape:
+                raise ValueError("diagonal covariance must match lower's shape [B,D]")
+            component_variance = self.covariance
+        elif self.covariance.ndim == 3:
+            if self.covariance.shape != (batch, state_dim, state_dim):
+                raise ValueError("full covariance must have shape [B,D,D]")
+            component_variance = self.covariance.diagonal(dim1=-2, dim2=-1)
+        else:
+            raise ValueError("GaussianBelief covariance must be [B,D] or [B,D,D]")
+
+        if bool((component_variance < 0).any()):
+            raise ValueError("GaussianBelief covariance must be non-negative")
 
     def value(self):
+        """Midpoint of [lower, upper], [B,D] -- a representative descriptor,
+        not a substitute for enclosure-based predicate evaluation."""
         return (self.lower + self.upper) / 2
 
-    def probability_bounds(self, predicate):
-        """Return distribution-free bounds for an inclusive comparison."""
-        sense = getattr(predicate, "sense", None)
-        if sense not in (">=", "<="):
-            raise ValueError(f"IntervalBelief cannot evaluate {predicate}")
-
+    def _project(self, predicate):
+        full_covariance = self.covariance.ndim == 3
         dim = getattr(predicate, "dim", 0)
         if not isinstance(dim, int) or not 0 <= dim < self.lower.shape[1]:
             raise ValueError(f"predicate dimension {dim} is outside the state")
-
         lower = self.lower[:, dim]
         upper = self.upper[:, dim]
+        variance = self.covariance[:, dim, dim] if full_covariance else self.covariance[:, dim]
+        return lower, upper, variance
+
+    def probability_bounds(self, predicate):
+        """Enclose the predicate's probability over every admissible location, [B,2].
+
+        For X >= c the tail probability increases with the location; for
+        X <= c it decreases. Either way the extrema sit at the enclosure
+        endpoints, so the same CDF evaluated there brackets every value the
+        map takes in between.
+        """
+        sense = getattr(predicate, "sense", None)
+        if sense not in (">=", "<="):
+            raise ValueError(f"GaussianBelief cannot evaluate {predicate}")
+
+        lower, upper, variance = self._project(predicate)
         threshold = torch.as_tensor(
             predicate.threshold, dtype=lower.dtype, device=lower.device
         )
 
-        if sense == ">=":
-            guaranteed = lower >= threshold
-            possible = upper >= threshold
-        else:
-            guaranteed = upper <= threshold
-            possible = lower <= threshold
-
-        return torch.stack(
-            (guaranteed.to(lower.dtype), possible.to(lower.dtype)), dim=-1
-        )
-
-
-def create_interval_belief_trajectory(
-    lower_trace, upper_trace, dtype=None, device=None
-):
-    """Build a scalar interval trajectory from matching ``[T]`` traces."""
-    lower = torch.as_tensor(lower_trace, dtype=dtype, device=device)
-    upper = torch.as_tensor(
-        upper_trace, dtype=lower.dtype, device=lower.device
-    )
-
-    if lower.ndim != 1 or upper.ndim != 1:
-        raise ValueError("interval traces must have shape [T]")
-    if lower.shape != upper.shape:
-        raise ValueError("interval traces must have matching shapes")
-
-    return BeliefTrajectory(
-        [
-            IntervalBelief(lower[t : t + 1, None], upper[t : t + 1, None])
-            for t in range(len(lower))
-        ]
-    )
-
-
-# Gaussian belief
-
-
-class GaussianBelief(Belief):
-    """Gaussian belief with sigma-displaced probability endpoints."""
-
-    def __init__(self, mean, variance, sigma_multiplier):
-        sigma_multiplier = float(sigma_multiplier)
-        if not math.isfinite(sigma_multiplier) or sigma_multiplier < 0:
-            raise ValueError("sigma_multiplier must be finite and non-negative")
-        self.mean = mean
-        self.var = variance
-        self.sigma_multiplier = sigma_multiplier
-        self._validate_shapes()
-
-    def _validate_shapes(self):
-        if not torch.is_tensor(self.mean) or self.mean.ndim != 2:
-            raise ValueError("GaussianBelief mean must have shape [B,D]")
-        if not torch.is_tensor(self.var):
-            raise ValueError("GaussianBelief variance must be a tensor")
-
-        batch, state_dim = self.mean.shape
-        if self.var.ndim == 2:
-            if self.var.shape != self.mean.shape:
-                raise ValueError(
-                    "GaussianBelief diagonal variance must match mean shape [B,D]"
-                )
-            component_variance = self.var
-        elif self.var.ndim == 3:
-            if self.var.shape[0] != batch:
-                raise ValueError(
-                    "GaussianBelief mean and covariance batch dimensions differ"
-                )
-            if self.var.shape[1] != self.var.shape[2]:
-                raise ValueError("GaussianBelief covariance matrices must be square")
-            if self.var.shape[1] != state_dim:
-                raise ValueError(
-                    "GaussianBelief covariance state dimension must match mean"
-                )
-            component_variance = self.var.diagonal(dim1=-2, dim2=-1)
-        else:
-            raise ValueError("GaussianBelief variance must be [B,D] or [B,D,D]")
-
-        if bool((component_variance < 0).any()):
-            raise ValueError("GaussianBelief variance must be non-negative")
-
-    def value(self):
-        return self.mean
-
-    def _component_variance(self):
-        if self.var.ndim == 2:
-            return self.var
-        return self.var.diagonal(dim1=-2, dim2=-1)
-
-    def lower_bound(self):
-        return self.mean - self.sigma_multiplier * torch.sqrt(
-            self._component_variance()
-        )
-
-    def upper_bound(self):
-        return self.mean + self.sigma_multiplier * torch.sqrt(
-            self._component_variance()
-        )
-
-    def _project(self, predicate):
-        full_covariance = self.var.ndim == 3
-        dim = getattr(predicate, "dim", 0)
-        if not isinstance(dim, int) or not 0 <= dim < self.mean.shape[1]:
-            raise ValueError(f"predicate dimension {dim} is outside the state")
-        mean = self.mean[:, dim]
-        variance = self.var[:, dim, dim] if full_covariance else self.var[:, dim]
-        return mean, variance
-
-    def probability_bounds(self, predicate):
-        """Return an inclusive comparison probability interval, shaped [B,2]."""
-        sense = getattr(predicate, "sense", None)
-        if sense not in (">=", "<="):
-            raise ValueError(f"GaussianBelief cannot evaluate {predicate}")
-        mean, variance = self._project(predicate)
-        threshold = torch.as_tensor(
-            predicate.threshold, dtype=mean.dtype, device=mean.device
-        )
         positive = variance > 0
         sigma = torch.sqrt(variance)
         safe_sigma = torch.where(positive, sigma, torch.ones_like(sigma))
-        displacement = self.sigma_multiplier * sigma
-        lower_state = mean - displacement
-        upper_state = mean + displacement
+
         if sense == ">=":
-            lower = torch.special.ndtr((lower_state - threshold) / safe_sigma)
-            upper = torch.special.ndtr((upper_state - threshold) / safe_sigma)
-            deterministic = mean >= threshold
+            bound_lower = torch.special.ndtr((lower - threshold) / safe_sigma)
+            bound_upper = torch.special.ndtr((upper - threshold) / safe_sigma)
+            deterministic_lower = lower >= threshold
+            deterministic_upper = upper >= threshold
         else:
-            lower = torch.special.ndtr((threshold - upper_state) / safe_sigma)
-            upper = torch.special.ndtr((threshold - lower_state) / safe_sigma)
-            deterministic = mean <= threshold
-        lower = torch.where(positive, lower, deterministic.to(mean.dtype))
-        upper = torch.where(positive, upper, deterministic.to(mean.dtype))
-        return torch.stack((lower, upper), dim=-1)
+            bound_lower = torch.special.ndtr((threshold - upper) / safe_sigma)
+            bound_upper = torch.special.ndtr((threshold - lower) / safe_sigma)
+            deterministic_lower = upper <= threshold
+            deterministic_upper = lower <= threshold
+
+        bound_lower = torch.where(positive, bound_lower, deterministic_lower.to(lower.dtype))
+        bound_upper = torch.where(positive, bound_upper, deterministic_upper.to(lower.dtype))
+        return torch.stack((bound_lower, bound_upper), dim=-1)
 
 
-def create_gaussian_belief_trajectory(
-    mean_trace, variance_trace, sigma_multiplier, dtype=None, device=None
-):
-    """Build a trajectory from scalar, vector, or batched Gaussian traces."""
-    mean = torch.as_tensor(mean_trace, dtype=dtype, device=device)
-    variance = torch.as_tensor(variance_trace, dtype=dtype, device=device)
+def create_gaussian_belief_trajectory(lower, upper, covariance, dtype=None, device=None):
+    """Build a trajectory of GaussianBelief, one per step.
 
-    if mean.ndim == 1:
-        if variance.shape != mean.shape:
-            raise ValueError("scalar trace variance must exactly match mean shape [T]")
-        mean = mean.unsqueeze(-1)
-        variance = variance.unsqueeze(-1)
-    if mean.ndim == 2:
-        diagonal = variance.ndim == 2 and variance.shape == mean.shape
-        covariance = variance.ndim == 3 and variance.shape == (
-            mean.shape[0],
-            mean.shape[1],
-            mean.shape[1],
-        )
-        if not (diagonal or covariance):
-            raise ValueError(
-                "vector trace variance must exactly match [T,D] or [T,D,D]"
-            )
-        beliefs = [
-            GaussianBelief(
-                mean[t : t + 1], variance[t : t + 1], sigma_multiplier
-            )
-            for t in range(mean.shape[0])
+    lower, upper : [T] (scalar state) or [T, D]
+    covariance   : [T] / [T, D] (diagonal) or [T, D, D] (full), matching lower's D
+    """
+    lower = torch.as_tensor(lower, dtype=dtype, device=device)
+    upper = torch.as_tensor(upper, dtype=lower.dtype, device=lower.device)
+    covariance = torch.as_tensor(covariance, dtype=lower.dtype, device=lower.device)
+
+    if lower.ndim == 1:
+        lower, upper = lower.unsqueeze(-1), upper.unsqueeze(-1)
+        if covariance.ndim == 1:
+            covariance = covariance.unsqueeze(-1)
+
+    if lower.ndim != 2 or upper.shape != lower.shape:
+        raise ValueError("lower and upper traces must have matching shape [T] or [T,D]")
+    if covariance.shape[0] != lower.shape[0]:
+        raise ValueError("covariance must have the same number of steps as lower/upper")
+
+    return BeliefTrajectory(
+        [
+            GaussianBelief(lower[t : t + 1], upper[t : t + 1], covariance[t : t + 1])
+            for t in range(lower.shape[0])
         ]
-    elif mean.ndim == 3:
-        diagonal = variance.ndim == 3 and variance.shape == mean.shape
-        covariance = variance.ndim == 4 and variance.shape == (
-            mean.shape[0],
-            mean.shape[1],
-            mean.shape[2],
-            mean.shape[2],
-        )
-        if not (diagonal or covariance):
-            raise ValueError(
-                "batched trace variance must exactly match [B,T,D] or [B,T,D,D]"
-            )
-        beliefs = [
-            GaussianBelief(mean[:, t], variance[:, t], sigma_multiplier)
-            for t in range(mean.shape[1])
-        ]
-    else:
-        raise ValueError("mean trace must have shape [T], [T,D], or [B,T,D]")
-    return BeliefTrajectory(beliefs)
+    )

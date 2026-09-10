@@ -20,10 +20,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from models.dynamics import SingleIntegrator
-from models.dynamics import GaussianBelief
+from models.dynamics import SingleIntegrator, create_gaussian_belief_trajectory
 from experiments.planning import build_environment, load_scenario_config
-from pdstl.base import BeliefTrajectory
 
 
 def build_spec_and_env(T, device):
@@ -55,13 +53,7 @@ def single_iteration_time(T, device, n_warmup=3, n_trials=10):
         mean_trace, cov_trace = dyn(v_params, x0_mean, x0_cov)
 
         # --- Wrap for STL evaluation ---
-        beliefs = [
-            GaussianBelief(
-                mean_trace[:, t, :], cov_trace[:, t], sigma_multiplier=0.0
-            )
-            for t in range(T + 1)
-        ]
-        traj = BeliefTrajectory(beliefs)
+        traj = create_gaussian_belief_trajectory(mean_trace[0], mean_trace[0], cov_trace[0])
 
         # --- STL evaluation ---
         stl_trace = spec(traj)

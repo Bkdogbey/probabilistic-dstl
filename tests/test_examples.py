@@ -37,9 +37,8 @@ def _example(name):
     config = _config()[name]
     time, mean, variance = piecewise_signal(config["values"])
     predicate = GreaterThan(config["threshold"])
-    beliefs = create_gaussian_belief_trajectory(
-        mean, variance, sigma_multiplier=config["sigma_multiplier"]
-    )
+    sigma = config["sigma_multiplier"] * np.sqrt(variance)
+    beliefs = create_gaussian_belief_trajectory(mean - sigma, mean + sigma, variance)
     return config, (time, mean, variance), predicate, beliefs
 
 

@@ -42,27 +42,14 @@ def scalar(values, event="p"):
     return supplied(*[{event: (v, v)} for v in values])
 
 
-def gaussian(mean, var, sigma_multiplier=0.0):
-    """Trajectory of Gaussian steps from [T, D] mean and [T, D] or [T, D, D] var."""
+def gaussian(mean, var):
+    """Trajectory of exact Gaussian steps (collapsed bound = mean) from [T, D]
+    mean and [T, D] or [T, D, D] var."""
     mean = torch.as_tensor(mean, dtype=torch.float64)
     var = torch.as_tensor(var, dtype=torch.float64)
     return BeliefTrajectory(
         [
-            GaussianBelief(
-                mean[t : t + 1], var[t : t + 1], sigma_multiplier
-            )
-            for t in range(len(mean))
-        ]
-    )
-
-
-def interval_gaussian(mean, var, k):
-    """Trajectory of k-sigma-displaced Gaussian steps, same shapes as `gaussian`."""
-    mean = torch.as_tensor(mean, dtype=torch.float64)
-    var = torch.as_tensor(var, dtype=torch.float64)
-    return BeliefTrajectory(
-        [
-            GaussianBelief(mean[t : t + 1], var[t : t + 1], sigma_multiplier=k)
+            GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1])
             for t in range(len(mean))
         ]
     )
@@ -103,14 +90,14 @@ def test_zero_variance_is_an_inclusive_deterministic_comparison(m, c, expect_ge)
 
 
 def test_negative_variance_is_rejected():
-    with pytest.raises(ValueError, match="variance must be non-negative"):
+    with pytest.raises(ValueError, match="covariance must be non-negative"):
         gaussian([[1.0]], [[-2.0]])
 
 
 def test_full_covariance_selects_the_requested_marginal():
     mean = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
     covariance = torch.tensor([[[4.0, 3.0], [3.0, 9.0]]], dtype=torch.float64)
-    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance, 0.0)])
+    trajectory = BeliefTrajectory([GaussianBelief(mean, mean, covariance)])
 
     got = GreaterThan(0.0, dim=1)(trajectory)[0, 0, 0].item()
 
@@ -118,22 +105,22 @@ def test_full_covariance_selects_the_requested_marginal():
 
 
 @pytest.mark.parametrize(
-    "mean,variance,message",
+    "lower,upper,covariance,message",
     [
-        (torch.zeros(2), torch.ones(2), r"mean must have shape \[B,D\]"),
-        (torch.zeros(2, 2), torch.ones(3, 2), "diagonal variance"),
-        (torch.zeros(2, 2), torch.ones(2, 2, 3), "square"),
-        (torch.zeros(2, 2), torch.ones(2, 3, 3), "state dimension"),
+        (torch.zeros(2), torch.zeros(2), torch.ones(2), r"lower must have shape \[B,D\]"),
+        (torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(3, 2), "diagonal covariance"),
+        (torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(2, 2, 3), r"full covariance must have shape \[B,D,D\]"),
+        (torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(2, 3, 3), r"full covariance must have shape \[B,D,D\]"),
     ],
 )
-def test_gaussian_belief_rejects_invalid_shapes(mean, variance, message):
+def test_gaussian_belief_rejects_invalid_shapes(lower, upper, covariance, message):
     with pytest.raises(ValueError, match=message):
-        GaussianBelief(mean, variance, sigma_multiplier=0.0)
+        GaussianBelief(lower, upper, covariance)
 
 
 def test_gaussian_belief_rejects_an_invalid_predicate_dimension():
     trajectory = BeliefTrajectory(
-        [GaussianBelief(torch.zeros(1, 2), torch.ones(1, 2), 0.0)]
+        [GaussianBelief(torch.zeros(1, 2), torch.zeros(1, 2), torch.ones(1, 2))]
     )
 
     with pytest.raises(ValueError, match="dimension 2 is outside"):
@@ -143,116 +130,6 @@ def test_gaussian_belief_rejects_an_invalid_predicate_dimension():
 def test_unsupported_event_fails_clearly():
     with pytest.raises(ValueError, match="cannot evaluate"):
         Predicate("safe")(gaussian([[1.0]], [[1.0]]))
-
-
-# --- 1b. Interval Gaussian predicate ---------------------------------------
-
-MEAN_3 = [[45.0], [55.0], [50.0]]
-VAR_3 = [[4.0], [4.0], [9.0]]
-
-
-def test_zero_k_reproduces_the_exact_gaussian():
-    exact = GreaterThan(50.0)(gaussian(MEAN_3, VAR_3))[0].numpy()
-
-    got = GreaterThan(50.0)(interval_gaussian(MEAN_3, VAR_3, k=0.0))[0].numpy()
-
-    np.testing.assert_allclose(got, exact, atol=1e-12)
-
-
-@pytest.mark.parametrize("k", [0.5, 1.0, 2.0])
-def test_endpoints_straddle_the_exact_probability(k):
-    exact = GreaterThan(50.0)(gaussian(MEAN_3, VAR_3))[0, :, 0].numpy()
-
-    got = GreaterThan(50.0)(interval_gaussian(MEAN_3, VAR_3, k=k))[0].numpy()
-
-    # strict, because every step here has positive variance
-    assert (got[:, 0] < exact).all()
-    assert (exact < got[:, 1]).all()
-
-
-def test_endpoints_are_the_displaced_mean_probabilities():
-    k, threshold = 2.0, 50.0
-    mean, var = np.array(MEAN_3)[:, 0], np.array(VAR_3)[:, 0]
-    sigma = np.sqrt(var)
-
-    got = GreaterThan(threshold)(interval_gaussian(MEAN_3, VAR_3, k=k))[0].numpy()
-
-    # displacing the mean by k*sigma is the same as shifting z by k
-    lower = 1.0 - norm.cdf((threshold - (mean - k * sigma)) / sigma)
-    upper = 1.0 - norm.cdf((threshold - (mean + k * sigma)) / sigma)
-    np.testing.assert_allclose(got[:, 0], lower, atol=1e-9)
-    np.testing.assert_allclose(got[:, 1], upper, atol=1e-9)
-
-
-def test_band_widens_monotonically_with_k():
-    widths = []
-    for k in (0.0, 0.5, 1.0, 2.0, 4.0):
-        trace = GreaterThan(50.0)(interval_gaussian(MEAN_3, VAR_3, k=k))[0].numpy()
-        widths.append(trace[:, 1] - trace[:, 0])
-
-    for narrow, wide in zip(widths, widths[1:]):
-        assert (wide > narrow).all()
-
-
-def test_pessimism_flips_direction_with_the_sense():
-    k = 1.5
-    traj = interval_gaussian([[45.0]], [[4.0]], k=k)
-
-    gt = GreaterThan(50.0)(traj)[0, 0].numpy()
-    lt = LessThan(50.0)(traj)[0, 0].numpy()
-
-    # The pessimistic mean for x >= c is the optimistic mean for x <= c, so the
-    # two bands are reflections of one another.
-    np.testing.assert_allclose(lt[0], 1.0 - gt[1], atol=1e-9)
-    np.testing.assert_allclose(lt[1], 1.0 - gt[0], atol=1e-9)
-
-
-@pytest.mark.parametrize("k", [0.0, 2.0])
-@pytest.mark.parametrize(
-    "m, c, expect_ge", [(3.0, 1.0, 1.0), (1.0, 3.0, 0.0), (2.0, 2.0, 1.0)]
-)
-def test_zero_variance_stays_deterministic_at_any_k(k, m, c, expect_ge):
-    traj = interval_gaussian([[m]], [[0.0]], k=k)
-
-    got = GreaterThan(c)(traj)[0, 0]
-
-    assert got[0].item() == expect_ge  # the displacement is k*sigma = 0
-    assert got[1].item() == expect_ge
-
-
-@pytest.mark.parametrize("k", [-1.0, float("inf"), float("nan")])
-def test_invalid_k_is_rejected(k):
-    with pytest.raises(ValueError, match="sigma_multiplier must be finite and non-negative"):
-        GaussianBelief(torch.zeros(1, 1), torch.ones(1, 1), sigma_multiplier=k)
-
-
-def test_bounds_are_well_formed_through_a_temporal_formula():
-    # An ordered, in-range band is what check_probability_bounds demands, and
-    # Always must not disturb that.
-    trace = Always(GreaterThan(50.0), interval=[0, 1])(
-        interval_gaussian(MEAN_3, VAR_3, k=3.0)
-    )
-
-    assert (trace[..., 0] <= trace[..., 1]).all()
-    assert (trace >= 0.0).all() and (trace <= 1.0).all()
-
-
-def test_gradients_reach_the_mean_through_an_interval_belief():
-    mean = torch.tensor(
-        [[48.0], [52.0], [51.0]], dtype=torch.float64, requires_grad=True
-    )
-    var = torch.full((3, 1), 4.0, dtype=torch.float64)
-    traj = BeliefTrajectory(
-        [
-            GaussianBelief(mean[t : t + 1], var[t : t + 1], sigma_multiplier=2.0)
-            for t in range(3)
-        ]
-    )
-
-    Always(GreaterThan(50.0), interval=[0, 2])(traj)[..., 0].sum().backward()
-
-    assert torch.isfinite(mean.grad).all()
-    assert (mean.grad != 0).any()
 
 
 # --- 2. Trace assembly and validation --------------------------------------
@@ -642,7 +519,7 @@ def test_dtype_is_preserved_through_a_temporal_formula(dtype):
     mean = torch.tensor([[45.0], [55.0], [60.0]], dtype=dtype)
     var = torch.full((3, 1), 4.0, dtype=dtype)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0) for t in range(3)]
+        [GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1]) for t in range(3)]
     )
 
     assert Always(GreaterThan(50.0), interval=[0, 1])(traj).dtype == dtype
@@ -652,7 +529,7 @@ def test_gradients_reach_the_mean_through_a_composed_formula():
     mean = torch.tensor([[45.0], [55.0], [60.0], [48.0]], requires_grad=True)
     var = torch.full((4, 1), 4.0)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0) for t in range(4)]
+        [GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1]) for t in range(4)]
     )
     spec = Always(
         And(GreaterThan(50.0), LessThan(70.0)), interval=[0, 1]
@@ -669,7 +546,7 @@ def test_smooth_formula_passes_a_finite_difference_gradcheck():
         var = torch.full_like(mean, 4.0)
         traj = BeliefTrajectory(
             [
-                GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0)
+                GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1])
                 for t in range(len(mean))
             ]
         )
@@ -699,7 +576,7 @@ def test_control_to_mean_to_formula_is_differentiable():
     var = torch.full_like(mean, 0.25)
     traj = BeliefTrajectory(
         [
-            GaussianBelief(mean[t : t + 1], var[t : t + 1], 0.0)
+            GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1])
             for t in range(len(u))
         ]
     )
