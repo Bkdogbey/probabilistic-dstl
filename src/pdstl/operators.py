@@ -3,6 +3,31 @@ import numpy as np
 
 from pdstl.base import check_probability_bounds
 
+# Supported formula fragment
+#
+#   pointwise := predicate
+#              | Not(pointwise)
+#              | And(pointwise, pointwise)
+#              | Or(pointwise, pointwise)
+#              | Implies(pointwise, pointwise)
+#
+#   temporal  := Always(pointwise | temporal, interval)
+#              | Eventually(pointwise | temporal, interval)
+#              | Until(pointwise | temporal, pointwise | temporal, interval)
+#
+#   formula   := pointwise | temporal
+#
+# Boolean operators (And/Or/Not/Implies) combine two events at the SAME time
+# step with Frechet bounds; they never combine two temporal robustness
+# intervals (And(Always(a), Eventually(b)) is rejected -- see
+# _require_pointwise). Temporal operators accept either a pointwise
+# sub-formula or another temporal one, so temporal nesting is unrestricted
+# (Eventually(Always(a)) is fine). Until is exempt from the pointwise check:
+# it is itself a temporal reduction over its children's traces (an
+# inclusive-prefix max-min across time), not a same-timestep Boolean
+# combination, so the restriction that applies to And/Or/Not does not apply
+# to it.
+
 
 class STL_Formula(torch.nn.Module):
     """Base formula for pointwise probabilities and temporal robustness."""
@@ -124,12 +149,20 @@ def _align(*traces):
 
 
 def _require_pointwise(operator, *subformulas):
-    """Reject Boolean composition of temporal robustness intervals."""
+    """Reject Boolean composition of temporal robustness intervals.
+
+    This is an implementation restriction, not an STL syntax error: the given
+    formula is valid STL, this implementation just does not yet compose two
+    temporal robustness intervals with a Boolean connective. See the
+    "Supported formula fragment" note above.
+    """
     for subformula in subformulas:
         if not subformula.is_pointwise:
             raise ValueError(
                 f"{operator} only accepts pointwise event formulas; "
-                f"got temporal formula {subformula}"
+                f"got temporal formula {subformula}. This is a limitation of "
+                f"this implementation, not invalid STL -- Boolean operators "
+                f"only compose same-time-step events here."
             )
 
 

@@ -101,6 +101,8 @@ def plot_case(
     formula_trace,
     mean_trace=None,
     var_trace=None,
+    lower_trace=None,
+    upper_trace=None,
     predicate_traces=None,
     thresholds=None,
     formula_str=None,
@@ -115,6 +117,12 @@ def plot_case(
     formula_trace    : [B, K, 2] or [K, 2] formula bounds, K <= T
     mean_trace       : [T] mean of the constrained state component
     var_trace        : [T] variance of that component
+    lower_trace, upper_trace : [T] explicit descriptor bounds of the state
+        component, when the belief is a propagated enclosure rather than a
+        point mean. Takes precedence over mean_trace for panel (a); var_trace
+        may still be given alongside them and is drawn as a separate,
+        visually distinct residual-spread envelope, not folded into the
+        descriptor band.
     predicate_traces : {label: [B, T, 2]} atomic probabilities
     """
     time = np.asarray(time)
@@ -127,7 +135,23 @@ def plot_case(
     ax_form = axes[-1]
 
     # (a) state and its uncertainty
-    if mean_trace is not None and var_trace is not None:
+    if lower_trace is not None and upper_trace is not None:
+        lower, upper = np.asarray(lower_trace), np.asarray(upper_trace)
+        if var_trace is not None:
+            sigma = np.sqrt(np.maximum(np.asarray(var_trace), 0.0))
+            ax_state.fill_between(
+                time, lower - sigma, upper + sigma, alpha=0.12, color=_GRAY,
+                zorder=1, label=r"$\pm$ residual std",
+            )
+        ax_state.fill_between(
+            time, lower, upper, alpha=0.25, color=_BLUE, zorder=2,
+            label="descriptor bounds [lower, upper]",
+        )
+        ax_state.plot(
+            time, (lower + upper) / 2, color=_BLUE, lw=1.8, marker="o", ms=3,
+            zorder=3, label="descriptor midpoint",
+        )
+    elif mean_trace is not None and var_trace is not None:
         mean = np.asarray(mean_trace)
         sigma = np.sqrt(np.maximum(np.asarray(var_trace), 0.0))
         ax_state.fill_between(
@@ -136,10 +160,10 @@ def plot_case(
         )
         ax_state.plot(time, mean, color=_BLUE, lw=1.8, marker="o", ms=3, label=r"$\mu(t)$")
 
-        for th in np.atleast_1d(thresholds) if thresholds is not None else []:
+    if (mean_trace is not None or lower_trace is not None) and thresholds is not None:
+        for th in np.atleast_1d(thresholds):
             ax_state.axhline(float(th), color=_RED, ls="--", lw=1.3)
-        if thresholds is not None:
-            ax_state.plot([], [], color=_RED, ls="--", lw=1.3, label="threshold")
+        ax_state.plot([], [], color=_RED, ls="--", lw=1.3, label="threshold")
 
     ax_state.set_ylabel("state $x$")
     ax_state.set_title("(a) Predicted state", loc="left", fontweight="bold")
@@ -193,8 +217,11 @@ def plot_synthesis(
 ):
     """Initial vs optimized behaviour plus a compact objective history.
 
-    `initial` and `optimized` are dicts with keys ``mean``, ``var`` and
-    ``formula`` (the directly evaluated bound trace).
+    `initial` and `optimized` are dicts with a ``formula`` key (the directly
+    evaluated bound trace) plus either ``mean``/``var`` (a point-mass belief,
+    band drawn as mean +- sigma) or ``lower``/``upper`` (a propagated
+    descriptor enclosure, band drawn from the bounds directly; ``var`` may
+    still be given alongside them for a separate residual-spread envelope).
     """
     time = np.asarray(time)
     fig, ((ax_state, ax_form), (ax_obj, ax_blank)) = plt.subplots(
@@ -203,10 +230,23 @@ def plot_synthesis(
     ax_blank.axis("off")
 
     for run, color, name in ((initial, _GRAY, "initial"), (optimized, _BLUE, "optimized")):
-        mean = np.asarray(run["mean"])
-        sigma = np.sqrt(np.maximum(np.asarray(run["var"]), 0.0))
-        ax_state.fill_between(time, mean - sigma, mean + sigma, alpha=0.18, color=color)
-        ax_state.plot(time, mean, color=color, lw=1.8, marker="o", ms=3, label=name)
+        if "lower" in run and "upper" in run:
+            lower, upper = np.asarray(run["lower"]), np.asarray(run["upper"])
+            if run.get("var") is not None:
+                sigma = np.sqrt(np.maximum(np.asarray(run["var"]), 0.0))
+                ax_state.fill_between(
+                    time, lower - sigma, upper + sigma, alpha=0.08, color=color
+                )
+            ax_state.fill_between(time, lower, upper, alpha=0.18, color=color)
+            ax_state.plot(
+                time, (lower + upper) / 2, color=color, lw=1.8, marker="o", ms=3,
+                label=name,
+            )
+        else:
+            mean = np.asarray(run["mean"])
+            sigma = np.sqrt(np.maximum(np.asarray(run["var"]), 0.0))
+            ax_state.fill_between(time, mean - sigma, mean + sigma, alpha=0.18, color=color)
+            ax_state.plot(time, mean, color=color, lw=1.8, marker="o", ms=3, label=name)
 
         bounds = _to_numpy(run["formula"])
         t = time[: len(bounds)]
@@ -220,7 +260,8 @@ def plot_synthesis(
 
     ax_state.set_xlabel("time [s]")
     ax_state.set_ylabel("state $x$")
-    ax_state.set_title("(a) State, band = $\\mu \\pm \\sigma$", loc="left", fontweight="bold")
+    ax_state.set_title("(a) State (band = descriptor bounds or $\\mu \\pm \\sigma$)",
+                       loc="left", fontweight="bold")
     ax_state.legend(fontsize=8)
     ax_state.grid(True, alpha=0.3)
 

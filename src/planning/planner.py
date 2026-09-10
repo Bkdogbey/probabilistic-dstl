@@ -112,21 +112,33 @@ class Planner:
         return J
 
     def _optimize_window(
-        self, x0_mean, x0_cov, *, env=None, verbose=True,
-        spec=None, init_guess=None,
+        self, x0_mean=None, x0_cov=None, *, env=None, verbose=True,
+        spec=None, init_guess=None, rollout=None,
     ):
         """Run gradient-descent optimisation for one planning window.
 
-        Returns the best iterate: controls, predicted mean/covariance, its lower
-        stochastic robustness and the objective history. Controls, predictions
-        and score all come from the same candidate, so a smaller total loss
-        alone never selects an iterate.
+        Returns the best iterate: controls, predicted lower bound/covariance,
+        its lower stochastic robustness and the objective history. Controls,
+        predictions and score all come from the same candidate, so a smaller
+        total loss alone never selects an iterate.
 
         Parameters
         ----------
         env : Environment, optional
             Override self.env for this window (used by MPC to pass env_t).
+        rollout : callable, optional
+            ``v_params -> (lower_trace, upper_trace, cov_trace)``, each
+            ``[1,T+1,...]``, e.g. ``SingleIntegrator.rollout_enclosure`` bound
+            to its initial enclosure and offsets. When given, this replaces
+            the default point-mass rollout (``x0_mean``/``x0_cov`` are then
+            unused and may be omitted); the enclosure bounds are never
+            collapsed to their midpoint for belief construction.
         """
+        if rollout is None and (x0_mean is None or x0_cov is None):
+            raise ValueError(
+                "_optimize_window requires x0_mean and x0_cov, or a rollout callable"
+            )
+
         if env is not None:
             saved_env = self.env
             self.env = env
@@ -136,7 +148,7 @@ class Planner:
         phi = spec if spec is not None else self.env.get_specification(self.T)
         scale = self.cfg["scale"]
 
-        best = None  # (robustness, u, mean, cov, objective) of one iterate
+        best = None  # (u, lower, cov, objective) of one iterate
         best_r = -float("inf")
         history = []
         prev_loss = float("inf")
@@ -148,17 +160,21 @@ class Planner:
         for k in range(self.cfg["max_iters"]):
             optimizer.zero_grad()
 
-            mean_trace, cov_trace = self.dyn(v_params, x0_mean, x0_cov)
+            if rollout is not None:
+                lower_trace, upper_trace, cov_trace = rollout(v_params)
+            else:
+                lower_trace, cov_trace = self.dyn(v_params, x0_mean, x0_cov)
+                upper_trace = lower_trace
             u_seq = self.dyn.bound_control(v_params)
 
             traj = create_gaussian_belief_trajectory(
-                mean_trace[0], mean_trace[0], cov_trace[0]
+                lower_trace[0], upper_trace[0], cov_trace[0]
             )
 
             stl_trace = phi(traj, scale=scale)
             robustness = stl_trace[0, 0, 0]
 
-            J = self._compute_loss(mean_trace, u_seq, robustness)
+            J = self._compute_loss(lower_trace, u_seq, robustness)
             J.backward()
             optimizer.step()
 
@@ -171,7 +187,7 @@ class Planner:
                 best_r = current_r
                 best = (
                     u_seq.detach().clone(),
-                    mean_trace.detach().clone(),
+                    lower_trace.detach().clone(),
                     cov_trace.detach().clone(),
                     J.item(),
                 )
@@ -201,8 +217,8 @@ class Planner:
         if env is not None:
             self.env = saved_env
 
-        best_u, best_mean, best_cov, self.best_objective = best
-        return best_mean, best_cov, best_u, best_r, history
+        best_u, best_lower, best_cov, self.best_objective = best
+        return best_lower, best_cov, best_u, best_r, history
 
     def _step_with_noise(self, curr_mean, curr_cov, u):
         pred_mean, next_cov = self.dyn.step(curr_mean, curr_cov, u)

@@ -11,7 +11,7 @@ from models.dynamics import (
     piecewise_signal,
 )
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import GreaterThan
+from pdstl.operators import Always, GreaterThan
 from planning.environment import Environment, extract_trajectory_stats
 from planning.planner import Planner
 
@@ -187,6 +187,69 @@ def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():
 def test_gaussian_trajectory_factory_rejects_mismatched_shapes(lower, upper, covariance, message):
     with pytest.raises(ValueError, match=message):
         create_gaussian_belief_trajectory(lower, upper, covariance)
+
+
+# --- Input validation --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "lower,upper,covariance,message",
+    [
+        ([[float("nan"), 0.0]], [[1.0, 1.0]], [[1.0, 1.0]], "lower must be finite"),
+        ([[0.0, 0.0]], [[float("inf"), 1.0]], [[1.0, 1.0]], "upper must be finite"),
+        ([[0.0, 0.0]], [[1.0, 1.0]], [[float("-inf"), 1.0]], "covariance must be finite"),
+    ],
+)
+def test_gaussian_belief_rejects_nonfinite_inputs(lower, upper, covariance, message):
+    t = lambda v: torch.as_tensor(v, dtype=torch.float64)
+    with pytest.raises(ValueError, match=message):
+        GaussianBelief(t(lower), t(upper), t(covariance))
+
+
+def test_gaussian_belief_rejects_an_asymmetric_full_covariance():
+    lower = upper = torch.zeros(1, 2)
+    covariance = torch.tensor([[[1.0, 2.0], [3.0, 1.0]]])
+
+    with pytest.raises(ValueError, match="must be symmetric"):
+        GaussianBelief(lower, upper, covariance)
+
+
+def test_gaussian_belief_rejects_a_symmetric_non_positive_semidefinite_covariance():
+    lower = upper = torch.zeros(1, 2)
+    covariance = torch.tensor([[[1.0, 2.0], [2.0, 1.0]]])  # eigenvalues -1, 3
+
+    with pytest.raises(ValueError, match="positive semi-definite"):
+        GaussianBelief(lower, upper, covariance)
+
+
+def test_gaussian_belief_accepts_a_covariance_actually_propagated_by_rollout():
+    """A regression guard: the new symmetry/PSD checks must not reject a
+    covariance that came from real (float-roundoff-bearing) propagation."""
+    model = DoubleIntegrator(dt=0.2, u_max=1.0, q_std=0.1)
+    x, P = torch.zeros(4), torch.eye(4) * 0.3
+    for _ in range(10):
+        x, P = model.step(x, P, torch.tensor([0.3, -0.1]))
+
+    GaussianBelief(x.unsqueeze(0), x.unsqueeze(0), P.unsqueeze(0))  # must not raise
+
+
+def test_gradient_reaches_controls_through_the_full_enclosure_belief_path():
+    """controls -> rollout_enclosure -> belief trajectory -> predicate
+    probability, the general enclosure machinery end to end."""
+    model = SingleIntegrator(dt=1.0, u_max=3.0, q_std=0.5)
+    controls = torch.zeros(4, 2, requires_grad=True)
+    lower0, upper0 = torch.tensor([48.0, 0.0]), torch.tensor([49.0, 0.0])
+    covariance0 = torch.eye(2) * 4.0
+
+    lower, upper, covariance = model.rollout_enclosure(controls, lower0, upper0, covariance0)
+    traj = create_gaussian_belief_trajectory(lower[0], upper[0], covariance[0])
+
+    formula = Always(GreaterThan(50.0), interval=[0, 1])
+    formula(traj)[..., 0].sum().backward()
+
+    assert controls.grad is not None
+    assert torch.isfinite(controls.grad).all()
+    assert controls.grad.abs().sum() > 0
 
 
 def test_piecewise_signal_returns_time_mean_and_variance():

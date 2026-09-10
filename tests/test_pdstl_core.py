@@ -215,6 +215,28 @@ def test_boolean_bounds_on_hand_calculated_values():
     assert Or(a, b)(traj)[0, 0, 1].item() == pytest.approx(1.0)
 
 
+def test_nested_pointwise_boolean_composes_frechet_at_each_level():
+    """And(And(a,b), Or(b,c)), evaluated standalone (not merely as a side
+    effect of being wrapped in a temporal operator): is_pointwise propagates
+    correctly through two levels of nesting, and the numeric result matches
+    hand-computed nested Frechet bounds."""
+    traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9), "c": (0.3, 0.5)})
+    a, b, c = Predicate("a"), Predicate("b"), Predicate("c")
+
+    inner_and = And(a, b)
+    inner_or = Or(b, c)
+    nested = And(inner_and, inner_or)
+
+    assert inner_and.is_pointwise and inner_or.is_pointwise and nested.is_pointwise
+
+    # inner_and = [max(0, 0.7+0.6-1), min(0.8,0.9)] = [0.3, 0.8]
+    # inner_or  = [max(0.6,0.3), min(1, 0.9+0.5)]   = [0.6, 1.0]
+    # nested    = [max(0, 0.3+0.6-1), min(0.8,1.0)] = [0.0, 0.8]
+    np.testing.assert_allclose(inner_and(traj)[0, 0].numpy(), [0.3, 0.8], atol=1e-6)
+    np.testing.assert_allclose(inner_or(traj)[0, 0].numpy(), [0.6, 1.0], atol=1e-6)
+    np.testing.assert_allclose(nested(traj)[0, 0].numpy(), [0.0, 0.8], atol=1e-6)
+
+
 def test_implies_is_negation_then_or():
     traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
     a, b = Predicate("a"), Predicate("b")

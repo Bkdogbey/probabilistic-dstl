@@ -1,7 +1,8 @@
 show_plots: true
 
-# Every example supplies an upstream scalar state model: (mean, variance) per
-# step. The atomic probability bounds are computed from it, not listed here.
+# always/eventually/nested each supply an upstream scalar state model:
+# (mean, variance) per step. The atomic probability bounds are computed from
+# it, not listed here.
 
 always:
   threshold: 50.0
@@ -42,3 +43,28 @@ nested:
     - [48.0, 4.0]
     - [50.0, 4.0]
     - [56.0, 4.0]
+
+# Control optimisation over a propagated descriptor enclosure: a SingleIntegrator
+# rolled out with rollout_enclosure(), not a manufactured mean +- sigma band.
+# lower0/upper0 (descriptor bounds), covariance0 (residual), and d_lower/d_upper
+# (bounded offset) are independent inputs -- none is derived from another.
+enclosure_reach:
+  threshold: 2.5
+  interval_steps: [1, 8]
+  H: 8
+  dt: 0.5
+  u_max: 1.0
+  q_std: 0.05
+  lower0: [0.0, 0.0]
+  upper0: [0.3, 0.3]
+  covariance0: [0.09, 0.09]
+  d_lower: [-0.02, -0.02]
+  d_upper: [0.03, 0.03]
+  seed: 0
+  planner:
+    w_u: 0.0
+    w_du: 0.0
+    w_dist: 0.0
+    w_obs: 0.0
+    w_visit: 0.0
+    scale: -1

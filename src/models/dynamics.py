@@ -174,14 +174,20 @@ class GaussianBelief(Belief):
     def _validate_shapes(self):
         if not torch.is_tensor(self.lower) or self.lower.ndim != 2:
             raise ValueError("GaussianBelief lower must have shape [B,D]")
+        if not torch.isfinite(self.lower).all():
+            raise ValueError("GaussianBelief lower must be finite")
         if not torch.is_tensor(self.upper) or self.upper.shape != self.lower.shape:
             raise ValueError("GaussianBelief upper must match lower's shape")
+        if not torch.isfinite(self.upper).all():
+            raise ValueError("GaussianBelief upper must be finite")
         if bool((self.lower > self.upper).any()):
             raise ValueError("GaussianBelief requires lower <= upper")
 
         batch, state_dim = self.lower.shape
         if not torch.is_tensor(self.covariance):
             raise ValueError("GaussianBelief covariance must be a tensor")
+        if not torch.isfinite(self.covariance).all():
+            raise ValueError("GaussianBelief covariance must be finite")
         if self.covariance.ndim == 2:
             if self.covariance.shape != self.lower.shape:
                 raise ValueError("diagonal covariance must match lower's shape [B,D]")
@@ -189,6 +195,15 @@ class GaussianBelief(Belief):
         elif self.covariance.ndim == 3:
             if self.covariance.shape != (batch, state_dim, state_dim):
                 raise ValueError("full covariance must have shape [B,D,D]")
+            # A @ P @ A^T accumulates float roundoff, so this is a tolerance
+            # check, not exact equality.
+            if not torch.allclose(
+                self.covariance, self.covariance.transpose(-1, -2), atol=1e-5
+            ):
+                raise ValueError("full covariance must be symmetric")
+            eigenvalues = torch.linalg.eigvalsh(self.covariance)
+            if bool((eigenvalues < -1e-6).any()):
+                raise ValueError("full covariance must be positive semi-definite")
             component_variance = self.covariance.diagonal(dim1=-2, dim2=-1)
         else:
             raise ValueError("GaussianBelief covariance must be [B,D] or [B,D,D]")

@@ -86,3 +86,11 @@ with skip_run("run", "Nested") as check, check():
         inner_label=str(inner), inner_trace=inner_trace,
         show=show_plots,
     )
+
+
+# 4. EnclosureReach: control optimisation over a propagated descriptor enclosure
+with skip_run("run", "EnclosureReach") as check, check():
+    from planning.examples import run_enclosure_reach
+
+    print("\nEnclosureReach")
+    run_enclosure_reach(show=show_plots, save=True, verbose=True)

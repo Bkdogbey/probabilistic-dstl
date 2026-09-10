@@ -398,6 +398,137 @@ def run_mpc_check(verbose=True):
     return steps
 
 
+# --- Enclosure-rollout control example -------------------------------------
+
+
+def load_enclosure_reach_config():
+    """Example parameters merged with the planner defaults."""
+    cfg = load_config("configs/examples.yaml")["enclosure_reach"]
+    planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
+    return cfg, planner_cfg
+
+
+def _enclosure_initial_state(cfg, device):
+    lower0 = torch.tensor(cfg["lower0"], device=device, dtype=torch.float32)
+    upper0 = torch.tensor(cfg["upper0"], device=device, dtype=torch.float32)
+    covariance0 = torch.diag(
+        torch.tensor(cfg["covariance0"], device=device, dtype=torch.float32)
+    )
+    d_lower = torch.tensor(cfg["d_lower"], device=device, dtype=torch.float32)
+    d_upper = torch.tensor(cfg["d_upper"], device=device, dtype=torch.float32)
+    return lower0, upper0, covariance0, d_lower, d_upper
+
+
+def run_enclosure_reach(*, show=False, save=True, verbose=True):
+    """Propagate a descriptor enclosure through SingleIntegrator and optimise
+    controls to raise Eventually(x[0] >= c)'s exact lower endpoint.
+
+    The state's uncertainty has two independent parts throughout: the
+    descriptor bounds [lower, upper] (a set-valued location, propagated by
+    rollout_enclosure) and the residual covariance (Gaussian noise around any
+    admissible location). Neither is derived from the other, and the belief
+    is never collapsed to the descriptor midpoint.
+    """
+    cfg, planner_cfg = load_enclosure_reach_config()
+    device = get_device()
+    H = cfg["H"]
+
+    dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
+    lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
+
+    def rollout(v_params):
+        return dyn.rollout_enclosure(v_params, lower0, upper0, covariance0, d_lower, d_upper)
+
+    spec = Eventually(GreaterThan(cfg["threshold"], dim=0), interval=cfg["interval_steps"])
+    time = [t * cfg["dt"] for t in range(H + 1)]
+
+    planner = Planner(dyn, None, H, config=planner_cfg)
+
+    # One consistent initial-control convention: reseed and let Planner's own
+    # random fallback (_init_controls(None)) run twice under the identical
+    # seed, so the displayed "initial" trajectory is exactly what the
+    # optimiser starts from -- no separate re-derivation, no tanh round-trip.
+    torch.manual_seed(cfg["seed"])
+    v_init = planner._init_controls(None).detach()
+    lower_init, upper_init, cov_init = rollout(v_init)
+    traj_init = create_gaussian_belief_trajectory(lower_init[0], upper_init[0], cov_init[0])
+    interval_init = evaluate_direct(spec, traj_init)
+
+    torch.manual_seed(cfg["seed"])  # same seed -> _optimize_window draws v_init again
+    best_lower, best_cov, best_u, best_r, history = planner._optimize_window(
+        spec=spec, rollout=rollout, verbose=verbose,
+    )
+
+    # Replay the returned physical controls: recovers `upper` (never carried
+    # in _optimize_window's return, to keep its 5-tuple contract unchanged for
+    # every other caller) and is the reproduction check itself.
+    v_best = torch.atanh(torch.clamp(best_u / dyn.u_max, -0.999999, 0.999999))
+    lower_final, upper_final, cov_final = rollout(v_best)
+    traj_final = create_gaussian_belief_trajectory(lower_final[0], upper_final[0], cov_final[0])
+    interval_final = evaluate_direct(spec, traj_final)
+
+    lower_mismatch = (lower_final - best_lower).abs().max().item()
+
+    result = {
+        "interval_initial": interval_init.detach()[0, 0].tolist(),
+        "interval_final": interval_final.detach()[0, 0].tolist(),
+        "controls": best_u.detach(),
+        "lower_trace": lower_final.detach(),
+        "upper_trace": upper_final.detach(),
+        "cov_trace": cov_final.detach(),
+        "history": history,
+        "objective": planner.best_objective,
+        "lower_mismatch": lower_mismatch,
+    }
+
+    if verbose:
+        lo_i, hi_i = result["interval_initial"]
+        lo_f, hi_f = result["interval_final"]
+        log_utils._log.info(
+            f"[enclosure_reach] {spec}\n"
+            f"    direct interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
+            f"  ->  final [{lo_f:.4f}, {hi_f:.4f}]\n"
+            f"    objective {planner.best_objective:.4f} | "
+            f"replay mismatch {lower_mismatch:.2e}"
+        )
+
+    if save or show:
+        base = os.path.join(OUTPUT_DIR, "enclosure_reach")
+        plot_case(
+            time,
+            interval_final.detach(),
+            lower_trace=lower_final.detach()[0, :, 0],
+            upper_trace=upper_final.detach()[0, :, 0],
+            var_trace=cov_final.detach()[0, :, 0, 0],
+            thresholds=[cfg["threshold"]],
+            title=f"enclosure_reach: {spec}",
+            save_path=f"{base}_case.png" if save else None,
+            show=show,
+        )
+        plot_synthesis(
+            time,
+            {
+                "lower": lower_init.detach()[0, :, 0],
+                "upper": upper_init.detach()[0, :, 0],
+                "var": cov_init.detach()[0, :, 0, 0],
+                "formula": interval_init.detach(),
+            },
+            {
+                "lower": lower_final.detach()[0, :, 0],
+                "upper": upper_final.detach()[0, :, 0],
+                "var": cov_final.detach()[0, :, 0, 0],
+                "formula": interval_final.detach(),
+            },
+            history,
+            thresholds=[cfg["threshold"]],
+            title="enclosure_reach: initial vs optimised",
+            save_path=f"{base}_synthesis.png" if save else None,
+            show=show,
+        )
+
+    return result
+
+
 def run_all(*, show=False, save=True, verbose=True):
     """Run the five cases plus the step-zero bottleneck report."""
     results = {name: run_case(name, show=show, save=save, verbose=verbose)

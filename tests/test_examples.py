@@ -231,7 +231,7 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
 
 def test_examples_configuration_holds_only_numerical_example_data():
     config = _config()
-    assert set(config) == {"show_plots", *EXAMPLES}
+    assert set(config) == {"show_plots", "enclosure_reach", *EXAMPLES}
 
     shared = {"threshold", "sigma_multiplier", "values"}
     assert set(config["always"]) == shared | {"interval_steps"}
@@ -242,6 +242,13 @@ def test_examples_configuration_holds_only_numerical_example_data():
     }
     for name in EXAMPLES:
         assert all(len(pair) == 2 for pair in config[name]["values"])
+
+    enclosure = config["enclosure_reach"]
+    assert set(enclosure) == {
+        "threshold", "interval_steps", "H", "dt", "u_max", "q_std",
+        "lower0", "upper0", "covariance0", "d_lower", "d_upper", "seed", "planner",
+    }
+    assert len(enclosure["lower0"]) == len(enclosure["upper0"]) == 2
 
 
 def test_offline_module_and_signal_dispatcher_remain_absent():
@@ -281,6 +288,7 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
         "Always",
         "Eventually",
         "Nested",
+        "EnclosureReach",
     ]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
@@ -290,7 +298,11 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
 
 @pytest.mark.parametrize(
     "flags",
-    [("run", "run", "run"), ("run", "skip", "run"), ("skip", "skip", "skip")],
+    [
+        ("run", "run", "run", "run"),
+        ("run", "skip", "run", "skip"),
+        ("skip", "skip", "skip", "skip"),
+    ],
 )
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
     source = (ROOT / "src/main.py").read_text()
