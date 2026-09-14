@@ -9,7 +9,7 @@ import pytest
 import torch
 from scipy.stats import norm
 
-from models.dynamics import EnclosureGaussianBelief, create_enclosure_belief_trajectory
+from models.dynamics import EnclosureGaussianBelief, GaussianBelief, create_enclosure_belief_trajectory
 from pdstl.operators import Always, GreaterThan, LessThan
 
 
@@ -129,3 +129,13 @@ def test_unevaluable_predicate_and_malformed_shapes_are_rejected():
 
     with pytest.raises(ValueError, match="must be non-negative"):
         belief(1.0, 2.0, -1.0)
+
+
+@pytest.mark.parametrize("predicate", [GreaterThan(50.0), LessThan(50.0)])
+def test_bounds_contain_the_exact_probability_of_every_admissible_location(predicate):
+    lower, upper = belief(48.0, 52.0, 4.0).probability_bounds(predicate)[0]
+
+    for location in torch.linspace(48.0, 52.0, 9, dtype=torch.float64):
+        exact = GaussianBelief(location.reshape(1, 1), torch.tensor([[4.0]], dtype=torch.float64))
+        p = exact.probability_bounds(predicate)[0, 0]
+        assert lower - 1e-12 <= p <= upper + 1e-12

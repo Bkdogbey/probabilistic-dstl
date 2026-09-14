@@ -54,7 +54,7 @@ def test_gradient_reaches_controls_through_the_whole_pipeline():
 
     atomic = predicate(traj)
     robustness = spec(traj, scale=planner_cfg["scale"])[0, 0, 0]
-    loss = Planner(dyn, None, cfg["H"], config=planner_cfg)._compute_loss(
+    loss = Planner(dyn, None, cfg["H"], config=planner_cfg)._objective(
         mean, dyn.bound_control(v), robustness
     )
     loss.backward()

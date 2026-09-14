@@ -21,6 +21,7 @@ from planning.examples import (
     load_end_to_end_config,
     run_end_to_end_mpc_reach,
 )
+from models.rollouts import gaussian_rollout
 from planning.planner import Planner
 from utils import get_device
 from visualization.robustness import plot_mpc_reach
@@ -45,7 +46,7 @@ def result():
 
 
 def _replans(result):
-    return len(result["all_plans"])
+    return len(result["plan_mean_traces"])
 
 
 def _assert_valid_covariance(cov):
@@ -56,7 +57,7 @@ def _assert_valid_covariance(cov):
 # A
 def test_planner_replans_multiple_times(result):
     assert _replans(result) >= 2
-    assert len(result["p_sat_trace"]) == len(result["plan_controls"]) == _replans(result)
+    assert len(result["hard_scores"]) == len(result["plan_controls"]) == _replans(result)
 
 
 # B
@@ -82,15 +83,19 @@ def test_without_noise_each_step_applies_exactly_the_first_planned_control(setup
     planner = Planner(dyn, None, cfg["H"], config=planner_cfg)
 
     result = planner.run_receding_horizon(
-        x0_mean, x0_cov, spec=spec, max_steps=3, is_done=lambda mean: False,
+        (x0_mean, x0_cov),
+        make_rollout=lambda state: gaussian_rollout(dyn, *state),
+        execute=lambda state, u: dyn.step(*state, u),
+        is_done=lambda state: False,
+        spec=spec,
+        max_steps=3,
         init_guess=torch.tensor(cfg["init_control"]).repeat(cfg["H"], 1),
-        execute=dyn.step,
     )
 
     assert result["stopped_reason"] == "max_steps"
-    means = result["mean_trace"][0]
-    for k, plan_u in enumerate(result["plan_controls"]):
-        torch.testing.assert_close(means[k + 1], dyn.A @ means[k] + dyn.B @ plan_u[0])
+    means = [mean for mean, _ in result["states"]]
+    for k, best in enumerate(result["candidates"]):
+        torch.testing.assert_close(means[k + 1], dyn.A @ means[k] + dyn.B @ best.controls[0])
 
 
 # C
@@ -105,11 +110,11 @@ def test_control_limits_are_respected(result):
 def test_states_covariances_controls_and_scores_are_finite(result):
     for key in ("mean_trace", "cov_trace", "u_trace"):
         assert torch.isfinite(result[key]).all(), key
-    assert all(math.isfinite(s) for s in result["p_sat_trace"])
-    assert all(math.isfinite(j) for j in result["loss_trace"])
+    assert all(math.isfinite(s) for s in result["hard_scores"])
+    assert all(math.isfinite(j) for j in result["objectives"])
     for cov in result["cov_trace"][0]:
         _assert_valid_covariance(cov)
-    for plan in result["all_plans"]:
+    for plan in result["plan_mean_traces"]:
         assert torch.isfinite(plan).all()
 
 
@@ -145,7 +150,7 @@ def test_progress_comes_from_the_pdstl_objective(result, config):
     # the optimiser moved away from the initial guess in the very first window
     init = torch.tensor(cfg["init_control"])
     assert (result["plan_controls"][0][0] - init).abs().max() > 0.1
-    assert result["p_sat_trace"][-1] > result["p_sat_trace"][0]
+    assert result["hard_scores"][-1] > result["hard_scores"][0]
 
 
 # I
@@ -171,7 +176,7 @@ def test_predicted_plans_and_executed_trajectory_are_distinct(result, config):
     cfg, _ = config
     means = result["mean_trace"][0]
 
-    for k, plan in enumerate(result["all_plans"]):
+    for k, plan in enumerate(result["plan_mean_traces"]):
         assert plan.shape == (1, cfg["H"] + 1, 2)
         torch.testing.assert_close(plan[0, 0], means[k])  # each plan starts at the executed belief
         assert not torch.equal(plan[0, 1], means[k + 1])  # execution is not the prediction

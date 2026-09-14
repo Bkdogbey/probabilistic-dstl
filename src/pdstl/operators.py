@@ -3,30 +3,9 @@ import numpy as np
 
 from pdstl.base import check_probability_bounds
 
-# Supported formula fragment
-#
-#   pointwise := predicate
-#              | Not(pointwise)
-#              | And(pointwise, pointwise)
-#              | Or(pointwise, pointwise)
-#              | Implies(pointwise, pointwise)
-#
-#   temporal  := Always(pointwise | temporal, interval)
-#              | Eventually(pointwise | temporal, interval)
-#              | Until(pointwise | temporal, pointwise | temporal, interval)
-#
-#   formula   := pointwise | temporal
-#
-# Boolean operators (And/Or/Not/Implies) combine two events at the SAME time
-# step with Frechet bounds; they never combine two temporal robustness
-# intervals (And(Always(a), Eventually(b)) is rejected -- see
-# _require_pointwise). Temporal operators accept either a pointwise
-# sub-formula or another temporal one, so temporal nesting is unrestricted
-# (Eventually(Always(a)) is fine). Until is exempt from the pointwise check:
-# it is itself a temporal reduction over its children's traces (an
-# inclusive-prefix max-min across time), not a same-timestep Boolean
-# combination, so the restriction that applies to And/Or/Not does not apply
-# to it.
+# Predicates give [L, U] probability bounds per step. Boolean operators combine
+# any child intervals at the same evaluation origin (Frechet rules); temporal
+# operators reduce a child's trace over a window. Any nesting is allowed.
 
 
 class STL_Formula(torch.nn.Module):
@@ -148,156 +127,103 @@ def _align(*traces):
     return tuple(t[:, :n] for t in traces)
 
 
-def _require_pointwise(operator, *subformulas):
-    """Reject Boolean composition of temporal robustness intervals.
+def _conjunction(trace1, trace2):
+    """[max(0, L1 + L2 - 1), min(U1, U2)]"""
+    lower = torch.clamp(trace1[..., 0] + trace2[..., 0] - 1.0, min=0.0)
+    upper = torch.minimum(trace1[..., 1], trace2[..., 1])
+    return torch.stack([lower, upper], dim=-1)
 
-    This is an implementation restriction, not an STL syntax error: the given
-    formula is valid STL, this implementation just does not yet compose two
-    temporal robustness intervals with a Boolean connective. See the
-    "Supported formula fragment" note above.
-    """
-    for subformula in subformulas:
-        if not subformula.is_pointwise:
-            raise ValueError(
-                f"{operator} only accepts pointwise event formulas; "
-                f"got temporal formula {subformula}. This is a limitation of "
-                f"this implementation, not invalid STL -- Boolean operators "
-                f"only compose same-time-step events here."
-            )
+
+def _disjunction(trace1, trace2):
+    """[max(L1, L2), min(1, U1 + U2)]"""
+    lower = torch.maximum(trace1[..., 0], trace2[..., 0])
+    upper = torch.clamp(trace1[..., 1] + trace2[..., 1], max=1.0)
+    return torch.stack([lower, upper], dim=-1)
+
+
+def _children(formula, belief_trajectory, **kwargs):
+    """Both child traces of a binary formula, aligned to shared origins."""
+    trace1 = formula.subformula1(belief_trajectory, **kwargs)
+    trace2 = formula.subformula2(belief_trajectory, **kwargs)
+    return _align(trace1, trace2)
+
+
+def _negation(trace):
+    """[1 - U, 1 - L]"""
+    return torch.stack([1.0 - trace[..., 1], 1.0 - trace[..., 0]], dim=-1)
 
 
 class Negation(STL_Formula):
-    """
-    Negation: ¬ϕ
-    [L, U] -> [1 - U, 1 - L]
-
-    Exact complement of a pointwise probability interval; never smoothed.
-    """
+    """¬φ. Exact, never smoothed."""
 
     def __init__(self, subformula):
-        super(Negation, self).__init__()
-        _require_pointwise("Negation", subformula)
+        super().__init__()
         self.subformula = subformula
 
     @property
-    def is_pointwise(self) -> bool:
-        return True
+    def is_pointwise(self):
+        return self.subformula.is_pointwise
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace = self.subformula(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        # trace: [B,T,2]
-        # [lower, upper] -> [1 - upper, 1 - lower]
-        lower = 1.0 - trace[..., 1]
-        upper = 1.0 - trace[..., 0]
-        return torch.stack([lower, upper], dim=-1)
+    def robustness_trace(self, belief_trajectory, **kwargs):
+        return _negation(self.subformula(belief_trajectory, **kwargs))
 
     def __str__(self):
         return f"¬({self.subformula})"
 
 
 class And(STL_Formula):
-    """
-    Conjunction: ϕ₁ ∧ ϕ₂
-
-    Exact and never smoothed; `scale` is only forwarded to the sub-formulas.
-
-    Both sub-formulas must be pointwise. Exact Fréchet probability bounds:
-      lower = max(0, l1 + l2 - 1)
-      upper = min(u1, u2)
-    """
+    """φ₁ ∧ φ₂ at the same origins. Exact, never smoothed."""
 
     def __init__(self, subformula1, subformula2):
-        super(And, self).__init__()
-        _require_pointwise("And", subformula1, subformula2)
+        super().__init__()
         self.subformula1 = subformula1
         self.subformula2 = subformula2
 
     @property
-    def is_pointwise(self) -> bool:
-        return True
+    def is_pointwise(self):
+        return self.subformula1.is_pointwise and self.subformula2.is_pointwise
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace1 = self.subformula1(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        trace2 = self.subformula2(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        trace1, trace2 = _align(trace1, trace2)
-        l1, u1 = trace1[..., 0], trace1[..., 1]
-        l2, u2 = trace2[..., 0], trace2[..., 1]
-
-        # P(A ∩ B) ≥ max(0, P(A) + P(B) - 1) for any dependence.
-        lower = torch.clamp(l1 + l2 - 1.0, min=0.0)
-        upper = torch.minimum(u1, u2)
-        return torch.stack([lower, upper], dim=-1)
+    def robustness_trace(self, belief_trajectory, **kwargs):
+        return _conjunction(*_children(self, belief_trajectory, **kwargs))
 
     def __str__(self):
         return f"({self.subformula1}) ∧ ({self.subformula2})"
 
 
 class Or(STL_Formula):
-    """
-    Disjunction: ϕ₁ ∨ ϕ₂
-
-    Exact and never smoothed; `scale` is only forwarded to the sub-formulas.
-
-    Both sub-formulas must be pointwise. Exact Fréchet/Boole bounds:
-      lower = max(l1, l2)
-      upper = min(1, u1 + u2)
-    """
+    """φ₁ ∨ φ₂ at the same origins. Exact, never smoothed."""
 
     def __init__(self, subformula1, subformula2):
-        super(Or, self).__init__()
-        _require_pointwise("Or", subformula1, subformula2)
+        super().__init__()
         self.subformula1 = subformula1
         self.subformula2 = subformula2
 
     @property
-    def is_pointwise(self) -> bool:
-        return True
+    def is_pointwise(self):
+        return self.subformula1.is_pointwise and self.subformula2.is_pointwise
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace1 = self.subformula1(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        trace2 = self.subformula2(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
-        trace1, trace2 = _align(trace1, trace2)
-        l1, u1 = trace1[..., 0], trace1[..., 1]
-        l2, u2 = trace2[..., 0], trace2[..., 1]
-
-        lower = torch.maximum(l1, l2)
-        upper = torch.clamp(u1 + u2, max=1.0)
-        return torch.stack([lower, upper], dim=-1)
+    def robustness_trace(self, belief_trajectory, **kwargs):
+        return _disjunction(*_children(self, belief_trajectory, **kwargs))
 
     def __str__(self):
         return f"({self.subformula1}) ∨ ({self.subformula2})"
 
 
 class Implies(STL_Formula):
-    """
-    Implication: ϕ₁ ⇒ ϕ₂
-    Defined as: ¬ϕ₁ ∨ ϕ₂, so it inherits Or's exact, unsmoothed bounds.
-    """
+    """φ₁ ⇒ φ₂ := ¬φ₁ ∨ φ₂."""
 
     def __init__(self, subformula1, subformula2):
-        super(Implies, self).__init__()
+        super().__init__()
         self.subformula1 = subformula1
         self.subformula2 = subformula2
         self.equivalent = Or(Negation(subformula1), subformula2)
 
     @property
-    def is_pointwise(self) -> bool:
-        return True
+    def is_pointwise(self):
+        return self.equivalent.is_pointwise
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        return self.equivalent(
-            belief_trajectory, scale=scale, keepdim=keepdim, **kwargs
-        )
+    def robustness_trace(self, belief_trajectory, **kwargs):
+        return self.equivalent(belief_trajectory, **kwargs)
 
     def __str__(self):
         return f"({self.subformula1}) ⇒ ({self.subformula2})"
@@ -572,18 +498,7 @@ class Until(STL_Formula):
                 prefix = self.min_op(
                     phi[:, t : tau + 1, :], scale, dim=1, keepdim=False
                 )  # [B,2]
-                psi_tau = psi[:, tau, :]  # [B,2]
-
-                # Both must hold at this witness: endpointwise min, the same
-                # reduction Always takes over a window.
-                candidates.append(
-                    self.min_op(
-                        torch.stack([prefix, psi_tau], dim=1),
-                        scale,
-                        dim=1,
-                        keepdim=False,
-                    )
-                )  # [B,2]
+                candidates.append(_conjunction(prefix, psi[:, tau, :]))  # [B,2]
 
             # best witness in [t+a, t+b]
             best = self.max_op(

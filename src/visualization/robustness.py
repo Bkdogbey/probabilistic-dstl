@@ -360,17 +360,17 @@ def plot_mpc_reach(
 
     `result` is the dict returned by ``Planner.run_receding_horizon``: the
     executed ``mean_trace`` [1, N+1, D], applied ``u_trace`` [1, N, 2], one
-    predicted plan per replan in ``all_plans`` ([1, H+1, D] each), and the
-    per-window pdSTL score in ``p_sat_trace``.
+    predicted plan per replan in ``plan_mean_traces`` ([1, H+1, D] each), and the
+    per-window hard pdSTL score in ``hard_scores``.
     """
     executed = _to_array(result["mean_trace"])[0, :, dim]
     controls = _to_array(result["u_trace"])[0]
-    scores = np.asarray(result["p_sat_trace"])
+    scores = np.asarray(result["hard_scores"])
     time = dt * np.arange(len(executed))
 
     fig, (ax_state, ax_score, ax_u) = plt.subplots(3, 1, figsize=figsize, sharex=True)
 
-    for k, plan in enumerate(result["all_plans"]):
+    for k, plan in enumerate(result["plan_mean_traces"]):
         plan_x = _to_array(plan)[0, :, dim]
         ax_state.plot(
             dt * (k + np.arange(len(plan_x))), plan_x, color=_BLUE, lw=0.8, alpha=0.25,

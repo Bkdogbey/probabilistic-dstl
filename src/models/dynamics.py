@@ -212,12 +212,17 @@ def _tail_probability(owner, predicate, location, variance):
     safe_sigma = torch.where(positive, torch.sqrt(variance), torch.ones_like(variance))
 
     if sense == ">=":
-        probability = torch.special.ndtr((location - threshold) / safe_sigma)
+        probability = _normal_cdf((location - threshold) / safe_sigma)
         deterministic = location >= threshold
     else:
-        probability = torch.special.ndtr((threshold - location) / safe_sigma)
+        probability = _normal_cdf((threshold - location) / safe_sigma)
         deterministic = location <= threshold
     return torch.where(positive, probability, deterministic.to(location.dtype))
+
+
+def _normal_cdf(z):
+    """Phi(z), accurate far into the lower tail in float32."""
+    return torch.exp(torch.special.log_ndtr(z))
 
 
 class GaussianBelief(Belief):

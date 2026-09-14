@@ -15,6 +15,7 @@ from pdstl.base import BeliefTrajectory
 from pdstl.operators import Always, GreaterThan, LessThan
 from scipy.stats import norm
 from planning.environment import Environment, extract_trajectory_stats
+from models.rollouts import gaussian_rollout
 from planning.planner import Planner
 
 
@@ -144,16 +145,14 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     planner = Planner(
         SingleIntegrator(), environment, 3, config={"max_iters": 1, "scale": -1}
     )
-    mean, covariance, controls, score, history = planner._optimize_window(
-        torch.tensor([0.0, 0.0]),
-        torch.eye(2) * 0.1,
+    best, history = planner.optimize_window(
+        gaussian_rollout(planner.dyn, torch.tensor([0.0, 0.0]), torch.eye(2) * 0.1),
         init_guess=torch.zeros(3, 2),
-        verbose=False,
     )
-    assert mean.shape == (1, 4, 2)
-    assert covariance.shape == (1, 4, 2, 2)
-    assert controls.shape == (3, 2)
-    assert 0 <= score <= 1
+    assert best.rollout.aux["mean_trace"].shape == (1, 4, 2)
+    assert best.rollout.aux["cov_trace"].shape == (1, 4, 2, 2)
+    assert best.controls.shape == (3, 2)
+    assert 0 <= best.hard_score <= 1
     assert len(history) == 1
     assert torch.isfinite(torch.tensor(history)).all()
 
@@ -306,3 +305,16 @@ def test_piecewise_signal_returns_time_mean_and_variance():
 def test_piecewise_signal_rejects_non_pair_values():
     with pytest.raises(ValueError, match=r"\[T, 2\]"):
         piecewise_signal([[45.0, 4.0, 1.0]])
+
+
+@pytest.mark.parametrize("z", [-7.3, -10.0])
+def test_float32_gaussian_tail_keeps_a_usable_probability_and_gradient(z):
+    mean = torch.tensor([[z]], requires_grad=True)
+    belief = GaussianBelief(mean, torch.ones(1, 1))
+
+    p = belief.probability_bounds(GreaterThan(0.0))[0, 0]
+    p.backward()
+
+    assert p.item() > 0
+    assert p.item() == pytest.approx(norm.cdf(z), rel=1e-3, abs=0)
+    assert torch.isfinite(mean.grad).all() and mean.grad.item() > 0

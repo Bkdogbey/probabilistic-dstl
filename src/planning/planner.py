@@ -1,16 +1,28 @@
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models.dynamics import (
-    create_enclosure_belief_trajectory,
-    create_gaussian_belief_trajectory,
-)
-from utils import load_config
+
+from models.rollouts import BeliefRollout, gaussian_rollout
 from planning import log_utils
+from planning.simulation import simulate_gaussian_step
+from utils import load_config
+
+
+class PlanCandidate(NamedTuple):
+    """One scored control sequence; every field comes from the same iterate."""
+
+    controls: torch.Tensor
+    rollout: BeliefRollout
+    smooth_score: float
+    hard_score: float
+    hard_interval: tuple
+    objective: float
 
 
 class Planner:
-    """Gradient-based motion planner for Probabilistic STL specifications."""
+    """Gradient-based pdSTL planner over any belief rollout."""
 
     def __init__(self, dynamics, environment, T, config=None):
         self.dyn = dynamics
@@ -81,161 +93,133 @@ class Planner:
             loss = loss + torch.sum(min_dist_sq)
         return loss
 
-    def _compute_loss(self, mean_trace, u_seq, robustness):
-        """Total weighted objective J.
-
-        `robustness` is the lower stochastic robustness at the evaluation
-        origin. It enters negated rather than through a logarithm: under a
-        positive smoothing scale the score is an approximation that is not
-        confined to [0, 1], so log() has no valid domain here.
-        """
-        loss_u = torch.sum(u_seq ** 2)
-        u_diff = u_seq[1:] - u_seq[:-1]
-        loss_du = torch.sum(u_diff ** 2) + torch.sum(u_seq[0] ** 2)
-        loss_phi = -robustness
-
-        J = (
-            self.cfg["w_u"]     * loss_u
-            + self.cfg["w_du"]  * loss_du
-            + self.cfg["w_phi"] * loss_phi
+    def _objective(self, nominal_trace, controls, smooth_score):
+        """J = -w_phi * smooth_score + w_u |u|^2 + w_du (|du|^2 + |u_0|^2) + shaping."""
+        control_cost = torch.sum(controls ** 2)
+        smoothness_cost = torch.sum((controls[1:] - controls[:-1]) ** 2) + torch.sum(controls[0] ** 2)
+        objective = (
+            -self.cfg["w_phi"] * smooth_score
+            + self.cfg["w_u"] * control_cost
+            + self.cfg["w_du"] * smoothness_cost
         )
-
-        # The environment-shaping heuristics are optional. Skipping them at zero
-        # weight keeps the objective the specification plus control
-        # regularisation, and lets a case run without an Environment at all.
         shaping = (
             ("w_dist", self._goal_dist_loss),
             ("w_obs", self._obs_repulsion_loss),
             ("w_visit", self._visit_loss),
         )
         for key, term in shaping:
-            weight = self.cfg[key]
-            if weight:
-                J = J + weight * term(mean_trace)
-        return J
+            if self.cfg[key]:
+                objective = objective + self.cfg[key] * term(nominal_trace)
+        return objective
 
-    def _optimize_window(
-        self, x0_mean=None, x0_cov=None, *, env=None, verbose=True,
-        spec=None, init_guess=None, rollout=None,
-    ):
-        """Run gradient-descent optimisation for one planning window.
-
-        Returns the best iterate: controls, predicted lower bound/covariance,
-        its lower stochastic robustness and the objective history. Controls,
-        predictions and score all come from the same candidate, so a smaller
-        total loss alone never selects an iterate.
-
-        Parameters
-        ----------
-        env : Environment, optional
-            Override self.env for this window (used by MPC to pass env_t).
-        rollout : callable, optional
-            ``v_params -> (lower_trace, upper_trace, cov_trace)``, each
-            ``[1,T+1,...]``, e.g. ``SingleIntegrator.rollout_enclosure`` bound
-            to its initial enclosure and offsets. When given, this replaces
-            the default point-mass rollout (``x0_mean``/``x0_cov`` are then
-            unused and may be omitted); the enclosure bounds are never
-            collapsed to their midpoint for belief construction.
-        """
-        if rollout is None and (x0_mean is None or x0_cov is None):
-            raise ValueError(
-                "_optimize_window requires x0_mean and x0_cov, or a rollout callable"
-            )
-
-        if env is not None:
-            saved_env = self.env
-            self.env = env
-
-        v_params = self._init_controls(init_guess)
-        optimizer = optim.Adam([v_params], lr=self.cfg["lr"])
-        phi = spec if spec is not None else self.env.get_specification(self.T)
+    def _scores(self, phi, belief_trajectory):
+        """Smooth lower score (for gradients) and hard [L, U] interval at origin 0."""
         scale = self.cfg["scale"]
+        smooth = phi(belief_trajectory, scale=scale)[0, 0]
+        if scale <= 0:
+            return smooth[0], smooth.detach()
+        with torch.no_grad():
+            hard = phi(belief_trajectory, scale=-1)[0, 0]
+        return smooth[0], hard
 
-        best = None  # (u, lower, cov, objective) of one iterate
-        best_r = -float("inf")
-        history = []
-        prev_loss = float("inf")
-        converged_iters = 0
+    def optimize_window(self, rollout, *, spec=None, env=None, init_guess=None, verbose=False):
+        """Optimise controls for one window. Returns (best PlanCandidate, objective history)."""
+        saved_env = self.env
+        if env is not None:
+            self.env = env
+        phi = spec if spec is not None else self.env.get_specification(self.T)
+
+        v = self._init_controls(init_guess)
+        optimizer = optim.Adam([v], lr=self.cfg["lr"])
+        best, history, converged_iters = None, [], 0
 
         if verbose:
             log_utils._log.info(f"Starting optimisation (max iters: {self.cfg['max_iters']})")
 
         for k in range(self.cfg["max_iters"]):
             optimizer.zero_grad()
+            predicted = rollout(v)
+            controls = self.dyn.bound_control(v)
+            smooth_score, hard_interval = self._scores(phi, predicted.belief_trajectory)
+            objective = self._objective(predicted.nominal_trace, controls, smooth_score)
 
-            if rollout is not None:
-                lower_trace, upper_trace, cov_trace = rollout(v_params)
-                traj = create_enclosure_belief_trajectory(
-                    lower_trace[0], upper_trace[0], cov_trace[0]
-                )
-            else:
-                lower_trace, cov_trace = self.dyn(v_params, x0_mean, x0_cov)
-                traj = create_gaussian_belief_trajectory(lower_trace[0], cov_trace[0])
-            u_seq = self.dyn.bound_control(v_params)
+            candidate = PlanCandidate(
+                controls=controls.detach().clone(),
+                rollout=predicted.detached(),
+                smooth_score=smooth_score.item(),
+                hard_score=hard_interval[0].item(),
+                hard_interval=tuple(hard_interval.tolist()),
+                objective=objective.item(),
+            )
+            history.append(candidate.objective)
+            if best is None or candidate.objective < best.objective:
+                best = candidate
 
-            stl_trace = phi(traj, scale=scale)
-            robustness = stl_trace[0, 0, 0]
-
-            J = self._compute_loss(lower_trace, u_seq, robustness)
-            J.backward()
+            objective.backward()
             optimizer.step()
 
-            # Snapshot before the step is applied, so every recorded quantity
-            # belongs to the candidate that was actually scored.
-            current_r = robustness.item()
-            history.append(J.item())
-
-            if current_r > best_r:
-                best_r = current_r
-                best = (
-                    u_seq.detach().clone(),
-                    lower_trace.detach().clone(),
-                    cov_trace.detach().clone(),
-                    J.item(),
-                )
-
-            if current_r >= self.cfg["alpha"]:
+            if candidate.hard_score >= self.cfg["alpha"]:
                 converged_iters += 1
                 if converged_iters >= self.cfg["converge_patience"]:
-                    log_utils._log.info(
-                        f"Converged at iter {k}. Lower robustness: {current_r:.4f}"
-                    )
+                    if verbose:
+                        log_utils._log.info(f"Converged at iter {k}. Hard score: {candidate.hard_score:.4f}")
                     break
             else:
                 converged_iters = 0
 
-            if abs(prev_loss - J.item()) < self.cfg["loss_tol"] and k > self.cfg["min_iters"]:
+            if k > self.cfg["min_iters"] and abs(history[-2] - history[-1]) < self.cfg["loss_tol"]:
                 if verbose:
                     log_utils._log.info(f"Loss converged at iter {k}.")
                 break
-            prev_loss = J.item()
 
             if verbose and k % 50 == 0:
                 log_utils._log.info(
-                    f"Iter {k:03d} | Loss: {J.item():.4f} | "
-                    f"Lower robustness: {current_r:.4f} | Best: {best_r:.4f}"
+                    f"Iter {k:03d} | Objective: {candidate.objective:.4f} | "
+                    f"Hard score: {candidate.hard_score:.4f} | Best objective: {best.objective:.4f}"
                 )
 
-        if env is not None:
-            self.env = saved_env
+        self.env = saved_env
+        return best, history
 
-        best_u, best_lower, best_cov, self.best_objective = best
-        return best_lower, best_cov, best_u, best_r, history
+    def run_receding_horizon(
+        self, state, *, make_rollout, execute, is_done, spec, max_steps, init_guess=None
+    ):
+        """Plan a window, execute its first control, observe the next state, replan.
 
-    def _step_with_noise(self, curr_mean, curr_cov, u):
-        pred_mean, next_cov = self.dyn.step(curr_mean, curr_cov, u)
-        noise = torch.distributions.MultivariateNormal(
-            torch.zeros_like(pred_mean), self.dyn.Q
-        ).sample()
-        return pred_mean + noise, next_cov
+        make_rollout(state) -> rollout;  execute(state, u) -> next state.
+        """
+        states, applied, candidates, warm_starts = [state], [], [], []
+        guess = init_guess
+        while not is_done(state) and len(applied) < max_steps:
+            best, _ = self.optimize_window(make_rollout(state), spec=spec, init_guess=guess)
+            warm_starts.append(guess)
+            candidates.append(best)
+            state = execute(state, best.controls[0])
+            states.append(state)
+            applied.append(best.controls[0])
+            guess = self._shift_controls(best.controls)
 
-    def _empty_u_trace(self, x0_mean):
-        return torch.empty(1, 0, 2, device=x0_mean.device, dtype=x0_mean.dtype)
+        return {
+            "states": states,
+            "u_trace": torch.stack(applied).unsqueeze(0) if applied else self._empty_u_trace(),
+            "candidates": candidates,
+            "warm_starts": warm_starts,
+            "stopped_reason": "goal_reached" if is_done(state) else "max_steps",
+        }
+
+    def _empty_u_trace(self):
+        return torch.empty(1, 0, 2, device=self.device)
 
     def _shift_controls(self, prev_u_sol):
         if prev_u_sol is None:
             return None
         return torch.cat([prev_u_sol[1:], prev_u_sol[-1:]], dim=0)
+
+    # --- Legacy environment scenarios (Gaussian), used by experiments/planning.py
+
+    def _gaussian_window(self, mean, cov, **kwargs):
+        best, history = self.optimize_window(gaussian_rollout(self.dyn, mean, cov), **kwargs)
+        return best.rollout.aux["mean_trace"], best.rollout.aux["cov_trace"], best.controls, best.hard_score, history
 
     def _pack_result(
         self,
@@ -267,71 +251,6 @@ class Planner:
             "mode": mode,
             "stopped_reason": stopped_reason,
         }
-
-    def run_receding_horizon(
-        self, x0_mean, x0_cov, *, spec, max_steps, is_done, init_guess=None, execute=None,
-    ):
-        """Plan H steps, execute only the first control, update the belief, replan.
-
-        Stops with ``"goal_reached"`` once ``is_done(current_mean)`` holds, or
-        ``"max_steps"`` after that many executed controls.
-
-        execute : callable, optional
-            ``(mean, cov, u) -> (mean, cov)`` advances the executed system by
-            one step. Defaults to ``_step_with_noise``: the predicted step plus
-            sampled process noise, keeping the predicted covariance. This is the
-            point a state estimator or hardware backend later replaces; the
-            executed state is never read back from a predicted plan.
-        """
-        execute = self._step_with_noise if execute is None else execute
-        curr_mean, curr_cov = x0_mean, x0_cov
-        mean_trace_list, cov_trace_list, u_trace_list = [curr_mean], [curr_cov], []
-        scores, loss_trace, all_plans, plan_controls, warm_starts = [], [], [], [], []
-        guess = init_guess
-        stopped_reason = "max_steps"
-
-        while True:
-            if is_done(curr_mean):
-                stopped_reason = "goal_reached"
-                break
-            if len(u_trace_list) == max_steps:
-                break
-
-            plan_mean, _, plan_u, score, history = self._optimize_window(
-                curr_mean, curr_cov, spec=spec, init_guess=guess, verbose=False
-            )
-            warm_starts.append(guess)
-            all_plans.append(plan_mean)
-            plan_controls.append(plan_u)
-            scores.append(score)
-            loss_trace.append(history[-1])
-
-            u_curr = plan_u[0]
-            curr_mean, curr_cov = execute(curr_mean, curr_cov, u_curr)
-            mean_trace_list.append(curr_mean)
-            cov_trace_list.append(curr_cov)
-            u_trace_list.append(u_curr)
-
-            guess = self._shift_controls(plan_u)
-
-        u_trace = (
-            torch.stack(u_trace_list).unsqueeze(0)
-            if u_trace_list
-            else self._empty_u_trace(x0_mean)
-        )
-        result = self._pack_result(
-            mean_trace=torch.stack(mean_trace_list).unsqueeze(0),
-            cov_trace=torch.stack(cov_trace_list).unsqueeze(0),
-            u_trace=u_trace,
-            p_sat_trace=scores,
-            loss_trace=loss_trace,
-            all_plans=all_plans,
-            mode="receding_horizon",
-            stopped_reason=stopped_reason,
-        )
-        result["plan_controls"] = plan_controls
-        result["warm_starts"] = warm_starts
-        return result
 
     def _goal_center(self, env):
         if env.goal is None:
@@ -388,11 +307,8 @@ class Planner:
 
             win_guess = self._shift_controls(prev_u_sol)
 
-            best_mean, best_cov, best_u, best_p, history = self._optimize_window(
-                curr_mean, curr_cov,
-                env=env_t,
-                init_guess=win_guess,
-                verbose=False,
+            best_mean, best_cov, best_u, best_p, history = self._gaussian_window(
+                curr_mean, curr_cov, env=env_t, init_guess=win_guess
             )
 
             prev_u_sol = best_u.detach()
@@ -401,7 +317,7 @@ class Planner:
             loss_trace.append(history[-1] if history else 0.0)
 
             u_curr = best_u[0]
-            next_mean, next_cov = self._step_with_noise(curr_mean, curr_cov, u_curr)
+            next_mean, next_cov = simulate_gaussian_step(self.dyn, curr_mean, curr_cov, u_curr)
 
             mean_trace_list.append(next_mean)
             cov_trace_list.append(next_cov)
@@ -423,7 +339,7 @@ class Planner:
         u_trace = (
             torch.stack(u_trace_list).unsqueeze(0)
             if u_trace_list
-            else self._empty_u_trace(x0_mean)
+            else self._empty_u_trace()
         )
         return self._pack_result(
             mean_trace=torch.stack(mean_trace_list).unsqueeze(0),
@@ -463,10 +379,8 @@ class Planner:
 
             win_guess = self._shift_controls(prev_u_sol)
 
-            best_mean, best_cov, best_u, best_p, history = self._optimize_window(
-                curr_mean, curr_cov,
-                verbose=False,
-                init_guess=win_guess,
+            best_mean, best_cov, best_u, best_p, history = self._gaussian_window(
+                curr_mean, curr_cov, init_guess=win_guess
             )
 
             prev_u_sol = best_u.detach()
@@ -475,7 +389,7 @@ class Planner:
             loss_trace.append(history[-1] if history else 0.0)
 
             u_curr = best_u[0]
-            next_mean, next_cov = self._step_with_noise(curr_mean, curr_cov, u_curr)
+            next_mean, next_cov = simulate_gaussian_step(self.dyn, curr_mean, curr_cov, u_curr)
 
             mean_trace_list.append(next_mean)
             cov_trace_list.append(next_cov)
@@ -494,7 +408,7 @@ class Planner:
         u_trace = (
             torch.stack(u_trace_list).unsqueeze(0)
             if u_trace_list
-            else self._empty_u_trace(x0_mean)
+            else self._empty_u_trace()
         )
         return self._pack_result(
             mean_trace=torch.stack(mean_trace_list).unsqueeze(0),
@@ -514,7 +428,7 @@ class Planner:
         elif "MAX_STEPS" in self.cfg:
             return self._run_mpc_goal(x0_mean, x0_cov, verbose=verbose, step_callback=step_callback)
         else:
-            mean_trace, cov_trace, u_trace, best_p, history = self._optimize_window(
+            mean_trace, cov_trace, u_trace, best_p, history = self._gaussian_window(
                 x0_mean, x0_cov, verbose=verbose
             )
             return self._pack_result(

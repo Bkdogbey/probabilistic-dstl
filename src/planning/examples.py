@@ -20,12 +20,10 @@ from pdstl.operators import (
     Until,
 )
 from planning import log_utils
-from models.dynamics import (
-    SingleIntegrator,
-    create_enclosure_belief_trajectory,
-    create_gaussian_belief_trajectory,
-)
+from models.dynamics import SingleIntegrator
+from models.rollouts import enclosure_rollout, gaussian_rollout
 from planning.planner import Planner
+from planning.simulation import simulate_gaussian_step
 from utils import get_device, load_config
 from visualization.robustness import (
     plot_case,
@@ -127,15 +125,9 @@ def build_case(name, cfg):
     return CASES[name](cfg["cases"][name], cfg["dim"])
 
 
-def belief_trajectory(mean_trace, cov_trace):
-    """Wrap a predicted mean/covariance rollout as one belief per step."""
-    return create_gaussian_belief_trajectory(mean_trace[0], cov_trace[0])
-
-
-def rollout(dyn, v_params, x0_mean, x0_cov):
-    """Predicted beliefs for a control sequence."""
-    mean_trace, cov_trace = dyn(v_params, x0_mean, x0_cov)
-    return belief_trajectory(mean_trace, cov_trace), mean_trace, cov_trace
+def controls_to_params(dyn, controls):
+    """Invert the tanh control bound, for replaying returned physical controls."""
+    return torch.atanh(torch.clamp(controls / dyn.u_max, -0.999999, 0.999999))
 
 
 def evaluate_direct(formula, traj):
@@ -175,36 +167,34 @@ def run_case(name, *, show=False, save=True, verbose=True):
     x0_mean, x0_cov = _initial_state(cfg, device)
     time = [t * dt for t in range(H + 1)]
 
-    # 1. Evaluate a fixed belief trajectory directly.
-    v_init = _initial_controls(cfg, device)
-    traj_init, mean_init, cov_init = rollout(dyn, v_init, x0_mean, x0_cov)
-    interval_init = evaluate_direct(formula, traj_init)
+    rollout = gaussian_rollout(dyn, x0_mean, x0_cov)
 
-    # 2. Optimise through the same pipeline.
+    v_init = _initial_controls(cfg, device)
+    initial = rollout(v_init)
+    interval_init = evaluate_direct(formula, initial.belief_trajectory)
+    mean_init, cov_init = initial.aux["mean_trace"], initial.aux["cov_trace"]
+
     torch.manual_seed(cfg["seed"])
     planner = Planner(dyn, None, H, config=planner_cfg)
-    best_mean, _, best_u, best_r, history = planner._optimize_window(
-        x0_mean, x0_cov, spec=formula, init_guess=v_init, verbose=verbose
+    best, history = planner.optimize_window(
+        rollout, spec=formula, init_guess=v_init, verbose=verbose
     )
 
-    # 3. Re-evaluate the returned controls directly and confirm consistency.
-    #    best_u are physical controls, so invert the tanh squashing to recover
-    #    the optimisation variable the rollout expects.
-    v_best = torch.atanh(torch.clamp(best_u / dyn.u_max, -0.999999, 0.999999))
-    traj_final, mean_final, cov_final = rollout(dyn, v_best, x0_mean, x0_cov)
-    interval_final = evaluate_direct(formula, traj_final)
-
-    mean_mismatch = (mean_final - best_mean).abs().max().item()
+    final = rollout(controls_to_params(dyn, best.controls))
+    interval_final = evaluate_direct(formula, final.belief_trajectory)
+    mean_final, cov_final = final.aux["mean_trace"], final.aux["cov_trace"]
+    mean_mismatch = (mean_final - best.rollout.aux["mean_trace"]).abs().max().item()
 
     result = {
         "case": name,
         "description": description,
         "interval_initial": interval_init.detach()[0, 0].tolist(),
         "interval_final": interval_final.detach()[0, 0].tolist(),
-        "smooth_best": best_r,
-        "controls": best_u.detach(),
+        "smooth_score": best.smooth_score,
+        "hard_score": best.hard_score,
+        "controls": best.controls,
         "history": history,
-        "objective": planner.best_objective,
+        "objective": best.objective,
         "trace_length": interval_final.shape[1],
         "mean_mismatch": mean_mismatch,
     }
@@ -214,15 +204,15 @@ def run_case(name, *, show=False, save=True, verbose=True):
         lo_f, hi_f = result["interval_final"]
         log_utils._log.info(
             f"[{name}] {description}\n"
-            f"    direct interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
+            f"    hard interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
             f"  ->  final [{lo_f:.4f}, {hi_f:.4f}]\n"
-            f"    smooth best {best_r:.4f} | objective {planner.best_objective:.4f} "
+            f"    smooth {best.smooth_score:.4f} | objective {best.objective:.4f} "
             f"| valid origins {result['trace_length']} | mean match {mean_mismatch:.2e}"
         )
 
     if save or show:
         atom_traces = {
-            label: evaluate_direct(atom, traj_final) for label, atom in atoms.items()
+            label: evaluate_direct(atom, final.belief_trajectory) for label, atom in atoms.items()
         }
         base = os.path.join(OUTPUT_DIR, name)
         plot_case(
@@ -279,17 +269,13 @@ def run_always_step_zero(verbose=True):
     x0_mean, x0_cov = _initial_state(cfg, device)
     v_init = _initial_controls(cfg, device)
 
-    traj_init, _, _ = rollout(dyn, v_init, x0_mean, x0_cov)
-    before = evaluate_direct(formula, traj_init).detach()[0, 0].tolist()
+    rollout = gaussian_rollout(dyn, x0_mean, x0_cov)
+    before = evaluate_direct(formula, rollout(v_init).belief_trajectory).detach()[0, 0].tolist()
 
     torch.manual_seed(cfg["seed"])
     planner = Planner(dyn, None, cfg["H"], config=planner_cfg)
-    best_mean, best_cov, _, _, _ = planner._optimize_window(
-        x0_mean, x0_cov, spec=formula, init_guess=v_init, verbose=False
-    )
-    after = evaluate_direct(
-        formula, belief_trajectory(best_mean, best_cov)
-    ).detach()[0, 0].tolist()
+    best, _ = planner.optimize_window(rollout, spec=formula, init_guess=v_init)
+    after = list(best.hard_interval)
 
     if verbose:
         log_utils._log.info(
@@ -356,21 +342,13 @@ def run_mpc_check(verbose=True):
         guess = warm_start[:horizon] if warm_start is not None else None
         if guess is not None and guess.shape[0] < horizon:
             guess = None
-        best_mean, best_cov, best_u, best_r, _ = planner._optimize_window(
-            belief_mean, belief_cov, spec=spec, init_guess=guess, verbose=False
+        best, _ = planner.optimize_window(
+            gaussian_rollout(dyn, belief_mean, belief_cov), spec=spec, init_guess=guess
         )
-        # Report the directly evaluated interval; best_r is the smooth score,
-        # which under scale > 0 is an approximation that can exceed 1.
-        direct = evaluate_direct(
-            spec, belief_trajectory(best_mean, best_cov)
-        )[0, 0].tolist()
+        direct = list(best.hard_interval)
 
-        # Apply only the first control; sample the physical transition.
-        u0 = best_u[0]
-        noise = torch.distributions.MultivariateNormal(
-            torch.zeros_like(true_state), dyn.Q
-        ).sample()
-        next_true = true_state + u0 * dyn.dt + noise
+        u0 = best.controls[0]
+        next_true, _ = simulate_gaussian_step(dyn, true_state, zero_cov, u0)
 
         steps.append(
             {
@@ -380,7 +358,7 @@ def run_mpc_check(verbose=True):
                 "belief_cov_trace": float(torch.diagonal(belief_cov).sum()),
                 "true_state": true_state.tolist(),
                 "robustness_direct": direct,
-                "robustness_smooth": best_r,
+                "robustness_smooth": best.smooth_score,
                 "u0": u0.detach().tolist(),
                 "satisfied": bool(true_state[dim] >= c),
             }
@@ -397,7 +375,7 @@ def run_mpc_check(verbose=True):
 
         true_state = next_true
         # Shift the warm start by the applied control.
-        warm_start = planner._shift_controls(best_u)
+        warm_start = planner._shift_controls(best.controls)
 
     if verbose:
         log_utils._log.info(
@@ -450,48 +428,37 @@ def run_enclosure_reach(*, cfg=None, show=False, save=True, verbose=True):
     dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
     lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
 
-    def rollout(v_params):
-        return dyn.rollout_enclosure(v_params, lower0, upper0, covariance0, d_lower, d_upper)
+    rollout = enclosure_rollout(dyn, lower0, upper0, covariance0, d_lower, d_upper)
 
     spec = Eventually(GreaterThan(cfg["threshold"], dim=0), interval=cfg["interval_steps"])
     time = [t * cfg["dt"] for t in range(H + 1)]
 
     planner = Planner(dyn, None, H, config=planner_cfg)
 
-    # One consistent initial-control convention: reseed and let Planner's own
-    # random fallback (_init_controls(None)) run twice under the identical
-    # seed, so the displayed "initial" trajectory is exactly what the
-    # optimiser starts from -- no separate re-derivation, no tanh round-trip.
+    # The same seed draws the planner's random initial controls twice, so the
+    # displayed initial trajectory is exactly where the optimiser starts.
     torch.manual_seed(cfg["seed"])
-    v_init = planner._init_controls(None).detach()
-    lower_init, upper_init, cov_init = rollout(v_init)
-    traj_init = create_enclosure_belief_trajectory(lower_init[0], upper_init[0], cov_init[0])
-    interval_init = evaluate_direct(spec, traj_init)
+    initial = rollout(planner._init_controls(None).detach())
+    interval_init = evaluate_direct(spec, initial.belief_trajectory)
+    lower_init, upper_init, cov_init = (initial.aux[k] for k in ("lower_trace", "upper_trace", "cov_trace"))
 
-    torch.manual_seed(cfg["seed"])  # same seed -> _optimize_window draws v_init again
-    best_lower, best_cov, best_u, best_r, history = planner._optimize_window(
-        spec=spec, rollout=rollout, verbose=verbose,
-    )
+    torch.manual_seed(cfg["seed"])
+    best, history = planner.optimize_window(rollout, spec=spec, verbose=verbose)
 
-    # Replay the returned physical controls: recovers `upper` (never carried
-    # in _optimize_window's return, to keep its 5-tuple contract unchanged for
-    # every other caller) and is the reproduction check itself.
-    v_best = torch.atanh(torch.clamp(best_u / dyn.u_max, -0.999999, 0.999999))
-    lower_final, upper_final, cov_final = rollout(v_best)
-    traj_final = create_enclosure_belief_trajectory(lower_final[0], upper_final[0], cov_final[0])
-    interval_final = evaluate_direct(spec, traj_final)
-
-    lower_mismatch = (lower_final - best_lower).abs().max().item()
+    final = rollout(controls_to_params(dyn, best.controls))
+    interval_final = evaluate_direct(spec, final.belief_trajectory)
+    lower_final, upper_final, cov_final = (final.aux[k].detach() for k in ("lower_trace", "upper_trace", "cov_trace"))
+    lower_mismatch = (lower_final - best.rollout.aux["lower_trace"]).abs().max().item()
 
     result = {
         "interval_initial": interval_init.detach()[0, 0].tolist(),
         "interval_final": interval_final.detach()[0, 0].tolist(),
-        "controls": best_u.detach(),
-        "lower_trace": lower_final.detach(),
-        "upper_trace": upper_final.detach(),
-        "cov_trace": cov_final.detach(),
+        "controls": best.controls,
+        "lower_trace": lower_final,
+        "upper_trace": upper_final,
+        "cov_trace": cov_final,
         "history": history,
-        "objective": planner.best_objective,
+        "objective": best.objective,
         "lower_mismatch": lower_mismatch,
     }
 
@@ -500,10 +467,9 @@ def run_enclosure_reach(*, cfg=None, show=False, save=True, verbose=True):
         lo_f, hi_f = result["interval_final"]
         log_utils._log.info(
             f"[enclosure_reach] {spec}\n"
-            f"    direct interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
+            f"    hard interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
             f"  ->  final [{lo_f:.4f}, {hi_f:.4f}]\n"
-            f"    objective {planner.best_objective:.4f} | "
-            f"replay mismatch {lower_mismatch:.2e}"
+            f"    objective {best.objective:.4f} | replay mismatch {lower_mismatch:.2e}"
         )
 
     if save or show:
@@ -562,14 +528,14 @@ def end_to_end_setup(cfg, device):
     return dyn, x0_mean, x0_cov, predicate, spec
 
 
-def _evaluate_plan(dyn, v, x0_mean, x0_cov, predicate, spec):
-    """Rollout, atomic trace and directly evaluated pdSTL interval for v."""
-    traj, mean, cov = rollout(dyn, v, x0_mean, x0_cov)
+def _evaluate_plan(rollout, v, predicate, spec):
+    """Mean, covariance, atomic trace and hard pdSTL interval for v."""
+    predicted = rollout(v)
     return {
-        "mean": mean.detach(),
-        "cov": cov.detach(),
-        "atomic": evaluate_direct(predicate, traj).detach(),
-        "interval": evaluate_direct(spec, traj).detach(),
+        "mean": predicted.aux["mean_trace"].detach(),
+        "cov": predicted.aux["cov_trace"].detach(),
+        "atomic": evaluate_direct(predicate, predicted.belief_trajectory).detach(),
+        "interval": evaluate_direct(spec, predicted.belief_trajectory).detach(),
     }
 
 
@@ -588,16 +554,13 @@ def run_end_to_end_reach(*, show=False, save=True, verbose=True):
     H, dim = cfg["H"], cfg["dim"]
     dyn, x0_mean, x0_cov, predicate, spec = end_to_end_setup(cfg, device)
 
+    rollout = gaussian_rollout(dyn, x0_mean, x0_cov)
     u_init = torch.zeros(H, 2, device=device)
-    initial = _evaluate_plan(dyn, torch.zeros_like(u_init), x0_mean, x0_cov, predicate, spec)
+    initial = _evaluate_plan(rollout, torch.zeros_like(u_init), predicate, spec)
 
     planner = Planner(dyn, None, H, config=planner_cfg)
-    _, _, best_u, _, history = planner._optimize_window(
-        x0_mean, x0_cov, spec=spec, init_guess=u_init, verbose=verbose
-    )
-
-    v_best = torch.atanh(torch.clamp(best_u / dyn.u_max, -0.999999, 0.999999))
-    final = _evaluate_plan(dyn, v_best, x0_mean, x0_cov, predicate, spec)
+    best, history = planner.optimize_window(rollout, spec=spec, init_guess=u_init, verbose=verbose)
+    final = _evaluate_plan(rollout, controls_to_params(dyn, best.controls), predicate, spec)
 
     result = {
         "spec": str(spec),
@@ -605,7 +568,7 @@ def run_end_to_end_reach(*, show=False, save=True, verbose=True):
         "score_final": final["interval"][0, 0, 0].item(),
         "interval_initial": initial["interval"][0, 0].tolist(),
         "interval_final": final["interval"][0, 0].tolist(),
-        "controls": best_u.detach(),
+        "controls": best.controls,
         "u_max": dyn.u_max,
         "mean_initial": initial["mean"],
         "mean_final": final["mean"],
@@ -614,7 +577,7 @@ def run_end_to_end_reach(*, show=False, save=True, verbose=True):
         "atomic_initial": initial["atomic"],
         "atomic_final": final["atomic"],
         "history": history,
-        "objective": planner.best_objective,
+        "objective": best.objective,
     }
 
     if verbose:
@@ -623,7 +586,7 @@ def run_end_to_end_reach(*, show=False, save=True, verbose=True):
             f"    pdSTL score  initial {result['score_initial']:.4f}"
             f"  ->  final {result['score_final']:.4f}\n"
             f"    final mean x {final['mean'][0, -1, dim].item():.3f} | "
-            f"objective {planner.best_objective:.4f} | iterations {len(history)}"
+            f"objective {best.objective:.4f} | iterations {len(history)}"
         )
 
     if save or show:
@@ -667,19 +630,32 @@ def run_end_to_end_mpc_reach(*, show=False, save=True, verbose=True):
 
     torch.manual_seed(cfg["seed"])  # the simulated process noise
     planner = Planner(dyn, None, H, config=planner_cfg)
-    result = planner.run_receding_horizon(
-        x0_mean,
-        x0_cov,
+    loop = planner.run_receding_horizon(
+        (x0_mean, x0_cov),
+        make_rollout=lambda state: gaussian_rollout(dyn, *state),
+        execute=lambda state, u: simulate_gaussian_step(dyn, *state, u),
+        is_done=lambda state: bool(state[0][dim] >= threshold),
         spec=spec,
         max_steps=cfg["max_steps"],
-        is_done=lambda mean: bool(mean[dim] >= threshold),
         init_guess=torch.tensor(cfg["init_control"], device=device).repeat(H, 1),
     )
-    result["spec"] = str(spec)
-    result["u_max"] = dyn.u_max
+    candidates = loop["candidates"]
+    result = {
+        "spec": str(spec),
+        "u_max": dyn.u_max,
+        "mean_trace": torch.stack([mean for mean, _ in loop["states"]]).unsqueeze(0),
+        "cov_trace": torch.stack([cov for _, cov in loop["states"]]).unsqueeze(0),
+        "u_trace": loop["u_trace"],
+        "hard_scores": [c.hard_score for c in candidates],
+        "objectives": [c.objective for c in candidates],
+        "plan_mean_traces": [c.rollout.aux["mean_trace"] for c in candidates],
+        "plan_controls": [c.controls for c in candidates],
+        "warm_starts": loop["warm_starts"],
+        "stopped_reason": loop["stopped_reason"],
+    }
 
     if verbose:
-        scores = result["p_sat_trace"]
+        scores = result["hard_scores"]
         executed = result["mean_trace"][0, :, dim]
         log_utils._log.info(
             f"[end_to_end_mpc_reach] {spec} per window\n"

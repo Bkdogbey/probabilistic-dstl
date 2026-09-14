@@ -7,6 +7,7 @@ import torch
 from scipy.stats import norm
 
 from models.dynamics import SingleIntegrator, create_enclosure_belief_trajectory
+from models.rollouts import gaussian_rollout
 from pdstl.operators import Eventually, GreaterThan
 from planning.examples import (
     CASES,
@@ -17,7 +18,6 @@ from planning.examples import (
     evaluate_direct,
     load_enclosure_reach_config,
     load_examples_config,
-    rollout,
     run_always_step_zero,
     run_case,
     run_enclosure_reach,
@@ -35,8 +35,9 @@ def setup():
         dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device
     )
     x0_mean, x0_cov = _initial_state(cfg, device)
-    traj, mean, cov = rollout(dyn, _initial_controls(cfg, device), x0_mean, x0_cov)
-    return cfg, planner_cfg, traj, mean, cov
+    predicted = gaussian_rollout(dyn, x0_mean, x0_cov)(_initial_controls(cfg, device))
+    mean, cov = predicted.aux["mean_trace"], predicted.aux["cov_trace"]
+    return cfg, planner_cfg, predicted.belief_trajectory, mean, cov
 
 
 def atom_probs(mean, cov, threshold, dim, sense):
@@ -95,7 +96,7 @@ def test_corridor_matches_frechet_inside_the_window(setup):
     np.testing.assert_allclose(got[:, 1], ref_upper, atol=1e-6)
 
 
-def test_until_matches_inclusive_prefix_reference(setup):
+def test_until_matches_the_frechet_witness_reference(setup):
     cfg, _, traj, mean, cov = setup
     case = cfg["cases"]["until"]
     a, b = case["interval"]
@@ -110,7 +111,7 @@ def test_until_matches_inclusive_prefix_reference(setup):
         best = 0.0
         for tau in range(t + a, t + b + 1):
             prefix = left[t : tau + 1].min()  # inclusive of the witness
-            best = max(best, min(prefix, right[tau]))  # endpointwise, not Frechet
+            best = max(best, max(0.0, prefix + right[tau] - 1.0))
         ref.append(best)
 
     np.testing.assert_allclose(got, ref, atol=1e-6)
@@ -206,7 +207,7 @@ def test_gradients_are_finite_in_a_smooth_nondegenerate_optimisation():
     v = _initial_controls(cfg, device).clone().requires_grad_(True)
 
     formula, _, _, _ = build_case("eventually", cfg)
-    traj, _, _ = rollout(dyn, v, x0_mean, x0_cov)
+    traj = gaussian_rollout(dyn, x0_mean, x0_cov)(v).belief_trajectory
     formula(traj, scale=planner_cfg["scale"])[0, 0, 0].backward()
 
     assert v.grad is not None

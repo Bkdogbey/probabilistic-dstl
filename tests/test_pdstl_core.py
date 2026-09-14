@@ -263,21 +263,92 @@ def test_pointwise_flag_tracks_the_formula_kind():
 
     assert not windowed.is_pointwise
     assert not Until(a, b).is_pointwise
+    assert not And(windowed, b).is_pointwise
+    assert not Negation(windowed).is_pointwise
+    assert not Implies(a, windowed).is_pointwise
 
 
-def test_boolean_over_temporal_is_rejected_at_construction():
+A_TRACE = [(0.9, 0.95), (0.7, 0.8), (0.85, 0.9), (0.6, 0.75), (0.95, 1.0)]
+B_TRACE = [(0.2, 0.4), (0.5, 0.6), (0.3, 0.35), (0.8, 0.9), (0.1, 0.2)]
+
+
+def ab_trajectory():
+    return supplied(*[{"a": a, "b": b} for a, b in zip(A_TRACE, B_TRACE)])
+
+
+def window_ref(trace, a, b, reduce):
+    return [
+        [reduce(x[0] for x in trace[t + a : t + b + 1]), reduce(x[1] for x in trace[t + a : t + b + 1])]
+        for t in range(len(trace) - b)
+    ]
+
+
+def and_ref(x, y):
+    return [max(0.0, x[0] + y[0] - 1.0), min(x[1], y[1])]
+
+
+def or_ref(x, y):
+    return [max(x[0], y[0]), min(1.0, x[1] + y[1])]
+
+
+def not_ref(x):
+    return [1.0 - x[1], 1.0 - x[0]]
+
+
+def test_boolean_combines_temporal_children_at_the_same_origins():
     a, b = Predicate("a"), Predicate("b")
-    windowed = Always(a, interval=[0, 1])
+    always_a = Always(a, interval=[0, 2])  # 3 origins
+    eventually_b = Eventually(b, interval=[0, 1])  # 4 origins
+    alw = window_ref(A_TRACE, 0, 2, min)
+    ev = window_ref(B_TRACE, 0, 1, max)
 
-    for build in (
-        lambda: And(windowed, b),
-        lambda: Or(a, windowed),
-        lambda: Implies(windowed, b),
-        lambda: Implies(a, windowed),
-        lambda: Negation(windowed),
-    ):
-        with pytest.raises(ValueError, match="only accepts pointwise"):
-            build()
+    got_and = And(always_a, eventually_b)(ab_trajectory())[0]
+    got_or = Or(always_a, eventually_b)(ab_trajectory())[0]
+
+    assert got_and.shape == got_or.shape == (3, 2)
+    np.testing.assert_allclose(got_and.tolist(), [and_ref(alw[t], ev[t]) for t in range(3)], atol=1e-6)
+    np.testing.assert_allclose(got_or.tolist(), [or_ref(alw[t], ev[t]) for t in range(3)], atol=1e-6)
+
+
+def test_boolean_combines_temporal_and_atomic_children():
+    a, b = Predicate("a"), Predicate("b")
+    ev = window_ref(A_TRACE, 0, 1, max)
+
+    got = And(Eventually(a, interval=[0, 1]), b)(ab_trajectory())[0]
+
+    np.testing.assert_allclose(got.tolist(), [and_ref(ev[t], B_TRACE[t]) for t in range(4)], atol=1e-6)
+
+
+def test_negation_of_a_temporal_formula_is_its_dual():
+    a = Predicate("a")
+    traj = ab_trajectory()
+
+    got = Negation(Always(a, interval=[0, 2]))(traj)
+
+    np.testing.assert_allclose(got[0].tolist(), [not_ref(x) for x in window_ref(A_TRACE, 0, 2, min)], atol=1e-6)
+    torch.testing.assert_close(got, Eventually(Negation(a), interval=[0, 2])(traj))
+
+
+def test_implies_over_temporal_children_is_negation_then_or():
+    a, b = Predicate("a"), Predicate("b")
+    left, right = Always(a, interval=[0, 1]), Eventually(b, interval=[0, 2])
+    traj = ab_trajectory()
+
+    torch.testing.assert_close(Implies(left, right)(traj), Or(Negation(left), right)(traj))
+
+
+def test_nested_boolean_and_temporal_composition_matches_the_reference():
+    a, b = Predicate("a"), Predicate("b")
+    inner = Or(Negation(Always(a, interval=[0, 2])), And(Eventually(b, interval=[0, 1]), a))
+    formula = Eventually(inner, interval=[0, 1])
+
+    alw = window_ref(A_TRACE, 0, 2, min)
+    ev = window_ref(B_TRACE, 0, 1, max)
+    inner_ref = [or_ref(not_ref(alw[t]), and_ref(ev[t], A_TRACE[t])) for t in range(3)]
+
+    got = formula(ab_trajectory())[0]
+
+    np.testing.assert_allclose(got.tolist(), window_ref(inner_ref, 0, 1, max), atol=1e-6)
 
 
 # --- 4. Always / Eventually ------------------------------------------------
@@ -417,39 +488,44 @@ def test_unbounded_start_offsets_the_suffix():
 
 
 def until_reference(left, right, a, b):
-    """Inclusive-prefix Until, written independently of the implementation."""
+    """[lower, upper] per origin, straight from the Until equations."""
     T = len(left)
     out = []
-    for t in range(T - (b if np.isfinite(b) else a)):
-        best = None
-        hi = min(t + (T - 1 if not np.isfinite(b) else b), T - 1)
-        for tau in range(t + a, hi + 1):
-            prefix = min(left[t : tau + 1])  # inclusive of tau
-            cand = min(prefix, right[tau])
-            best = cand if best is None else max(best, cand)
-        out.append(best)
+    for t in range(T - b):
+        lowers, uppers = [], []
+        for tau in range(t + a, t + b + 1):
+            prefix_lower = min(lo for lo, _ in left[t : tau + 1])
+            prefix_upper = min(hi for _, hi in left[t : tau + 1])
+            lowers.append(max(0.0, prefix_lower + right[tau][0] - 1.0))
+            uppers.append(min(prefix_upper, right[tau][1]))
+        out.append([max(lowers), max(uppers)])
     return out
 
 
-UNTIL_LEFT = [0.9, 0.8, 0.4, 0.7, 0.95, 0.6]
-UNTIL_RIGHT = [0.1, 0.3, 0.9, 0.2, 0.5, 0.85]
+UNTIL_LEFT = [(0.9, 0.95), (0.8, 0.9), (0.4, 0.7), (0.7, 0.8), (0.95, 1.0), (0.6, 0.75)]
+UNTIL_RIGHT = [(0.1, 0.2), (0.3, 0.6), (0.9, 0.95), (0.2, 0.4), (0.5, 0.7), (0.85, 0.9)]
 
 
 def until_trajectory():
-    return supplied(
-        *[{"l": (lo, lo), "r": (hi, hi)} for lo, hi in zip(UNTIL_LEFT, UNTIL_RIGHT)]
-    )
+    return supplied(*[{"l": lo, "r": hi} for lo, hi in zip(UNTIL_LEFT, UNTIL_RIGHT)])
 
 
-@pytest.mark.parametrize("interval", [[0, 0], [0, 1], [1, 2]])
-def test_until_matches_the_inclusive_reference(interval):
+@pytest.mark.parametrize("interval", [[0, 0], [0, 1], [1, 2], [0, 3]])
+def test_until_matches_the_reference_equations(interval):
     got = Until(Predicate("l"), Predicate("r"), interval=interval)(until_trajectory())
 
     np.testing.assert_allclose(
-        got[0, :, 0].tolist(),
-        until_reference(UNTIL_LEFT, UNTIL_RIGHT, *interval),
-        atol=1e-6,
+        got[0].tolist(), until_reference(UNTIL_LEFT, UNTIL_RIGHT, *interval), atol=1e-6
     )
+
+
+def test_until_lower_bound_is_a_frechet_conjunction_of_prefix_and_witness():
+    traj = supplied({"l": (0.6, 0.9), "r": (0.6, 0.8)})
+
+    lower, upper = Until(Predicate("l"), Predicate("r"), interval=[0, 0])(traj)[0, 0]
+
+    assert lower.item() == pytest.approx(0.6 + 0.6 - 1.0)  # 0.2, not min = 0.6
+    assert upper.item() == pytest.approx(0.8)
 
 
 def test_until_smooth_approaches_the_exact_reduction():
@@ -463,7 +539,7 @@ def test_until_smooth_approaches_the_exact_reduction():
     assert not torch.equal(smooth, exact)  # a surrogate, not the same tensor
 
 
-def test_until_reduces_both_endpoints_with_the_exact_and_smooth_max_min():
+def test_until_smooths_only_the_temporal_min_and_max():
     trajectory = supplied(
         {"l": (0.7, 0.9), "r": (0.1, 0.3)},
         {"l": (0.4, 0.8), "r": (0.6, 0.75)},
@@ -472,21 +548,23 @@ def test_until_reduces_both_endpoints_with_the_exact_and_smooth_max_min():
     formula = Until(Predicate("l"), Predicate("r"), interval=[0, 2])
 
     exact = formula(trajectory, scale=-1)[0, 0]
-    torch.testing.assert_close(exact, torch.tensor([0.4, 0.8]))
+    # witnesses: [max(0, .7+.1-1), min(.9,.3)], [max(0, .4+.6-1), min(.8,.75)],
+    #            [max(0, .4+.5-1), min(.8,.85)]
+    torch.testing.assert_close(exact, torch.tensor([0.0, 0.8]))
 
     left = Predicate("l")(trajectory)[0]
     right = Predicate("r")(trajectory)[0]
     scale = 4.0
     candidates = []
     for witness in range(3):
-        prefix = -torch.logsumexp(
-            -left[: witness + 1] * scale, dim=0
-        ) / scale
+        prefix = -torch.logsumexp(-left[: witness + 1] * scale, dim=0) / scale
         candidates.append(
-            -torch.logsumexp(
-                -torch.stack((prefix, right[witness])) * scale, dim=0
+            torch.stack(
+                (
+                    torch.clamp(prefix[0] + right[witness, 0] - 1.0, min=0.0),
+                    torch.minimum(prefix[1], right[witness, 1]),
+                )
             )
-            / scale
         )
     expected_smooth = torch.logsumexp(
         torch.stack(candidates) * scale, dim=0
@@ -502,9 +580,8 @@ def test_until_at_zero_zero_combines_both_operands_now():
 
     lower, upper = Until(Predicate("l"), Predicate("r"), interval=[0, 0])(traj)[0, 0]
 
-    # endpointwise min of prefix and witness, not a Frechet conjunction
-    assert lower.item() == pytest.approx(min(0.9, 0.4))
-    assert upper.item() == pytest.approx(min(0.9, 0.4))
+    assert lower.item() == pytest.approx(0.9 + 0.4 - 1.0)
+    assert upper.item() == pytest.approx(0.4)
 
 
 # --- 6. Finite trace -------------------------------------------------------
