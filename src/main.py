@@ -99,3 +99,11 @@ with skip_run("run", "EndToEndReach") as check, check():
 
     print("\nEndToEndReach")
     run_end_to_end_reach(show=show_plots, save=True, verbose=True)
+
+
+# 6. EndToEndMPCReach: plan H steps -> execute first control -> update belief -> replan
+with skip_run("run", "EndToEndMPCReach") as check, check():
+    from planning.examples import run_end_to_end_mpc_reach
+
+    print("\nEndToEndMPCReach")
+    run_end_to_end_mpc_reach(show=show_plots, save=True, verbose=True)

@@ -222,7 +222,9 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
 
 def test_examples_configuration_holds_only_numerical_example_data():
     config = _config()
-    assert set(config) == {"show_plots", "enclosure_reach", "end_to_end_reach", *EXAMPLES}
+    assert set(config) == {
+        "show_plots", "enclosure_reach", "end_to_end_reach", "end_to_end_mpc_reach", *EXAMPLES
+    }
 
     shared = {"threshold", "values"}
     assert set(config["always"]) == shared | {"interval_steps"}
@@ -247,6 +249,11 @@ def test_examples_configuration_holds_only_numerical_example_data():
     }
     for heuristic in ("w_dist", "w_obs", "w_visit"):
         assert end_to_end["planner"][heuristic] == 0
+
+    mpc = config["end_to_end_mpc_reach"]
+    assert set(mpc) == set(end_to_end) | {"max_steps", "init_control", "seed"}
+    for heuristic in ("w_dist", "w_obs", "w_visit"):
+        assert mpc["planner"][heuristic] == 0
 
 
 def test_offline_module_and_signal_dispatcher_remain_absent():
@@ -288,6 +295,7 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
         "Nested",
         "EnclosureReach",
         "EndToEndReach",
+        "EndToEndMPCReach",
     ]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
@@ -298,9 +306,9 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
 @pytest.mark.parametrize(
     "flags",
     [
-        ("run", "run", "run", "run", "run"),
-        ("run", "skip", "run", "skip", "run"),
-        ("skip", "skip", "skip", "skip", "skip"),
+        ("run", "run", "run", "run", "run", "run"),
+        ("run", "skip", "run", "skip", "run", "skip"),
+        ("skip", "skip", "skip", "skip", "skip", "run"),
     ],
 )
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):

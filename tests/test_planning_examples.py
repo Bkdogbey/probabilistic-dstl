@@ -263,12 +263,40 @@ def test_every_named_case_runs():
 
 # --- 6. Enclosure rollout -> pdSTL -> control optimisation ------------------
 
+# Self-contained, so the regression does not follow edits to configs/examples.yaml.
+# Reachable: 8 steps of dt=0.5 at |u| <= 1 cover 4.0 > threshold 2.5.
+ENCLOSURE_CFG = {
+    "threshold": 2.5,
+    "interval_steps": [1, 8],
+    "H": 8,
+    "dt": 0.5,
+    "u_max": 1.0,
+    "q_std": 0.05,
+    "lower0": [0.0, 0.0],
+    "upper0": [0.3, 0.3],
+    "covariance0": [0.09, 0.09],
+    "d_lower": [-0.02, -0.02],
+    "d_upper": [0.03, 0.03],
+    "seed": 0,
+    "planner": {
+        "w_phi": 10.0,
+        "w_u": 0.0,
+        "w_du": 0.0,
+        "w_dist": 0.0,
+        "w_obs": 0.0,
+        "w_visit": 0.0,
+        "scale": -1,
+        "lr": 0.05,
+        "max_iters": 500,
+    },
+}
+
 
 def test_enclosure_gradient_is_finite_and_nonzero_under_direct_evaluation():
     """The pdSTL lower endpoint's gradient with respect to controls, through
     the actual enclosure-rollout -> belief -> predicate path this example
     uses, evaluated directly (scale <= 0), not smoothed."""
-    cfg, planner_cfg = load_enclosure_reach_config()
+    cfg, planner_cfg = load_enclosure_reach_config(ENCLOSURE_CFG)
     device = get_device()
     dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
     lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
@@ -285,7 +313,7 @@ def test_enclosure_gradient_is_finite_and_nonzero_under_direct_evaluation():
 
 
 def test_enclosure_optimisation_improves_the_directly_evaluated_lower_endpoint():
-    result = run_enclosure_reach(save=False, verbose=False)
+    result = run_enclosure_reach(cfg=ENCLOSURE_CFG, save=False, verbose=False)
 
     lo_initial = result["interval_initial"][0]
     lo_final = result["interval_final"][0]
@@ -298,13 +326,13 @@ def test_enclosure_optimisation_improves_the_directly_evaluated_lower_endpoint()
 def test_enclosure_controls_reproduce_the_reported_interval_and_bounds():
     """Replaying the returned physical controls reproduces the reported
     enclosure (lower, upper, covariance) and pdSTL interval."""
-    cfg, _ = load_enclosure_reach_config()
+    cfg, _ = load_enclosure_reach_config(ENCLOSURE_CFG)
     device = get_device()
     dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
     lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
     spec = Eventually(GreaterThan(cfg["threshold"], dim=0), interval=cfg["interval_steps"])
 
-    result = run_enclosure_reach(save=False, verbose=False)
+    result = run_enclosure_reach(cfg=ENCLOSURE_CFG, save=False, verbose=False)
 
     assert result["lower_mismatch"] < 1e-5
 
@@ -328,7 +356,7 @@ def test_enclosure_is_never_collapsed_to_its_midpoint():
     bounds, not a point at the descriptor midpoint -- lower and upper
     genuinely differ throughout, and covariance is a rollout output, never a
     trainable parameter."""
-    result = run_enclosure_reach(save=False, verbose=False)
+    result = run_enclosure_reach(cfg=ENCLOSURE_CFG, save=False, verbose=False)
 
     assert not torch.allclose(result["lower_trace"], result["upper_trace"])
     assert not result["cov_trace"].requires_grad

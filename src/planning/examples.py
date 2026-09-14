@@ -27,7 +27,12 @@ from models.dynamics import (
 )
 from planning.planner import Planner
 from utils import get_device, load_config
-from visualization.robustness import plot_case, plot_end_to_end, plot_synthesis
+from visualization.robustness import (
+    plot_case,
+    plot_end_to_end,
+    plot_mpc_reach,
+    plot_synthesis,
+)
 
 OUTPUT_DIR = "outputs"
 
@@ -392,7 +397,7 @@ def run_mpc_check(verbose=True):
 
         true_state = next_true
         # Shift the warm start by the applied control.
-        warm_start = torch.cat([best_u[1:], best_u[-1:]], dim=0)
+        warm_start = planner._shift_controls(best_u)
 
     if verbose:
         log_utils._log.info(
@@ -405,9 +410,14 @@ def run_mpc_check(verbose=True):
 # --- Enclosure-rollout control example -------------------------------------
 
 
-def load_enclosure_reach_config():
-    """Example parameters merged with the planner defaults."""
-    cfg = load_config("configs/examples.yaml")["enclosure_reach"]
+def load_enclosure_reach_config(cfg=None):
+    """Example parameters merged with the planner defaults.
+
+    cfg defaults to the ``enclosure_reach`` section of configs/examples.yaml;
+    tests pass their own so they do not depend on the editable example file.
+    """
+    if cfg is None:
+        cfg = load_config("configs/examples.yaml")["enclosure_reach"]
     planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
     return cfg, planner_cfg
 
@@ -423,7 +433,7 @@ def _enclosure_initial_state(cfg, device):
     return lower0, upper0, covariance0, d_lower, d_upper
 
 
-def run_enclosure_reach(*, show=False, save=True, verbose=True):
+def run_enclosure_reach(*, cfg=None, show=False, save=True, verbose=True):
     """Propagate a descriptor enclosure through SingleIntegrator and optimise
     controls to raise Eventually(x[0] >= c)'s exact lower endpoint.
 
@@ -433,7 +443,7 @@ def run_enclosure_reach(*, show=False, save=True, verbose=True):
     admissible location). Neither is derived from the other, and the belief
     is never collapsed to the descriptor midpoint.
     """
-    cfg, planner_cfg = load_enclosure_reach_config()
+    cfg, planner_cfg = load_enclosure_reach_config(cfg)
     device = get_device()
     H = cfg["H"]
 
@@ -536,9 +546,9 @@ def run_enclosure_reach(*, show=False, save=True, verbose=True):
 # --- End-to-end planning smoke test ----------------------------------------
 
 
-def load_end_to_end_config():
+def load_end_to_end_config(name="end_to_end_reach"):
     """Smoke-test parameters merged with the planner defaults."""
-    cfg = load_config("configs/examples.yaml")["end_to_end_reach"]
+    cfg = load_config("configs/examples.yaml")[name]
     planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
     return cfg, planner_cfg
 
@@ -635,6 +645,59 @@ def run_end_to_end_reach(*, show=False, save=True, verbose=True):
             cfg["threshold"],
             title=f"end_to_end_reach: {spec}",
             save_path=os.path.join(OUTPUT_DIR, "end_to_end_reach.png") if save else None,
+            show=show,
+        )
+
+    return result
+
+
+def run_end_to_end_mpc_reach(*, show=False, save=True, verbose=True):
+    """Receding-horizon version of the smoke test, same pipeline per window:
+
+        current belief -> H-step Gaussian prediction -> [p_k, p_k] -> Eventually
+        -> optimise controls -> execute only u_0 -> simulated step -> replan
+
+    Shaping heuristics are disabled and the planner has no environment, so the
+    pdSTL term and control regularisation are the whole objective.
+    """
+    cfg, planner_cfg = load_end_to_end_config("end_to_end_mpc_reach")
+    device = get_device()
+    H, dim, threshold = cfg["H"], cfg["dim"], cfg["threshold"]
+    dyn, x0_mean, x0_cov, _, spec = end_to_end_setup(cfg, device)
+
+    torch.manual_seed(cfg["seed"])  # the simulated process noise
+    planner = Planner(dyn, None, H, config=planner_cfg)
+    result = planner.run_receding_horizon(
+        x0_mean,
+        x0_cov,
+        spec=spec,
+        max_steps=cfg["max_steps"],
+        is_done=lambda mean: bool(mean[dim] >= threshold),
+        init_guess=torch.tensor(cfg["init_control"], device=device).repeat(H, 1),
+    )
+    result["spec"] = str(spec)
+    result["u_max"] = dyn.u_max
+
+    if verbose:
+        scores = result["p_sat_trace"]
+        executed = result["mean_trace"][0, :, dim]
+        log_utils._log.info(
+            f"[end_to_end_mpc_reach] {spec} per window\n"
+            f"    executed x  initial {executed[0].item():.3f}"
+            f"  ->  final {executed[-1].item():.3f} | replans {len(scores)} | "
+            f"stopped: {result['stopped_reason']}\n"
+            f"    pdSTL score  first window {scores[0]:.4f}"
+            f"  ->  last window {scores[-1]:.4f}"
+        )
+
+    if save or show:
+        plot_mpc_reach(
+            cfg["dt"],
+            result,
+            threshold,
+            dim=dim,
+            title=f"end_to_end_mpc_reach: {spec} per window",
+            save_path=os.path.join(OUTPUT_DIR, "end_to_end_mpc_reach.png") if save else None,
             show=show,
         )
 

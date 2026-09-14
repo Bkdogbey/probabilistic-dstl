@@ -268,6 +268,71 @@ class Planner:
             "stopped_reason": stopped_reason,
         }
 
+    def run_receding_horizon(
+        self, x0_mean, x0_cov, *, spec, max_steps, is_done, init_guess=None, execute=None,
+    ):
+        """Plan H steps, execute only the first control, update the belief, replan.
+
+        Stops with ``"goal_reached"`` once ``is_done(current_mean)`` holds, or
+        ``"max_steps"`` after that many executed controls.
+
+        execute : callable, optional
+            ``(mean, cov, u) -> (mean, cov)`` advances the executed system by
+            one step. Defaults to ``_step_with_noise``: the predicted step plus
+            sampled process noise, keeping the predicted covariance. This is the
+            point a state estimator or hardware backend later replaces; the
+            executed state is never read back from a predicted plan.
+        """
+        execute = self._step_with_noise if execute is None else execute
+        curr_mean, curr_cov = x0_mean, x0_cov
+        mean_trace_list, cov_trace_list, u_trace_list = [curr_mean], [curr_cov], []
+        scores, loss_trace, all_plans, plan_controls, warm_starts = [], [], [], [], []
+        guess = init_guess
+        stopped_reason = "max_steps"
+
+        while True:
+            if is_done(curr_mean):
+                stopped_reason = "goal_reached"
+                break
+            if len(u_trace_list) == max_steps:
+                break
+
+            plan_mean, _, plan_u, score, history = self._optimize_window(
+                curr_mean, curr_cov, spec=spec, init_guess=guess, verbose=False
+            )
+            warm_starts.append(guess)
+            all_plans.append(plan_mean)
+            plan_controls.append(plan_u)
+            scores.append(score)
+            loss_trace.append(history[-1])
+
+            u_curr = plan_u[0]
+            curr_mean, curr_cov = execute(curr_mean, curr_cov, u_curr)
+            mean_trace_list.append(curr_mean)
+            cov_trace_list.append(curr_cov)
+            u_trace_list.append(u_curr)
+
+            guess = self._shift_controls(plan_u)
+
+        u_trace = (
+            torch.stack(u_trace_list).unsqueeze(0)
+            if u_trace_list
+            else self._empty_u_trace(x0_mean)
+        )
+        result = self._pack_result(
+            mean_trace=torch.stack(mean_trace_list).unsqueeze(0),
+            cov_trace=torch.stack(cov_trace_list).unsqueeze(0),
+            u_trace=u_trace,
+            p_sat_trace=scores,
+            loss_trace=loss_trace,
+            all_plans=all_plans,
+            mode="receding_horizon",
+            stopped_reason=stopped_reason,
+        )
+        result["plan_controls"] = plan_controls
+        result["warm_starts"] = warm_starts
+        return result
+
     def _goal_center(self, env):
         if env.goal is None:
             return None

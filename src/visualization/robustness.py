@@ -344,3 +344,71 @@ def plot_end_to_end(
 
     _finish(fig, save_path, show)
     return fig, (ax_state, ax_prob)
+
+
+def plot_mpc_reach(
+    dt,
+    result,
+    threshold,
+    dim=0,
+    title=None,
+    figsize=(9, 8),
+    save_path=None,
+    show=False,
+):
+    """Closed-loop view of a receding-horizon run: plan -> execute u_0 -> replan.
+
+    `result` is the dict returned by ``Planner.run_receding_horizon``: the
+    executed ``mean_trace`` [1, N+1, D], applied ``u_trace`` [1, N, 2], one
+    predicted plan per replan in ``all_plans`` ([1, H+1, D] each), and the
+    per-window pdSTL score in ``p_sat_trace``.
+    """
+    executed = _to_array(result["mean_trace"])[0, :, dim]
+    controls = _to_array(result["u_trace"])[0]
+    scores = np.asarray(result["p_sat_trace"])
+    time = dt * np.arange(len(executed))
+
+    fig, (ax_state, ax_score, ax_u) = plt.subplots(3, 1, figsize=figsize, sharex=True)
+
+    for k, plan in enumerate(result["all_plans"]):
+        plan_x = _to_array(plan)[0, :, dim]
+        ax_state.plot(
+            dt * (k + np.arange(len(plan_x))), plan_x, color=_BLUE, lw=0.8, alpha=0.25,
+            label="predicted H-step plans" if k == 0 else None,
+        )
+    ax_state.plot(time, executed, color="black", lw=2.0, marker="o", ms=3, label="executed x")
+    ax_state.axhline(float(threshold), color=_RED, ls="--", lw=1.3, label=f"x = {threshold}")
+    ax_state.set_ylabel("state $x$")
+    ax_state.set_title(
+        f"(a) Executed trajectory ({result['stopped_reason']})", loc="left", fontweight="bold"
+    )
+    ax_state.legend(fontsize=8, loc="best", framealpha=0.95)
+    ax_state.grid(True, alpha=0.3)
+
+    ax_score.plot(time[: len(scores)], scores, color=_GREEN, lw=1.8, marker="o", ms=3)
+    ax_score.set_ylim(-0.05, 1.05)
+    ax_score.set_ylabel("pdSTL score")
+    ax_score.set_title("(b) Lower robustness of each replanned window", loc="left", fontweight="bold")
+    ax_score.grid(True, alpha=0.3)
+
+    t_u = time[: len(controls)]
+    ax_u.step(t_u, controls[:, 0], where="post", color=_BLUE, lw=1.6, label="$v_x$ applied")
+    ax_u.step(t_u, controls[:, 1], where="post", color=_GRAY, lw=1.6, label="$v_y$ applied")
+    ax_u.set_ylabel("control")
+    ax_u.set_xlabel("time [s]")
+    ax_u.set_title("(c) First control of each plan", loc="left", fontweight="bold")
+    ax_u.legend(fontsize=8, loc="best", framealpha=0.95)
+    ax_u.grid(True, alpha=0.3)
+
+    if title:
+        fig.suptitle(title, fontsize=11, fontweight="bold")
+
+    _finish(fig, save_path, show)
+    return fig, (ax_state, ax_score, ax_u)
+
+
+def _to_array(value):
+    """Detach a tensor (or pass an array through) as numpy."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
