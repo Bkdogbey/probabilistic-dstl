@@ -1,4 +1,4 @@
-"""GaussianBelief: X = x* + E, x* in [lower, upper], E ~ N(0, covariance).
+"""EnclosureGaussianBelief: X = x* + E, x* in [lower, upper], E ~ N(0, covariance).
 
 Kept small: analytic agreement, the zero-variance boundary, and the
 structural guarantees that matter -- a tighter bound gives a tighter
@@ -9,14 +9,14 @@ import pytest
 import torch
 from scipy.stats import norm
 
-from models.dynamics import GaussianBelief, create_gaussian_belief_trajectory
+from models.dynamics import EnclosureGaussianBelief, create_enclosure_belief_trajectory
 from pdstl.operators import Always, GreaterThan, LessThan
 
 
 def belief(lower, upper, variance):
     """One-step, one-dimensional belief from plain floats, shape [1,1]."""
     t = lambda v: torch.as_tensor([[v]], dtype=torch.float64)
-    return GaussianBelief(t(lower), t(upper), t(variance))
+    return EnclosureGaussianBelief(t(lower), t(upper), t(variance))
 
 
 @pytest.mark.parametrize("sense", [">=", "<="])
@@ -86,7 +86,7 @@ def test_collapsed_bound_recovers_a_single_gaussian_tail_probability():
 def test_gradients_reach_the_bounds():
     lower = torch.tensor([[48.0]], dtype=torch.float64, requires_grad=True)
     upper = torch.tensor([[52.0]], dtype=torch.float64, requires_grad=True)
-    step = GaussianBelief(lower, upper, torch.tensor([[4.0]], dtype=torch.float64))
+    step = EnclosureGaussianBelief(lower, upper, torch.tensor([[4.0]], dtype=torch.float64))
 
     step.probability_bounds(GreaterThan(50.0)).sum().backward()
 
@@ -99,7 +99,7 @@ def test_trajectory_factory_builds_one_belief_per_step_and_composes_with_always(
     upper = torch.tensor([[52.0], [53.0], [54.0]], dtype=torch.float64)
     variance = torch.full((3, 1), 4.0, dtype=torch.float64)
 
-    trajectory = create_gaussian_belief_trajectory(lower, upper, variance)
+    trajectory = create_enclosure_belief_trajectory(lower, upper, variance)
 
     assert len(trajectory) == 3
     trace = Always(GreaterThan(50.0), interval=[0, 2])(trajectory)
@@ -112,7 +112,7 @@ def test_trajectory_factory_accepts_a_scalar_trace():
     upper = torch.tensor([52.0, 53.0, 54.0], dtype=torch.float64)
     variance = torch.full((3,), 4.0, dtype=torch.float64)
 
-    trajectory = create_gaussian_belief_trajectory(lower, upper, variance)
+    trajectory = create_enclosure_belief_trajectory(lower, upper, variance)
 
     assert len(trajectory) == 3
     assert trajectory[0].lower.shape == (1, 1)

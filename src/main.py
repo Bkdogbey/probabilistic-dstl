@@ -14,12 +14,11 @@ show_plots = examples["show_plots"]
 with skip_run("run", "Always") as check, check():
     config = examples["always"]
     threshold = config["threshold"]
-    sigma_multiplier = config["sigma_multiplier"]
     interval = config["interval_steps"]
 
     time, mean, variance = piecewise_signal(config["values"])
-    sigma = sigma_multiplier * np.sqrt(variance)
-    beliefs = create_gaussian_belief_trajectory(mean - sigma, mean + sigma, variance)
+    beliefs = create_gaussian_belief_trajectory(mean, variance)
+    sigma = np.sqrt(variance)  # visualization only: the mean +- sigma band
     predicate = GreaterThan(threshold)
     formula = Always(predicate, interval=interval)
 
@@ -38,12 +37,11 @@ with skip_run("run", "Always") as check, check():
 with skip_run("run", "Eventually") as check, check():
     config = examples["eventually"]
     threshold = config["threshold"]
-    sigma_multiplier = config["sigma_multiplier"]
     interval = config["interval_steps"]
 
     time, mean, variance = piecewise_signal(config["values"])
-    sigma = sigma_multiplier * np.sqrt(variance)
-    beliefs = create_gaussian_belief_trajectory(mean - sigma, mean + sigma, variance)
+    beliefs = create_gaussian_belief_trajectory(mean, variance)
+    sigma = np.sqrt(variance)  # visualization only: the mean +- sigma band
     predicate = GreaterThan(threshold)
     formula = Eventually(predicate, interval=interval)
 
@@ -62,13 +60,12 @@ with skip_run("run", "Eventually") as check, check():
 with skip_run("run", "Nested") as check, check():
     config = examples["nested"]
     threshold = config["threshold"]
-    sigma_multiplier = config["sigma_multiplier"]
     always_interval = config["always_interval_steps"]
     eventually_interval = config["eventually_interval_steps"]
 
     time, mean, variance = piecewise_signal(config["values"])
-    sigma = sigma_multiplier * np.sqrt(variance)
-    beliefs = create_gaussian_belief_trajectory(mean - sigma, mean + sigma, variance)
+    beliefs = create_gaussian_belief_trajectory(mean, variance)
+    sigma = np.sqrt(variance)  # visualization only: the mean +- sigma band
     predicate = GreaterThan(threshold)
     inner = Always(predicate, interval=always_interval)
     formula = Eventually(inner, interval=eventually_interval)
@@ -94,3 +91,11 @@ with skip_run("run", "EnclosureReach") as check, check():
 
     print("\nEnclosureReach")
     run_enclosure_reach(show=show_plots, save=True, verbose=True)
+
+
+# 5. EndToEndReach: controls -> Gaussian prediction -> p_k -> Eventually -> loss -> gradient
+with skip_run("run", "EndToEndReach") as check, check():
+    from planning.examples import run_end_to_end_reach
+
+    print("\nEndToEndReach")
+    run_end_to_end_reach(show=show_plots, save=True, verbose=True)

@@ -43,13 +43,13 @@ def scalar(values, event="p"):
 
 
 def gaussian(mean, var):
-    """Trajectory of exact Gaussian steps (collapsed bound = mean) from [T, D]
-    mean and [T, D] or [T, D, D] var."""
+    """Trajectory of precise Gaussian steps from [T, D] mean and [T, D] or
+    [T, D, D] var."""
     mean = torch.as_tensor(mean, dtype=torch.float64)
     var = torch.as_tensor(var, dtype=torch.float64)
     return BeliefTrajectory(
         [
-            GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1])
+            GaussianBelief(mean[t : t + 1], var[t : t + 1])
             for t in range(len(mean))
         ]
     )
@@ -97,7 +97,7 @@ def test_negative_variance_is_rejected():
 def test_full_covariance_selects_the_requested_marginal():
     mean = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
     covariance = torch.tensor([[[4.0, 3.0], [3.0, 9.0]]], dtype=torch.float64)
-    trajectory = BeliefTrajectory([GaussianBelief(mean, mean, covariance)])
+    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance)])
 
     got = GreaterThan(0.0, dim=1)(trajectory)[0, 0, 0].item()
 
@@ -105,22 +105,22 @@ def test_full_covariance_selects_the_requested_marginal():
 
 
 @pytest.mark.parametrize(
-    "lower,upper,covariance,message",
+    "mean,covariance,message",
     [
-        (torch.zeros(2), torch.zeros(2), torch.ones(2), r"lower must have shape \[B,D\]"),
-        (torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(3, 2), "diagonal covariance"),
-        (torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(2, 2, 3), r"full covariance must have shape \[B,D,D\]"),
-        (torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(2, 3, 3), r"full covariance must have shape \[B,D,D\]"),
+        (torch.zeros(2), torch.ones(2), r"mean must have shape \[B,D\]"),
+        (torch.zeros(2, 2), torch.ones(3, 2), "diagonal covariance"),
+        (torch.zeros(2, 2), torch.ones(2, 2, 3), r"full covariance must have shape \[B,D,D\]"),
+        (torch.zeros(2, 2), torch.ones(2, 3, 3), r"full covariance must have shape \[B,D,D\]"),
     ],
 )
-def test_gaussian_belief_rejects_invalid_shapes(lower, upper, covariance, message):
+def test_gaussian_belief_rejects_invalid_shapes(mean, covariance, message):
     with pytest.raises(ValueError, match=message):
-        GaussianBelief(lower, upper, covariance)
+        GaussianBelief(mean, covariance)
 
 
 def test_gaussian_belief_rejects_an_invalid_predicate_dimension():
     trajectory = BeliefTrajectory(
-        [GaussianBelief(torch.zeros(1, 2), torch.zeros(1, 2), torch.ones(1, 2))]
+        [GaussianBelief(torch.zeros(1, 2), torch.ones(1, 2))]
     )
 
     with pytest.raises(ValueError, match="dimension 2 is outside"):
@@ -541,7 +541,7 @@ def test_dtype_is_preserved_through_a_temporal_formula(dtype):
     mean = torch.tensor([[45.0], [55.0], [60.0]], dtype=dtype)
     var = torch.full((3, 1), 4.0, dtype=dtype)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1]) for t in range(3)]
+        [GaussianBelief(mean[t : t + 1], var[t : t + 1]) for t in range(3)]
     )
 
     assert Always(GreaterThan(50.0), interval=[0, 1])(traj).dtype == dtype
@@ -551,7 +551,7 @@ def test_gradients_reach_the_mean_through_a_composed_formula():
     mean = torch.tensor([[45.0], [55.0], [60.0], [48.0]], requires_grad=True)
     var = torch.full((4, 1), 4.0)
     traj = BeliefTrajectory(
-        [GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1]) for t in range(4)]
+        [GaussianBelief(mean[t : t + 1], var[t : t + 1]) for t in range(4)]
     )
     spec = Always(
         And(GreaterThan(50.0), LessThan(70.0)), interval=[0, 1]
@@ -568,7 +568,7 @@ def test_smooth_formula_passes_a_finite_difference_gradcheck():
         var = torch.full_like(mean, 4.0)
         traj = BeliefTrajectory(
             [
-                GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1])
+                GaussianBelief(mean[t : t + 1], var[t : t + 1])
                 for t in range(len(mean))
             ]
         )
@@ -598,7 +598,7 @@ def test_control_to_mean_to_formula_is_differentiable():
     var = torch.full_like(mean, 0.25)
     traj = BeliefTrajectory(
         [
-            GaussianBelief(mean[t : t + 1], mean[t : t + 1], var[t : t + 1])
+            GaussianBelief(mean[t : t + 1], var[t : t + 1])
             for t in range(len(u))
         ]
     )

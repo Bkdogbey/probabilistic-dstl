@@ -53,7 +53,7 @@ def single_iteration_time(T, device, n_warmup=3, n_trials=10):
         mean_trace, cov_trace = dyn(v_params, x0_mean, x0_cov)
 
         # --- Wrap for STL evaluation ---
-        traj = create_gaussian_belief_trajectory(mean_trace[0], mean_trace[0], cov_trace[0])
+        traj = create_gaussian_belief_trajectory(mean_trace[0], cov_trace[0])
 
         # --- STL evaluation ---
         stl_trace = spec(traj)

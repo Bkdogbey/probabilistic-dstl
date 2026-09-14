@@ -27,16 +27,19 @@ def _trace(value, name):
 
 
 def _plot_state(ax, time, mean, sigma, threshold, title):
-    """Draw the upstream mean trace, its state endpoints, and the threshold."""
+    """Draw the upstream mean trace, a mean +- sigma band, and the threshold.
+
+    The band is visualization only; it is not a probability bound.
+    """
     lower, upper = mean - sigma, mean + sigma
     ax.fill_between(time, lower, upper, step="post", color=LOWER_COLOR, alpha=0.12)
     ax.step(
         time, lower, where="post", color=LOWER_COLOR, linewidth=1.5, alpha=0.9,
-        label="lower endpoint",
+        label="mean − σ",
     )
     ax.step(
         time, upper, where="post", color=UPPER_COLOR, linewidth=1.5, linestyle="--",
-        alpha=0.9, label="upper endpoint",
+        alpha=0.9, label="mean + σ",
     )
     ax.step(
         time, mean, where="post", marker="o", markersize=5, color="black",

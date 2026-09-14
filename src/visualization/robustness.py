@@ -286,3 +286,61 @@ def plot_synthesis(
 
     _finish(fig, save_path, show)
     return fig, (ax_state, ax_form, ax_obj)
+
+
+def plot_end_to_end(
+    time,
+    initial,
+    optimized,
+    threshold,
+    title=None,
+    figsize=(9, 6),
+    save_path=None,
+    show=False,
+):
+    """Diagnostic view of the end-to-end smoke test, initial vs optimized.
+
+    `initial` and `optimized` are dicts with ``mean`` [T] and ``var`` [T] of the
+    constrained state component, ``atomic`` [B, T, 2] (or [T, 2]) atomic
+    probabilities, and ``score`` the directly evaluated pdSTL lower endpoint.
+    The mean +- sigma band is visualization only, not a probability bound.
+    """
+    time = np.asarray(time)
+    fig, (ax_state, ax_prob) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+
+    for run, color, name in ((initial, _GRAY, "initial"), (optimized, _BLUE, "optimized")):
+        mean = np.asarray(run["mean"])
+        sigma = np.sqrt(np.maximum(np.asarray(run["var"]), 0.0))
+        ax_state.fill_between(time, mean - sigma, mean + sigma, alpha=0.18, color=color)
+        ax_state.plot(
+            time, mean, color=color, lw=1.8, marker="o", ms=3,
+            label=rf"{name} $\mu_x$ ($\pm\sigma$ band)",
+        )
+
+        atomic = _to_numpy(run["atomic"])
+        ax_prob.plot(
+            time[: len(atomic)], atomic[:, 0], color=color, lw=1.8, marker="o", ms=3,
+            label=f"{name}: R = {run['score']:.4f}",
+        )
+
+    ax_state.axhline(float(threshold), color=_RED, ls="--", lw=1.3, label=f"x = {threshold}")
+    ax_state.set_ylabel("state $x$")
+    ax_state.set_title("(a) Predicted mean and uncertainty", loc="left", fontweight="bold")
+    ax_state.legend(fontsize=8, loc="best", framealpha=0.95)
+    ax_state.grid(True, alpha=0.3)
+
+    ax_prob.set_ylabel("probability")
+    ax_prob.set_xlabel("time [s]")
+    ax_prob.set_ylim(-0.05, 1.05)
+    ax_prob.set_title(
+        rf"(b) Atomic probability $p_k = P(X_k \geq {threshold})$", loc="left",
+        fontweight="bold",
+    )
+    ax_prob.legend(fontsize=8, loc="best", framealpha=0.95)
+    ax_prob.grid(True, alpha=0.3)
+
+    if title:
+        fig.suptitle(title, fontsize=11, fontweight="bold")
+
+    _finish(fig, save_path, show)
+    return fig, (ax_state, ax_prob)

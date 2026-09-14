@@ -20,10 +20,14 @@ from pdstl.operators import (
     Until,
 )
 from planning import log_utils
-from models.dynamics import SingleIntegrator, create_gaussian_belief_trajectory
+from models.dynamics import (
+    SingleIntegrator,
+    create_enclosure_belief_trajectory,
+    create_gaussian_belief_trajectory,
+)
 from planning.planner import Planner
 from utils import get_device, load_config
-from visualization.robustness import plot_case, plot_synthesis
+from visualization.robustness import plot_case, plot_end_to_end, plot_synthesis
 
 OUTPUT_DIR = "outputs"
 
@@ -120,7 +124,7 @@ def build_case(name, cfg):
 
 def belief_trajectory(mean_trace, cov_trace):
     """Wrap a predicted mean/covariance rollout as one belief per step."""
-    return create_gaussian_belief_trajectory(mean_trace[0], mean_trace[0], cov_trace[0])
+    return create_gaussian_belief_trajectory(mean_trace[0], cov_trace[0])
 
 
 def rollout(dyn, v_params, x0_mean, x0_cov):
@@ -451,7 +455,7 @@ def run_enclosure_reach(*, show=False, save=True, verbose=True):
     torch.manual_seed(cfg["seed"])
     v_init = planner._init_controls(None).detach()
     lower_init, upper_init, cov_init = rollout(v_init)
-    traj_init = create_gaussian_belief_trajectory(lower_init[0], upper_init[0], cov_init[0])
+    traj_init = create_enclosure_belief_trajectory(lower_init[0], upper_init[0], cov_init[0])
     interval_init = evaluate_direct(spec, traj_init)
 
     torch.manual_seed(cfg["seed"])  # same seed -> _optimize_window draws v_init again
@@ -464,7 +468,7 @@ def run_enclosure_reach(*, show=False, save=True, verbose=True):
     # every other caller) and is the reproduction check itself.
     v_best = torch.atanh(torch.clamp(best_u / dyn.u_max, -0.999999, 0.999999))
     lower_final, upper_final, cov_final = rollout(v_best)
-    traj_final = create_gaussian_belief_trajectory(lower_final[0], upper_final[0], cov_final[0])
+    traj_final = create_enclosure_belief_trajectory(lower_final[0], upper_final[0], cov_final[0])
     interval_final = evaluate_direct(spec, traj_final)
 
     lower_mismatch = (lower_final - best_lower).abs().max().item()
@@ -523,6 +527,114 @@ def run_enclosure_reach(*, show=False, save=True, verbose=True):
             thresholds=[cfg["threshold"]],
             title="enclosure_reach: initial vs optimised",
             save_path=f"{base}_synthesis.png" if save else None,
+            show=show,
+        )
+
+    return result
+
+
+# --- End-to-end planning smoke test ----------------------------------------
+
+
+def load_end_to_end_config():
+    """Smoke-test parameters merged with the planner defaults."""
+    cfg = load_config("configs/examples.yaml")["end_to_end_reach"]
+    planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
+    return cfg, planner_cfg
+
+
+def end_to_end_setup(cfg, device):
+    """Dynamics, initial Gaussian state and specification for the smoke test."""
+    dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
+    x0_mean, x0_cov = _initial_state(cfg, device)
+    predicate = GreaterThan(cfg["threshold"], dim=cfg["dim"])
+    spec = Eventually(predicate, interval=[0, cfg["H"]])
+    return dyn, x0_mean, x0_cov, predicate, spec
+
+
+def _evaluate_plan(dyn, v, x0_mean, x0_cov, predicate, spec):
+    """Rollout, atomic trace and directly evaluated pdSTL interval for v."""
+    traj, mean, cov = rollout(dyn, v, x0_mean, x0_cov)
+    return {
+        "mean": mean.detach(),
+        "cov": cov.detach(),
+        "atomic": evaluate_direct(predicate, traj).detach(),
+        "interval": evaluate_direct(spec, traj).detach(),
+    }
+
+
+def run_end_to_end_reach(*, show=False, save=True, verbose=True):
+    """Optimise controls to raise Eventually[0,H](x >= c) through one precise
+    Gaussian belief model:
+
+        v -> u -> (mu, Sigma) -> [p_k, p_k] -> Eventually -> J -> grad_v J
+
+    Controls start at zero, so the initial mean never leaves x0 and the
+    initial score is small. Shaping heuristics are disabled in the config, so
+    any improvement comes from the pdSTL term.
+    """
+    cfg, planner_cfg = load_end_to_end_config()
+    device = get_device()
+    H, dim = cfg["H"], cfg["dim"]
+    dyn, x0_mean, x0_cov, predicate, spec = end_to_end_setup(cfg, device)
+
+    u_init = torch.zeros(H, 2, device=device)
+    initial = _evaluate_plan(dyn, torch.zeros_like(u_init), x0_mean, x0_cov, predicate, spec)
+
+    planner = Planner(dyn, None, H, config=planner_cfg)
+    _, _, best_u, _, history = planner._optimize_window(
+        x0_mean, x0_cov, spec=spec, init_guess=u_init, verbose=verbose
+    )
+
+    v_best = torch.atanh(torch.clamp(best_u / dyn.u_max, -0.999999, 0.999999))
+    final = _evaluate_plan(dyn, v_best, x0_mean, x0_cov, predicate, spec)
+
+    result = {
+        "spec": str(spec),
+        "score_initial": initial["interval"][0, 0, 0].item(),
+        "score_final": final["interval"][0, 0, 0].item(),
+        "interval_initial": initial["interval"][0, 0].tolist(),
+        "interval_final": final["interval"][0, 0].tolist(),
+        "controls": best_u.detach(),
+        "u_max": dyn.u_max,
+        "mean_initial": initial["mean"],
+        "mean_final": final["mean"],
+        "cov_initial": initial["cov"],
+        "cov_final": final["cov"],
+        "atomic_initial": initial["atomic"],
+        "atomic_final": final["atomic"],
+        "history": history,
+        "objective": planner.best_objective,
+    }
+
+    if verbose:
+        log_utils._log.info(
+            f"[end_to_end_reach] {spec}\n"
+            f"    pdSTL score  initial {result['score_initial']:.4f}"
+            f"  ->  final {result['score_final']:.4f}\n"
+            f"    final mean x {final['mean'][0, -1, dim].item():.3f} | "
+            f"objective {planner.best_objective:.4f} | iterations {len(history)}"
+        )
+
+    if save or show:
+        time = [t * cfg["dt"] for t in range(H + 1)]
+        plot_end_to_end(
+            time,
+            {
+                "mean": initial["mean"][0, :, dim],
+                "var": initial["cov"][0, :, dim, dim],
+                "atomic": initial["atomic"],
+                "score": result["score_initial"],
+            },
+            {
+                "mean": final["mean"][0, :, dim],
+                "var": final["cov"][0, :, dim, dim],
+                "atomic": final["atomic"],
+                "score": result["score_final"],
+            },
+            cfg["threshold"],
+            title=f"end_to_end_reach: {spec}",
+            save_path=os.path.join(OUTPUT_DIR, "end_to_end_reach.png") if save else None,
             show=show,
         )
 

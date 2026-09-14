@@ -37,23 +37,14 @@ def _example(name):
     config = _config()[name]
     time, mean, variance = piecewise_signal(config["values"])
     predicate = GreaterThan(config["threshold"])
-    sigma = config["sigma_multiplier"] * np.sqrt(variance)
-    beliefs = create_gaussian_belief_trajectory(mean - sigma, mean + sigma, variance)
+    beliefs = create_gaussian_belief_trajectory(mean, variance)
     return config, (time, mean, variance), predicate, beliefs
 
 
 def _expected_atomic(config, mean, variance):
-    """The sigma-displaced Gaussian CDF the belief is supposed to produce."""
-    sigma = np.sqrt(variance)
-    displacement = config["sigma_multiplier"] * sigma
-    threshold = config["threshold"]
-    return np.stack(
-        (
-            ndtr((mean - displacement - threshold) / sigma),
-            ndtr((mean + displacement - threshold) / sigma),
-        ),
-        axis=-1,
-    )
+    """The exact Gaussian marginal, as coincident bounds [p, p]."""
+    p = ndtr((mean - config["threshold"]) / np.sqrt(variance))
+    return np.stack((p, p), axis=-1)
 
 
 def _reduce(trace, interval, reduction):
@@ -98,7 +89,7 @@ def test_every_example_produces_a_valid_state_signal(name):
 @pytest.mark.parametrize("name", EXAMPLES)
 def test_every_example_plots_aligned_panels_over_the_state_trace(name):
     config, (time, mean, variance), predicate, beliefs = _example(name)
-    sigma = config["sigma_multiplier"] * np.sqrt(variance)
+    sigma = np.sqrt(variance)  # visualization only
 
     if name == "nested":
         inner = Always(predicate, interval=config["always_interval_steps"])
@@ -147,7 +138,7 @@ def test_always_applies_the_endpointwise_minimum():
     assert temporal.shape == (1, 6, 2)
     # The window covering the sub-threshold dip is pinned by its worst step.
     np.testing.assert_allclose(
-        temporal[0, 2].numpy(), [0.02275013, 0.5], atol=1e-8
+        temporal[0, 2].numpy(), [0.15865525, 0.15865525], atol=1e-8
     )
 
 
@@ -162,7 +153,7 @@ def test_eventually_applies_the_endpointwise_maximum():
     assert temporal.shape == (1, 6, 2)
     # The window reaching the above-threshold peak takes that step's bounds.
     np.testing.assert_allclose(
-        temporal[0, 3].numpy(), [0.84134475, 0.9986501], atol=1e-8
+        temporal[0, 3].numpy(), [0.97724987, 0.97724987], atol=1e-8
     )
 
 
@@ -231,9 +222,9 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
 
 def test_examples_configuration_holds_only_numerical_example_data():
     config = _config()
-    assert set(config) == {"show_plots", "enclosure_reach", *EXAMPLES}
+    assert set(config) == {"show_plots", "enclosure_reach", "end_to_end_reach", *EXAMPLES}
 
-    shared = {"threshold", "sigma_multiplier", "values"}
+    shared = {"threshold", "values"}
     assert set(config["always"]) == shared | {"interval_steps"}
     assert set(config["eventually"]) == shared | {"interval_steps"}
     assert set(config["nested"]) == shared | {
@@ -249,6 +240,13 @@ def test_examples_configuration_holds_only_numerical_example_data():
         "lower0", "upper0", "covariance0", "d_lower", "d_upper", "seed", "planner",
     }
     assert len(enclosure["lower0"]) == len(enclosure["upper0"]) == 2
+
+    end_to_end = config["end_to_end_reach"]
+    assert set(end_to_end) == {
+        "threshold", "dim", "H", "dt", "u_max", "q_std", "x0_mean", "x0_cov_scale", "planner",
+    }
+    for heuristic in ("w_dist", "w_obs", "w_visit"):
+        assert end_to_end["planner"][heuristic] == 0
 
 
 def test_offline_module_and_signal_dispatcher_remain_absent():
@@ -289,6 +287,7 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
         "Eventually",
         "Nested",
         "EnclosureReach",
+        "EndToEndReach",
     ]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
@@ -299,9 +298,9 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
 @pytest.mark.parametrize(
     "flags",
     [
-        ("run", "run", "run", "run"),
-        ("run", "skip", "run", "skip"),
-        ("skip", "skip", "skip", "skip"),
+        ("run", "run", "run", "run", "run"),
+        ("run", "skip", "run", "skip", "run"),
+        ("skip", "skip", "skip", "skip", "skip"),
     ],
 )
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):

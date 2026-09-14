@@ -148,21 +148,120 @@ def piecewise_signal(values=None):
     return np.arange(len(values), dtype=float), values[:, 0], values[:, 1]
 
 
-# Gaussian belief
+# Gaussian beliefs
 #
-#   X = x* + E,   x* in [lower, upper],   E ~ N(0, covariance)
+#   GaussianBelief:           X ~ N(mean, covariance)
+#   EnclosureGaussianBelief:  X = x* + E,  x* in [lower, upper],  E ~ N(0, covariance)
 #
-# The location enclosure and the residual covariance are separate,
-# independently supplied uncertainties -- one is never derived from the other.
+# A precise Gaussian gives one exact marginal probability per predicate, so its
+# bounds coincide: [p, p]. The enclosure belief brackets that probability over
+# every admissible location. Its location bounds and residual covariance are
+# independently supplied -- one is never derived from the other.
+
+
+def _validate_covariance(owner, covariance, batch, state_dim):
+    """Check a [B,D] diagonal or [B,D,D] full covariance; return its [B,D] diagonal."""
+    if not torch.is_tensor(covariance):
+        raise ValueError(f"{owner} covariance must be a tensor")
+    if not torch.isfinite(covariance).all():
+        raise ValueError(f"{owner} covariance must be finite")
+    if covariance.ndim == 2:
+        if covariance.shape != (batch, state_dim):
+            raise ValueError("diagonal covariance must have shape [B,D]")
+        component_variance = covariance
+    elif covariance.ndim == 3:
+        if covariance.shape != (batch, state_dim, state_dim):
+            raise ValueError("full covariance must have shape [B,D,D]")
+        # A @ P @ A^T accumulates float roundoff, so this is a tolerance
+        # check, not exact equality.
+        if not torch.allclose(covariance, covariance.transpose(-1, -2), atol=1e-5):
+            raise ValueError("full covariance must be symmetric")
+        eigenvalues = torch.linalg.eigvalsh(covariance)
+        if bool((eigenvalues < -1e-6).any()):
+            raise ValueError("full covariance must be positive semi-definite")
+        component_variance = covariance.diagonal(dim1=-2, dim2=-1)
+    else:
+        raise ValueError(f"{owner} covariance must be [B,D] or [B,D,D]")
+
+    if bool((component_variance < 0).any()):
+        raise ValueError(f"{owner} covariance must be non-negative")
+
+
+def _marginal(covariance, predicate, state_dim):
+    """The predicate's state dimension and that component's [B] variance."""
+    dim = getattr(predicate, "dim", 0)
+    if not isinstance(dim, int) or not 0 <= dim < state_dim:
+        raise ValueError(f"predicate dimension {dim} is outside the state")
+    variance = covariance[:, dim, dim] if covariance.ndim == 3 else covariance[:, dim]
+    return dim, variance
+
+
+def _tail_probability(owner, predicate, location, variance):
+    """P(X sense threshold) for X ~ N(location, variance), [B].
+
+    Zero variance is an inclusive deterministic comparison.
+    """
+    sense = getattr(predicate, "sense", None)
+    if sense not in (">=", "<="):
+        raise ValueError(f"{owner} cannot evaluate {predicate}")
+
+    threshold = torch.as_tensor(
+        predicate.threshold, dtype=location.dtype, device=location.device
+    )
+    positive = variance > 0
+    safe_sigma = torch.where(positive, torch.sqrt(variance), torch.ones_like(variance))
+
+    if sense == ">=":
+        probability = torch.special.ndtr((location - threshold) / safe_sigma)
+        deterministic = location >= threshold
+    else:
+        probability = torch.special.ndtr((threshold - location) / safe_sigma)
+        deterministic = location <= threshold
+    return torch.where(positive, probability, deterministic.to(location.dtype))
 
 
 class GaussianBelief(Belief):
+    """One precise Gaussian state belief, X ~ N(mean, covariance).
+
+    mean : [B, D]
+    covariance : [B, D] (diagonal) or [B, D, D] (full)
+        Only the diagonal enters a one-dimensional predicate's marginal.
+    """
+
+    def __init__(self, mean, covariance):
+        self.mean = mean
+        self.covariance = covariance
+        self._validate_shapes()
+
+    def _validate_shapes(self):
+        if not torch.is_tensor(self.mean) or self.mean.ndim != 2:
+            raise ValueError("GaussianBelief mean must have shape [B,D]")
+        if not torch.isfinite(self.mean).all():
+            raise ValueError("GaussianBelief mean must be finite")
+        _validate_covariance("GaussianBelief", self.covariance, *self.mean.shape)
+
+    def value(self):
+        """The mean, [B,D]."""
+        return self.mean
+
+    def probability_bounds(self, predicate):
+        """Exact marginal probability of the predicate, returned as [p, p], [B,2].
+
+        x_j >= h:  p = Phi((mu_j - h) / sigma_j)
+        x_j <= h:  p = Phi((h - mu_j) / sigma_j)
+        """
+        dim, variance = _marginal(self.covariance, predicate, self.mean.shape[1])
+        p = _tail_probability("GaussianBelief", predicate, self.mean[:, dim], variance)
+        return torch.stack((p, p), dim=-1)
+
+
+class EnclosureGaussianBelief(Belief):
     """A location known only within [lower, upper], plus Gaussian residual noise.
 
     lower, upper : [B, D]
         Admissible bounds on the location, supplied directly.
     covariance : [B, D] (diagonal) or [B, D, D] (full)
-        Covariance of the residual. Only its diagonal is used; see _project.
+        Covariance of the residual. Only its diagonal is used.
     """
 
     def __init__(self, lower, upper, covariance):
@@ -172,59 +271,23 @@ class GaussianBelief(Belief):
         self._validate_shapes()
 
     def _validate_shapes(self):
+        owner = "EnclosureGaussianBelief"
         if not torch.is_tensor(self.lower) or self.lower.ndim != 2:
-            raise ValueError("GaussianBelief lower must have shape [B,D]")
+            raise ValueError(f"{owner} lower must have shape [B,D]")
         if not torch.isfinite(self.lower).all():
-            raise ValueError("GaussianBelief lower must be finite")
+            raise ValueError(f"{owner} lower must be finite")
         if not torch.is_tensor(self.upper) or self.upper.shape != self.lower.shape:
-            raise ValueError("GaussianBelief upper must match lower's shape")
+            raise ValueError(f"{owner} upper must match lower's shape")
         if not torch.isfinite(self.upper).all():
-            raise ValueError("GaussianBelief upper must be finite")
+            raise ValueError(f"{owner} upper must be finite")
         if bool((self.lower > self.upper).any()):
-            raise ValueError("GaussianBelief requires lower <= upper")
-
-        batch, state_dim = self.lower.shape
-        if not torch.is_tensor(self.covariance):
-            raise ValueError("GaussianBelief covariance must be a tensor")
-        if not torch.isfinite(self.covariance).all():
-            raise ValueError("GaussianBelief covariance must be finite")
-        if self.covariance.ndim == 2:
-            if self.covariance.shape != self.lower.shape:
-                raise ValueError("diagonal covariance must match lower's shape [B,D]")
-            component_variance = self.covariance
-        elif self.covariance.ndim == 3:
-            if self.covariance.shape != (batch, state_dim, state_dim):
-                raise ValueError("full covariance must have shape [B,D,D]")
-            # A @ P @ A^T accumulates float roundoff, so this is a tolerance
-            # check, not exact equality.
-            if not torch.allclose(
-                self.covariance, self.covariance.transpose(-1, -2), atol=1e-5
-            ):
-                raise ValueError("full covariance must be symmetric")
-            eigenvalues = torch.linalg.eigvalsh(self.covariance)
-            if bool((eigenvalues < -1e-6).any()):
-                raise ValueError("full covariance must be positive semi-definite")
-            component_variance = self.covariance.diagonal(dim1=-2, dim2=-1)
-        else:
-            raise ValueError("GaussianBelief covariance must be [B,D] or [B,D,D]")
-
-        if bool((component_variance < 0).any()):
-            raise ValueError("GaussianBelief covariance must be non-negative")
+            raise ValueError(f"{owner} requires lower <= upper")
+        _validate_covariance(owner, self.covariance, *self.lower.shape)
 
     def value(self):
         """Midpoint of [lower, upper], [B,D] -- a representative descriptor,
         not a substitute for enclosure-based predicate evaluation."""
         return (self.lower + self.upper) / 2
-
-    def _project(self, predicate):
-        full_covariance = self.covariance.ndim == 3
-        dim = getattr(predicate, "dim", 0)
-        if not isinstance(dim, int) or not 0 <= dim < self.lower.shape[1]:
-            raise ValueError(f"predicate dimension {dim} is outside the state")
-        lower = self.lower[:, dim]
-        upper = self.upper[:, dim]
-        variance = self.covariance[:, dim, dim] if full_covariance else self.covariance[:, dim]
-        return lower, upper, variance
 
     def probability_bounds(self, predicate):
         """Enclose the predicate's probability over every admissible location, [B,2].
@@ -234,37 +297,43 @@ class GaussianBelief(Belief):
         endpoints, so the same CDF evaluated there brackets every value the
         map takes in between.
         """
-        sense = getattr(predicate, "sense", None)
-        if sense not in (">=", "<="):
-            raise ValueError(f"GaussianBelief cannot evaluate {predicate}")
-
-        lower, upper, variance = self._project(predicate)
-        threshold = torch.as_tensor(
-            predicate.threshold, dtype=lower.dtype, device=lower.device
-        )
-
-        positive = variance > 0
-        sigma = torch.sqrt(variance)
-        safe_sigma = torch.where(positive, sigma, torch.ones_like(sigma))
-
-        if sense == ">=":
-            bound_lower = torch.special.ndtr((lower - threshold) / safe_sigma)
-            bound_upper = torch.special.ndtr((upper - threshold) / safe_sigma)
-            deterministic_lower = lower >= threshold
-            deterministic_upper = upper >= threshold
-        else:
-            bound_lower = torch.special.ndtr((threshold - upper) / safe_sigma)
-            bound_upper = torch.special.ndtr((threshold - lower) / safe_sigma)
-            deterministic_lower = upper <= threshold
-            deterministic_upper = lower <= threshold
-
-        bound_lower = torch.where(positive, bound_lower, deterministic_lower.to(lower.dtype))
-        bound_upper = torch.where(positive, bound_upper, deterministic_upper.to(lower.dtype))
-        return torch.stack((bound_lower, bound_upper), dim=-1)
+        owner = "EnclosureGaussianBelief"
+        dim, variance = _marginal(self.covariance, predicate, self.lower.shape[1])
+        at_lower = _tail_probability(owner, predicate, self.lower[:, dim], variance)
+        at_upper = _tail_probability(owner, predicate, self.upper[:, dim], variance)
+        if predicate.sense == ">=":
+            return torch.stack((at_lower, at_upper), dim=-1)
+        return torch.stack((at_upper, at_lower), dim=-1)
 
 
-def create_gaussian_belief_trajectory(lower, upper, covariance, dtype=None, device=None):
-    """Build a trajectory of GaussianBelief, one per step.
+def create_gaussian_belief_trajectory(mean, covariance, dtype=None, device=None):
+    """Build a trajectory of precise GaussianBelief, one per step.
+
+    mean       : [T] (scalar state), [T, D], or [B, T, D] (batched)
+    covariance : matching mean -- [T]; [T, D] or [T, D, D]; [B, T, D] or [B, T, D, D]
+    """
+    mean = torch.as_tensor(mean, dtype=dtype, device=device)
+    covariance = torch.as_tensor(covariance, dtype=mean.dtype, device=mean.device)
+
+    if mean.ndim == 1:
+        mean = mean.unsqueeze(-1)
+        if covariance.ndim == 1:
+            covariance = covariance.unsqueeze(-1)
+    if mean.ndim == 2:
+        mean, covariance = mean.unsqueeze(0), covariance.unsqueeze(0)
+
+    if mean.ndim != 3:
+        raise ValueError("mean trace must have shape [T], [T,D] or [B,T,D]")
+    if covariance.ndim < 2 or covariance.shape[:2] != mean.shape[:2]:
+        raise ValueError("covariance must have the same batch and number of steps as mean")
+
+    return BeliefTrajectory(
+        [GaussianBelief(mean[:, t], covariance[:, t]) for t in range(mean.shape[1])]
+    )
+
+
+def create_enclosure_belief_trajectory(lower, upper, covariance, dtype=None, device=None):
+    """Build a trajectory of EnclosureGaussianBelief, one per step.
 
     lower, upper : [T] (scalar state) or [T, D]
     covariance   : [T] / [T, D] (diagonal) or [T, D, D] (full), matching lower's D
@@ -285,7 +354,7 @@ def create_gaussian_belief_trajectory(lower, upper, covariance, dtype=None, devi
 
     return BeliefTrajectory(
         [
-            GaussianBelief(lower[t : t + 1], upper[t : t + 1], covariance[t : t + 1])
+            EnclosureGaussianBelief(lower[t : t + 1], upper[t : t + 1], covariance[t : t + 1])
             for t in range(lower.shape[0])
         ]
     )

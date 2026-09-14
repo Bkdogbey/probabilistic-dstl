@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models.dynamics import create_gaussian_belief_trajectory
+from models.dynamics import (
+    create_enclosure_belief_trajectory,
+    create_gaussian_belief_trajectory,
+)
 from utils import load_config
 from planning import log_utils
 
@@ -162,14 +165,13 @@ class Planner:
 
             if rollout is not None:
                 lower_trace, upper_trace, cov_trace = rollout(v_params)
+                traj = create_enclosure_belief_trajectory(
+                    lower_trace[0], upper_trace[0], cov_trace[0]
+                )
             else:
                 lower_trace, cov_trace = self.dyn(v_params, x0_mean, x0_cov)
-                upper_trace = lower_trace
+                traj = create_gaussian_belief_trajectory(lower_trace[0], cov_trace[0])
             u_seq = self.dyn.bound_control(v_params)
-
-            traj = create_gaussian_belief_trajectory(
-                lower_trace[0], upper_trace[0], cov_trace[0]
-            )
 
             stl_trace = phi(traj, scale=scale)
             robustness = stl_trace[0, 0, 0]

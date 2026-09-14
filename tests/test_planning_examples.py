@@ -6,7 +6,7 @@ import pytest
 import torch
 from scipy.stats import norm
 
-from models.dynamics import SingleIntegrator, create_gaussian_belief_trajectory
+from models.dynamics import SingleIntegrator, create_enclosure_belief_trajectory
 from pdstl.operators import Eventually, GreaterThan
 from planning.examples import (
     CASES,
@@ -276,7 +276,7 @@ def test_enclosure_gradient_is_finite_and_nonzero_under_direct_evaluation():
 
     v = torch.zeros(cfg["H"], 2, device=device, requires_grad=True)
     lower, upper, cov = dyn.rollout_enclosure(v, lower0, upper0, covariance0, d_lower, d_upper)
-    traj = create_gaussian_belief_trajectory(lower[0], upper[0], cov[0])
+    traj = create_enclosure_belief_trajectory(lower[0], upper[0], cov[0])
     spec(traj, scale=planner_cfg["scale"])[0, 0, 0].backward()
 
     assert v.grad is not None
@@ -312,7 +312,7 @@ def test_enclosure_controls_reproduce_the_reported_interval_and_bounds():
     lower_replay, upper_replay, cov_replay = dyn.rollout_enclosure(
         v_replay, lower0, upper0, covariance0, d_lower, d_upper
     )
-    traj_replay = create_gaussian_belief_trajectory(
+    traj_replay = create_enclosure_belief_trajectory(
         lower_replay[0], upper_replay[0], cov_replay[0]
     )
     interval_replay = evaluate_direct(spec, traj_replay)[0, 0].tolist()

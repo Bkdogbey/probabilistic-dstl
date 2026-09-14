@@ -7,11 +7,13 @@ from models.dynamics import (
     DoubleIntegrator,
     GaussianBelief,
     SingleIntegrator,
+    create_enclosure_belief_trajectory,
     create_gaussian_belief_trajectory,
     piecewise_signal,
 )
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import Always, GreaterThan
+from pdstl.operators import Always, GreaterThan, LessThan
+from scipy.stats import norm
 from planning.environment import Environment, extract_trajectory_stats
 from planning.planner import Planner
 
@@ -121,7 +123,7 @@ def test_rollout_enclosure_defaults_the_offset_to_zero():
 def test_planning_extracts_the_same_gaussian_beliefs():
     mean = torch.tensor([[1.0, 2.0]])
     covariance = torch.tensor([[[0.5, 0.2], [0.2, 0.8]]])
-    trajectory = BeliefTrajectory([GaussianBelief(mean, mean, covariance)] * 2)
+    trajectory = BeliefTrajectory([GaussianBelief(mean, covariance)] * 2)
     extracted_mean, extracted_covariance = extract_trajectory_stats(
         trajectory, diagonal_only=False
     )
@@ -157,24 +159,39 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
 
 
 def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():
-    scalar_lower = np.array([1.0, 2.0], dtype=np.float64)
     scalar = create_gaussian_belief_trajectory(
-        scalar_lower, scalar_lower + 1.0, np.array([0.25, 1.0])
+        np.array([1.0, 2.0], dtype=np.float64), np.array([0.25, 1.0])
     )
-    assert scalar[0].lower.shape == (1, 1)
-    assert scalar[0].lower.dtype == torch.float64
+    assert len(scalar) == 2 and scalar[0].mean.shape == (1, 1)
+    assert scalar[0].mean.dtype == torch.float64
 
-    vector = create_gaussian_belief_trajectory(
-        np.zeros((3, 2)), np.ones((3, 2)), np.ones((3, 2, 2))
-    )
+    vector = create_gaussian_belief_trajectory(np.zeros((3, 2)), np.eye(2)[None].repeat(3, 0))
     assert len(vector) == 3 and vector[0].covariance.shape == (1, 2, 2)
 
-    lower = torch.zeros(3, 2, dtype=torch.float64, requires_grad=True)
-    trajectory = create_gaussian_belief_trajectory(lower, lower + 1.0, torch.ones(3, 2))
-    assert len(trajectory) == 3 and trajectory[0].lower.shape == (1, 2)
-    assert trajectory[0].lower.device == lower.device
+    batched = create_gaussian_belief_trajectory(torch.zeros(4, 3, 2), torch.ones(4, 3, 2))
+    assert len(batched) == 3 and batched[0].mean.shape == (4, 2)
+    assert GreaterThan(0.0)(batched).shape == (4, 3, 2)
+
+    mean = torch.zeros(3, 2, dtype=torch.float64, requires_grad=True)
+    trajectory = create_gaussian_belief_trajectory(mean, torch.ones(3, 2))
+    assert len(trajectory) == 3 and trajectory[0].mean.shape == (1, 2)
+    assert trajectory[0].mean.device == mean.device
+    assert trajectory[0].covariance.dtype == torch.float64
     GreaterThan(0.0)(trajectory).sum().backward()
-    assert lower.grad is not None and torch.isfinite(lower.grad).all()
+    assert mean.grad is not None and torch.isfinite(mean.grad).all()
+
+
+@pytest.mark.parametrize(
+    "mean,covariance,message",
+    [
+        (np.zeros((2, 2, 2, 2)), np.zeros((2, 2, 2)), r"\[T\], \[T,D\] or \[B,T,D\]"),
+        (np.zeros((3, 2)), np.zeros((2, 2)), "same batch and number of steps"),
+        (np.zeros((2, 3, 2)), np.zeros((2, 2, 2)), "same batch and number of steps"),
+    ],
+)
+def test_gaussian_trajectory_factory_rejects_mismatched_shapes(mean, covariance, message):
+    with pytest.raises(ValueError, match=message):
+        create_gaussian_belief_trajectory(mean, covariance)
 
 
 @pytest.mark.parametrize(
@@ -184,42 +201,68 @@ def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():
         (np.zeros((3, 2)), np.zeros((3, 2)), np.zeros((2, 2)), "same number of steps"),
     ],
 )
-def test_gaussian_trajectory_factory_rejects_mismatched_shapes(lower, upper, covariance, message):
+def test_enclosure_trajectory_factory_rejects_mismatched_shapes(lower, upper, covariance, message):
     with pytest.raises(ValueError, match=message):
-        create_gaussian_belief_trajectory(lower, upper, covariance)
+        create_enclosure_belief_trajectory(lower, upper, covariance)
+
+
+# --- Precise Gaussian semantics ----------------------------------------
+
+
+@pytest.mark.parametrize("predicate", [GreaterThan(50.0), LessThan(50.0)])
+def test_precise_gaussian_returns_the_exact_marginal_as_equal_bounds(predicate):
+    mean, variance = 51.0, 4.0
+    belief = GaussianBelief(
+        torch.tensor([[mean]], dtype=torch.float64), torch.tensor([[variance]], dtype=torch.float64)
+    )
+
+    got = belief.probability_bounds(predicate)[0]
+
+    z = (mean - 50.0) / variance**0.5
+    expected = norm.cdf(z) if predicate.sense == ">=" else norm.cdf(-z)
+    assert got[0].item() == pytest.approx(expected, abs=1e-12)
+    assert got[0].item() == got[1].item()
+
+
+@pytest.mark.parametrize(
+    "mean, expect_ge, expect_le",
+    [(51.0, 1.0, 0.0), (49.0, 0.0, 1.0), (50.0, 1.0, 1.0)],
+)
+def test_precise_gaussian_zero_variance_is_an_inclusive_comparison(mean, expect_ge, expect_le):
+    belief = GaussianBelief(torch.tensor([[mean]]), torch.zeros(1, 1))
+
+    assert belief.probability_bounds(GreaterThan(50.0))[0].tolist() == [expect_ge, expect_ge]
+    assert belief.probability_bounds(LessThan(50.0))[0].tolist() == [expect_le, expect_le]
 
 
 # --- Input validation --------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "lower,upper,covariance,message",
+    "mean,covariance,message",
     [
-        ([[float("nan"), 0.0]], [[1.0, 1.0]], [[1.0, 1.0]], "lower must be finite"),
-        ([[0.0, 0.0]], [[float("inf"), 1.0]], [[1.0, 1.0]], "upper must be finite"),
-        ([[0.0, 0.0]], [[1.0, 1.0]], [[float("-inf"), 1.0]], "covariance must be finite"),
+        ([[float("nan"), 0.0]], [[1.0, 1.0]], "mean must be finite"),
+        ([[0.0, 0.0]], [[float("-inf"), 1.0]], "covariance must be finite"),
     ],
 )
-def test_gaussian_belief_rejects_nonfinite_inputs(lower, upper, covariance, message):
+def test_gaussian_belief_rejects_nonfinite_inputs(mean, covariance, message):
     t = lambda v: torch.as_tensor(v, dtype=torch.float64)
     with pytest.raises(ValueError, match=message):
-        GaussianBelief(t(lower), t(upper), t(covariance))
+        GaussianBelief(t(mean), t(covariance))
 
 
 def test_gaussian_belief_rejects_an_asymmetric_full_covariance():
-    lower = upper = torch.zeros(1, 2)
     covariance = torch.tensor([[[1.0, 2.0], [3.0, 1.0]]])
 
     with pytest.raises(ValueError, match="must be symmetric"):
-        GaussianBelief(lower, upper, covariance)
+        GaussianBelief(torch.zeros(1, 2), covariance)
 
 
 def test_gaussian_belief_rejects_a_symmetric_non_positive_semidefinite_covariance():
-    lower = upper = torch.zeros(1, 2)
     covariance = torch.tensor([[[1.0, 2.0], [2.0, 1.0]]])  # eigenvalues -1, 3
 
     with pytest.raises(ValueError, match="positive semi-definite"):
-        GaussianBelief(lower, upper, covariance)
+        GaussianBelief(torch.zeros(1, 2), covariance)
 
 
 def test_gaussian_belief_accepts_a_covariance_actually_propagated_by_rollout():
@@ -230,7 +273,7 @@ def test_gaussian_belief_accepts_a_covariance_actually_propagated_by_rollout():
     for _ in range(10):
         x, P = model.step(x, P, torch.tensor([0.3, -0.1]))
 
-    GaussianBelief(x.unsqueeze(0), x.unsqueeze(0), P.unsqueeze(0))  # must not raise
+    GaussianBelief(x.unsqueeze(0), P.unsqueeze(0))  # must not raise
 
 
 def test_gradient_reaches_controls_through_the_full_enclosure_belief_path():
@@ -242,7 +285,7 @@ def test_gradient_reaches_controls_through_the_full_enclosure_belief_path():
     covariance0 = torch.eye(2) * 4.0
 
     lower, upper, covariance = model.rollout_enclosure(controls, lower0, upper0, covariance0)
-    traj = create_gaussian_belief_trajectory(lower[0], upper[0], covariance[0])
+    traj = create_enclosure_belief_trajectory(lower[0], upper[0], covariance[0])
 
     formula = Always(GreaterThan(50.0), interval=[0, 1])
     formula(traj)[..., 0].sum().backward()
