@@ -209,9 +209,9 @@ def test_precise_gaussian_zero_variance_is_an_inclusive_comparison(mean, expect_
     ],
 )
 def test_gaussian_belief_rejects_nonfinite_inputs(mean, covariance, message):
-    t = lambda v: torch.as_tensor(v, dtype=torch.float64)
+    mean, covariance = (torch.as_tensor(v, dtype=torch.float64) for v in (mean, covariance))
     with pytest.raises(ValueError, match=message):
-        GaussianBelief(t(mean), t(covariance))
+        GaussianBelief(mean, covariance)
 
 
 def test_gaussian_belief_rejects_an_asymmetric_full_covariance():
