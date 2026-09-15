@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
-from models.dynamics import GaussianBelief, create_gaussian_belief_trajectory
+from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
 from pdstl.operators import LessThan
 from planning.examples import (
     end_to_end_setup,

@@ -17,7 +17,8 @@ from scipy.special import ndtr
 import yaml
 
 import models.dynamics
-from models.dynamics import create_gaussian_belief_trajectory, piecewise_signal
+from models.beliefs import create_gaussian_belief_trajectory
+from experiments.signals import piecewise_signal
 from pdstl.operators import Always, Eventually, GreaterThan
 from utils import to_steps
 from visualization.temporal import plot_temporal_example
@@ -223,7 +224,7 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
 def test_examples_configuration_holds_only_numerical_example_data():
     config = _config()
     assert set(config) == {
-        "show_plots", "enclosure_reach", "end_to_end_reach", "end_to_end_mpc_reach", *EXAMPLES
+        "show_plots", "end_to_end_reach", "end_to_end_mpc_reach", *EXAMPLES
     }
 
     shared = {"threshold", "values"}
@@ -235,13 +236,6 @@ def test_examples_configuration_holds_only_numerical_example_data():
     }
     for name in EXAMPLES:
         assert all(len(pair) == 2 for pair in config[name]["values"])
-
-    enclosure = config["enclosure_reach"]
-    assert set(enclosure) == {
-        "threshold", "interval_steps", "H", "dt", "u_max", "q_std",
-        "lower0", "upper0", "covariance0", "d_lower", "d_upper", "seed", "planner",
-    }
-    assert len(enclosure["lower0"]) == len(enclosure["upper0"]) == 2
 
     end_to_end = config["end_to_end_reach"]
     assert set(end_to_end) == {
@@ -263,7 +257,8 @@ def test_offline_module_and_signal_dispatcher_remain_absent():
 
 def test_reusable_modules_do_not_run_examples_or_eagerly_import_planning():
     code = (
-        "import sys; import models.dynamics; import pdstl.base; "
+        "import sys; import models.dynamics; import models.beliefs; "
+        "import models.rollouts; import experiments.signals; import pdstl.base; "
         "assert 'visualization.planning' not in sys.modules; "
         "assert 'visualization.live_plots' not in sys.modules; "
         "assert 'visualization.animation' not in sys.modules"
@@ -293,7 +288,6 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
         "Always",
         "Eventually",
         "Nested",
-        "EnclosureReach",
         "EndToEndReach",
         "EndToEndMPCReach",
     ]
@@ -306,9 +300,9 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
 @pytest.mark.parametrize(
     "flags",
     [
-        ("run", "run", "run", "run", "run", "run"),
-        ("run", "skip", "run", "skip", "run", "skip"),
-        ("skip", "skip", "skip", "skip", "skip", "run"),
+        ("run", "run", "run", "run", "run"),
+        ("run", "skip", "run", "run", "skip"),
+        ("skip", "skip", "skip", "skip", "run"),
     ],
 )
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
@@ -344,3 +338,16 @@ def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
     assert result.stderr.count("Skipping the block") == len(flags) - ran
     for (_, name), flag in zip(_main_blocks(source), flags):
         assert (f"\n{name}\n" in result.stdout) == (flag == "run")
+
+
+def test_piecewise_signal_returns_time_mean_and_variance():
+    time, mean, variance = piecewise_signal([[45.0, 4.0], [55.0, 9.0]])
+    np.testing.assert_allclose(time, [0.0, 1.0])
+    np.testing.assert_allclose(mean, [45.0, 55.0])
+    np.testing.assert_allclose(variance, [4.0, 9.0])
+    assert len(piecewise_signal()[0]) == 7
+
+
+def test_piecewise_signal_rejects_non_pair_values():
+    with pytest.raises(ValueError, match=r"\[T, 2\]"):
+        piecewise_signal([[45.0, 4.0, 1.0]])

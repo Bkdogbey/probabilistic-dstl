@@ -117,9 +117,8 @@ def plot_case(
     formula_trace    : [B, K, 2] or [K, 2] formula bounds, K <= T
     mean_trace       : [T] mean of the constrained state component
     var_trace        : [T] variance of that component
-    lower_trace, upper_trace : [T] explicit descriptor bounds of the state
-        component, when the belief is a propagated enclosure rather than a
-        point mean. Takes precedence over mean_trace for panel (a); var_trace
+    lower_trace, upper_trace : [T] optional, explicitly supplied state bands.
+        Takes precedence over mean_trace for panel (a); var_trace
         may still be given alongside them and is drawn as a separate,
         visually distinct residual-spread envelope, not folded into the
         descriptor band.
@@ -218,9 +217,9 @@ def plot_synthesis(
     """Initial vs optimized behaviour plus a compact objective history.
 
     `initial` and `optimized` are dicts with a ``formula`` key (the directly
-    evaluated bound trace) plus either ``mean``/``var`` (a point-mass belief,
-    band drawn as mean +- sigma) or ``lower``/``upper`` (a propagated
-    descriptor enclosure, band drawn from the bounds directly; ``var`` may
+    evaluated bound trace) plus either ``mean``/``var`` (a Gaussian mean with
+    a mean +- sigma band) or ``lower``/``upper`` (explicit state bands,
+    drawn from the supplied bounds directly; ``var`` may
     still be given alongside them for a separate residual-spread envelope).
     """
     time = np.asarray(time)

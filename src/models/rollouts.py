@@ -2,24 +2,34 @@ from typing import NamedTuple
 
 import torch
 
-from models.dynamics import (
-    create_enclosure_belief_trajectory,
-    create_gaussian_belief_trajectory,
-)
+from models.beliefs import create_gaussian_belief_trajectory
 from pdstl.base import BeliefTrajectory
 
 
 class BeliefRollout(NamedTuple):
-    """Predicted beliefs for one control sequence, plus traces for costs and plots."""
+    """Predicted beliefs, with optional traces for costs and plots.
+
+    Only belief_trajectory defines the semantics consumed by pdSTL. Diagnostics
+    neither identify the belief representation nor replace its probability bounds.
+    """
 
     belief_trajectory: BeliefTrajectory
-    nominal_trace: torch.Tensor  # [1, T+1, D]
-    aux: dict
+    nominal_trace: torch.Tensor | None = None  # [1, T+1, D], when supplied
+    aux: dict[str, torch.Tensor] | None = None
 
-    def detached(self):
+    def detach_diagnostics(self):
+        """Detach optional tensors, preserving the original belief trajectory.
+
+        This does not detach beliefs or promise a graph-free rollout.
+        """
         return self._replace(
-            nominal_trace=self.nominal_trace.detach(),
-            aux={name: trace.detach() for name, trace in self.aux.items()},
+            nominal_trace=(
+                None if self.nominal_trace is None else self.nominal_trace.detach()
+            ),
+            aux=(
+                None if self.aux is None
+                else {name: trace.detach() for name, trace in self.aux.items()}
+            ),
         )
 
 
@@ -32,22 +42,6 @@ def gaussian_rollout(dynamics, mean0, cov0):
             create_gaussian_belief_trajectory(mean_trace[0], cov_trace[0]),
             mean_trace,
             {"mean_trace": mean_trace, "cov_trace": cov_trace},
-        )
-
-    return rollout
-
-
-def enclosure_rollout(dynamics, lower0, upper0, cov0, d_lower=None, d_upper=None):
-    """v -> BeliefRollout of enclosure beliefs; nominal trace is the midpoint."""
-
-    def rollout(v):
-        lower_trace, upper_trace, cov_trace = dynamics.rollout_enclosure(
-            v, lower0, upper0, cov0, d_lower, d_upper
-        )
-        return BeliefRollout(
-            create_enclosure_belief_trajectory(lower_trace[0], upper_trace[0], cov_trace[0]),
-            (lower_trace + upper_trace) / 2,
-            {"lower_trace": lower_trace, "upper_trace": upper_trace, "cov_trace": cov_trace},
         )
 
     return rollout

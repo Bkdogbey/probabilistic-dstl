@@ -6,21 +6,17 @@ import pytest
 import torch
 from scipy.stats import norm
 
-from models.dynamics import SingleIntegrator, create_enclosure_belief_trajectory
+from models.dynamics import SingleIntegrator
 from models.rollouts import gaussian_rollout
-from pdstl.operators import Eventually, GreaterThan
 from planning.examples import (
     CASES,
-    _enclosure_initial_state,
     _initial_controls,
     _initial_state,
     build_case,
     evaluate_direct,
-    load_enclosure_reach_config,
     load_examples_config,
     run_always_step_zero,
     run_case,
-    run_enclosure_reach,
     run_mpc_check,
 )
 from utils import get_device
@@ -260,104 +256,3 @@ def test_every_named_case_runs():
         assert len(result["interval_final"]) == 2
         lo, hi = result["interval_final"]
         assert lo <= hi + 1e-6
-
-
-# --- 6. Enclosure rollout -> pdSTL -> control optimisation ------------------
-
-# Self-contained, so the regression does not follow edits to configs/examples.yaml.
-# Reachable: 8 steps of dt=0.5 at |u| <= 1 cover 4.0 > threshold 2.5.
-ENCLOSURE_CFG = {
-    "threshold": 2.5,
-    "interval_steps": [1, 8],
-    "H": 8,
-    "dt": 0.5,
-    "u_max": 1.0,
-    "q_std": 0.05,
-    "lower0": [0.0, 0.0],
-    "upper0": [0.3, 0.3],
-    "covariance0": [0.09, 0.09],
-    "d_lower": [-0.02, -0.02],
-    "d_upper": [0.03, 0.03],
-    "seed": 0,
-    "planner": {
-        "w_phi": 10.0,
-        "w_u": 0.0,
-        "w_du": 0.0,
-        "w_dist": 0.0,
-        "w_obs": 0.0,
-        "w_visit": 0.0,
-        "scale": -1,
-        "lr": 0.05,
-        "max_iters": 500,
-    },
-}
-
-
-def test_enclosure_gradient_is_finite_and_nonzero_under_direct_evaluation():
-    """The pdSTL lower endpoint's gradient with respect to controls, through
-    the actual enclosure-rollout -> belief -> predicate path this example
-    uses, evaluated directly (scale <= 0), not smoothed."""
-    cfg, planner_cfg = load_enclosure_reach_config(ENCLOSURE_CFG)
-    device = get_device()
-    dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
-    lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
-    spec = Eventually(GreaterThan(cfg["threshold"], dim=0), interval=cfg["interval_steps"])
-
-    v = torch.zeros(cfg["H"], 2, device=device, requires_grad=True)
-    lower, upper, cov = dyn.rollout_enclosure(v, lower0, upper0, covariance0, d_lower, d_upper)
-    traj = create_enclosure_belief_trajectory(lower[0], upper[0], cov[0])
-    spec(traj, scale=planner_cfg["scale"])[0, 0, 0].backward()
-
-    assert v.grad is not None
-    assert torch.isfinite(v.grad).all()
-    assert v.grad.abs().sum() > 0
-
-
-def test_enclosure_optimisation_improves_the_directly_evaluated_lower_endpoint():
-    result = run_enclosure_reach(cfg=ENCLOSURE_CFG, save=False, verbose=False)
-
-    lo_initial = result["interval_initial"][0]
-    lo_final = result["interval_final"][0]
-    assert lo_final > lo_initial + 0.05
-    # a meaningful demonstration starts away from both saturation ends
-    assert 0.001 < lo_initial < 0.95
-    assert lo_final > 0.95  # and actually reaches the goal, not just improves
-
-
-def test_enclosure_controls_reproduce_the_reported_interval_and_bounds():
-    """Replaying the returned physical controls reproduces the reported
-    enclosure (lower, upper, covariance) and pdSTL interval."""
-    cfg, _ = load_enclosure_reach_config(ENCLOSURE_CFG)
-    device = get_device()
-    dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
-    lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
-    spec = Eventually(GreaterThan(cfg["threshold"], dim=0), interval=cfg["interval_steps"])
-
-    result = run_enclosure_reach(cfg=ENCLOSURE_CFG, save=False, verbose=False)
-
-    assert result["lower_mismatch"] < 1e-5
-
-    v_replay = torch.atanh(torch.clamp(result["controls"] / dyn.u_max, -0.999999, 0.999999))
-    lower_replay, upper_replay, cov_replay = dyn.rollout_enclosure(
-        v_replay, lower0, upper0, covariance0, d_lower, d_upper
-    )
-    traj_replay = create_enclosure_belief_trajectory(
-        lower_replay[0], upper_replay[0], cov_replay[0]
-    )
-    interval_replay = evaluate_direct(spec, traj_replay)[0, 0].tolist()
-
-    torch.testing.assert_close(lower_replay, result["lower_trace"], atol=1e-5, rtol=0)
-    torch.testing.assert_close(upper_replay, result["upper_trace"], atol=1e-5, rtol=0)
-    torch.testing.assert_close(cov_replay, result["cov_trace"], atol=1e-5, rtol=0)
-    np.testing.assert_allclose(interval_replay, result["interval_final"], atol=1e-5)
-
-
-def test_enclosure_is_never_collapsed_to_its_midpoint():
-    """The belief the optimiser scores is built from the real enclosure
-    bounds, not a point at the descriptor midpoint -- lower and upper
-    genuinely differ throughout, and covariance is a rollout output, never a
-    trainable parameter."""
-    result = run_enclosure_reach(cfg=ENCLOSURE_CFG, save=False, verbose=False)
-
-    assert not torch.allclose(result["lower_trace"], result["upper_trace"])
-    assert not result["cov_trace"].requires_grad

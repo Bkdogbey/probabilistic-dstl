@@ -21,7 +21,7 @@ from pdstl.operators import (
 )
 from planning import log_utils
 from models.dynamics import SingleIntegrator
-from models.rollouts import enclosure_rollout, gaussian_rollout
+from models.rollouts import gaussian_rollout
 from planning.planner import Planner
 from planning.simulation import simulate_gaussian_step
 from utils import get_device, load_config
@@ -383,130 +383,6 @@ def run_mpc_check(verbose=True):
             f"{b0} -> {steps[-1]['window'][1] if steps else b0}, never restarted"
         )
     return steps
-
-
-# --- Enclosure-rollout control example -------------------------------------
-
-
-def load_enclosure_reach_config(cfg=None):
-    """Example parameters merged with the planner defaults.
-
-    cfg defaults to the ``enclosure_reach`` section of configs/examples.yaml;
-    tests pass their own so they do not depend on the editable example file.
-    """
-    if cfg is None:
-        cfg = load_config("configs/examples.yaml")["enclosure_reach"]
-    planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
-    return cfg, planner_cfg
-
-
-def _enclosure_initial_state(cfg, device):
-    lower0 = torch.tensor(cfg["lower0"], device=device, dtype=torch.float32)
-    upper0 = torch.tensor(cfg["upper0"], device=device, dtype=torch.float32)
-    covariance0 = torch.diag(
-        torch.tensor(cfg["covariance0"], device=device, dtype=torch.float32)
-    )
-    d_lower = torch.tensor(cfg["d_lower"], device=device, dtype=torch.float32)
-    d_upper = torch.tensor(cfg["d_upper"], device=device, dtype=torch.float32)
-    return lower0, upper0, covariance0, d_lower, d_upper
-
-
-def run_enclosure_reach(*, cfg=None, show=False, save=True, verbose=True):
-    """Propagate a descriptor enclosure through SingleIntegrator and optimise
-    controls to raise Eventually(x[0] >= c)'s exact lower endpoint.
-
-    The state's uncertainty has two independent parts throughout: the
-    descriptor bounds [lower, upper] (a set-valued location, propagated by
-    rollout_enclosure) and the residual covariance (Gaussian noise around any
-    admissible location). Neither is derived from the other, and the belief
-    is never collapsed to the descriptor midpoint.
-    """
-    cfg, planner_cfg = load_enclosure_reach_config(cfg)
-    device = get_device()
-    H = cfg["H"]
-
-    dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
-    lower0, upper0, covariance0, d_lower, d_upper = _enclosure_initial_state(cfg, device)
-
-    rollout = enclosure_rollout(dyn, lower0, upper0, covariance0, d_lower, d_upper)
-
-    spec = Eventually(GreaterThan(cfg["threshold"], dim=0), interval=cfg["interval_steps"])
-    time = [t * cfg["dt"] for t in range(H + 1)]
-
-    planner = Planner(dyn, None, H, config=planner_cfg)
-
-    # The same seed draws the planner's random initial controls twice, so the
-    # displayed initial trajectory is exactly where the optimiser starts.
-    torch.manual_seed(cfg["seed"])
-    initial = rollout(planner._init_controls(None).detach())
-    interval_init = evaluate_direct(spec, initial.belief_trajectory)
-    lower_init, upper_init, cov_init = (initial.aux[k] for k in ("lower_trace", "upper_trace", "cov_trace"))
-
-    torch.manual_seed(cfg["seed"])
-    best, history = planner.optimize_window(rollout, spec=spec, verbose=verbose)
-
-    final = rollout(controls_to_params(dyn, best.controls))
-    interval_final = evaluate_direct(spec, final.belief_trajectory)
-    lower_final, upper_final, cov_final = (final.aux[k].detach() for k in ("lower_trace", "upper_trace", "cov_trace"))
-    lower_mismatch = (lower_final - best.rollout.aux["lower_trace"]).abs().max().item()
-
-    result = {
-        "interval_initial": interval_init.detach()[0, 0].tolist(),
-        "interval_final": interval_final.detach()[0, 0].tolist(),
-        "controls": best.controls,
-        "lower_trace": lower_final,
-        "upper_trace": upper_final,
-        "cov_trace": cov_final,
-        "history": history,
-        "objective": best.objective,
-        "lower_mismatch": lower_mismatch,
-    }
-
-    if verbose:
-        lo_i, hi_i = result["interval_initial"]
-        lo_f, hi_f = result["interval_final"]
-        log_utils._log.info(
-            f"[enclosure_reach] {spec}\n"
-            f"    hard interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
-            f"  ->  final [{lo_f:.4f}, {hi_f:.4f}]\n"
-            f"    objective {best.objective:.4f} | replay mismatch {lower_mismatch:.2e}"
-        )
-
-    if save or show:
-        base = os.path.join(OUTPUT_DIR, "enclosure_reach")
-        plot_case(
-            time,
-            interval_final.detach(),
-            lower_trace=lower_final.detach()[0, :, 0],
-            upper_trace=upper_final.detach()[0, :, 0],
-            var_trace=cov_final.detach()[0, :, 0, 0],
-            thresholds=[cfg["threshold"]],
-            title=f"enclosure_reach: {spec}",
-            save_path=f"{base}_case.png" if save else None,
-            show=show,
-        )
-        plot_synthesis(
-            time,
-            {
-                "lower": lower_init.detach()[0, :, 0],
-                "upper": upper_init.detach()[0, :, 0],
-                "var": cov_init.detach()[0, :, 0, 0],
-                "formula": interval_init.detach(),
-            },
-            {
-                "lower": lower_final.detach()[0, :, 0],
-                "upper": upper_final.detach()[0, :, 0],
-                "var": cov_final.detach()[0, :, 0, 0],
-                "formula": interval_final.detach(),
-            },
-            history,
-            thresholds=[cfg["threshold"]],
-            title="enclosure_reach: initial vs optimised",
-            save_path=f"{base}_synthesis.png" if save else None,
-            show=show,
-        )
-
-    return result
 
 
 # --- End-to-end planning smoke test ----------------------------------------

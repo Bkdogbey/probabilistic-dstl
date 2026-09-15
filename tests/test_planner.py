@@ -1,5 +1,6 @@
 """Planner contract: silent when asked, independent of the belief type."""
 
+import ast
 import logging
 from pathlib import Path
 
@@ -37,15 +38,18 @@ def test_quiet_optimisation_emits_no_log_records(caplog):
     assert caplog.records == []
 
 
-def _probability_rollout(dynamics, event):
+def _probability_rollout(dynamics, event, *, diagnostics=True):
     """A non-Gaussian upstream model: p_k = sigmoid(4 (progress_k - 1)), bounds [0.9 p, p]."""
 
     def rollout(v):
         progress = torch.cat([torch.zeros(1), torch.cumsum(dynamics.bound_control(v)[:, 0], 0) * 0.5])
         p = torch.sigmoid(4.0 * (progress - 1.0))
         bounds = torch.stack([0.9 * p, p], dim=-1)
+        trajectory = create_probability_belief_trajectory(event, bounds)
+        if not diagnostics:
+            return BeliefRollout(trajectory)
         nominal = progress.reshape(1, -1, 1)
-        return BeliefRollout(create_probability_belief_trajectory(event, bounds), nominal, {})
+        return BeliefRollout(trajectory, nominal, {})
 
     return rollout
 
@@ -66,9 +70,131 @@ def test_planner_optimises_a_belief_rollout_it_knows_nothing_about():
 
 
 def test_planner_source_builds_no_concrete_beliefs():
-    source = (ROOT / "src/planning/planner.py").read_text()
-    for name in ("create_gaussian_belief_trajectory", "create_enclosure_belief_trajectory", "GaussianBelief("):
+    source = (ROOT / "src/planning/planner.py").read_text(encoding="utf-8")
+    for name in ("create_gaussian_belief_trajectory", "GaussianBelief("):
         assert name not in source
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+            assert all(
+                "Belief" not in alias.name or alias.name == "BeliefRollout"
+                for alias in node.names
+            )
+        else:
+            continue
+        assert all(
+            not module.startswith("models") or module == "models.rollouts"
+            for module in modules
+        )
+
+
+def test_pdstl_imports_no_model_implementation():
+    for path in (ROOT / "src/pdstl").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or "", *(alias.name for alias in node.names)]
+            else:
+                continue
+            assert not any(
+                name.split(".")[0] in {"models", "planning", "baselines", "experiments"}
+                or "Gaussian" in name
+                for name in names
+            ), path
+
+
+def test_planner_optimises_without_diagnostics_with_control_regularisation():
+    planner = _planner(max_iters=100, alpha=2.0)
+    event = Predicate("reach")
+    spec = Eventually(event, interval=[0, 3])
+    rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
+    initial = spec(rollout(torch.zeros(3, 2)).belief_trajectory)[0, 0, 0].item()
+
+    best, history = planner.optimize_window(
+        rollout, spec=spec, init_guess=torch.zeros(3, 2)
+    )
+
+    assert planner.cfg["w_u"] > 0 and planner.cfg["w_du"] > 0
+    assert best.rollout.nominal_trace is None
+    assert best.rollout.aux is None
+    assert best.hard_score > initial + 0.2
+    assert best.objective == min(history)
+    replay = rollout(torch.atanh(best.controls / planner.dyn.u_max))
+    smooth, hard = planner._scores(spec, replay.belief_trajectory)
+    objective = planner._objective(None, best.controls, smooth)
+    assert objective.item() == pytest.approx(best.objective, abs=1e-5)
+    torch.testing.assert_close(hard, torch.tensor(best.hard_interval))
+
+
+@pytest.mark.parametrize("scale", [-1.0, 5.0])
+def test_belief_only_rollout_keeps_gradients_to_controls(scale):
+    planner = _planner(scale=scale)
+    event = Predicate("reach")
+    rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
+    v = torch.zeros(3, 2, requires_grad=True)
+    predicted = rollout(v)
+    smooth, _ = planner._scores(
+        Eventually(event, interval=[0, 3]), predicted.belief_trajectory
+    )
+    objective = planner._objective(None, planner.dyn.bound_control(v), smooth)
+    objective.backward()
+
+    assert v.grad is not None
+    assert torch.isfinite(v.grad).all()
+    assert v.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("heuristic", ["w_dist", "w_obs", "w_visit"])
+def test_enabled_shaping_requires_nominal_trace(heuristic):
+    planner = _planner(**{heuristic: 1.0})
+    event = Predicate("reach")
+    rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
+
+    with pytest.raises(ValueError, match=rf"{heuristic}.*nominal_trace"):
+        planner.optimize_window(
+            rollout, spec=Eventually(event, interval=[0, 3]),
+            init_guess=torch.zeros(3, 2),
+        )
+
+
+@pytest.mark.parametrize("with_nominal", [False, True])
+@pytest.mark.parametrize("aux_kind", ["absent", "empty", "populated"])
+def test_detach_diagnostics_preserves_beliefs_and_handles_optional_fields(
+    with_nominal, aux_kind
+):
+    event = Predicate("reach")
+    v = torch.zeros(3, 2, requires_grad=True)
+    original = _probability_rollout(SingleIntegrator(), event)(v)
+    nominal = original.nominal_trace if with_nominal else None
+    aux = None if aux_kind == "absent" else {}
+    if aux_kind == "populated":
+        aux["progress"] = original.nominal_trace
+    predicted = BeliefRollout(original.belief_trajectory, nominal, aux)
+
+    detached = predicted.detach_diagnostics()
+
+    assert detached.belief_trajectory is predicted.belief_trajectory
+    if nominal is None:
+        assert detached.nominal_trace is None
+    else:
+        torch.testing.assert_close(detached.nominal_trace, nominal)
+        assert not detached.nominal_trace.requires_grad
+        assert nominal.requires_grad
+    if aux is None:
+        assert detached.aux is None
+    else:
+        assert detached.aux is not aux
+        assert detached.aux.keys() == aux.keys()
+        for name, trace in aux.items():
+            torch.testing.assert_close(detached.aux[name], trace)
+            assert not detached.aux[name].requires_grad
+            assert trace.requires_grad
+    event(detached.belief_trajectory).sum().backward()
+    assert torch.isfinite(v.grad).all()
+    assert v.grad.abs().sum() > 0
 
 
 def test_legacy_environment_solve_modes_still_run():

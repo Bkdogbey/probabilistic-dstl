@@ -6,7 +6,7 @@ import pytest
 import torch
 from scipy.stats import norm
 
-from models.dynamics import GaussianBelief
+from models.beliefs import GaussianBelief
 from pdstl.base import (
     BeliefTrajectory,
     OnlineBeliefTrajectory,

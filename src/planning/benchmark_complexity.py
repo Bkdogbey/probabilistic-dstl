@@ -20,7 +20,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from models.dynamics import SingleIntegrator, create_gaussian_belief_trajectory
+from models.dynamics import SingleIntegrator
+from models.beliefs import create_gaussian_belief_trajectory
 from experiments.planning import build_environment, load_scenario_config
 
 

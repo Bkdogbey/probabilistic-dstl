@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
-from models.dynamics import create_gaussian_belief_trajectory
+from models.beliefs import create_gaussian_belief_trajectory
 from planning.examples import (
     end_to_end_setup,
     load_end_to_end_config,

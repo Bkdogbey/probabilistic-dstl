@@ -1,6 +1,7 @@
 import numpy as np
 
-from models.dynamics import create_gaussian_belief_trajectory, piecewise_signal
+from models.beliefs import create_gaussian_belief_trajectory
+from experiments.signals import piecewise_signal
 from pdstl.operators import Always, Eventually, GreaterThan
 from utils import load_config, skip_run
 from visualization.temporal import plot_temporal_example, print_temporal_results
@@ -85,15 +86,7 @@ with skip_run("run", "Nested") as check, check():
     )
 
 
-# 4. EnclosureReach: control optimisation over a propagated descriptor enclosure
-with skip_run("run", "EnclosureReach") as check, check():
-    from planning.examples import run_enclosure_reach
-
-    print("\nEnclosureReach")
-    run_enclosure_reach(show=show_plots, save=True, verbose=True)
-
-
-# 5. EndToEndReach: controls -> Gaussian prediction -> p_k -> Eventually -> loss -> gradient
+# 4. EndToEndReach: controls -> Gaussian prediction -> p_k -> Eventually -> loss -> gradient
 with skip_run("run", "EndToEndReach") as check, check():
     from planning.examples import run_end_to_end_reach
 
@@ -101,7 +94,7 @@ with skip_run("run", "EndToEndReach") as check, check():
     run_end_to_end_reach(show=show_plots, save=True, verbose=True)
 
 
-# 6. EndToEndMPCReach: plan H steps -> execute first control -> update belief -> replan
+# 5. EndToEndMPCReach: plan H steps -> execute first control -> update belief -> replan
 with skip_run("run", "EndToEndMPCReach") as check, check():
     from planning.examples import run_end_to_end_mpc_reach
 

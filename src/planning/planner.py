@@ -109,6 +109,10 @@ class Planner:
         )
         for key, term in shaping:
             if self.cfg[key]:
+                if nominal_trace is None:
+                    raise ValueError(
+                        f"{key} shaping requires a rollout nominal_trace"
+                    )
                 objective = objective + self.cfg[key] * term(nominal_trace)
         return objective
 
@@ -123,7 +127,11 @@ class Planner:
         return smooth[0], hard
 
     def optimize_window(self, rollout, *, spec=None, env=None, init_guess=None, verbose=False):
-        """Optimise controls for one window. Returns (best PlanCandidate, objective history)."""
+        """Optimise rollout(v) -> BeliefRollout for one window.
+
+        pdSTL evaluates only the belief trajectory. A nominal trace is required
+        only for enabled heuristic shaping. Returns (best candidate, history).
+        """
         saved_env = self.env
         if env is not None:
             self.env = env
@@ -145,7 +153,7 @@ class Planner:
 
             candidate = PlanCandidate(
                 controls=controls.detach().clone(),
-                rollout=predicted.detached(),
+                rollout=predicted.detach_diagnostics(),
                 smooth_score=smooth_score.item(),
                 hard_score=hard_interval[0].item(),
                 hard_interval=tuple(hard_interval.tolist()),

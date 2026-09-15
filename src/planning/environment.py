@@ -13,9 +13,9 @@ def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
     Parameters
     ----------
     belief_trajectory : list of GaussianBelief
-        Beliefs are read through their generic ``value()``/``covariance``
-        surface only, not their enclosure bounds -- this stays an exact-Gaussian
-        (collapsed-enclosure) helper for the predicates below.
+        This helper reads ``value()`` and ``covariance`` for the legacy Gaussian
+        environment predicates below. Generic pdSTL evaluation instead uses
+        each belief's ``probability_bounds(predicate)`` contract.
     diagonal_only : bool
         If True, extract only the diagonal of full covariance matrices,
         returning var of shape [Batch, Time, Dim].
