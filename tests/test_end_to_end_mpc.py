@@ -57,7 +57,7 @@ def _assert_valid_covariance(cov):
 # A
 def test_planner_replans_multiple_times(result):
     assert _replans(result) >= 2
-    assert len(result["hard_scores"]) == len(result["plan_controls"]) == _replans(result)
+    assert len(result["exact_lowers"]) == len(result["plan_controls"]) == _replans(result)
 
 
 # B
@@ -110,7 +110,7 @@ def test_control_limits_are_respected(result):
 def test_states_covariances_controls_and_scores_are_finite(result):
     for key in ("mean_trace", "cov_trace", "u_trace"):
         assert torch.isfinite(result[key]).all(), key
-    assert all(math.isfinite(s) for s in result["hard_scores"])
+    assert all(math.isfinite(s) for s in result["exact_lowers"])
     assert all(math.isfinite(j) for j in result["objectives"])
     for cov in result["cov_trace"][0]:
         _assert_valid_covariance(cov)
@@ -150,7 +150,7 @@ def test_progress_comes_from_the_pdstl_objective(result, config):
     # the optimiser moved away from the initial guess in the very first window
     init = torch.tensor(cfg["init_control"])
     assert (result["plan_controls"][0][0] - init).abs().max() > 0.1
-    assert result["hard_scores"][-1] > result["hard_scores"][0]
+    assert result["exact_lowers"][-1] > result["exact_lowers"][0]
 
 
 # I

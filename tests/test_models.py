@@ -119,7 +119,7 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     environment = Environment()
     environment.set_goal([0.5, 1.5], [-0.5, 0.5])
     planner = Planner(
-        SingleIntegrator(), environment, 3, config={"max_iters": 1, "scale": -1}
+        SingleIntegrator(), environment, 3, config={"max_iters": 1}
     )
     best, history = planner.optimize_window(
         gaussian_rollout(planner.dyn, torch.tensor([0.0, 0.0]), torch.eye(2) * 0.1),
@@ -128,7 +128,7 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     assert best.rollout.aux["mean_trace"].shape == (1, 4, 2)
     assert best.rollout.aux["cov_trace"].shape == (1, 4, 2, 2)
     assert best.controls.shape == (3, 2)
-    assert 0 <= best.hard_score <= 1
+    assert 0 <= best.exact_lower <= 1
     assert len(history) == 1
     assert torch.isfinite(torch.tensor(history)).all()
 

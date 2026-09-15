@@ -1,7 +1,13 @@
-"""pdSTL operators on [B, N, 2] probability-interval traces (Frechet Boolean, windowed temporal)."""
+"""pdSTL operators on [B, N, 2] probability-interval traces (Frechet Boolean, windowed temporal).
+
+scale <= 0 gives the exact semantics; scale = beta > 0 gives a smooth optimization surrogate.
+"""
+
+import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from pdstl.base import check_probability_bounds
 
@@ -29,21 +35,26 @@ class STL_Formula(torch.nn.Module):
         return Negation(self)
 
 
+def _smooth_max(x, beta, dim, keepdim):
+    """Normalized log-mean-exp: lies in [mean, max] and tends to max as beta grows."""
+    return (torch.logsumexp(beta * x, dim=dim, keepdim=keepdim) - math.log(x.shape[dim])) / beta
+
+
 class Minish(torch.nn.Module):
-    """Exact (scale <= 0) or log-sum-exp smooth minimum along dim."""
+    """Exact min (scale <= 0) or normalized smooth min along dim."""
 
     def forward(self, x, scale, dim=1, keepdim=True):
         if scale > 0:
-            return -torch.logsumexp(-x * scale, dim=dim, keepdim=keepdim) / scale
+            return -_smooth_max(-x, scale, dim, keepdim)
         return x.min(dim=dim, keepdim=keepdim)[0]
 
 
 class Maxish(torch.nn.Module):
-    """Exact (scale <= 0) or log-sum-exp smooth maximum along dim."""
+    """Exact max (scale <= 0) or normalized smooth max along dim."""
 
     def forward(self, x, scale, dim=1, keepdim=True):
         if scale > 0:
-            return torch.logsumexp(x * scale, dim=dim, keepdim=keepdim) / scale
+            return _smooth_max(x, scale, dim, keepdim)
         return x.max(dim=dim, keepdim=keepdim)[0]
 
 
@@ -101,14 +112,15 @@ def _align(*traces):
     return tuple(t[:, :n] for t in traces)
 
 
-def _conjunction(trace1, trace2):
-    """[max(0, L1 + L2 - 1), min(U1, U2)]"""
-    lower = torch.clamp(trace1[..., 0] + trace2[..., 0] - 1.0, min=0.0)
+def _conjunction(trace1, trace2, scale=-1):
+    """[max(0, L1 + L2 - 1), min(U1, U2)]; the lower clamp becomes softplus when scale > 0."""
+    excess = trace1[..., 0] + trace2[..., 0] - 1.0
+    lower = F.softplus(excess, beta=scale) if scale > 0 else torch.clamp(excess, min=0.0)
     upper = torch.minimum(trace1[..., 1], trace2[..., 1])
     return torch.stack([lower, upper], dim=-1)
 
 
-def _disjunction(trace1, trace2):
+def _disjunction(trace1, trace2, scale=-1):
     """[max(L1, L2), min(1, U1 + U2)]"""
     lower = torch.maximum(trace1[..., 0], trace2[..., 0])
     upper = torch.clamp(trace1[..., 1] + trace2[..., 1], max=1.0)
@@ -153,7 +165,7 @@ class _Binary(STL_Formula):
     def robustness_trace(self, belief_trajectory, **kwargs):
         trace1 = self.subformula1(belief_trajectory, **kwargs)
         trace2 = self.subformula2(belief_trajectory, **kwargs)
-        return type(self).combine(*_align(trace1, trace2))
+        return type(self).combine(*_align(trace1, trace2), scale=kwargs.get("scale", -1))
 
     def __str__(self):
         return f"({self.subformula1}) {self.symbol} ({self.subformula2})"
@@ -346,7 +358,7 @@ class Until(STL_Formula):
             for tau in range(t + a, min(t + b, T - 1) + 1):
                 # Inclusive: φ must hold from t through the witness τ.
                 prefix = self.min_op(phi[:, t : tau + 1, :], scale, dim=1, keepdim=False)
-                candidates.append(_conjunction(prefix, psi[:, tau, :]))
+                candidates.append(_conjunction(prefix, psi[:, tau, :], scale))
             results.append(self.max_op(torch.stack(candidates, dim=1), scale, dim=1, keepdim=False))
         return torch.stack(results, dim=1)
 

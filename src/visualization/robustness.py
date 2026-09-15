@@ -322,7 +322,7 @@ def plot_mpc_reach(
     """Receding-horizon run: executed state, per-window plans, scores and applied controls."""
     executed = _to_array(result["mean_trace"])[0, :, dim]
     controls = _to_array(result["u_trace"])[0]
-    scores = np.asarray(result["hard_scores"])
+    scores = np.asarray(result["exact_lowers"])
     time = dt * np.arange(len(executed))
 
     fig, (ax_state, ax_score, ax_u) = plt.subplots(3, 1, figsize=figsize, sharex=True)

@@ -14,10 +14,12 @@ class PlanCandidate(NamedTuple):
 
     controls: torch.Tensor
     rollout: BeliefRollout
-    smooth_score: float
-    hard_score: float
-    hard_interval: tuple
+    optimization_score: float  # smooth surrogate used for gradients; not a probability bound
+    exact_lower: float
+    pdstl_interval: tuple  # exact [R_lower, R_upper]
+    control_cost: float
     objective: float
+    iteration: int | None = None
 
 
 class Planner:
@@ -29,7 +31,9 @@ class Planner:
         self.T = T
         self.device = dynamics.device
 
-        self.cfg = {**load_config("configs/planning.yaml"), **(config or {})}
+        defaults, config = load_config("configs/planning.yaml"), config or {}
+        self.cfg = {**defaults, **config}
+        self.cfg["smoothing"] = {**defaults["smoothing"], **config.get("smoothing", {})}
 
     def _control_parameters(self, controls):
         """Inverse of bound_control, clipped inside the bound."""
@@ -103,15 +107,14 @@ class Planner:
             loss = loss + torch.sum(min_dist_sq)
         return loss
 
-    def _objective(self, nominal_trace, controls, smooth_score):
-        """J = -w_phi * smooth_score + w_u |u|^2 + w_du (|du|^2 + |u_0|^2) + shaping."""
-        control_cost = torch.sum(controls ** 2)
-        smoothness_cost = torch.sum((controls[1:] - controls[:-1]) ** 2) + torch.sum(controls[0] ** 2)
-        objective = (
-            -self.cfg["w_phi"] * smooth_score
-            + self.cfg["w_u"] * control_cost
-            + self.cfg["w_du"] * smoothness_cost
-        )
+    def _control_cost(self, controls):
+        """w_u |u|^2 + w_du (|du|^2 + |u_0|^2)."""
+        smoothness = torch.sum((controls[1:] - controls[:-1]) ** 2) + torch.sum(controls[0] ** 2)
+        return self.cfg["w_u"] * torch.sum(controls**2) + self.cfg["w_du"] * smoothness
+
+    def _objective(self, nominal_trace, controls, optimization_score):
+        """J = -w_phi * optimization_score + control cost + enabled shaping."""
+        objective = -self.cfg["w_phi"] * optimization_score + self._control_cost(controls)
         shaping = (
             ("w_dist", self._goal_dist_loss),
             ("w_obs", self._obs_repulsion_loss),
@@ -126,46 +129,62 @@ class Planner:
                 objective = objective + self.cfg[key] * term(nominal_trace)
         return objective
 
-    def _scores(self, phi, belief_trajectory):
-        """Smooth lower score (for gradients) and hard [L, U] interval at origin 0."""
-        scale = self.cfg["scale"]
-        smooth = phi(belief_trajectory, scale=scale)[0, 0]
-        if scale <= 0:
-            return smooth[0], smooth.detach()
-        with torch.no_grad():
-            hard = phi(belief_trajectory, scale=-1)[0, 0]
-        return smooth[0], hard
+    def _beta(self, k):
+        """Smoothing beta at iteration k (geometric from beta_start to beta_end), or None if off."""
+        smoothing = self.cfg["smoothing"]
+        if not smoothing["enabled"]:
+            return None
+        start, end = smoothing["beta_start"], smoothing["beta_end"]
+        return start * (end / start) ** (k / max(self.cfg["max_iters"] - 1, 1))
 
-    def _candidate(self, phi, rollout, v):
+    def _scores(self, phi, belief_trajectory, beta=None):
+        """Optimization score (graph kept) and exact pdSTL interval [R_lower, R_upper] (detached)."""
+        if beta is None:
+            exact = phi(belief_trajectory, scale=-1)[0, 0]
+            return exact[0], exact.detach()
+        score = phi(belief_trajectory, scale=beta)[0, 0, 0]
+        with torch.no_grad():
+            exact = phi(belief_trajectory, scale=-1)[0, 0]
+        return score, exact
+
+    def _candidate(self, phi, rollout, v, beta=None):
         """Score parameters v; returns (PlanCandidate, objective with graph)."""
         predicted = rollout(v)
         controls = self.dyn.bound_control(v)
-        smooth_score, hard_interval = self._scores(phi, predicted.belief_trajectory)
-        objective = self._objective(predicted.nominal_trace, controls, smooth_score)
+        score, exact = self._scores(phi, predicted.belief_trajectory, beta)
+        objective = self._objective(predicted.nominal_trace, controls, score)
 
         candidate = PlanCandidate(
             controls=controls.detach().clone(),
             rollout=predicted.detach_diagnostics(),
-            smooth_score=smooth_score.item(),
-            hard_score=hard_interval[0].item(),
-            hard_interval=tuple(hard_interval.tolist()),
+            optimization_score=score.item(),
+            exact_lower=exact[0].item(),
+            pdstl_interval=tuple(exact.tolist()),
+            control_cost=self._control_cost(controls).item(),
             objective=objective.item(),
         )
         return candidate, objective
 
     def evaluate_controls(self, rollout, controls, *, spec):
-        """Score given controls [T, m] exactly as an optimizer iterate is scored."""
+        """Score given controls [T, m]; the optimization score uses the final beta."""
         v = self._control_parameters(controls.to(self.device))
-        candidate, _ = self._candidate(spec, rollout, v)
+        candidate, _ = self._candidate(spec, rollout, v, self._beta(self.cfg["max_iters"] - 1))
         return candidate
+
+    @staticmethod
+    def _better(candidate, best):
+        """Higher exact lower pdSTL score wins; control cost breaks ties."""
+        if best is None:
+            return True
+        return (candidate.exact_lower, -candidate.control_cost) > (best.exact_lower, -best.control_cost)
 
     def optimize_window(
         self, rollout, *, spec=None, env=None, init_guess=None, verbose=False,
         on_iteration=None,
     ):
-        """Optimise rollout(v) -> BeliefRollout; returns (best candidate, objective history).
+        """Descend the smooth objective; return the iterate with the best exact pdSTL score.
 
-        on_iteration(k, candidate) observes each iterate without affecting the run."""
+        Returns (best candidate, objective history). on_iteration(k, candidate) only observes."""
         saved_env = self.env
         if env is not None:
             self.env = env
@@ -180,26 +199,30 @@ class Planner:
 
         for k in range(self.cfg["max_iters"]):
             optimizer.zero_grad()
-            candidate, objective = self._candidate(phi, rollout, v)
+            beta = self._beta(k)
+            candidate, objective = self._candidate(phi, rollout, v, beta)
+            candidate = candidate._replace(iteration=k)
             history.append(candidate.objective)
             if on_iteration is not None:
                 on_iteration(k, candidate)
-            if best is None or candidate.objective < best.objective:
+            if self._better(candidate, best):
                 best = candidate
 
             objective.backward()
             optimizer.step()
 
-            if candidate.hard_score >= self.cfg["alpha"]:
+            if candidate.exact_lower >= self.cfg["alpha"]:
                 converged_iters += 1
                 if converged_iters >= self.cfg["converge_patience"]:
                     if verbose:
-                        log_utils._log.info(f"Converged at iter {k}. Hard score: {candidate.hard_score:.4f}")
+                        log_utils._log.info(f"Converged at iter {k}. Exact lower: {candidate.exact_lower:.4f}")
                     break
             else:
                 converged_iters = 0
 
-            if k > self.cfg["min_iters"] and abs(history[-2] - history[-1]) < self.cfg["loss_tol"]:
+            # While beta anneals the objective itself moves, so the plateau test waits for a fixed beta.
+            plateau = k > self.cfg["min_iters"] and beta == self._beta(k - 1)
+            if plateau and abs(history[-2] - history[-1]) < self.cfg["loss_tol"]:
                 if verbose:
                     log_utils._log.info(f"Loss converged at iter {k}.")
                 break
@@ -207,7 +230,7 @@ class Planner:
             if verbose and k % 50 == 0:
                 log_utils._log.info(
                     f"Iter {k:03d} | Objective: {candidate.objective:.4f} | "
-                    f"Hard score: {candidate.hard_score:.4f} | Best objective: {best.objective:.4f}"
+                    f"Exact lower: {candidate.exact_lower:.4f} | Best exact lower: {best.exact_lower:.4f}"
                 )
 
         self.env = saved_env
@@ -296,7 +319,7 @@ class Planner:
             )
             prev_u, plan = best.controls, best.rollout.aux["mean_trace"]
             plans.append(plan)
-            p_sat.append(best.hard_score)
+            p_sat.append(best.exact_lower)
             losses.append(history[-1] if history else 0.0)
 
             mean, cov = self.dyn.sample_step(mean, cov, best.controls[0])
@@ -305,10 +328,10 @@ class Planner:
             controls.append(best.controls[0])
 
             if step_callback is not None:
-                step_callback(step, mean, cov, plan, best.hard_score)
+                step_callback(step, mean, cov, plan, best.exact_lower)
 
             if lane_change:
-                self._log_lane_change_step(step, mean, best.hard_score)
+                self._log_lane_change_step(step, mean, best.exact_lower)
                 success_counter, done = self._lane_change_success(mean, success_counter)
                 if done:
                     stopped_reason = "lane_change_success"
@@ -316,7 +339,7 @@ class Planner:
                     break
             elif not fixed:
                 distance = dist.item() if dist is not None else 0.0
-                log_utils.log_mpc_step(step, mean.cpu().numpy(), distance, best.hard_score)
+                log_utils.log_mpc_step(step, mean.cpu().numpy(), distance, best.exact_lower)
 
         return self._pack_result(
             torch.stack(means).unsqueeze(0), torch.stack(covs).unsqueeze(0), self._stack_controls(controls),
@@ -344,5 +367,5 @@ class Planner:
         best, history = self.optimize_window(gaussian_rollout(self.dyn, x0_mean, x0_cov), verbose=verbose)
         return self._pack_result(
             best.rollout.aux["mean_trace"], best.rollout.aux["cov_trace"], best.controls,
-            [best.hard_score], history, [], mode="single_shot", stopped_reason="optimized",
+            [best.exact_lower], history, [], mode="single_shot", stopped_reason="optimized",
         )

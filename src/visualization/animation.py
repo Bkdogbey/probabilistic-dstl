@@ -201,7 +201,7 @@ def animate_results(
 
 def animate_altitude_optimization(result, *, dt, threshold, u_max, filename=None, fps=6):
     """One frame per optimizer iterate up to the returned plan, held for one second at the end."""
-    returned = int(np.argmin([f["objective"] for f in result["frames"]]))
+    returned = result["returned_iteration"]
     frames = result["frames"][: returned + 1]
     H = len(_to_np(frames[0]["controls"]))
     bands = [

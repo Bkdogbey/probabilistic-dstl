@@ -111,7 +111,7 @@ def _event_trace(event, rollout):
 def _plan_summary(candidate, atom):
     with torch.no_grad():
         return {
-            "interval": list(candidate.hard_interval),
+            "interval": list(candidate.pdstl_interval),
             "objective": candidate.objective,
             "atomic": _event_trace(atom, candidate.rollout),
             "mean": candidate.rollout.aux["mean_trace"],
@@ -137,7 +137,8 @@ def run_altitude_safety(config_path="configs/scenarios/altitude_safety.yaml", *,
     result = {
         **{f"{key}_initial": value for key, value in initial.items()},
         **{f"{key}_final": value for key, value in final.items()},
-        "stored_interval": list(best.hard_interval),
+        "stored_interval": list(best.pdstl_interval),
+        "returned_iteration": best.iteration,
         "controls": final["controls"],
         "history": history,
         "iterations": len(history),
@@ -160,8 +161,8 @@ def run_altitude_safety(config_path="configs/scenarios/altitude_safety.yaml", *,
 def _mean_clearance(mean_trace, obstacle):
     """Post-hoc diagnostic: smallest mean-to-rectangle distance (negative inside)."""
     points = mean_trace[0, 1:]
-    lower = torch.tensor([obstacle["x"][0], obstacle["y"][0]])
-    upper = torch.tensor([obstacle["x"][1], obstacle["y"][1]])
+    lower = torch.tensor([obstacle["x"][0], obstacle["y"][0]], device=points.device, dtype=points.dtype)
+    upper = torch.tensor([obstacle["x"][1], obstacle["y"][1]], device=points.device, dtype=points.dtype)
     gap = torch.maximum(lower - points, points - upper)
     outside = gap.clamp(min=0).norm(dim=1)
     return torch.where(outside > 0, outside, gap.max(dim=1).values).min().item()
@@ -174,16 +175,19 @@ def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=Tr
 
     initial = s.planner.evaluate_controls(s.rollout, s.u_init, spec=spec)
     best, history = s.planner.optimize_window(s.rollout, spec=spec, init_guess=s.u_init, verbose=True)
+    final = s.planner.evaluate_controls(s.rollout, best.controls, spec=spec)
 
     events = s.env.get_predicates()
-    goal = _event_trace(events["goal"], best.rollout)
-    safe = _event_trace(events["obstacles"][0], best.rollout)
+    goal = _event_trace(events["goal"], final.rollout)
+    safe = _event_trace(events["obstacles"][0], final.rollout)
     goal_step, safe_step = int(goal[1:, 0].argmax()) + 1, int(safe[1:, 0].argmin()) + 1
-    mean_trace = best.rollout.aux["mean_trace"]
+    mean_trace = final.rollout.aux["mean_trace"]
     result = {
-        "interval_initial": list(initial.hard_interval),
-        "interval_final": list(best.hard_interval),
-        "controls": best.controls,
+        "interval_initial": list(initial.pdstl_interval),
+        "interval_final": list(final.pdstl_interval),
+        "stored_interval": list(best.pdstl_interval),
+        "returned_iteration": best.iteration,
+        "controls": final.controls,
         "history": history,
         "iterations": len(history),
         "goal_trace": goal,
@@ -193,8 +197,8 @@ def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=Tr
         "safe_step": safe_step,
         "min_safe_interval": safe[safe_step].tolist(),
         "mean_trace": mean_trace,
-        "cov_trace": best.rollout.aux["cov_trace"],
-        "u_trace": best.controls.unsqueeze(0),
+        "cov_trace": final.rollout.aux["cov_trace"],
+        "u_trace": final.controls.unsqueeze(0),
         "mean_initial": initial.rollout.aux["mean_trace"],
         "cov_initial": initial.rollout.aux["cov_trace"],
         "final_mean": mean_trace[0, -1].tolist(),

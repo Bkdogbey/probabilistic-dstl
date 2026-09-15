@@ -204,7 +204,7 @@ def test_gradients_are_finite_in_a_smooth_nondegenerate_optimisation():
 
     formula, _, _, _ = build_case("eventually", cfg)
     traj = gaussian_rollout(dyn, x0_mean, x0_cov)(v).belief_trajectory
-    formula(traj, scale=planner_cfg["scale"])[0, 0, 0].backward()
+    formula(traj, scale=planner_cfg["smoothing"]["beta_end"])[0, 0, 0].backward()
 
     assert v.grad is not None
     assert torch.isfinite(v.grad).all()

@@ -17,7 +17,8 @@ end_to_end_reach:
     w_dist: 0.0
     w_obs: 0.0
     w_visit: 0.0
-    scale: -1
+    smoothing:
+      enabled: false
 
 # MPC version: one 10-step window cannot reach x = 2, so it must replan.
 # init_control must be nonzero: at rest P(x_k >= 2) underflows and the objective is flat.
@@ -42,4 +43,5 @@ end_to_end_mpc_reach:
     w_dist: 0.0
     w_obs: 0.0
     w_visit: 0.0
-    scale: -1
+    smoothing:
+      enabled: false

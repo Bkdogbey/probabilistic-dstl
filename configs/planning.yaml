@@ -7,11 +7,16 @@ w_phi: 10.0       # Weight on STL objective
 lr: 0.05          # Adam learning rate
 max_iters: 500    # Maximum optimisation iterations
 alpha: 0.95       # Lower stochastic robustness threshold for early stopping
-scale: -1         # Smoothing: <= 0 evaluates directly, > 0 smooths (Minish/Maxish)
 w_dist: 5.0       # Goal guidance heuristic weight
 w_obs: 5.0        # Obstacle repulsion heuristic weight
 w_visit: 5.0      # Visit-region heuristic weight
-loss_tol: 1.0e-4  # Loss convergence tolerance
+loss_tol: 1.0e-4  # Loss convergence tolerance (unsmoothed runs only)
+
+# Smooth lower-score surrogate for gradients; exact pdSTL is always used for reporting and selection
+smoothing:
+  enabled: true
+  beta_start: 2.0
+  beta_end: 20.0
 
 # Planner convergence internals
 obs_margin: 0.75       # Safety margin (m) added to obstacle radius in repulsion loss

@@ -59,7 +59,7 @@ def test_scenario_is_a_one_dimensional_gaussian_belief_rollout(problem):
 def test_objective_has_no_shaping(problem):
     _, planner_cfg, *_ = problem
     assert planner_cfg["w_dist"] == planner_cfg["w_obs"] == planner_cfg["w_visit"] == 0
-    assert planner_cfg["w_phi"] > 0 and planner_cfg["scale"] <= 0
+    assert planner_cfg["w_phi"] > 0 and planner_cfg["smoothing"]["enabled"]
 
 
 def test_downward_initial_plan_scores_poorly(result):
@@ -93,7 +93,7 @@ def test_gradient_flows_from_controls_to_the_objective(problem):
     v = planner._control_parameters(u_init).clone().requires_grad_(True)
 
     predicted = rollout(v)
-    smooth, _ = planner._scores(spec, predicted.belief_trajectory)
+    smooth, _ = planner._scores(spec, predicted.belief_trajectory, planner._beta(0))
     planner._objective(predicted.nominal_trace, dyn.bound_control(v), smooth).backward()
 
     assert torch.isfinite(v.grad).all()
@@ -110,8 +110,9 @@ def test_every_optimizer_iterate_is_recorded(result):
     assert len(frames) == result["iterations"]
     assert [f["objective"] for f in frames] == result["history"]
     assert frames[0]["interval"] == pytest.approx(result["interval_initial"], abs=1e-6)
-    returned = min(frames, key=lambda f: f["objective"])
+    returned = frames[result["returned_iteration"]]
     assert returned["interval"] == pytest.approx(result["stored_interval"], abs=1e-6)
+    assert returned["interval"][0] == max(f["interval"][0] for f in frames)
 
 
 def test_initial_controls_are_the_configured_descent(result, problem):
@@ -139,7 +140,7 @@ def test_plot_has_belief_probability_and_control_panels(result, problem):
 def test_animation_runs_from_the_initial_guess_to_the_returned_plan(result, problem, tmp_path):
     cfg, _, dyn, *_ = problem
     fps = 2
-    returned = min(range(len(result["frames"])), key=lambda i: result["history"][i])
+    returned = result["returned_iteration"]
     path = tmp_path / "optimization.gif"
 
     animate_altitude_optimization(

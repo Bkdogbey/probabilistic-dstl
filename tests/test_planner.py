@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _planner(**config):
     base = {
-        "max_iters": 60, "converge_patience": 1, "alpha": 0.0, "scale": -1,
+        "max_iters": 60, "converge_patience": 1, "alpha": 0.0, "smoothing": {"enabled": False},
         "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
     }
     return Planner(SingleIntegrator(), None, 3, config={**base, **config})
@@ -56,7 +56,7 @@ def _probability_rollout(dynamics, event, *, diagnostics=True):
 
 def test_planner_optimises_a_belief_rollout_it_knows_nothing_about():
     planner = Planner(SingleIntegrator(), None, 5, config={
-        "max_iters": 150, "scale": -1, "w_u": 0.0, "w_du": 0.0,
+        "max_iters": 150, "smoothing": {"enabled": False}, "w_u": 0.0, "w_du": 0.0,
         "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
     })
     event = Predicate("reach")
@@ -66,7 +66,7 @@ def test_planner_optimises_a_belief_rollout_it_knows_nothing_about():
 
     best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(5, 2))
 
-    assert best.hard_score > initial + 0.5
+    assert best.exact_lower > initial + 0.5
 
 
 def test_planner_source_builds_no_concrete_beliefs():
@@ -120,24 +120,23 @@ def test_planner_optimises_without_diagnostics_with_control_regularisation():
     assert planner.cfg["w_u"] > 0 and planner.cfg["w_du"] > 0
     assert best.rollout.nominal_trace is None
     assert best.rollout.aux is None
-    assert best.hard_score > initial + 0.2
-    assert best.objective == min(history)
+    assert best.exact_lower > initial + 0.2
     replay = rollout(torch.atanh(best.controls / planner.dyn.u_max))
-    smooth, hard = planner._scores(spec, replay.belief_trajectory)
-    objective = planner._objective(None, best.controls, smooth)
+    score, exact = planner._scores(spec, replay.belief_trajectory)
+    objective = planner._objective(None, best.controls, score)
     assert objective.item() == pytest.approx(best.objective, abs=1e-5)
-    torch.testing.assert_close(hard, torch.tensor(best.hard_interval))
+    torch.testing.assert_close(exact, torch.tensor(best.pdstl_interval))
 
 
-@pytest.mark.parametrize("scale", [-1.0, 5.0])
-def test_belief_only_rollout_keeps_gradients_to_controls(scale):
-    planner = _planner(scale=scale)
+@pytest.mark.parametrize("beta", [None, 5.0])
+def test_belief_only_rollout_keeps_gradients_to_controls(beta):
+    planner = _planner()
     event = Predicate("reach")
     rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
     v = torch.zeros(3, 2, requires_grad=True)
     predicted = rollout(v)
     smooth, _ = planner._scores(
-        Eventually(event, interval=[0, 3]), predicted.belief_trajectory
+        Eventually(event, interval=[0, 3]), predicted.belief_trajectory, beta
     )
     objective = planner._objective(None, planner.dyn.bound_control(v), smooth)
     objective.backward()
@@ -210,7 +209,8 @@ def test_legacy_environment_solve_modes_still_run():
 
 
 def _smooth_problem(**config):
-    planner = _planner(scale=5.0, lr=0.05, alpha=2.0, **config)
+    smoothing = {"enabled": True, "beta_start": 2.0, "beta_end": 20.0}
+    planner = _planner(smoothing=smoothing, lr=0.05, alpha=2.0, **config)
     spec = Eventually(GreaterThan(0.5), interval=[0, 3])
     rollout = gaussian_rollout(planner.dyn, torch.zeros(2), torch.eye(2) * 0.01)
     return planner, spec, rollout
@@ -219,7 +219,7 @@ def _smooth_problem(**config):
 def test_planner_handles_one_dimensional_controls():
     dyn = SingleIntegrator(state_dim=1)
     planner = Planner(dyn, None, 3, config={
-        "max_iters": 5, "scale": -1, "alpha": 2.0, "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
+        "max_iters": 5, "alpha": 2.0, "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
     })
     rollout = gaussian_rollout(dyn, torch.zeros(1), torch.eye(1) * 0.01)
     spec = Eventually(GreaterThan(0.1), interval=[0, 3])
@@ -246,7 +246,7 @@ def test_on_iteration_observes_every_iterate_without_changing_the_result():
     assert [k for k, _ in seen] == list(range(len(history)))
     assert [objective for _, objective in seen] == history
     assert history == plain_history
-    assert best.hard_interval == plain.hard_interval
+    assert best.pdstl_interval == plain.pdstl_interval
 
 
 def test_evaluate_controls_scores_returned_controls_like_the_optimiser():
@@ -256,48 +256,58 @@ def test_evaluate_controls_scores_returned_controls_like_the_optimiser():
     replay = planner.evaluate_controls(rollout, best.controls, spec=spec)
 
     torch.testing.assert_close(
-        torch.tensor(replay.hard_interval), torch.tensor(best.hard_interval), atol=1e-5, rtol=0
+        torch.tensor(replay.pdstl_interval), torch.tensor(best.pdstl_interval), atol=1e-5, rtol=0
     )
-    assert replay.objective == pytest.approx(best.objective, abs=1e-5)
     torch.testing.assert_close(replay.controls, best.controls, atol=1e-5, rtol=0)
 
 
-def test_best_candidate_replays_to_its_own_hard_interval_and_objective():
+def test_returned_candidate_has_the_best_exact_lower_score():
     planner, spec, rollout = _smooth_problem()
+    seen = []
 
-    best, history = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 2))
+    best, _ = planner.optimize_window(
+        rollout, spec=spec, init_guess=torch.zeros(3, 2),
+        on_iteration=lambda k, candidate: seen.append(candidate),
+    )
 
-    replay = rollout(torch.atanh(best.controls / planner.dyn.u_max))
-    smooth, hard = planner._scores(spec, replay.belief_trajectory)
-    objective = planner._objective(replay.nominal_trace, best.controls, smooth)
-    torch.testing.assert_close(hard, torch.tensor(best.hard_interval), atol=1e-5, rtol=0)
-    assert objective.item() == pytest.approx(best.objective, abs=1e-5)
-    assert best.objective == min(history)
+    top = max(c.exact_lower for c in seen)
+    assert best.exact_lower == top
+    assert best.control_cost == min(c.control_cost for c in seen if c.exact_lower == top)
+    assert seen[best.iteration] == best
 
 
-def test_smooth_score_carries_gradients_and_hard_score_is_the_exact_interval():
+def test_optimization_score_carries_gradients_and_the_interval_is_exact():
     planner, spec, rollout = _smooth_problem()
     v = torch.zeros(3, 2, requires_grad=True)
     predicted = rollout(v)
 
-    smooth, hard = planner._scores(spec, predicted.belief_trajectory)
-    smooth.backward()
+    score, exact = planner._scores(spec, predicted.belief_trajectory, beta=5.0)
+    score.backward()
 
-    assert not hard.requires_grad
-    torch.testing.assert_close(hard, spec(predicted.belief_trajectory, scale=-1)[0, 0].detach())
-    assert smooth.item() != pytest.approx(hard[0].item())
-    assert v.grad.abs().sum() > 0
+    assert not exact.requires_grad
+    torch.testing.assert_close(exact, spec(predicted.belief_trajectory, scale=-1)[0, 0].detach())
+    assert score.item() != pytest.approx(exact[0].item())
+    assert torch.isfinite(v.grad).all() and v.grad.abs().sum() > 0
 
 
-def test_alpha_stopping_uses_the_hard_score():
+def test_beta_anneals_geometrically_and_is_none_when_smoothing_is_off():
+    planner, _, _ = _smooth_problem(max_iters=11)
+    betas = [planner._beta(k) for k in range(11)]
+
+    assert betas[0] == pytest.approx(2.0) and betas[-1] == pytest.approx(20.0)
+    assert all(b2 / b1 == pytest.approx(10 ** 0.1) for b1, b2 in zip(betas, betas[1:]))
+    assert _planner()._beta(0) is None
+
+
+def test_alpha_stopping_uses_the_exact_lower_score():
     planner, spec, rollout = _smooth_problem()
-    smooth, hard = planner._scores(spec, rollout(torch.zeros(3, 2)).belief_trajectory)
-    assert hard[0] < smooth  # the soft max overestimates
+    smooth, exact = planner._scores(spec, rollout(torch.zeros(3, 2)).belief_trajectory, planner._beta(0))
+    assert smooth < exact[0]  # the normalized smooth max underestimates the max
 
     planner.cfg.update(
-        lr=0.0, alpha=(hard[0].item() + smooth.item()) / 2,
+        lr=0.0, alpha=(exact[0].item() + smooth.item()) / 2,
         converge_patience=1, min_iters=20, max_iters=20,
     )
     _, history = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 2))
 
-    assert len(history) == 20
+    assert len(history) == 1

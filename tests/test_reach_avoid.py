@@ -111,7 +111,7 @@ def test_shaping_weights_are_zero(problem):
     _, planner_cfg, *_ = problem
     assert planner_cfg["w_dist"] == planner_cfg["w_obs"] == planner_cfg["w_visit"] == 0
     assert planner_cfg["w_phi"] > 0
-    assert planner_cfg["scale"] <= 0
+    assert planner_cfg["smoothing"]["enabled"]
 
 
 # --- Planning outcome ----------------------------------------------------------
@@ -140,12 +140,13 @@ def test_plan_has_useful_goal_and_safety_probabilities(result):
     assert result["goal_trace"][1:, 0].max() == pytest.approx(result["goal_interval"][0])
 
 
-def test_returned_controls_replay_to_the_stored_hard_interval(result, problem):
+def test_returned_controls_replay_to_the_stored_pdstl_interval(result, problem):
     *_, rollout, spec, planner = problem
     replay = planner.evaluate_controls(rollout, result["controls"], spec=spec)
 
     assert all(isinstance(b, GaussianBelief) for b in replay.rollout.belief_trajectory)
-    assert list(replay.hard_interval) == pytest.approx(result["interval_final"], abs=1e-4)
+    assert list(replay.pdstl_interval) == pytest.approx(result["interval_final"], abs=1e-4)
+    assert result["interval_final"] == pytest.approx(result["stored_interval"], abs=1e-4)
 
 
 def test_gradients_flow_from_controls_through_beliefs_and_events_to_the_objective(problem):
@@ -154,7 +155,7 @@ def test_gradients_flow_from_controls_through_beliefs_and_events_to_the_objectiv
     v = planner._control_parameters(u_init).clone().requires_grad_(True)
 
     predicted = rollout(v)
-    smooth, _ = planner._scores(spec, predicted.belief_trajectory)
+    smooth, _ = planner._scores(spec, predicted.belief_trajectory, planner._beta(0))
     objective = planner._objective(predicted.nominal_trace, dyn.bound_control(v), smooth)
     objective.backward()
 

@@ -26,7 +26,6 @@ planner:
   w_dist: 0.0
   w_obs: 0.0
   w_visit: 0.0
-  scale: -1
 
 # --- Output ---
 figure: altitude_safety.png

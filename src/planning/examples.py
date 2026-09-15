@@ -121,7 +121,7 @@ def controls_to_params(dyn, controls):
 
 
 def evaluate_direct(formula, traj):
-    """Evaluate with scale <= 0: the reported interval, never the smooth score."""
+    """Exact pdSTL interval (scale <= 0), never the optimization score."""
     return formula(traj, scale=-1)
 
 
@@ -176,8 +176,8 @@ def run_case(name, *, show=False, save=True, verbose=True):
         "description": description,
         "interval_initial": interval_init.detach()[0, 0].tolist(),
         "interval_final": interval_final.detach()[0, 0].tolist(),
-        "smooth_score": best.smooth_score,
-        "hard_score": best.hard_score,
+        "optimization_score": best.optimization_score,
+        "exact_lower": best.exact_lower,
         "controls": best.controls,
         "history": history,
         "objective": best.objective,
@@ -192,7 +192,7 @@ def run_case(name, *, show=False, save=True, verbose=True):
             f"[{name}] {description}\n"
             f"    hard interval  initial [{lo_i:.4f}, {hi_i:.4f}]"
             f"  ->  final [{lo_f:.4f}, {hi_f:.4f}]\n"
-            f"    smooth {best.smooth_score:.4f} | objective {best.objective:.4f} "
+            f"    optimization score {best.optimization_score:.4f} | objective {best.objective:.4f} "
             f"| valid origins {result['trace_length']} | mean match {mean_mismatch:.2e}"
         )
 
@@ -256,7 +256,7 @@ def run_always_step_zero(verbose=True):
     torch.manual_seed(cfg["seed"])
     planner = Planner(dyn, None, cfg["H"], config=planner_cfg)
     best, _ = planner.optimize_window(rollout, spec=formula, init_guess=v_init)
-    after = list(best.hard_interval)
+    after = list(best.pdstl_interval)
 
     if verbose:
         log_utils._log.info(
@@ -310,7 +310,7 @@ def run_mpc_check(verbose=True):
         best, _ = planner.optimize_window(
             gaussian_rollout(dyn, belief_mean, belief_cov), spec=spec, init_guess=guess
         )
-        direct = list(best.hard_interval)
+        direct = list(best.pdstl_interval)
 
         u0 = best.controls[0]
         next_true, _ = dyn.sample_step(true_state, zero_cov, u0)
@@ -323,7 +323,7 @@ def run_mpc_check(verbose=True):
                 "belief_cov_trace": float(torch.diagonal(belief_cov).sum()),
                 "true_state": true_state.tolist(),
                 "robustness_direct": direct,
-                "robustness_smooth": best.smooth_score,
+                "optimization_score": best.optimization_score,
                 "u0": u0.detach().tolist(),
                 "satisfied": bool(true_state[dim] >= c),
             }
@@ -472,7 +472,7 @@ def run_end_to_end_mpc_reach(*, show=False, save=True, verbose=True):
         "mean_trace": torch.stack([mean for mean, _ in loop["states"]]).unsqueeze(0),
         "cov_trace": torch.stack([cov for _, cov in loop["states"]]).unsqueeze(0),
         "u_trace": loop["u_trace"],
-        "hard_scores": [c.hard_score for c in candidates],
+        "exact_lowers": [c.exact_lower for c in candidates],
         "objectives": [c.objective for c in candidates],
         "plan_mean_traces": [c.rollout.aux["mean_trace"] for c in candidates],
         "plan_controls": [c.controls for c in candidates],
@@ -481,7 +481,7 @@ def run_end_to_end_mpc_reach(*, show=False, save=True, verbose=True):
     }
 
     if verbose:
-        scores = result["hard_scores"]
+        scores = result["exact_lowers"]
         executed = result["mean_trace"][0, :, dim]
         log_utils._log.info(
             f"[end_to_end_mpc_reach] {spec} per window\n"

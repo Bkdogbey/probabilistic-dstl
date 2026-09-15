@@ -20,6 +20,8 @@ from pdstl.operators import (
     GreaterThan,
     Implies,
     LessThan,
+    Maxish,
+    Minish,
     Negation,
     Or,
     Predicate,
@@ -244,12 +246,49 @@ def test_implies_is_negation_then_or():
     torch.testing.assert_close(Implies(a, b)(traj), Or(Negation(a), b)(traj))
 
 
-def test_boolean_bounds_are_unchanged_by_scale():
+def test_only_the_and_lower_clamp_is_smoothed():
     traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
     a, b = Predicate("a"), Predicate("b")
 
-    for spec in (And(a, b), Or(a, b), Implies(a, b), Negation(a)):
+    for spec in (Or(a, b), Implies(a, b), Negation(a)):
         torch.testing.assert_close(spec(traj, scale=5.0), spec(traj, scale=-1))
+
+    exact, smooth = And(a, b)(traj, scale=-1)[0, 0], And(a, b)(traj, scale=5.0)[0, 0]
+    torch.testing.assert_close(exact, torch.tensor([0.3, 0.8]))
+    torch.testing.assert_close(smooth[1], exact[1])
+    torch.testing.assert_close(smooth[0], torch.nn.functional.softplus(torch.tensor(0.3), beta=5.0))
+
+
+def test_smooth_and_escapes_the_exact_zero_clamp():
+    lower = torch.tensor([[0.3], [0.4]], requires_grad=True)  # L1 + L2 - 1 < 0
+    upper = torch.ones(2, 1)
+
+    def conjunction_lower(scale):
+        traj = BeliefTrajectory([ProbabilityBelief({
+            "a": torch.stack([lower[0], upper[0]], dim=-1),
+            "b": torch.stack([lower[1], upper[1]], dim=-1),
+        })])
+        return And(Predicate("a"), Predicate("b"))(traj, scale=scale)[0, 0, 0]
+
+    exact = conjunction_lower(-1)
+    (exact_grad,) = torch.autograd.grad(exact, lower)
+    smooth = conjunction_lower(10.0)
+    (smooth_grad,) = torch.autograd.grad(smooth, lower)
+
+    assert exact.item() == 0.0 and exact_grad.abs().sum() == 0
+    assert smooth.item() > 0 and torch.isfinite(smooth_grad).all() and (smooth_grad > 0).all()
+
+
+def test_smooth_min_and_max_converge_to_the_exact_values_as_beta_grows():
+    x = torch.tensor([[0.2, 0.9, 0.5, 0.7]])
+    errors = []
+    for beta in (1.0, 10.0, 100.0, 1000.0):
+        smooth_min, smooth_max = Minish()(x, beta)[0, 0], Maxish()(x, beta)[0, 0]
+        assert x.min() <= smooth_min <= x.mean() <= smooth_max <= x.max()  # normalized
+        errors.append(max(smooth_min - x.min(), x.max() - smooth_max).item())
+        assert errors[-1] <= np.log(4) / beta + 1e-6
+    assert errors == sorted(errors, reverse=True)
+    assert Minish()(x, -1)[0, 0] == x.min() and Maxish()(x, -1)[0, 0] == x.max()
 
 
 def test_pointwise_flag_tracks_the_formula_kind():
@@ -401,12 +440,13 @@ def test_smooth_temporal_output_is_differentiable():
     [
         (
             Always,
-            lambda window, scale: -torch.logsumexp(-window * scale, dim=0)
+            lambda window, scale: -(torch.logsumexp(-window * scale, dim=0) - np.log(len(window)))
             / scale,
         ),
         (
             Eventually,
-            lambda window, scale: torch.logsumexp(window * scale, dim=0) / scale,
+            lambda window, scale: (torch.logsumexp(window * scale, dim=0) - np.log(len(window)))
+            / scale,
         ),
     ],
 )
@@ -539,7 +579,7 @@ def test_until_smooth_approaches_the_exact_reduction():
     assert not torch.equal(smooth, exact)  # a surrogate, not the same tensor
 
 
-def test_until_smooths_only_the_temporal_min_and_max():
+def test_until_smooth_matches_its_reference():
     trajectory = supplied(
         {"l": (0.7, 0.9), "r": (0.1, 0.3)},
         {"l": (0.4, 0.8), "r": (0.6, 0.75)},
@@ -557,18 +597,17 @@ def test_until_smooths_only_the_temporal_min_and_max():
     scale = 4.0
     candidates = []
     for witness in range(3):
-        prefix = -torch.logsumexp(-left[: witness + 1] * scale, dim=0) / scale
+        window = left[: witness + 1]
+        prefix = -(torch.logsumexp(-window * scale, dim=0) - np.log(len(window))) / scale
         candidates.append(
             torch.stack(
                 (
-                    torch.clamp(prefix[0] + right[witness, 0] - 1.0, min=0.0),
+                    torch.nn.functional.softplus(prefix[0] + right[witness, 0] - 1.0, beta=scale),
                     torch.minimum(prefix[1], right[witness, 1]),
                 )
             )
         )
-    expected_smooth = torch.logsumexp(
-        torch.stack(candidates) * scale, dim=0
-    ) / scale
+    expected_smooth = (torch.logsumexp(torch.stack(candidates) * scale, dim=0) - np.log(3)) / scale
 
     torch.testing.assert_close(
         formula(trajectory, scale=scale)[0, 0], expected_smooth
