@@ -29,10 +29,22 @@ class Dynamics(nn.Module):
         return self.u_max * torch.tanh(v)
 
     def step(self, x, P, u):
-        """One step of the mean/covariance. x: [D], P: [D,D], u: [control dim]."""
+        """Prediction: one step of the mean/covariance. x: [D], P: [D,D], u: [control dim]."""
         x_next = self.A @ x + self.B @ u
         P_next = self.A @ P @ self.A.t() + self.Q
         return x_next, P_next
+
+    def sample_step(self, x, P, u):
+        """Simulated physical transition: X' = A x + B u + W,  W ~ N(0, Q).
+
+        Returns the sampled next state and the predicted next covariance, so an
+        executed step and a predicted step share the same A, B and Q.
+        """
+        x_next, P_next = self.step(x, P, u)
+        noise = torch.distributions.MultivariateNormal(
+            torch.zeros_like(x_next), self.Q
+        ).sample()
+        return x_next + noise, P_next
 
     def forward(self, v_sequence, x0_mean, x0_cov):
         """Roll out mean and covariance for an unconstrained control sequence.

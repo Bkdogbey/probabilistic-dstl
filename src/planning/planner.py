@@ -6,7 +6,6 @@ import torch.optim as optim
 
 from models.rollouts import BeliefRollout, gaussian_rollout
 from planning import log_utils
-from planning.simulation import simulate_gaussian_step
 from utils import load_config
 
 
@@ -32,10 +31,14 @@ class Planner:
 
         self.cfg = {**load_config("configs/planning.yaml"), **(config or {})}
 
+    def _control_parameters(self, controls):
+        """Unconstrained v with bound_control(v) ~= controls (clipped inside the bound)."""
+        u_norm = torch.clamp(controls / (self.dyn.u_max + 1e-6), -0.99, 0.99)
+        return 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
+
     def _init_controls(self, init_guess):
         if init_guess is not None:
-            u_norm = torch.clamp(init_guess / (self.dyn.u_max + 1e-6), -0.99, 0.99)
-            v_init = 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
+            v_init = self._control_parameters(init_guess)
             return nn.Parameter(v_init.to(self.device), requires_grad=True)
         return nn.Parameter(
             torch.randn(self.T, 2, device=self.device) * 0.1
@@ -126,6 +129,29 @@ class Planner:
             hard = phi(belief_trajectory, scale=-1)[0, 0]
         return smooth[0], hard
 
+    def _candidate(self, phi, rollout, v):
+        """Score one parameter sequence v; returns (PlanCandidate, live objective)."""
+        predicted = rollout(v)
+        controls = self.dyn.bound_control(v)
+        smooth_score, hard_interval = self._scores(phi, predicted.belief_trajectory)
+        objective = self._objective(predicted.nominal_trace, controls, smooth_score)
+
+        candidate = PlanCandidate(
+            controls=controls.detach().clone(),
+            rollout=predicted.detach_diagnostics(),
+            smooth_score=smooth_score.item(),
+            hard_score=hard_interval[0].item(),
+            hard_interval=tuple(hard_interval.tolist()),
+            objective=objective.item(),
+        )
+        return candidate, objective
+
+    def evaluate_controls(self, rollout, controls, *, spec):
+        """Score physical controls [T, 2] without optimising, as the planner would."""
+        v = self._control_parameters(controls.to(self.device))
+        candidate, _ = self._candidate(spec, rollout, v)
+        return candidate
+
     def optimize_window(self, rollout, *, spec=None, env=None, init_guess=None, verbose=False):
         """Optimise rollout(v) -> BeliefRollout for one window.
 
@@ -146,19 +172,7 @@ class Planner:
 
         for k in range(self.cfg["max_iters"]):
             optimizer.zero_grad()
-            predicted = rollout(v)
-            controls = self.dyn.bound_control(v)
-            smooth_score, hard_interval = self._scores(phi, predicted.belief_trajectory)
-            objective = self._objective(predicted.nominal_trace, controls, smooth_score)
-
-            candidate = PlanCandidate(
-                controls=controls.detach().clone(),
-                rollout=predicted.detach_diagnostics(),
-                smooth_score=smooth_score.item(),
-                hard_score=hard_interval[0].item(),
-                hard_interval=tuple(hard_interval.tolist()),
-                objective=objective.item(),
-            )
+            candidate, objective = self._candidate(phi, rollout, v)
             history.append(candidate.objective)
             if best is None or candidate.objective < best.objective:
                 best = candidate
@@ -325,7 +339,7 @@ class Planner:
             loss_trace.append(history[-1] if history else 0.0)
 
             u_curr = best_u[0]
-            next_mean, next_cov = simulate_gaussian_step(self.dyn, curr_mean, curr_cov, u_curr)
+            next_mean, next_cov = self.dyn.sample_step(curr_mean, curr_cov, u_curr)
 
             mean_trace_list.append(next_mean)
             cov_trace_list.append(next_cov)
@@ -397,7 +411,7 @@ class Planner:
             loss_trace.append(history[-1] if history else 0.0)
 
             u_curr = best_u[0]
-            next_mean, next_cov = simulate_gaussian_step(self.dyn, curr_mean, curr_cov, u_curr)
+            next_mean, next_cov = self.dyn.sample_step(curr_mean, curr_cov, u_curr)
 
             mean_trace_list.append(next_mean)
             cov_trace_list.append(next_cov)

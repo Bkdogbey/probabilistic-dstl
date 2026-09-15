@@ -3,6 +3,7 @@
 import torch
 
 from pdstl.base import Belief, BeliefTrajectory
+from pdstl.predicates import InsideRectangle, OutsideRectangle
 
 
 def _validate_covariance(owner, covariance, batch, state_dim):
@@ -33,13 +34,11 @@ def _validate_covariance(owner, covariance, batch, state_dim):
         raise ValueError(f"{owner} covariance must be non-negative")
 
 
-def _marginal(covariance, predicate, state_dim):
-    """The predicate's state dimension and that component's [B] variance."""
-    dim = getattr(predicate, "dim", 0)
+def _marginal_variance(covariance, dim, state_dim):
+    """The [B] variance of state component ``dim``."""
     if not isinstance(dim, int) or not 0 <= dim < state_dim:
         raise ValueError(f"predicate dimension {dim} is outside the state")
-    variance = covariance[:, dim, dim] if covariance.ndim == 3 else covariance[:, dim]
-    return dim, variance
+    return covariance[:, dim, dim] if covariance.ndim == 3 else covariance[:, dim]
 
 
 def _tail_probability(owner, predicate, location, variance):
@@ -71,6 +70,28 @@ def _normal_cdf(z):
     return torch.exp(torch.special.log_ndtr(z))
 
 
+def _interval_probability(low, high, location, variance):
+    """P(low <= X <= high) for X ~ N(location, variance), [B].
+
+    The difference is taken between the two smaller tails, so an interval deep
+    in either tail keeps float32 resolution. Zero variance is an inclusive
+    deterministic test.
+    """
+    low = torch.as_tensor(low, dtype=location.dtype, device=location.device)
+    high = torch.as_tensor(high, dtype=location.dtype, device=location.device)
+    positive = variance > 0
+    sigma = torch.sqrt(torch.where(positive, variance, torch.ones_like(variance)))
+    a, b = (low - location) / sigma, (high - location) / sigma
+
+    probability = torch.where(
+        a > 0,
+        _normal_cdf(-a) - _normal_cdf(-b),  # interval right of the mean
+        _normal_cdf(b) - _normal_cdf(a),
+    ).clamp(0.0, 1.0)
+    deterministic = (location >= low) & (location <= high)
+    return torch.where(positive, probability, deterministic.to(location.dtype))
+
+
 class GaussianBelief(Belief):
     """One precise Gaussian state belief, X ~ N(mean, covariance).
 
@@ -96,14 +117,40 @@ class GaussianBelief(Belief):
         return self.mean
 
     def probability_bounds(self, predicate):
-        """Exact marginal probability of the predicate, returned as [p, p], [B,2].
+        """Probability interval of the predicate's event, [B,2].
 
-        x_j >= h:  p = Phi((mu_j - h) / sigma_j)
-        x_j <= h:  p = Phi((h - mu_j) / sigma_j)
+        x_j >= h:  exact, p = Phi((mu_j - h) / sigma_j), returned as [p, p]
+        x_j <= h:  exact, p = Phi((h - mu_j) / sigma_j), returned as [p, p]
+        InsideRectangle / OutsideRectangle:  see _rectangle_bounds
         """
-        dim, variance = _marginal(self.covariance, predicate, self.mean.shape[1])
+        if isinstance(predicate, (InsideRectangle, OutsideRectangle)):
+            return self._rectangle_bounds(predicate)
+
+        dim = getattr(predicate, "dim", 0)
+        variance = _marginal_variance(self.covariance, dim, self.mean.shape[1])
         p = _tail_probability("GaussianBelief", predicate, self.mean[:, dim], variance)
         return torch.stack((p, p), dim=-1)
+
+    def _rectangle_bounds(self, predicate):
+        """Bounds on P(X in R) from the two marginals, without assuming independence.
+
+        p_x = P(x_min <= X_i <= x_max),  p_y = P(y_min <= X_j <= y_max)
+        Inside:   [max(0, p_x + p_y - 1), min(p_x, p_y)]   (Frechet)
+        Outside:  [1 - U, 1 - L]                            (exact complement)
+        """
+        x_dim, y_dim = predicate.dims
+        p_x = self._marginal_interval(x_dim, predicate.x_range)
+        p_y = self._marginal_interval(y_dim, predicate.y_range)
+        lower = torch.clamp(p_x + p_y - 1.0, min=0.0)
+        upper = torch.minimum(p_x, p_y)
+        if isinstance(predicate, OutsideRectangle):
+            lower, upper = 1.0 - upper, 1.0 - lower
+        return torch.stack((lower, upper), dim=-1)
+
+    def _marginal_interval(self, dim, bounds):
+        """P(bounds[0] <= X_dim <= bounds[1]), [B]."""
+        variance = _marginal_variance(self.covariance, dim, self.mean.shape[1])
+        return _interval_probability(*bounds, self.mean[:, dim], variance)
 
 
 def create_gaussian_belief_trajectory(mean, covariance, dtype=None, device=None):

@@ -9,19 +9,15 @@ from planning import log_utils
 from models.dynamics import DoubleIntegrator, SingleIntegrator
 from models.rollouts import gaussian_rollout
 from planning.environment import Environment
-from planning.examples import controls_to_params
 from planning.planner import Planner
-from planning.specifications import inside_rectangle, reach_avoid
 from visualization.animation import animate_results
 from visualization.live_plots import (
     make_mpc_live_callback,
     make_lane_change_live_callback,
 )
 from visualization.planning import (
-    plot_controls,
-    plot_metrics,
-    plot_reach_avoid,
     visualize_lane_change,
+    visualize_reach_avoid,
     visualize_results,
 )
 
@@ -350,153 +346,111 @@ def run_lane_change(config_path="configs/scenarios/lane_change.yaml", *, show=Tr
     return result
 
 
-def _rectangle_clearance(points, x_range, y_range):
-    """Euclidean distance from each [N, 2] point to a rectangle; negative inside.
+def _event_trace(event, rollout):
+    """[H+1, 2] probability interval of one event along a predicted belief trajectory."""
+    return event(rollout.belief_trajectory).detach()[0]
 
-    A geometric diagnostic of the mean path only -- never part of the spec.
+
+def _mean_clearance(mean_trace, obstacle):
+    """Post-hoc diagnostic: smallest distance from the predicted mean to a rectangle.
+
+    Negative inside. Never part of the optimisation problem.
     """
-    x, y = points[:, 0], points[:, 1]
-    dx = torch.maximum(x_range[0] - x, x - x_range[1])
-    dy = torch.maximum(y_range[0] - y, y - y_range[1])
-    outside = torch.sqrt(dx.clamp(min=0) ** 2 + dy.clamp(min=0) ** 2)
-    inside = torch.minimum(torch.maximum(dx, dy), torch.zeros_like(dx))
-    return torch.where((dx > 0) | (dy > 0), outside, inside)
+    points = mean_trace[0, 1:]
+    lower = torch.tensor([obstacle["x"][0], obstacle["y"][0]])
+    upper = torch.tensor([obstacle["x"][1], obstacle["y"][1]])
+    gap = torch.maximum(lower - points, points - upper)  # [H, 2], > 0 outside per axis
+    outside = gap.clamp(min=0).norm(dim=1)
+    return torch.where(outside > 0, outside, gap.max(dim=1).values).min().item()
 
 
-def _hard_interval(formula, rollout):
-    """Directly evaluated [L, U] at origin 0; never the smooth surrogate."""
-    return formula(rollout.belief_trajectory, scale=-1).detach()[0, 0]
+def _reach_avoid_result(env, initial, best, history):
+    """Report the pdSTL intervals first; event traces and mean geometry are diagnostics."""
+    events = env.get_predicates()
+    goal = _event_trace(events["goal"], best.rollout)
+    safe = _event_trace(events["obstacles"][0], best.rollout)
+    goal_step = int(goal[1:, 0].argmax()) + 1
+    safe_step = int(safe[1:, 0].argmin()) + 1
+    mean_trace = best.rollout.aux["mean_trace"]
+    return {
+        "interval_initial": list(initial.hard_interval),
+        "interval_final": list(best.hard_interval),
+        "controls": best.controls,
+        "history": history,
+        "iterations": len(history),
+        "goal_trace": goal,
+        "safe_trace": safe,
+        "goal_step": goal_step,
+        "goal_interval": goal[goal_step].tolist(),
+        "safe_step": safe_step,
+        "min_safe_interval": safe[safe_step].tolist(),
+        "mean_trace": mean_trace,
+        "cov_trace": best.rollout.aux["cov_trace"],
+        "u_trace": best.controls.unsqueeze(0),
+        "mean_initial": initial.rollout.aux["mean_trace"],
+        "cov_initial": initial.rollout.aux["cov_trace"],
+        "final_mean": mean_trace[0, -1].tolist(),
+        "min_mean_clearance": _mean_clearance(mean_trace, env.obstacles[0]),
+    }
 
 
 def run_reach_avoid(
-    max_iterations=None,
-    *,
-    config_path="configs/scenarios/reach_avoid.yaml",
-    show=True,
-    save=True,
+    config_path="configs/scenarios/reach_avoid.yaml", *, show=True, save=True
 ):
-    """Plan Always[1,H](outside O) and Eventually[1,H](inside G) in one window:
+    """Single-shot reach-and-avoid:
 
-        v -> u -> SingleIntegrator -> gaussian_rollout -> GaussianBelief_k
-          -> probability_bounds(atoms) -> Frechet And/Or -> Always/Eventually -> J
+        scenario -> SingleIntegrator, Environment, b_0 = N(x0_mean, x0_cov)
+        -> gaussian_rollout: u -> b_0:H(u) -> Environment specification
+        -> Planner.optimize_window maximises R_lower(phi, b_0:H(u))
 
-    The rectangles are primitive x/y atoms, the planner receives the formula
-    directly, and every shaping heuristic is off. The Environment object only
-    holds geometry for the plots; its legacy specification is never built.
+    Shaping weights are zero in the scenario, so no mean-to-goal or obstacle
+    distance enters the objective.
     """
     device = get_device()
     log_utils.log_device(device)
 
     cfg, planner_cfg = load_scenario_config(config_path)
-    if max_iterations is not None:
-        planner_cfg["max_iters"] = max_iterations
     H = cfg["H"]
 
     dyn = build_dynamics(cfg, device)
+    env = build_environment(cfg, device)
     x0_mean, x0_cov = build_initial_belief(cfg, device)
     rollout = gaussian_rollout(dyn, x0_mean, x0_cov)
-    spec = reach_avoid(cfg["goal"], cfg["obstacle"], H)
-    goal_formula = inside_rectangle(**cfg["goal"])
+    spec = env.get_specification(H, t_goal_start=1)
 
+    planner = Planner(dyn, env, H, config=planner_cfg)
     u_init = torch.tensor(cfg["init_control"], device=device).repeat(H, 1)
-    initial = rollout(controls_to_params(dyn, u_init))
-    interval_initial = _hard_interval(spec, initial)
+    initial = planner.evaluate_controls(rollout, u_init, spec=spec)
 
     log_utils._log.info(f"Starting reach-avoid optimisation: {spec}")
-    planner = Planner(dyn, None, H, config=planner_cfg)
     best, history = planner.optimize_window(
         rollout, spec=spec, init_guess=u_init, verbose=True
     )
-
-    final = rollout(controls_to_params(dyn, best.controls))
-    interval_final = _hard_interval(spec, final)
-
-    mean_trace = final.aux["mean_trace"].detach()
-    cov_trace = final.aux["cov_trace"].detach()
-    path = mean_trace[0, 1:]  # steps 1..H, where the windows apply
-
-    goal_lower = goal_formula(final.belief_trajectory, scale=-1).detach()[0, 1:, 0]
-    goal_step = int(goal_lower.argmax()) + 1
-    clearance = _rectangle_clearance(
-        path, cfg["obstacle"]["x_range"], cfg["obstacle"]["y_range"]
-    )
-
-    result = {
-        "mean_trace": mean_trace,
-        "cov_trace": cov_trace,
-        "u_trace": best.controls.unsqueeze(0),
-        "loss_trace": history,
-        "history": history,
-        "best_p": interval_final[0].item(),
-        "spec": spec,
-        "dynamics": dyn,
-        "planner_cfg": planner_cfg,
-        "interval_initial": interval_initial.tolist(),
-        "interval_final": interval_final.tolist(),
-        "stored_hard_interval": list(best.hard_interval),
-        "controls": best.controls,
-        "u_init": u_init,
-        "u_max": dyn.u_max,
-        "mean_initial": initial.aux["mean_trace"].detach(),
-        "cov_initial": initial.aux["cov_trace"].detach(),
-        "iterations": len(history),
-        "final_state": mean_trace[0, -1].tolist(),
-        "goal_step": goal_step,
-        "goal_state": mean_trace[0, goal_step].tolist(),
-        "min_obstacle_clearance": clearance.min().item(),
-        "goal": cfg["goal"],
-        "obstacle": cfg["obstacle"],
-        "mode": "reach_avoid",
-    }
+    result = _reach_avoid_result(env, initial, best, history)
 
     lo_i, hi_i = result["interval_initial"]
     lo_f, hi_f = result["interval_final"]
-    gx, gy = result["goal_state"]
     log_utils._log.info(
-        f"[reach_avoid] hard interval initial [{lo_i:.4f}, {hi_i:.4f}]"
-        f"  ->  final [{lo_f:.4f}, {hi_f:.4f}]\n"
-        f"    goal witness step {goal_step} at ({gx:.3f}, {gy:.3f}) | "
-        f"min obstacle clearance {result['min_obstacle_clearance']:.3f} | "
-        f"iterations {result['iterations']}"
+        f"[reach_avoid] pdSTL interval initial [{lo_i:.4f}, {hi_i:.4f}]"
+        f" -> final [{lo_f:.4f}, {hi_f:.4f}] | iterations {result['iterations']}\n"
+        f"    P(goal) at step {result['goal_step']}: {result['goal_interval']} | "
+        f"min P(safe) at step {result['safe_step']}: {result['min_safe_interval']}"
     )
 
     if save:
-        path_out = RESULTS_DIR / cfg["save_file"]
-        path_out.parent.mkdir(parents=True, exist_ok=True)
-        saved = {k: v for k, v in result.items() if k not in ("spec", "dynamics")}
-        torch.save(saved, path_out)
-        log_utils.log_save(str(path_out))
+        path = RESULTS_DIR / cfg["save_file"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(result, path)
+        log_utils.log_save(str(path))
 
     if save or show:
-        env = Environment(device=device)
-        env.set_goal(**cfg["goal"])
-        env.add_obstacle(**cfg["obstacle"])
-        plot_reach_avoid(
-            result["mean_initial"],
-            result["cov_initial"],
-            mean_trace,
-            cov_trace,
+        visualize_reach_avoid(
+            result,
             env,
-            cfg["ellipse_steps"],
-            title=f"Reach-avoid: hard interval [{lo_f:.3f}, {hi_f:.3f}]",
+            dt=cfg["dt"],
+            ellipse_every=cfg["ellipse_every"],
             save_path=_animation_path(cfg["figure"]) if save else None,
             show=show,
-        )
-
-    if show:
-        plot_controls(best.controls.cpu().numpy())
-        plot_metrics(history, None)
-
-        anim = cfg["animation"]
-        animate_results(
-            mean_trace,
-            cov_trace,
-            env,
-            filename=_animation_path(anim["filename"]),
-            step=anim["step"],
-            dt=cfg["dt"],
-            title=anim["title"],
-            bounds=anim["bounds"],
         )
 
     return result

@@ -5,42 +5,15 @@ import numpy as np
 import torch
 
 from pdstl.operators import Always, And, Eventually, STL_Formula
-
-
-def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
-    """Stack mean and covariance tensors from a belief trajectory.
-
-    Parameters
-    ----------
-    belief_trajectory : list of GaussianBelief
-        This helper reads ``value()`` and ``covariance`` for the legacy Gaussian
-        environment predicates below. Generic pdSTL evaluation instead uses
-        each belief's ``probability_bounds(predicate)`` contract.
-    diagonal_only : bool
-        If True, extract only the diagonal of full covariance matrices,
-        returning var of shape [Batch, Time, Dim].
-        If False, stack full covariance matrices as-is.
-
-    Returns
-    -------
-    mu  : Tensor [Batch, Time, Dim]
-    var : Tensor [Batch, Time, Dim] (diagonal_only=True)
-          or [Batch, Time, Dim] / [Batch, Time, Dim, Dim] (diagonal_only=False)
-    """
-    means, vars_ = [], []
-    for belief in belief_trajectory:
-        means.append(belief.value())
-        if diagonal_only and belief.covariance.ndim > 2:
-            vars_.append(torch.diagonal(belief.covariance, dim1=-2, dim2=-1))
-        else:
-            vars_.append(belief.covariance)
-    return torch.stack(means, dim=1), torch.stack(vars_, dim=1)
+from pdstl.predicates import InsideRectangle, OutsideRectangle
 
 
 class Environment:
-    """
-    Defines the workspace, obstacles, and goal regions.
-    Generates the probabilistic STL specification based on the optimization problem PDF.
+    """The planning world: workspace, goal, obstacles, visit regions.
+
+    Geometry becomes pdSTL events (pdstl.predicates); the specification is built
+    from those events and the pdSTL operators. The environment never computes a
+    probability: each belief evaluates an event through probability_bounds.
     """
 
     def __init__(self, device="cpu"):
@@ -229,77 +202,100 @@ class Environment:
             obs["y_traj"] = obs["y_traj"][:num_points]
 
     def get_predicates(self):
-        """ """
-        preds = {"obstacles": [], "visit": [], "goal": None}
+        """Events for the configured geometry.
 
-        if self.goal:
-            preds["goal"] = RectangularGoalPredicate(self.goal)
-
-        for region in self.visit_regions:
-            preds["visit"].append(RectangularGoalPredicate(region))
-
-        if self.obstacles or self.circle_obstacles or self.moving_obstacles:
-            obs_preds = [RectangularObstaclePredicate(obs) for obs in self.obstacles]
-            obs_preds.extend(
-                [
-                    CircularObstaclePredicate(obs, device=self.device)
-                    for obs in self.circle_obstacles
-                ]
-            )
-            obs_preds.extend(
-                [
-                    MovingRectangularObstaclePredicate(obs, device=self.device)
-                    for obs in self.moving_obstacles
-                ]
-            )
-            preds["obstacles"] = obs_preds
-
-        return preds
+        Rectangles (goal, visit regions, static obstacles) are belief-evaluated
+        pdSTL events. Circle and moving obstacles still use the legacy
+        Gaussian-specific predicates below.
+        """
+        obstacles = [OutsideRectangle(obs["x"], obs["y"]) for obs in self.obstacles]
+        obstacles += [
+            CircularObstaclePredicate(obs, device=self.device)
+            for obs in self.circle_obstacles
+        ]
+        obstacles += [
+            MovingRectangularObstaclePredicate(obs, device=self.device)
+            for obs in self.moving_obstacles
+        ]
+        return {
+            "goal": InsideRectangle(self.goal["x"], self.goal["y"]) if self.goal else None,
+            "visit": [InsideRectangle(r["x"], r["y"]) for r in self.visit_regions],
+            "obstacles": obstacles,
+        }
 
     def get_specification(self, T, t_goal_start=0, t_constraints_start=1):
-        """
-        Generates the STL formula: phi = (Always Safe) & (Eventually Goal)
+        """phi = Always(safe) and Eventually(goal) [and visits] [and Always(in bounds)].
 
+        With one rectangular obstacle O and goal G:
+            Always(OutsideRectangle(O), [t_constraints_start, T])
+            and Eventually(InsideRectangle(G), [t_goal_start, T])
         """
         preds = self.get_predicates()
         specs = []
 
-        # 1. Goal Specification (Liveness)
-        if preds["goal"]:
+        if preds["obstacles"]:
+            safe = preds["obstacles"][0]
+            for obstacle in preds["obstacles"][1:]:
+                safe = And(safe, obstacle)
+            specs.append(Always(safe, interval=[t_constraints_start, T]))
+
+        if preds["goal"] is not None:
             specs.append(Eventually(preds["goal"], interval=[t_goal_start, T]))
 
-        # 2. Visit Regions (Liveness)
-        for visit_pred in preds["visit"]:
-            specs.append(Eventually(visit_pred, interval=[0, T]))
+        for visit in preds["visit"]:
+            specs.append(Eventually(visit, interval=[0, T]))
 
-        # 3. Obstacle Specification (Safety)
-        if preds["obstacles"]:
-            obs_preds = preds["obstacles"]
-            current_safe_formula = obs_preds[0]
-            for i in range(1, len(obs_preds)):
-                current_safe_formula = And(current_safe_formula, obs_preds[i])
-            phi_safety = Always(current_safe_formula, interval=[t_constraints_start, T])
-            specs.append(phi_safety)
-
-        # 4. Workspace Boundary (Always stay inside)
         if self.bounds is not None:
-            bounds_pred = RectangularGoalPredicate(self.bounds)
-            specs.append(Always(bounds_pred, interval=[t_constraints_start, T]))
+            inside = InsideRectangle(self.bounds["x"], self.bounds["y"])
+            specs.append(Always(inside, interval=[t_constraints_start, T]))
 
         if not specs:
             raise ValueError("No constraints defined in environment.")
 
-        # 5. Combined Specification
-        combined_spec = specs[0]
-        for i in range(1, len(specs)):
-            combined_spec = And(combined_spec, specs[i])
-
-        return combined_spec
+        combined = specs[0]
+        for spec in specs[1:]:
+            combined = And(combined, spec)
+        return combined
 
 
 # =============================================================================
-# PROBABILISTIC PREDICATES 
+# LEGACY: Gaussian-specific predicates (circle / moving obstacles, lane change)
+#
+# These read mean and covariance directly and compute Gaussian CDFs themselves,
+# bypassing Belief.probability_bounds. Rectangular goals, visit regions,
+# bounds and static obstacles no longer use them; they remain only until the
+# circle and moving-obstacle scenarios migrate to belief-evaluated events.
 # =============================================================================
+
+
+def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
+    """Stack mean and covariance tensors from a belief trajectory.
+
+    Parameters
+    ----------
+    belief_trajectory : list of GaussianBelief
+        This helper reads ``value()`` and ``covariance`` for the legacy Gaussian
+        environment predicates below. Generic pdSTL evaluation instead uses
+        each belief's ``probability_bounds(predicate)`` contract.
+    diagonal_only : bool
+        If True, extract only the diagonal of full covariance matrices,
+        returning var of shape [Batch, Time, Dim].
+        If False, stack full covariance matrices as-is.
+
+    Returns
+    -------
+    mu  : Tensor [Batch, Time, Dim]
+    var : Tensor [Batch, Time, Dim] (diagonal_only=True)
+          or [Batch, Time, Dim] / [Batch, Time, Dim, Dim] (diagonal_only=False)
+    """
+    means, vars_ = [], []
+    for belief in belief_trajectory:
+        means.append(belief.value())
+        if diagonal_only and belief.covariance.ndim > 2:
+            vars_.append(torch.diagonal(belief.covariance, dim1=-2, dim2=-1))
+        else:
+            vars_.append(belief.covariance)
+    return torch.stack(means, dim=1), torch.stack(vars_, dim=1)
 
 
 def normal_cdf(value, mean, var):
@@ -310,80 +306,6 @@ def normal_cdf(value, mean, var):
     std = torch.sqrt(var + 1e-6)  # Add epsilon for stability
     z = (value - mean) / std
     return 0.5 * (1 + torch.erf(z / math.sqrt(2)))
-
-
-class RectangularGoalPredicate(STL_Formula):
-    """
-    Implements PDF Eq (9):
-    P_goal(t) = min( P(x >= x_min), P(x <= x_max), P(y >= y_min), P(y <= y_max) )
-    """
-
-    def __init__(self, region):
-        super().__init__()
-        self.x_min, self.x_max = region["x"]
-        self.y_min, self.y_max = region["y"]
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        # **kwargs forwarded by the STL_Formula interface (see pdstl/operators.py)
-        mu, var = extract_trajectory_stats(belief_trajectory)
-
-        mu_x, mu_y = mu[..., 0], mu[..., 1]
-        var_x, var_y = var[..., 0], var[..., 1]
-
-        # 2. Compute Probabilities for intervals (assuming independence)
-        # P(x_min <= x <= x_max) = CDF(x_max) - CDF(x_min)
-        p_x = normal_cdf(self.x_max, mu_x, var_x) - normal_cdf(self.x_min, mu_x, var_x)
-
-        # P(y_min <= y <= y_max) = CDF(y_max) - CDF(y_min)
-        p_y = normal_cdf(self.y_max, mu_y, var_y) - normal_cdf(self.y_min, mu_y, var_y)
-
-        # 3. Combine using Product (Independence)
-        # This is more accurate for a rectangular region than min()
-        p_goal = torch.clamp(p_x * p_y, min=0.0, max=1.0)
-
-        # 4. Format Output for Operators
-        # Since we calculated exact probabilities (surrogates), Lower = Upper
-        return torch.stack([p_goal, p_goal], dim=-1)
-
-
-class RectangularObstaclePredicate(STL_Formula):
-    """
-    Implements PDF Eq (10):
-    P_safe(t) = max( P(x <= x_min), P(x >= x_max), P(y <= y_min), P(y >= y_max) )
-    (Safe if Left OR Right OR Below OR Above)
-    """
-
-    def __init__(self, region):
-        super().__init__()
-        self.x_min, self.x_max = region["x"]
-        self.y_min, self.y_max = region["y"]
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        mu, var = extract_trajectory_stats(belief_trajectory)
-
-        mu_x, mu_y = mu[..., 0], mu[..., 1]
-        var_x, var_y = var[..., 0], var[..., 1]
-
-        # 2. Compute Probabilities for being OUTSIDE
-        # P(x <= x_min) (Left of Obs)
-        p_left = normal_cdf(self.x_min, mu_x, var_x)
-
-        # P(x >= x_max) (Right of Obs)
-        p_right = 1.0 - normal_cdf(self.x_max, mu_x, var_x)
-
-        # P(y <= y_min) (Below Obs)
-        p_below = normal_cdf(self.y_min, mu_y, var_y)
-
-        # P(y >= y_max) (Above Obs)
-        p_above = 1.0 - normal_cdf(self.y_max, mu_y, var_y)
-
-        # 3. Combine using Max (Union)
-        # Safe if ANY of these are true
-        stacked_probs = torch.stack([p_left, p_right, p_below, p_above], dim=0)
-        p_safe, _ = torch.max(stacked_probs, dim=0)
-
-        # 4. Format Output
-        return torch.stack([p_safe, p_safe], dim=-1)
 
 
 class CircularObstaclePredicate(STL_Formula):

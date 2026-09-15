@@ -23,7 +23,6 @@ from planning import log_utils
 from models.dynamics import SingleIntegrator
 from models.rollouts import gaussian_rollout
 from planning.planner import Planner
-from planning.simulation import simulate_gaussian_step
 from utils import get_device, load_config
 from visualization.robustness import (
     plot_case,
@@ -348,7 +347,7 @@ def run_mpc_check(verbose=True):
         direct = list(best.hard_interval)
 
         u0 = best.controls[0]
-        next_true, _ = simulate_gaussian_step(dyn, true_state, zero_cov, u0)
+        next_true, _ = dyn.sample_step(true_state, zero_cov, u0)
 
         steps.append(
             {
@@ -509,7 +508,7 @@ def run_end_to_end_mpc_reach(*, show=False, save=True, verbose=True):
     loop = planner.run_receding_horizon(
         (x0_mean, x0_cov),
         make_rollout=lambda state: gaussian_rollout(dyn, *state),
-        execute=lambda state, u: simulate_gaussian_step(dyn, *state, u),
+        execute=lambda state, u: dyn.sample_step(*state, u),
         is_done=lambda state: bool(state[0][dim] >= threshold),
         spec=spec,
         max_steps=cfg["max_steps"],

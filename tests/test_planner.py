@@ -216,6 +216,19 @@ def _smooth_problem(**config):
     return planner, spec, rollout
 
 
+def test_evaluate_controls_scores_returned_controls_like_the_optimiser():
+    planner, spec, rollout = _smooth_problem()
+    best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 2))
+
+    replay = planner.evaluate_controls(rollout, best.controls, spec=spec)
+
+    torch.testing.assert_close(
+        torch.tensor(replay.hard_interval), torch.tensor(best.hard_interval), atol=1e-5, rtol=0
+    )
+    assert replay.objective == pytest.approx(best.objective, abs=1e-5)
+    torch.testing.assert_close(replay.controls, best.controls, atol=1e-5, rtol=0)
+
+
 def test_best_candidate_replays_to_its_own_hard_interval_and_objective():
     planner, spec, rollout = _smooth_problem()
 

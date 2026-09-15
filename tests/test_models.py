@@ -1,5 +1,7 @@
 """Controlled dynamics and the shared Gaussian belief boundary."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -48,6 +50,30 @@ def test_rollout_matches_step_and_linear_prediction(model_type, dimension):
     mean[0, -1].sum().backward()
     assert torch.isfinite(parameters.grad).all()
     assert parameters.grad.abs().sum() > 0
+
+
+def test_sample_step_is_the_predicted_step_plus_process_noise():
+    model = SingleIntegrator(dt=0.2, u_max=1.0, q_std=0.1)
+    x, P, u = torch.tensor([1.0, -2.0]), torch.eye(2) * 0.3, torch.tensor([0.5, -0.25])
+    predicted_mean, predicted_cov = model.step(x, P, u)
+
+    torch.manual_seed(3)
+    sampled, cov = model.sample_step(x, P, u)
+    torch.manual_seed(3)
+    noise = torch.distributions.MultivariateNormal(torch.zeros(2), model.Q).sample()
+    torch.testing.assert_close(sampled, predicted_mean + noise)
+    torch.testing.assert_close(cov, predicted_cov)
+
+    torch.manual_seed(4)
+    draws = torch.stack([model.sample_step(x, P, u)[0] for _ in range(20_000)])
+    torch.testing.assert_close(draws.mean(0), predicted_mean, atol=5e-3, rtol=0)
+    torch.testing.assert_close(torch.cov(draws.T), model.Q, atol=5e-4, rtol=0)
+
+
+def test_simulation_lives_in_the_dynamics_model():
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "src/planning/simulation.py").exists()
+    assert not (root / "src/planning/specifications.py").exists()
 
 
 def test_planning_extracts_the_same_gaussian_beliefs():
