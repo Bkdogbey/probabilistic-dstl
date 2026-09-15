@@ -1,109 +1,20 @@
-import numpy as np
+"""pdSTL planning demos.
 
-from models.dynamics import create_gaussian_belief_trajectory, piecewise_signal
-from pdstl.operators import Always, Eventually, GreaterThan
+scenario -> dynamics -> Gaussian beliefs b_0:H(u) -> event probabilities -> pdSTL interval -> Planner"""
+
+from planning.runners import run_altitude_safety, run_reach_avoid
 from utils import load_config, skip_run
-from visualization.temporal import plot_temporal_example, print_temporal_results
+
+show_plots = load_config("configs/examples.yaml")["show_plots"]
 
 
-examples = load_config("configs/examples.yaml")
-show_plots = examples["show_plots"]
+# 1. AltitudeSafety: 1-D altitude, Always[1,H](z >= 50 m)
+with skip_run("run", "AltitudeSafety") as check, check():
+    print("\nAltitudeSafety")
+    run_altitude_safety(show=show_plots, save=True)
 
 
-# 1. Always
-with skip_run("run", "Always") as check, check():
-    config = examples["always"]
-    threshold = config["threshold"]
-    interval = config["interval_steps"]
-
-    time, mean, variance = piecewise_signal(config["values"])
-    beliefs = create_gaussian_belief_trajectory(mean, variance)
-    sigma = np.sqrt(variance)  # visualization only: the mean +- sigma band
-    predicate = GreaterThan(threshold)
-    formula = Always(predicate, interval=interval)
-
-    atomic_trace = predicate(beliefs)
-    temporal_trace = formula(beliefs, scale=-1)
-
-    print_temporal_results("Always", atomic_trace, temporal_trace)
-    plot_temporal_example(
-        time, mean, sigma, threshold,
-        str(predicate), atomic_trace, str(formula), temporal_trace,
-        show=show_plots,
-    )
-
-
-# 2. Eventually
-with skip_run("run", "Eventually") as check, check():
-    config = examples["eventually"]
-    threshold = config["threshold"]
-    interval = config["interval_steps"]
-
-    time, mean, variance = piecewise_signal(config["values"])
-    beliefs = create_gaussian_belief_trajectory(mean, variance)
-    sigma = np.sqrt(variance)  # visualization only: the mean +- sigma band
-    predicate = GreaterThan(threshold)
-    formula = Eventually(predicate, interval=interval)
-
-    atomic_trace = predicate(beliefs)
-    temporal_trace = formula(beliefs, scale=-1)
-
-    print_temporal_results("Eventually", atomic_trace, temporal_trace)
-    plot_temporal_example(
-        time, mean, sigma, threshold,
-        str(predicate), atomic_trace, str(formula), temporal_trace,
-        show=show_plots,
-    )
-
-
-# 3. Nested Eventually(Always(predicate))
-with skip_run("run", "Nested") as check, check():
-    config = examples["nested"]
-    threshold = config["threshold"]
-    always_interval = config["always_interval_steps"]
-    eventually_interval = config["eventually_interval_steps"]
-
-    time, mean, variance = piecewise_signal(config["values"])
-    beliefs = create_gaussian_belief_trajectory(mean, variance)
-    sigma = np.sqrt(variance)  # visualization only: the mean +- sigma band
-    predicate = GreaterThan(threshold)
-    inner = Always(predicate, interval=always_interval)
-    formula = Eventually(inner, interval=eventually_interval)
-
-    atomic_trace = predicate(beliefs)
-    inner_trace = inner(beliefs, scale=-1)
-    temporal_trace = formula(beliefs, scale=-1)
-
-    print_temporal_results(
-        "Nested", atomic_trace, temporal_trace, inner_trace=inner_trace
-    )
-    plot_temporal_example(
-        time, mean, sigma, threshold,
-        str(predicate), atomic_trace, str(formula), temporal_trace,
-        inner_label=str(inner), inner_trace=inner_trace,
-        show=show_plots,
-    )
-
-
-# 4. EnclosureReach: control optimisation over a propagated descriptor enclosure
-with skip_run("run", "EnclosureReach") as check, check():
-    from planning.examples import run_enclosure_reach
-
-    print("\nEnclosureReach")
-    run_enclosure_reach(show=show_plots, save=True, verbose=True)
-
-
-# 5. EndToEndReach: controls -> Gaussian prediction -> p_k -> Eventually -> loss -> gradient
-with skip_run("run", "EndToEndReach") as check, check():
-    from planning.examples import run_end_to_end_reach
-
-    print("\nEndToEndReach")
-    run_end_to_end_reach(show=show_plots, save=True, verbose=True)
-
-
-# 6. EndToEndMPCReach: plan H steps -> execute first control -> update belief -> replan
-with skip_run("run", "EndToEndMPCReach") as check, check():
-    from planning.examples import run_end_to_end_mpc_reach
-
-    print("\nEndToEndMPCReach")
-    run_end_to_end_mpc_reach(show=show_plots, save=True, verbose=True)
+# 2. ReachAvoid: 2-D position, Always[1,H](outside obstacle) and Eventually[1,H](inside goal)
+with skip_run("run", "ReachAvoid") as check, check():
+    print("\nReachAvoid")
+    run_reach_avoid(show=show_plots, save=True)

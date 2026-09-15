@@ -5,7 +5,15 @@ import matplotlib.patches as patches
 import matplotlib.transforms as transforms
 from matplotlib.animation import FuncAnimation
 
-from visualization.planning import PALETTE, cov_ellipse_params, draw_env_on_ax
+from visualization.planning import (
+    PALETTE,
+    _altitude_axes,
+    _draw_altitude_plan,
+    _plan,
+    _to_np,
+    cov_ellipse_params,
+    draw_env_on_ax,
+)
 
 
 def animate_results(
@@ -189,3 +197,45 @@ def animate_results(
             plt.show()
     else:
         plt.show()
+
+
+def animate_altitude_optimization(result, *, dt, threshold, u_max, filename=None, fps=6):
+    """One frame per optimizer iterate up to the returned plan, held for one second at the end."""
+    returned = result["returned_iteration"]
+    frames = result["frames"][: returned + 1]
+    H = len(_to_np(frames[0]["controls"]))
+    bands = [
+        (_to_np(f["mean"])[:, 0], 2 * np.sqrt(_to_np(f["cov"])[:, 0, 0])) for f in frames
+    ]
+    low = min((mean - band).min() for mean, band in bands)
+    high = max((mean + band).max() for mean, band in bands)
+    state_ylim = (min(low, threshold) - 0.3, high + 0.3)
+
+    fig, axes = _altitude_axes(dt, H, threshold, u_max, state_ylim)
+    static_lines = [len(ax.lines) for ax in axes]  # threshold and control bounds
+    initial = _plan(result, "initial")
+
+    def update(k):
+        for ax, n_static in zip(axes, static_lines):
+            for artist in list(ax.lines[n_static:]) + list(ax.collections):
+                artist.remove()
+        _draw_altitude_plan(axes, initial, dt=dt, name="Initial", style="--",
+                            color=PALETTE["lane"]["stroke"], alpha=0.5)
+        _draw_altitude_plan(axes, frames[k], dt=dt, name="Iterate", style="-",
+                            color=PALETTE["ego"]["stroke"])
+        for ax in axes:
+            ax.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+        label = (f"Returned plan (iteration {k + 1})" if k == returned
+                 else f"Optimizer iteration {k + 1} / {returned + 1}")
+        fig.suptitle(
+            f"{label}    R_lower = {frames[k]['interval'][0]:.4f}",
+            fontsize=14, fontweight="bold", y=0.985,
+        )
+
+    fig.subplots_adjust(left=0.07, right=0.72, top=0.91, bottom=0.07, hspace=0.35)
+    sequence = list(range(len(frames))) + [returned] * fps
+    ani = FuncAnimation(fig, update, frames=sequence, blit=False)
+    if filename:
+        ani.save(filename, writer="pillow", fps=fps)
+    plt.close(fig)
+    return ani

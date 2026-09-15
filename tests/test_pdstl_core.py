@@ -6,7 +6,7 @@ import pytest
 import torch
 from scipy.stats import norm
 
-from models.dynamics import GaussianBelief
+from models.beliefs import GaussianBelief
 from pdstl.base import (
     BeliefTrajectory,
     OnlineBeliefTrajectory,
@@ -20,6 +20,8 @@ from pdstl.operators import (
     GreaterThan,
     Implies,
     LessThan,
+    Maxish,
+    Minish,
     Negation,
     Or,
     Predicate,
@@ -244,12 +246,49 @@ def test_implies_is_negation_then_or():
     torch.testing.assert_close(Implies(a, b)(traj), Or(Negation(a), b)(traj))
 
 
-def test_boolean_bounds_are_unchanged_by_scale():
+def test_only_the_and_lower_clamp_is_smoothed():
     traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
     a, b = Predicate("a"), Predicate("b")
 
-    for spec in (And(a, b), Or(a, b), Implies(a, b), Negation(a)):
+    for spec in (Or(a, b), Implies(a, b), Negation(a)):
         torch.testing.assert_close(spec(traj, scale=5.0), spec(traj, scale=-1))
+
+    exact, smooth = And(a, b)(traj, scale=-1)[0, 0], And(a, b)(traj, scale=5.0)[0, 0]
+    torch.testing.assert_close(exact, torch.tensor([0.3, 0.8]))
+    torch.testing.assert_close(smooth[1], exact[1])
+    torch.testing.assert_close(smooth[0], torch.nn.functional.softplus(torch.tensor(0.3), beta=5.0))
+
+
+def test_smooth_and_escapes_the_exact_zero_clamp():
+    lower = torch.tensor([[0.3], [0.4]], requires_grad=True)  # L1 + L2 - 1 < 0
+    upper = torch.ones(2, 1)
+
+    def conjunction_lower(scale):
+        traj = BeliefTrajectory([ProbabilityBelief({
+            "a": torch.stack([lower[0], upper[0]], dim=-1),
+            "b": torch.stack([lower[1], upper[1]], dim=-1),
+        })])
+        return And(Predicate("a"), Predicate("b"))(traj, scale=scale)[0, 0, 0]
+
+    exact = conjunction_lower(-1)
+    (exact_grad,) = torch.autograd.grad(exact, lower)
+    smooth = conjunction_lower(10.0)
+    (smooth_grad,) = torch.autograd.grad(smooth, lower)
+
+    assert exact.item() == 0.0 and exact_grad.abs().sum() == 0
+    assert smooth.item() > 0 and torch.isfinite(smooth_grad).all() and (smooth_grad > 0).all()
+
+
+def test_smooth_min_and_max_converge_to_the_exact_values_as_beta_grows():
+    x = torch.tensor([[0.2, 0.9, 0.5, 0.7]])
+    errors = []
+    for beta in (1.0, 10.0, 100.0, 1000.0):
+        smooth_min, smooth_max = Minish()(x, beta)[0, 0], Maxish()(x, beta)[0, 0]
+        assert x.min() <= smooth_min <= x.mean() <= smooth_max <= x.max()  # normalized
+        errors.append(max(smooth_min - x.min(), x.max() - smooth_max).item())
+        assert errors[-1] <= np.log(4) / beta + 1e-6
+    assert errors == sorted(errors, reverse=True)
+    assert Minish()(x, -1)[0, 0] == x.min() and Maxish()(x, -1)[0, 0] == x.max()
 
 
 def test_pointwise_flag_tracks_the_formula_kind():
@@ -263,21 +302,92 @@ def test_pointwise_flag_tracks_the_formula_kind():
 
     assert not windowed.is_pointwise
     assert not Until(a, b).is_pointwise
+    assert not And(windowed, b).is_pointwise
+    assert not Negation(windowed).is_pointwise
+    assert not Implies(a, windowed).is_pointwise
 
 
-def test_boolean_over_temporal_is_rejected_at_construction():
+A_TRACE = [(0.9, 0.95), (0.7, 0.8), (0.85, 0.9), (0.6, 0.75), (0.95, 1.0)]
+B_TRACE = [(0.2, 0.4), (0.5, 0.6), (0.3, 0.35), (0.8, 0.9), (0.1, 0.2)]
+
+
+def ab_trajectory():
+    return supplied(*[{"a": a, "b": b} for a, b in zip(A_TRACE, B_TRACE)])
+
+
+def window_ref(trace, a, b, reduce):
+    return [
+        [reduce(x[0] for x in trace[t + a : t + b + 1]), reduce(x[1] for x in trace[t + a : t + b + 1])]
+        for t in range(len(trace) - b)
+    ]
+
+
+def and_ref(x, y):
+    return [max(0.0, x[0] + y[0] - 1.0), min(x[1], y[1])]
+
+
+def or_ref(x, y):
+    return [max(x[0], y[0]), min(1.0, x[1] + y[1])]
+
+
+def not_ref(x):
+    return [1.0 - x[1], 1.0 - x[0]]
+
+
+def test_boolean_combines_temporal_children_at_the_same_origins():
     a, b = Predicate("a"), Predicate("b")
-    windowed = Always(a, interval=[0, 1])
+    always_a = Always(a, interval=[0, 2])  # 3 origins
+    eventually_b = Eventually(b, interval=[0, 1])  # 4 origins
+    alw = window_ref(A_TRACE, 0, 2, min)
+    ev = window_ref(B_TRACE, 0, 1, max)
 
-    for build in (
-        lambda: And(windowed, b),
-        lambda: Or(a, windowed),
-        lambda: Implies(windowed, b),
-        lambda: Implies(a, windowed),
-        lambda: Negation(windowed),
-    ):
-        with pytest.raises(ValueError, match="only accepts pointwise"):
-            build()
+    got_and = And(always_a, eventually_b)(ab_trajectory())[0]
+    got_or = Or(always_a, eventually_b)(ab_trajectory())[0]
+
+    assert got_and.shape == got_or.shape == (3, 2)
+    np.testing.assert_allclose(got_and.tolist(), [and_ref(alw[t], ev[t]) for t in range(3)], atol=1e-6)
+    np.testing.assert_allclose(got_or.tolist(), [or_ref(alw[t], ev[t]) for t in range(3)], atol=1e-6)
+
+
+def test_boolean_combines_temporal_and_atomic_children():
+    a, b = Predicate("a"), Predicate("b")
+    ev = window_ref(A_TRACE, 0, 1, max)
+
+    got = And(Eventually(a, interval=[0, 1]), b)(ab_trajectory())[0]
+
+    np.testing.assert_allclose(got.tolist(), [and_ref(ev[t], B_TRACE[t]) for t in range(4)], atol=1e-6)
+
+
+def test_negation_of_a_temporal_formula_is_its_dual():
+    a = Predicate("a")
+    traj = ab_trajectory()
+
+    got = Negation(Always(a, interval=[0, 2]))(traj)
+
+    np.testing.assert_allclose(got[0].tolist(), [not_ref(x) for x in window_ref(A_TRACE, 0, 2, min)], atol=1e-6)
+    torch.testing.assert_close(got, Eventually(Negation(a), interval=[0, 2])(traj))
+
+
+def test_implies_over_temporal_children_is_negation_then_or():
+    a, b = Predicate("a"), Predicate("b")
+    left, right = Always(a, interval=[0, 1]), Eventually(b, interval=[0, 2])
+    traj = ab_trajectory()
+
+    torch.testing.assert_close(Implies(left, right)(traj), Or(Negation(left), right)(traj))
+
+
+def test_nested_boolean_and_temporal_composition_matches_the_reference():
+    a, b = Predicate("a"), Predicate("b")
+    inner = Or(Negation(Always(a, interval=[0, 2])), And(Eventually(b, interval=[0, 1]), a))
+    formula = Eventually(inner, interval=[0, 1])
+
+    alw = window_ref(A_TRACE, 0, 2, min)
+    ev = window_ref(B_TRACE, 0, 1, max)
+    inner_ref = [or_ref(not_ref(alw[t]), and_ref(ev[t], A_TRACE[t])) for t in range(3)]
+
+    got = formula(ab_trajectory())[0]
+
+    np.testing.assert_allclose(got.tolist(), window_ref(inner_ref, 0, 1, max), atol=1e-6)
 
 
 # --- 4. Always / Eventually ------------------------------------------------
@@ -330,12 +440,13 @@ def test_smooth_temporal_output_is_differentiable():
     [
         (
             Always,
-            lambda window, scale: -torch.logsumexp(-window * scale, dim=0)
+            lambda window, scale: -(torch.logsumexp(-window * scale, dim=0) - np.log(len(window)))
             / scale,
         ),
         (
             Eventually,
-            lambda window, scale: torch.logsumexp(window * scale, dim=0) / scale,
+            lambda window, scale: (torch.logsumexp(window * scale, dim=0) - np.log(len(window)))
+            / scale,
         ),
     ],
 )
@@ -417,39 +528,44 @@ def test_unbounded_start_offsets_the_suffix():
 
 
 def until_reference(left, right, a, b):
-    """Inclusive-prefix Until, written independently of the implementation."""
+    """[lower, upper] per origin, straight from the Until equations."""
     T = len(left)
     out = []
-    for t in range(T - (b if np.isfinite(b) else a)):
-        best = None
-        hi = min(t + (T - 1 if not np.isfinite(b) else b), T - 1)
-        for tau in range(t + a, hi + 1):
-            prefix = min(left[t : tau + 1])  # inclusive of tau
-            cand = min(prefix, right[tau])
-            best = cand if best is None else max(best, cand)
-        out.append(best)
+    for t in range(T - b):
+        lowers, uppers = [], []
+        for tau in range(t + a, t + b + 1):
+            prefix_lower = min(lo for lo, _ in left[t : tau + 1])
+            prefix_upper = min(hi for _, hi in left[t : tau + 1])
+            lowers.append(max(0.0, prefix_lower + right[tau][0] - 1.0))
+            uppers.append(min(prefix_upper, right[tau][1]))
+        out.append([max(lowers), max(uppers)])
     return out
 
 
-UNTIL_LEFT = [0.9, 0.8, 0.4, 0.7, 0.95, 0.6]
-UNTIL_RIGHT = [0.1, 0.3, 0.9, 0.2, 0.5, 0.85]
+UNTIL_LEFT = [(0.9, 0.95), (0.8, 0.9), (0.4, 0.7), (0.7, 0.8), (0.95, 1.0), (0.6, 0.75)]
+UNTIL_RIGHT = [(0.1, 0.2), (0.3, 0.6), (0.9, 0.95), (0.2, 0.4), (0.5, 0.7), (0.85, 0.9)]
 
 
 def until_trajectory():
-    return supplied(
-        *[{"l": (lo, lo), "r": (hi, hi)} for lo, hi in zip(UNTIL_LEFT, UNTIL_RIGHT)]
-    )
+    return supplied(*[{"l": lo, "r": hi} for lo, hi in zip(UNTIL_LEFT, UNTIL_RIGHT)])
 
 
-@pytest.mark.parametrize("interval", [[0, 0], [0, 1], [1, 2]])
-def test_until_matches_the_inclusive_reference(interval):
+@pytest.mark.parametrize("interval", [[0, 0], [0, 1], [1, 2], [0, 3]])
+def test_until_matches_the_reference_equations(interval):
     got = Until(Predicate("l"), Predicate("r"), interval=interval)(until_trajectory())
 
     np.testing.assert_allclose(
-        got[0, :, 0].tolist(),
-        until_reference(UNTIL_LEFT, UNTIL_RIGHT, *interval),
-        atol=1e-6,
+        got[0].tolist(), until_reference(UNTIL_LEFT, UNTIL_RIGHT, *interval), atol=1e-6
     )
+
+
+def test_until_lower_bound_is_a_frechet_conjunction_of_prefix_and_witness():
+    traj = supplied({"l": (0.6, 0.9), "r": (0.6, 0.8)})
+
+    lower, upper = Until(Predicate("l"), Predicate("r"), interval=[0, 0])(traj)[0, 0]
+
+    assert lower.item() == pytest.approx(0.6 + 0.6 - 1.0)  # 0.2, not min = 0.6
+    assert upper.item() == pytest.approx(0.8)
 
 
 def test_until_smooth_approaches_the_exact_reduction():
@@ -463,7 +579,7 @@ def test_until_smooth_approaches_the_exact_reduction():
     assert not torch.equal(smooth, exact)  # a surrogate, not the same tensor
 
 
-def test_until_reduces_both_endpoints_with_the_exact_and_smooth_max_min():
+def test_until_smooth_matches_its_reference():
     trajectory = supplied(
         {"l": (0.7, 0.9), "r": (0.1, 0.3)},
         {"l": (0.4, 0.8), "r": (0.6, 0.75)},
@@ -472,25 +588,26 @@ def test_until_reduces_both_endpoints_with_the_exact_and_smooth_max_min():
     formula = Until(Predicate("l"), Predicate("r"), interval=[0, 2])
 
     exact = formula(trajectory, scale=-1)[0, 0]
-    torch.testing.assert_close(exact, torch.tensor([0.4, 0.8]))
+    # witnesses: [max(0, .7+.1-1), min(.9,.3)], [max(0, .4+.6-1), min(.8,.75)],
+    #            [max(0, .4+.5-1), min(.8,.85)]
+    torch.testing.assert_close(exact, torch.tensor([0.0, 0.8]))
 
     left = Predicate("l")(trajectory)[0]
     right = Predicate("r")(trajectory)[0]
     scale = 4.0
     candidates = []
     for witness in range(3):
-        prefix = -torch.logsumexp(
-            -left[: witness + 1] * scale, dim=0
-        ) / scale
+        window = left[: witness + 1]
+        prefix = -(torch.logsumexp(-window * scale, dim=0) - np.log(len(window))) / scale
         candidates.append(
-            -torch.logsumexp(
-                -torch.stack((prefix, right[witness])) * scale, dim=0
+            torch.stack(
+                (
+                    torch.nn.functional.softplus(prefix[0] + right[witness, 0] - 1.0, beta=scale),
+                    torch.minimum(prefix[1], right[witness, 1]),
+                )
             )
-            / scale
         )
-    expected_smooth = torch.logsumexp(
-        torch.stack(candidates) * scale, dim=0
-    ) / scale
+    expected_smooth = (torch.logsumexp(torch.stack(candidates) * scale, dim=0) - np.log(3)) / scale
 
     torch.testing.assert_close(
         formula(trajectory, scale=scale)[0, 0], expected_smooth
@@ -502,9 +619,8 @@ def test_until_at_zero_zero_combines_both_operands_now():
 
     lower, upper = Until(Predicate("l"), Predicate("r"), interval=[0, 0])(traj)[0, 0]
 
-    # endpointwise min of prefix and witness, not a Frechet conjunction
-    assert lower.item() == pytest.approx(min(0.9, 0.4))
-    assert upper.item() == pytest.approx(min(0.9, 0.4))
+    assert lower.item() == pytest.approx(0.9 + 0.4 - 1.0)
+    assert upper.item() == pytest.approx(0.4)
 
 
 # --- 6. Finite trace -------------------------------------------------------

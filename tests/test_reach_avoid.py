@@ -1,0 +1,204 @@
+"""Single-shot reach-and-avoid through the environment-driven pipeline:
+
+    scenario -> SingleIntegrator, Environment, b_0
+    -> gaussian_rollout: u -> b_0:H(u) -> InsideRectangle / OutsideRectangle events
+    -> GaussianBelief.probability_bounds -> pdSTL -> Planner.optimize_window
+
+The planner optimises pdSTL robustness of the predicted belief trajectory with
+every shaping weight at zero; the mean path is only checked post hoc.
+"""
+
+import ast
+import inspect
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import pytest
+import torch
+
+import planning.runners as runners
+from planning.runners import (
+    build_dynamics,
+    build_environment,
+    build_initial_belief,
+    load_scenario_config,
+    run_reach_avoid,
+)
+from models.beliefs import GaussianBelief
+from models.dynamics import SingleIntegrator
+from pdstl.predicates import InsideRectangle, OutsideRectangle
+from planning.environment import Environment
+from planning.planner import Planner
+from visualization.planning import plot_event_probabilities, plot_reach_avoid
+
+CONFIG = "configs/scenarios/reach_avoid.yaml"
+
+
+@pytest.fixture(scope="module")
+def problem():
+    """The same objects run_reach_avoid builds, for replay and gradient checks."""
+    cfg, planner_cfg = load_scenario_config(CONFIG)
+    dyn = build_dynamics(cfg, "cpu")
+    env = build_environment(cfg, "cpu")
+    x0_mean, x0_cov = build_initial_belief(cfg, "cpu")
+    rollout = runners.gaussian_rollout(dyn, x0_mean, x0_cov)
+    spec = env.get_specification(cfg["H"], t_goal_start=1)
+    planner = Planner(dyn, env, cfg["H"], config=planner_cfg)
+    return cfg, planner_cfg, dyn, env, rollout, spec, planner
+
+
+@pytest.fixture(scope="module")
+def result():
+    return run_reach_avoid(show=False, save=False)
+
+
+def _inside(points, x_range, y_range, strict):
+    x, y = points[:, 0], points[:, 1]
+    if strict:
+        return (x > x_range[0]) & (x < x_range[1]) & (y > y_range[0]) & (y < y_range[1])
+    return (x >= x_range[0]) & (x <= x_range[1]) & (y >= y_range[0]) & (y <= y_range[1])
+
+
+# --- Wiring ------------------------------------------------------------------
+
+
+def test_runner_uses_the_scenario_model_environment_and_rollout(monkeypatch):
+    calls = {"rollout": [], "spec": 0}
+    real_rollout = runners.gaussian_rollout
+    real_spec = Environment.get_specification
+
+    def rollout_spy(dynamics, mean0, cov0):
+        calls["rollout"].append(dynamics)
+        return real_rollout(dynamics, mean0, cov0)
+
+    def spec_spy(self, *args, **kwargs):
+        calls["spec"] += 1
+        return real_spec(self, *args, **kwargs)
+
+    monkeypatch.setattr(runners, "gaussian_rollout", rollout_spy)
+    monkeypatch.setattr(Environment, "get_specification", spec_spy)
+    run_reach_avoid(show=False, save=False)
+
+    assert len(calls["rollout"]) == 1
+    assert isinstance(calls["rollout"][0], SingleIntegrator)
+    assert calls["spec"] == 1
+
+
+def test_spec_is_built_from_spatial_events(problem):
+    *_, spec, _ = problem
+    events = [m for m in spec.modules() if isinstance(m, (InsideRectangle, OutsideRectangle))]
+    assert [type(e) for e in events] == [OutsideRectangle, InsideRectangle]
+
+
+def test_runner_contains_no_optimisation_or_probability_code():
+    tree = ast.parse(inspect.getsource(run_reach_avoid))
+    assert not any(isinstance(n, (ast.For, ast.While)) for n in ast.walk(tree))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    for forbidden in ("backward", "optim", "Adam", "normal_cdf", "cdf", "erf", "step"):
+        assert forbidden not in names
+
+    module = ast.parse(inspect.getsource(runners))
+    imported = {n.module for n in ast.walk(module) if isinstance(n, ast.ImportFrom)}
+    imported |= {a.name for n in ast.walk(module) if isinstance(n, ast.Import) for a in n.names}
+    assert not any("optim" in m for m in imported)
+
+
+def test_shaping_weights_are_zero(problem):
+    _, planner_cfg, *_ = problem
+    assert planner_cfg["w_dist"] == planner_cfg["w_obs"] == planner_cfg["w_visit"] == 0
+    assert planner_cfg["w_phi"] > 0
+    assert planner_cfg["smoothing"]["enabled"]
+
+
+# --- Planning outcome ----------------------------------------------------------
+
+
+def test_outputs_are_finite_and_controls_bounded(result, problem):
+    _, _, dyn, *_ = problem
+    for key in ("mean_trace", "cov_trace", "goal_trace", "safe_trace", "controls"):
+        assert torch.isfinite(result[key]).all(), key
+    assert torch.isfinite(torch.tensor(result["history"])).all()
+    assert (result["controls"].abs() <= dyn.u_max).all()
+
+
+def test_pdstl_lower_score_improves_from_a_poor_start(result):
+    lower_initial, lower_final = result["interval_initial"][0], result["interval_final"][0]
+    assert lower_initial < 0.1
+    assert lower_final > lower_initial + 0.5
+    assert lower_final > 0.9
+    assert lower_final <= result["interval_final"][1] + 1e-6
+
+
+def test_plan_has_useful_goal_and_safety_probabilities(result):
+    assert result["goal_interval"][0] > 0.9
+    assert result["min_safe_interval"][0] > 0.9
+    assert result["safe_trace"][1:, 0].min() == pytest.approx(result["min_safe_interval"][0])
+    assert result["goal_trace"][1:, 0].max() == pytest.approx(result["goal_interval"][0])
+
+
+def test_returned_controls_replay_to_the_stored_pdstl_interval(result, problem):
+    *_, rollout, spec, planner = problem
+    replay = planner.evaluate_controls(rollout, result["controls"], spec=spec)
+
+    assert all(isinstance(b, GaussianBelief) for b in replay.rollout.belief_trajectory)
+    assert list(replay.pdstl_interval) == pytest.approx(result["interval_final"], abs=1e-4)
+    assert result["interval_final"] == pytest.approx(result["stored_interval"], abs=1e-4)
+
+
+def test_gradients_flow_from_controls_through_beliefs_and_events_to_the_objective(problem):
+    cfg, _, dyn, _, rollout, spec, planner = problem
+    u_init = torch.tensor(cfg["init_control"]).repeat(cfg["H"], 1)
+    v = planner._control_parameters(u_init).clone().requires_grad_(True)
+
+    predicted = rollout(v)
+    smooth, _ = planner._scores(spec, predicted.belief_trajectory, planner._beta(0))
+    objective = planner._objective(predicted.nominal_trace, dyn.bound_control(v), smooth)
+    objective.backward()
+
+    assert torch.isfinite(objective)
+    assert torch.isfinite(v.grad).all()
+    assert v.grad.abs().sum() > 0
+
+
+def test_post_hoc_mean_avoids_the_obstacle_and_reaches_the_goal(result, problem):
+    cfg, *_ = problem
+    path = result["mean_trace"][0, 1:]
+    obstacle = cfg["obstacles"][0]
+
+    assert not _inside(path, obstacle["x_range"], obstacle["y_range"], strict=True).any()
+    assert result["min_mean_clearance"] > 0
+    assert _inside(path, cfg["goal"]["x_range"], cfg["goal"]["y_range"], strict=False).any()
+    # and the initial guess did not: it cuts through the obstacle
+    initial = result["mean_initial"][0, 1:]
+    assert _inside(initial, obstacle["x_range"], obstacle["y_range"], strict=True).any()
+
+
+# --- Visualization -------------------------------------------------------------
+
+
+def test_plots_draw_the_belief_sequence_and_event_probabilities(result, problem):
+    cfg, _, _, env, *_ = problem
+    fig, ax = plot_reach_avoid(
+        result["mean_initial"], result["cov_initial"],
+        result["mean_trace"], result["cov_trace"],
+        env, cfg["ellipse_every"], show=False,
+    )
+    ellipses = [p for p in ax.patches if isinstance(p, patches.Ellipse)]
+    rectangles = [p for p in ax.patches if isinstance(p, patches.Rectangle)]
+    assert len(rectangles) >= 2
+    assert len(ellipses) == 2 * len(range(0, cfg["H"] + 1, cfg["ellipse_every"]))
+    labels = ax.get_legend_handles_labels()[1]
+    assert "Optimized predicted mean" in labels
+    fig.canvas.draw()
+    plt.close(fig)
+
+    fig, ax = plot_event_probabilities(
+        cfg["dt"], {"P(goal)": result["goal_trace"], "P(safe)": result["safe_trace"]},
+        show=False,
+    )
+    assert len(ax.lines) == 4
+    plt.close(fig)

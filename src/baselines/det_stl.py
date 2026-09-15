@@ -1,15 +1,6 @@
-"""
-Deterministic STL operators for fair comparison with our probabilistic framework.
+"""Deterministic stlcg-style STL on the mean trajectory, for comparison.
 
-This module implements stlcg-style real-valued (signed-distance) STL robustness
-using the same RNN dynamic programming logic as stlcg, adapted to:
-  - Accept BeliefTrajectory input (uses mean only, ignores covariance)
-  - Work in forward time (same convention as our probabilistic operators)
-  - Return [B, T+1, 1] robustness traces (vs [B, T+1, 2] probability bounds)
-
-Accessing output[:, 0, 0] gives robustness at t=0, matching stl_trace[0, 0, 0]
-used in the probabilistic planner.
-"""
+Outputs [B, T+1, 1] signed-distance robustness in forward time."""
 
 import numpy as np
 import torch
@@ -18,23 +9,11 @@ import torch.nn as nn
 from pdstl.operators import Maxish, Minish
 
 
-# =============================================================================
-# BASE CLASS
-# =============================================================================
+# --- BASE CLASS ---
 
 
 class DetSTL_Formula(nn.Module):
-    """
-    Base class for deterministic stlcg-style STL formulas.
-
-    External interface (forward time):
-      Input:  BeliefTrajectory (list of beliefs with .mean [B, D])
-      Output: [B, T+1, 1] robustness trace, forward time
-
-    Internal interface (robustness_trace):
-      Input:  mu [B, T+1, D] mean trajectory, forward time
-      Output: [B, T+1, 1] robustness trace, forward time
-    """
+    """Base deterministic formula: BeliefTrajectory (means only) -> [B, T+1, 1] robustness."""
 
     def robustness_trace(self, mu, scale=-1, **kwargs):
         """
@@ -65,20 +44,11 @@ class DetSTL_Formula(nn.Module):
         return DetNegation(self)
 
 
-# =============================================================================
-# TEMPORAL OPERATORS (stlcg RNN logic, forward-time interface)
-# =============================================================================
+# --- TEMPORAL OPERATORS (stlcg RNN logic, forward-time interface) ---
 
 
 class DetTemporalOperator(DetSTL_Formula):
-    """
-    Sliding-window temporal operator using stlcg's RNN dynamic programming.
-
-    stlcg processes signals in reversed time order (element 0 = time T).
-    Internally we flip the subformula trace to reversed, run the stlcg RNN,
-    then flip the output back to forward time. This gives identical results to
-    stlcg while keeping the external interface in forward time.
-    """
+    """stlcg RNN window operator, run on the reversed trace and flipped back."""
 
     def __init__(self, subformula, interval=None):
         super().__init__()
@@ -156,9 +126,7 @@ class DetEventually(DetTemporalOperator):
         self.operation = Maxish()
 
 
-# =============================================================================
-# LOGICAL OPERATORS
-# =============================================================================
+# --- LOGICAL OPERATORS ---
 
 
 class DetAnd(DetSTL_Formula):
@@ -204,9 +172,7 @@ class DetNegation(DetSTL_Formula):
         return -self.subformula.robustness_trace(mu, scale=scale, **kwargs)
 
 
-# =============================================================================
-# DETERMINISTIC PREDICATES (signed distance on mean trajectory)
-# =============================================================================
+# --- DETERMINISTIC PREDICATES (signed distance on mean trajectory) ---
 
 
 class DetRectangularGoalPredicate(DetSTL_Formula):
@@ -329,31 +295,11 @@ class DetMovingRectangularObstaclePredicate(DetSTL_Formula):
         return stacked.max(dim=-1, keepdim=True)[0]  # [B, T+1, 1]
 
 
-# =============================================================================
-# SPECIFICATION BUILDER
-# =============================================================================
+# --- SPECIFICATION BUILDER ---
 
 
 def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
-    """
-    Build a deterministic STL specification from an Environment object.
-
-    Mirrors Environment.get_specification() but uses signed-distance robustness
-    (stlcg-style) instead of probabilistic CDF-based bounds. Operates on the
-    mean trajectory only; covariance is ignored.
-
-    Args:
-        env: Environment instance (from planning/environment.py)
-        T: total time horizon in steps
-        t_goal_start: step index for start of goal liveness window
-        t_constraints_start: step index for start of safety window (default=1
-            skips t=0 initial state, matching get_specification() convention)
-
-    Returns:
-        DetSTL_Formula: combined specification.
-        Call as: spec(belief_trajectory) → [B, T+1, 1] (forward time)
-        Planning objective: spec(belief_trajectory)[0, 0, 0]  (robustness at t=0)
-    """
+    """Deterministic mirror of Environment.get_specification on the mean trajectory."""
     specs = []
 
     # 1. Goal 

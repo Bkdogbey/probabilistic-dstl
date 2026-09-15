@@ -1,22 +1,20 @@
+import os
+
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import matplotlib.transforms as transforms
 import numpy as np
 import torch
 
-# Tableau 10 colors
-PALETTE = {
-    "ego": {"fill": "#1f77b4", "stroke": "#1f77b4"},  # Tableau Blue
-    "plan": {"fill": "#ff7f0e", "stroke": "#ff7f0e"},  # Tableau Orange
-    "visit": {"fill": "#c5b0d5", "stroke": "#9467bd"},  # Tableau Green (Light/Dark)
-    "obs_static": {"fill": "#ff9896", "stroke": "#d62728"},  # Tableau Red (Light/Dark)
-    "obs_moving": {
-        "fill": "#ff9896",
-        "stroke": "#d62728",
-    },  # Tableau Purple (Light/Dark)
-    "lane": {"fill": "#c7c7c7", "stroke": "#7f7f7f"},  # Tableau Gray (Light/Dark)
-    "goal": {"fill": "#98df8a", "stroke": "#2ca02c"},  # Tableau Green (Light/Dark)
-    "road": {"fill": "#F2F2F7"},  # Light Gray Background
+PALETTE = {  # Tableau 10
+    "ego": {"fill": "#1f77b4", "stroke": "#1f77b4"},
+    "plan": {"fill": "#ff7f0e", "stroke": "#ff7f0e"},
+    "visit": {"fill": "#c5b0d5", "stroke": "#9467bd"},
+    "obs_static": {"fill": "#ff9896", "stroke": "#d62728"},
+    "obs_moving": {"fill": "#ff9896", "stroke": "#d62728"},
+    "lane": {"fill": "#c7c7c7", "stroke": "#7f7f7f"},
+    "goal": {"fill": "#98df8a", "stroke": "#2ca02c"},
+    "road": {"fill": "#F2F2F7"},
 }
 
 
@@ -59,10 +57,7 @@ def plot_covariance_ellipse(
 
 
 def draw_road_backdrop(ax, env):
-    """Draw road background, goal lane fill, and lane markings onto ax.
-
-    Returns (road_lo, road_hi) so callers can set ylim from road extent.
-    """
+    """Road, goal lane and lane markings; returns (road_lo, road_hi)."""
     road_lo = min(lm["y"] for lm in env.lane_markings) if env.lane_markings else -2.0
     road_hi = max(lm["y"] for lm in env.lane_markings) if env.lane_markings else 6.0
     ax.axhspan(road_lo, road_hi, color=PALETTE["road"]["fill"], zorder=0)
@@ -358,6 +353,217 @@ def plot_trajectory(mean_np, cov_np, env):
 
     plt.show()
     plt.close(fig)
+
+
+def _to_np(trace):
+    """[1, T+1, ...] or [T+1, ...] tensor/array -> numpy without the batch axis."""
+    if isinstance(trace, torch.Tensor):
+        trace = trace.detach().cpu().numpy()
+    trace = np.asarray(trace)
+    return trace[0] if trace.ndim in (3, 4) else trace
+
+
+def _finish(fig, save_path, show):
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_reach_avoid(
+    mean_initial,
+    cov_initial,
+    mean_final,
+    cov_final,
+    env,
+    ellipse_every=10,
+    *,
+    title=None,
+    save_path=None,
+    show=True,
+):
+    """Initial vs optimized predicted means with 95% covariance ellipses every ellipse_every steps."""
+    runs = (
+        (_to_np(mean_initial), _to_np(cov_initial), PALETTE["lane"]["stroke"], "--",
+         "Initial"),
+        (_to_np(mean_final), _to_np(cov_final), PALETTE["ego"]["stroke"], "-",
+         "Optimized"),
+    )
+    all_means = np.concatenate([mean for mean, *_ in runs], axis=0)
+    x_min, x_max, y_min, y_max = _compute_env_bounds(all_means, env)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_xlim(x_min - 1.0, x_max + 1.0)
+    ax.set_ylim(y_min - 1.0, y_max + 1.0)
+    ax.set_aspect("equal")
+    ax.set_xlabel("$x$ [m]", fontsize=14, fontweight="bold")
+    ax.set_ylabel("$y$ [m]", fontsize=14, fontweight="bold")
+    ax.set_axisbelow(True)
+    ax.grid(True, alpha=0.3)
+
+    draw_env_on_ax(ax, env)
+    if env.goal:
+        gx, gy = env.goal["x"], env.goal["y"]
+        ax.text(
+            (gx[0] + gx[1]) / 2, (gy[0] + gy[1]) / 2, "G",
+            fontsize=20, fontweight="bold", ha="center", va="center",
+            color=PALETTE["goal"]["stroke"], zorder=30,
+        )
+
+    for mean, cov, color, style, label in runs:
+        ax.plot(
+            mean[:, 0], mean[:, 1], color=color, linestyle=style, linewidth=2.2,
+            alpha=0.9, label=f"{label} predicted mean", zorder=25,
+        )
+        steps = list(range(0, len(mean), ellipse_every))
+        for i, t in enumerate(steps):
+            plot_covariance_ellipse(
+                ax, mean[t, :2], cov[t, :2, :2],
+                facecolor=color, edgecolor=color, alpha=0.15, zorder=15,
+                label=f"{label} 95% covariance ellipse" if i == 0 else None,
+            )
+
+    start = runs[0][0][0, :2]
+    ax.plot(*start, marker="s", color="k", markersize=8, zorder=31, label="Start")
+    ax.text(
+        start[0] - 0.5, start[1], "S", fontsize=20, fontweight="bold",
+        ha="center", va="center", color="k", zorder=30,
+    )
+
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(
+        by_label.values(), by_label.keys(), loc="upper right", fontsize=9,
+        framealpha=0.95, edgecolor="#cccccc",
+    )
+    ax.set_title(title or "Predicted belief trajectory", fontsize=13, fontweight="bold")
+
+    _finish(fig, save_path, show)
+    return fig, ax
+
+
+def _altitude_axes(dt, H, threshold, u_max, state_ylim=None):
+    """Three panels on one time axis: belief, event probability, controls."""
+    fig, axes = plt.subplots(
+        3, 1, figsize=(11, 8.5), sharex=True, gridspec_kw={"height_ratios": [3, 2, 2]}
+    )
+    ax_state, ax_prob, ax_u = axes
+    red, gray = PALETTE["obs_static"]["stroke"], PALETTE["lane"]["stroke"]
+
+    ax_state.axhline(threshold, color=red, linestyle="--", linewidth=1.5,
+                     label=f"{threshold:g} m threshold")
+    ax_state.set_ylabel("altitude [m]", fontsize=12, fontweight="bold")
+    ax_state.set_title(r"Predicted Gaussian belief $N(\mu_k, \sigma_k^2)$",
+                       loc="left", fontsize=12, fontweight="bold")
+    if state_ylim is not None:
+        ax_state.set_ylim(*state_ylim)
+
+    ax_prob.set_ylim(-0.05, 1.05)
+    ax_prob.set_ylabel("probability", fontsize=12, fontweight="bold")
+    ax_prob.set_title(rf"$P(Z_k \geq {threshold:g}$ m$)$ and lower score R of "
+                      rf"Always$_{{[1,H]}}$", loc="left", fontsize=12, fontweight="bold")
+
+    for bound in (-u_max, u_max):
+        ax_u.axhline(bound, color=gray, linestyle=":", linewidth=1.2)
+    ax_u.set_ylim(-1.15 * u_max, 1.15 * u_max)
+    ax_u.set_ylabel("u [m/s]", fontsize=12, fontweight="bold")
+    ax_u.set_xlabel("time [s]", fontsize=12, fontweight="bold")
+    ax_u.set_title(rf"Controls $u_k$ (bounds $\pm${u_max:g})", loc="left",
+                   fontsize=12, fontweight="bold")
+
+    ax_u.set_xlim(-0.2 * dt, (H + 0.2) * dt)
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+    return fig, axes
+
+
+def _draw_altitude_plan(axes, plan, *, dt, name, color, style, alpha=1.0):
+    """One plan: +/-2 sigma band and mean, P(Z_k >= threshold), controls."""
+    ax_state, ax_prob, ax_u = axes
+    mean = _to_np(plan["mean"])[:, 0]
+    sigma = np.sqrt(_to_np(plan["cov"])[:, 0, 0])
+    time = np.arange(len(mean)) * dt
+
+    ax_state.fill_between(time, mean - 2 * sigma, mean + 2 * sigma, color=color,
+                          alpha=0.18 * alpha, label=f"{name} ±2σ band (Gaussian belief)")
+    ax_state.plot(time, mean, color=color, linestyle=style, linewidth=2.2, alpha=alpha,
+                  label=f"{name} predicted mean")
+    ax_prob.plot(time, _to_np(plan["atomic"])[:, 0], color=color, linestyle=style,
+                 linewidth=2.2, marker="o", markersize=3, alpha=alpha,
+                 label=f"{name}: R = {plan['interval'][0]:.4f}")
+    u = _to_np(plan["controls"])[:, 0]  # u_k holds over [t_k, t_k+1)
+    ax_u.step(time, np.append(u, u[-1]), where="post", color=color, linestyle=style,
+              linewidth=2.2, alpha=alpha, label=f"{name} controls")
+
+
+def _plan(result, tag):
+    keys = ("mean", "cov", "atomic", "interval", "controls")
+    return {key: result[f"{key}_{tag}"] for key in keys}
+
+
+def plot_altitude_safety(result, *, dt, threshold, u_max, save_path=None, show=True):
+    """Initial vs optimized plan for Always_[1,H](Z >= threshold)."""
+    H = len(_to_np(result["controls_final"]))
+    fig, axes = _altitude_axes(dt, H, threshold, u_max)
+    _draw_altitude_plan(axes, _plan(result, "initial"), dt=dt, name="Initial",
+                        color=PALETTE["lane"]["stroke"], style="--")
+    _draw_altitude_plan(axes, _plan(result, "final"), dt=dt, name="Optimized",
+                        color=PALETTE["ego"]["stroke"], style="-")
+    for ax in axes:
+        ax.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+
+    _finish(fig, save_path, show)
+    return fig, axes
+
+
+def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=True):
+    """Event probability intervals over time; traces is {label: [T+1, 2]}."""
+    colors = (PALETTE["goal"]["stroke"], PALETTE["obs_static"]["stroke"],
+              PALETTE["ego"]["stroke"])
+    fig, ax = plt.subplots(figsize=(9, 3.6))
+    for (label, trace), color in zip(traces.items(), colors):
+        trace = _to_np(trace)
+        time = np.arange(len(trace)) * dt
+        ax.fill_between(time, trace[:, 0], trace[:, 1], color=color, alpha=0.25)
+        ax.plot(time, trace[:, 0], color=color, linewidth=2, label=f"{label} lower")
+        ax.plot(time, trace[:, 1], color=color, linewidth=1, linestyle="--",
+                label=f"{label} upper")
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel("time [s]", fontsize=12, fontweight="bold")
+    ax.set_ylabel("probability", fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc="center right", framealpha=0.95)
+    ax.set_title(title or "Event probability intervals", fontsize=12, fontweight="bold")
+
+    _finish(fig, save_path, show)
+    return fig, ax
+
+
+def visualize_reach_avoid(result, env, *, dt, ellipse_every=10, save_path=None,
+                          show=True):
+    """Workspace with predicted beliefs, event probabilities, controls, objective."""
+    lo, hi = result["interval_final"]
+    plot_reach_avoid(
+        result["mean_initial"], result["cov_initial"],
+        result["mean_trace"], result["cov_trace"],
+        env, ellipse_every,
+        title=f"Reach-avoid: pdSTL interval [{lo:.3f}, {hi:.3f}]",
+        save_path=save_path, show=show,
+    )
+    probability_path = None
+    if save_path:
+        root, ext = os.path.splitext(save_path)
+        probability_path = f"{root}_probabilities{ext}"
+    plot_event_probabilities(
+        dt, {"P(goal)": result["goal_trace"], "P(safe)": result["safe_trace"]},
+        save_path=probability_path, show=show,
+    )
+    if show:
+        plot_controls(_to_np(result["controls"]))
+        plot_metrics(result["history"], None)
 
 
 def plot_controls(u_np):

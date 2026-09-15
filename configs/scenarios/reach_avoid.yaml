@@ -1,0 +1,43 @@
+# Reach-avoid: Always[1,H](OutsideRectangle(obstacle)) and Eventually[1,H](InsideRectangle(goal)).
+
+# --- Dynamics ---
+dynamics: single_integrator
+H: 80            # Planning horizon (time steps)
+dt: 0.2          # Time step [s]
+u_max: 1.0       # Maximum control magnitude per axis [m/s]
+q_std: 0.03      # Process noise standard deviation
+
+# --- Initial belief ---
+x0_mean: [0.0, 5.0]
+x0_cov_scale: 0.01   # Diagonal covariance initialised as I * x0_cov_scale
+
+# --- Environment ---
+goal:
+  x_range: [10.0, 12.0]
+  y_range: [2.0, 4.0]
+
+# The straight start-to-goal line clips this obstacle's corner; through its middle,
+# the And lower bound max(0, S + G - 1) would be 0 with no gradient.
+obstacles:
+  - type: rectangle
+    x_range: [4.0, 7.0]
+    y_range: [3.8, 8.0]
+
+# Initial guess only (straight line toward the goal), not part of the objective.
+init_control: [0.7, -0.125]
+
+# --- Planner overrides (on top of configs/planning.yaml); shaping off ---
+planner:
+  w_phi: 10.0
+  w_u: 0.01
+  w_du: 0.01
+  w_dist: 0.0
+  w_obs: 0.0
+  w_visit: 0.0
+  lr: 0.05
+  max_iters: 300
+
+# --- Output ---
+ellipse_every: 10    # Covariance ellipse every N predicted steps
+save_file: reach_avoid.pt
+figure: reach_avoid.png

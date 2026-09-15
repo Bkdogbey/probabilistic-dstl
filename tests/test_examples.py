@@ -1,4 +1,5 @@
-"""Offline examples drive pdSTL from an upstream scalar state model."""
+"""Reference checks of Always/Eventually/Nested on fixed scalar Gaussian signals,
+plus structure checks for main.py and configs/examples.yaml."""
 
 import ast
 import os
@@ -17,7 +18,7 @@ from scipy.special import ndtr
 import yaml
 
 import models.dynamics
-from models.dynamics import create_gaussian_belief_trajectory, piecewise_signal
+from models.beliefs import create_gaussian_belief_trajectory
 from pdstl.operators import Always, Eventually, GreaterThan
 from utils import to_steps
 from visualization.temporal import plot_temporal_example
@@ -25,7 +26,29 @@ from visualization.temporal import plot_temporal_example
 
 ROOT = Path(__file__).resolve().parents[1]
 
-EXAMPLES = ("always", "eventually", "nested")
+# Fixed (mean, variance) signals, one precise Gaussian belief per step.
+SIGNALS = {
+    "always": {
+        "threshold": 50.0,
+        "interval_steps": [0, 2],
+        "values": [[56.0, 4.0], [54.0, 4.0], [52.0, 4.0], [50.0, 4.0],
+                   [48.0, 4.0], [54.0, 4.0], [56.0, 4.0], [58.0, 4.0]],
+    },
+    "eventually": {
+        "threshold": 50.0,
+        "interval_steps": [0, 1],
+        "values": [[46.0, 4.0], [48.0, 4.0], [50.0, 4.0], [48.0, 4.0],
+                   [54.0, 4.0], [46.0, 4.0], [44.0, 4.0]],
+    },
+    "nested": {
+        "threshold": 50.0,
+        "always_interval_steps": [0, 1],
+        "eventually_interval_steps": [0, 1],
+        "values": [[48.0, 4.0], [54.0, 4.0], [52.0, 4.0], [48.0, 4.0],
+                   [50.0, 4.0], [56.0, 4.0]],
+    },
+}
+EXAMPLES = tuple(SIGNALS)
 
 
 def _config():
@@ -33,9 +56,10 @@ def _config():
 
 
 def _example(name):
-    """Build one example's state trace, predicate, and beliefs as main.py does."""
-    config = _config()[name]
-    time, mean, variance = piecewise_signal(config["values"])
+    """One signal's state trace, predicate, and beliefs."""
+    config = SIGNALS[name]
+    mean, variance = np.asarray(config["values"]).T
+    time = np.arange(len(mean), dtype=float)
     predicate = GreaterThan(config["threshold"])
     beliefs = create_gaussian_belief_trajectory(mean, variance)
     return config, (time, mean, variance), predicate, beliefs
@@ -220,28 +244,9 @@ def test_to_steps_rejects_invalid_time_grids(time, message):
 # ---------------------------------------------------------------------------
 
 
-def test_examples_configuration_holds_only_numerical_example_data():
+def test_examples_configuration_holds_no_hand_authored_signals():
     config = _config()
-    assert set(config) == {
-        "show_plots", "enclosure_reach", "end_to_end_reach", "end_to_end_mpc_reach", *EXAMPLES
-    }
-
-    shared = {"threshold", "values"}
-    assert set(config["always"]) == shared | {"interval_steps"}
-    assert set(config["eventually"]) == shared | {"interval_steps"}
-    assert set(config["nested"]) == shared | {
-        "always_interval_steps",
-        "eventually_interval_steps",
-    }
-    for name in EXAMPLES:
-        assert all(len(pair) == 2 for pair in config[name]["values"])
-
-    enclosure = config["enclosure_reach"]
-    assert set(enclosure) == {
-        "threshold", "interval_steps", "H", "dt", "u_max", "q_std",
-        "lower0", "upper0", "covariance0", "d_lower", "d_upper", "seed", "planner",
-    }
-    assert len(enclosure["lower0"]) == len(enclosure["upper0"]) == 2
+    assert set(config) == {"show_plots", "end_to_end_reach", "end_to_end_mpc_reach"}
 
     end_to_end = config["end_to_end_reach"]
     assert set(end_to_end) == {
@@ -263,7 +268,8 @@ def test_offline_module_and_signal_dispatcher_remain_absent():
 
 def test_reusable_modules_do_not_run_examples_or_eagerly_import_planning():
     code = (
-        "import sys; import models.dynamics; import pdstl.base; "
+        "import sys; import models.dynamics; import models.beliefs; "
+        "import models.rollouts; import pdstl.base; "
         "assert 'visualization.planning' not in sys.modules; "
         "assert 'visualization.live_plots' not in sys.modules; "
         "assert 'visualization.animation' not in sys.modules"
@@ -289,14 +295,7 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
     source = (ROOT / "src/main.py").read_text()
     tree = ast.parse(source)
 
-    assert [name for _, name in _main_blocks(source)] == [
-        "Always",
-        "Eventually",
-        "Nested",
-        "EnclosureReach",
-        "EndToEndReach",
-        "EndToEndMPCReach",
-    ]
+    assert [name for _, name in _main_blocks(source)] == ["AltitudeSafety", "ReachAvoid"]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
     )
@@ -306,9 +305,9 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
 @pytest.mark.parametrize(
     "flags",
     [
-        ("run", "run", "run", "run", "run", "run"),
-        ("run", "skip", "run", "skip", "run", "skip"),
-        ("skip", "skip", "skip", "skip", "skip", "run"),
+        ("run", "run"),
+        ("run", "skip"),
+        ("skip", "run"),
     ],
 )
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):

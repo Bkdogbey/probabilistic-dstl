@@ -43,7 +43,10 @@ planner:
   min_iters: 20
   alpha: 0.99
   loss_tol: 1.0e-6
-  scale: 10.0
+  smoothing:
+    enabled: true
+    beta_start: 10.0
+    beta_end: 10.0
 
 mpc:
   form: eventually

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
-from models.dynamics import GaussianBelief, create_gaussian_belief_trajectory
+from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
 from pdstl.operators import LessThan
 from planning.examples import (
     end_to_end_setup,
@@ -39,7 +39,7 @@ def test_config_disables_every_shaping_heuristic():
     _, planner_cfg = load_end_to_end_config()
     assert planner_cfg["w_dist"] == planner_cfg["w_obs"] == planner_cfg["w_visit"] == 0
     assert planner_cfg["w_phi"] > 0
-    assert planner_cfg["scale"] <= 0  # scored directly, not smoothed
+    assert not planner_cfg["smoothing"]["enabled"]  # scored exactly, not smoothed
 
 
 def test_gradient_reaches_controls_through_the_whole_pipeline():
@@ -53,8 +53,8 @@ def test_gradient_reaches_controls_through_the_whole_pipeline():
     assert all(isinstance(belief, GaussianBelief) for belief in traj)
 
     atomic = predicate(traj)
-    robustness = spec(traj, scale=planner_cfg["scale"])[0, 0, 0]
-    loss = Planner(dyn, None, cfg["H"], config=planner_cfg)._compute_loss(
+    robustness = spec(traj, scale=-1)[0, 0, 0]
+    loss = Planner(dyn, None, cfg["H"], config=planner_cfg)._objective(
         mean, dyn.bound_control(v), robustness
     )
     loss.backward()
