@@ -100,3 +100,12 @@ with skip_run("run", "EndToEndMPCReach") as check, check():
 
     print("\nEndToEndMPCReach")
     run_end_to_end_mpc_reach(show=show_plots, save=True, verbose=True)
+
+
+# 6. ReachAvoid: 2-D planning, Always[1,H](outside obstacle) and Eventually[1,H](inside goal)
+#    controls -> SingleIntegrator -> Gaussian beliefs -> x/y atoms -> pdSTL -> Planner
+with skip_run("run", "ReachAvoid") as check, check():
+    from experiments.planning import run_reach_avoid
+
+    print("\nReachAvoid")
+    run_reach_avoid(show=show_plots, save=True)

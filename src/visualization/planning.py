@@ -360,6 +360,97 @@ def plot_trajectory(mean_np, cov_np, env):
     plt.close(fig)
 
 
+def _to_np(trace):
+    """[1, T+1, ...] or [T+1, ...] tensor/array -> numpy without the batch axis."""
+    if isinstance(trace, torch.Tensor):
+        trace = trace.detach().cpu().numpy()
+    trace = np.asarray(trace)
+    return trace[0] if trace.ndim in (3, 4) else trace
+
+
+def plot_reach_avoid(
+    mean_initial,
+    cov_initial,
+    mean_final,
+    cov_final,
+    env,
+    ellipse_steps,
+    *,
+    title=None,
+    save_path=None,
+    show=True,
+):
+    """Initial vs optimized mean path in the reach-and-avoid workspace.
+
+    Means are [1, T+1, 2] or [T+1, 2]; covariances [1, T+1, 2, 2] or [T+1, 2, 2].
+    Ellipses are 95% regions of the predicted Gaussian at ``ellipse_steps``.
+    """
+    runs = (
+        (_to_np(mean_initial), _to_np(cov_initial), PALETTE["lane"]["stroke"],
+         "--", "Initial mean"),
+        (_to_np(mean_final), _to_np(cov_final), PALETTE["ego"]["stroke"],
+         "-", "Optimized mean"),
+    )
+    all_means = np.concatenate([mean for mean, *_ in runs], axis=0)
+    x_min, x_max, y_min, y_max = _compute_env_bounds(all_means, env)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_xlim(x_min - 0.75, x_max + 0.75)
+    ax.set_ylim(y_min - 0.75, y_max + 0.75)
+    ax.set_aspect("equal")
+    ax.set_xlabel("$x$ [m]", fontsize=14, fontweight="bold")
+    ax.set_ylabel("$y$ [m]", fontsize=14, fontweight="bold")
+    ax.set_axisbelow(True)
+    ax.grid(True, alpha=0.3)
+
+    draw_env_on_ax(ax, env)
+
+    if env.goal:
+        gx, gy = env.goal["x"], env.goal["y"]
+        ax.text(
+            (gx[0] + gx[1]) / 2, (gy[0] + gy[1]) / 2, "G",
+            fontsize=20, fontweight="bold", ha="center", va="center",
+            color=PALETTE["goal"]["stroke"], zorder=30,
+        )
+
+    for mean, cov, color, style, label in runs:
+        ax.plot(
+            mean[:, 0], mean[:, 1], color=color, linestyle=style, linewidth=2.2,
+            marker="o", markersize=2.5, alpha=0.9, label=label, zorder=25,
+        )
+        for i, t in enumerate(s for s in ellipse_steps if s < len(mean)):
+            plot_covariance_ellipse(
+                ax, mean[t, :2], cov[t, :2, :2],
+                facecolor=color, edgecolor=color, alpha=0.15, zorder=15,
+                label=f"{label} 95% ellipse" if i == 0 else None,
+            )
+
+    start = runs[0][0][0, :2]
+    ax.plot(*start, marker="s", color="k", markersize=8, zorder=31, label="Start")
+    ax.text(
+        start[0] - 0.3, start[1], "S", fontsize=20, fontweight="bold",
+        ha="center", va="center", color="k", zorder=30,
+    )
+
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(
+        by_label.values(), by_label.keys(), loc="upper left", fontsize=10,
+        framealpha=0.95, edgecolor="#cccccc",
+    )
+    if title:
+        ax.set_title(title, fontsize=13, fontweight="bold")
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax
+
+
 def plot_controls(u_np):
     T = u_np.shape[0]
     time_steps = np.arange(T)

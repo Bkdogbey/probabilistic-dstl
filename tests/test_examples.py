@@ -290,6 +290,7 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
         "Nested",
         "EndToEndReach",
         "EndToEndMPCReach",
+        "ReachAvoid",
     ]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in tree.body
@@ -300,9 +301,9 @@ def test_main_is_direct_and_holds_one_literal_skip_run_block_per_example():
 @pytest.mark.parametrize(
     "flags",
     [
-        ("run", "run", "run", "run", "run"),
-        ("run", "skip", "run", "run", "skip"),
-        ("skip", "skip", "skip", "skip", "run"),
+        ("run", "run", "run", "run", "run", "run"),
+        ("run", "skip", "run", "run", "skip", "skip"),
+        ("skip", "skip", "skip", "skip", "skip", "run"),
     ],
 )
 def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
