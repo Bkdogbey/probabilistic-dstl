@@ -8,12 +8,7 @@ import yaml
 
 
 def get_device():
-    """Return the configured torch device.
-
-    This project defaults to CPU because some lab machines expose CUDA libraries
-    even when the installed GPU/driver pair cannot actually initialize. Set
-    PDSTL_DEVICE=cuda or PDSTL_USE_CUDA=1 to opt into CUDA explicitly.
-    """
+    """CPU unless PDSTL_DEVICE is set or PDSTL_USE_CUDA=1 (some lab CUDA installs fail to initialise)."""
     requested = os.environ.get("PDSTL_DEVICE")
     if requested:
         return torch.device(requested)
@@ -23,14 +18,7 @@ def get_device():
 
 
 def load_config(path):
-    """Load a YAML config file and return it as a dict.
-
-    Parameters
-    ----------
-    path : str
-        Path to the YAML file. Can be relative to the project root
-
-    """
+    """Load a YAML file; relative paths resolve from the project root."""
     if not os.path.isabs(path):
         # Resolve relative paths from the project root (two levels above this file)
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,17 +33,7 @@ class SkipWith(Exception):
 
 @contextmanager
 def skip_run(flag, f):
-    """To skip a block of code.
-
-    Parameters
-    ----------
-    flag : str
-        skip or run.
-
-    Returns
-    -------
-    None
-    """
+    """Context manager that runs or skips a block: flag is 'run' or 'skip'."""
 
     @contextmanager
     def check_active():
@@ -87,20 +65,7 @@ class ColorPrint:
 
 
 def to_steps(interval_sec, t):
-    """Map a continuous interval to its nearest discrete grid indices.
-
-    Parameters
-    ----------
-    interval_sec : list of two numbers
-        Interval bounds in seconds. The second bound may be np.inf.
-    t : array-like
-        Strictly increasing, uniformly spaced time vector with at least two
-        samples. Interval seconds are rounded to the nearest grid indices.
-
-    Returns
-    -------
-    [a_step, b_step] : list
-    """
+    """Map an interval in seconds to the nearest indices of a uniform time grid [a, b]; b may be inf."""
     t = np.asarray(t)
     if t.ndim != 1 or len(t) < 2:
         raise ValueError("time vector must be one-dimensional with at least two samples")

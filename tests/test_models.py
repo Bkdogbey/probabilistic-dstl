@@ -52,6 +52,27 @@ def test_rollout_matches_step_and_linear_prediction(model_type, dimension):
     assert parameters.grad.abs().sum() > 0
 
 
+def test_single_integrator_defaults_to_the_planar_model():
+    model = SingleIntegrator(dt=0.2, q_std=0.05)
+    torch.testing.assert_close(model.A, torch.eye(2))
+    torch.testing.assert_close(model.B, 0.2 * torch.eye(2))
+    torch.testing.assert_close(model.Q, 0.05**2 * torch.eye(2))
+
+
+def test_scalar_single_integrator_propagates_mean_and_variance():
+    dt, q_std = 0.2, 0.08
+    model = SingleIntegrator(dt=dt, u_max=1.0, q_std=q_std, state_dim=1)
+    v = torch.tensor([[0.3], [-0.5], [1.2]])
+    mean, cov = model(v, torch.tensor([52.0]), torch.tensor([[0.25]]))
+
+    u = model.bound_control(v)[:, 0]
+    expected_mean = 52.0 + dt * torch.cat([torch.zeros(1), torch.cumsum(u, 0)])
+    expected_var = 0.25 + q_std**2 * torch.arange(4.0)
+    assert mean.shape == (1, 4, 1) and cov.shape == (1, 4, 1, 1)
+    torch.testing.assert_close(mean[0, :, 0], expected_mean)
+    torch.testing.assert_close(cov[0, :, 0, 0], expected_var)
+
+
 def test_sample_step_is_the_predicted_step_plus_process_noise():
     model = SingleIntegrator(dt=0.2, u_max=1.0, q_std=0.1)
     x, P, u = torch.tensor([1.0, -2.0]), torch.eye(2) * 0.3, torch.tensor([0.5, -0.25])

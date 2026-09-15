@@ -1,50 +1,6 @@
 show_plots: true
 
-# always/eventually/nested each supply an upstream scalar state model:
-# (mean, variance) per step, one precise Gaussian belief N(mean, variance). The
-# atomic probability p_k = P(X_k >= threshold) is computed from it and enters
-# pdSTL as [p_k, p_k]; any mean +- sigma band in the plots is visualization only.
-
-always:
-  threshold: 50.0
-  interval_steps: [0, 2]
-  values:
-    - [56.0, 4.0]
-    - [54.0, 4.0]
-    - [52.0, 4.0]
-    - [50.0, 4.0]
-    - [48.0, 4.0]
-    - [54.0, 4.0]
-    - [56.0, 4.0]
-    - [58.0, 4.0]
-
-eventually:
-  threshold: 50.0
-  interval_steps: [0, 1]
-  values:
-    - [46.0, 4.0]
-    - [48.0, 4.0]
-    - [50.0, 4.0]
-    - [48.0, 4.0]
-    - [54.0, 4.0]
-    - [46.0, 4.0]
-    - [44.0, 4.0]
-
-nested:
-  threshold: 50.0
-  always_interval_steps: [0, 1]
-  eventually_interval_steps: [0, 1]
-  values:
-    - [48.0, 4.0]
-    - [54.0, 4.0]
-    - [52.0, 4.0]
-    - [48.0, 4.0]
-    - [50.0, 4.0]
-    - [56.0, 4.0]
-
-# Minimal end-to-end planning smoke test: a precise Gaussian SingleIntegrator
-# rollout, one atomic predicate x >= threshold, and Eventually over [0, H].
-# Only the pdSTL term and control regularisation shape the objective.
+# End-to-end smoke test: Eventually[0, H](x >= threshold), shaping off.
 end_to_end_reach:
   threshold: 1.0
   dim: 0
@@ -63,14 +19,8 @@ end_to_end_reach:
     w_visit: 0.0
     scale: -1
 
-# Receding-horizon version of end_to_end_reach: at every executed step the
-# planner optimises Eventually[0, H](x >= threshold) from the current belief,
-# applies only the first control to a simulated system (predicted step plus
-# sampled process noise), and replans. A 10-step window reaches at most
-# x = 2.0, so the target cannot be met by a single plan.
-# init_control seeds the first window only (later windows warm-start from the
-# shifted previous plan). It must not be zero: at rest every P(x_k >= 2) is
-# below float32's CDF resolution (z ~ -7), so the objective is flat.
+# MPC version: one 10-step window cannot reach x = 2, so it must replan.
+# init_control must be nonzero: at rest P(x_k >= 2) underflows and the objective is flat.
 end_to_end_mpc_reach:
   threshold: 2.0
   dim: 0

@@ -1,11 +1,4 @@
-"""Five pdSTL example cases driven through one shared runner.
-
-Each case runs the same pipeline: predicted Gaussian beliefs -> atomic event
-probabilities -> Boolean/temporal intervals -> optimisation -> plot. The
-temporal output is a stochastic robustness interval; it is not a
-whole-trajectory satisfaction probability. Only the Gaussian atom values are
-probabilities.
-"""
+"""Scalar pdSTL cases (Always, Eventually, corridor, Until, nested) plus end-to-end reach demos."""
 
 import os
 
@@ -34,9 +27,7 @@ from visualization.robustness import (
 OUTPUT_DIR = "outputs"
 
 
-# --- Case specifications ---------------------------------------------------
-# Each builder returns (formula, atoms, thresholds, description). `atoms` are
-# plotted as atomic event probabilities; `thresholds` are drawn on the state.
+# --- Case specifications: each returns (formula, atoms, thresholds, description) ---
 
 
 def _always(cfg, dim):
@@ -150,11 +141,7 @@ def _initial_state(cfg, device):
 
 
 def run_case(name, *, show=False, save=True, verbose=True):
-    """Evaluate, optimise, re-evaluate and plot one case.
-
-    Returns a dict with the initial and final directly-evaluated intervals, the
-    returned controls, and the objective history.
-    """
+    """Evaluate, optimise, re-evaluate and plot one case; returns intervals, controls and history."""
     cfg, planner_cfg = load_examples_config()
     device = get_device()
     dim, H, dt = cfg["dim"], cfg["H"], cfg["dt"]
@@ -248,12 +235,7 @@ def run_case(name, *, show=False, save=True, verbose=True):
 
 
 def run_always_step_zero(verbose=True):
-    """Always including step 0, where the bottleneck is fixed at planning time.
-
-    x(0) is the given initial belief, so no control can change P(x(0) >= c).
-    Optimisation cannot improve this specification, and reporting it honestly
-    is the point of the check.
-    """
+    """Always including step 0: the fixed initial belief caps the score, so it cannot improve."""
     cfg, planner_cfg = load_examples_config()
     device = get_device()
     case_cfg = cfg["cases"]["always"]
@@ -289,21 +271,7 @@ def run_always_step_zero(verbose=True):
 
 
 def run_mpc_check(verbose=True):
-    """Short receding-horizon run reusing one case.
-
-    Simulation assumption, stated rather than estimated: at each replanning step
-    the physical state transition is sampled, that state is observed in full,
-    and the next controller belief is initialised there with zero covariance.
-    Process uncertainty then grows forward from the observation. This is not a
-    state estimator.
-
-    The deadline is absolute. For Eventually(., [a, b]) fixed at the first plan,
-    after k applied steps the remaining window is [max(0, a-k), b-k]; it is
-    never restarted.
-
-    Reported as an integration check -- not recursive feasibility, and not a
-    closed-loop satisfaction probability.
-    """
+    """Short MPC run: sampled steps, full-state observation with zero covariance, absolute deadline."""
     cfg, planner_cfg = load_examples_config()
     device = get_device()
     mpc_cfg = cfg["mpc"]
@@ -332,9 +300,7 @@ def run_mpc_check(verbose=True):
         horizon = max(1, b_k)
         spec = Eventually(GreaterThan(c, dim=dim), interval=[a_k, min(b_k, horizon)])
 
-        # Belief for this window: observed state, zero covariance. The
-        # degenerate Gaussian is handled by the atom's inclusive zero-variance
-        # branch.
+        # Belief for this window: the observed state with zero covariance.
         belief_mean, belief_cov = true_state.clone(), zero_cov.clone()
 
         planner = Planner(dyn, None, horizon, config=planner_cfg)
@@ -415,15 +381,7 @@ def _evaluate_plan(rollout, v, predicate, spec):
 
 
 def run_end_to_end_reach(*, show=False, save=True, verbose=True):
-    """Optimise controls to raise Eventually[0,H](x >= c) through one precise
-    Gaussian belief model:
-
-        v -> u -> (mu, Sigma) -> [p_k, p_k] -> Eventually -> J -> grad_v J
-
-    Controls start at zero, so the initial mean never leaves x0 and the
-    initial score is small. Shaping heuristics are disabled in the config, so
-    any improvement comes from the pdSTL term.
-    """
+    """Optimise Eventually[0,H](x >= c) from zero controls with shaping off."""
     cfg, planner_cfg = load_end_to_end_config()
     device = get_device()
     H, dim = cfg["H"], cfg["dim"]
@@ -490,14 +448,7 @@ def run_end_to_end_reach(*, show=False, save=True, verbose=True):
 
 
 def run_end_to_end_mpc_reach(*, show=False, save=True, verbose=True):
-    """Receding-horizon version of the smoke test, same pipeline per window:
-
-        current belief -> H-step Gaussian prediction -> [p_k, p_k] -> Eventually
-        -> optimise controls -> execute only u_0 -> simulated step -> replan
-
-    Shaping heuristics are disabled and the planner has no environment, so the
-    pdSTL term and control regularisation are the whole objective.
-    """
+    """Receding-horizon Eventually reach: plan, execute u_0, sample the step, replan."""
     cfg, planner_cfg = load_end_to_end_config("end_to_end_mpc_reach")
     device = get_device()
     H, dim, threshold = cfg["H"], cfg["dim"], cfg["threshold"]

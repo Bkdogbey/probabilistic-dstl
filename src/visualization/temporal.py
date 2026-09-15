@@ -27,10 +27,7 @@ def _trace(value, name):
 
 
 def _plot_state(ax, time, mean, sigma, threshold, title):
-    """Draw the upstream mean trace, a mean +- sigma band, and the threshold.
-
-    The band is visualization only; it is not a probability bound.
-    """
+    """Mean trace, mean +/- sigma band (visual only) and threshold."""
     lower, upper = mean - sigma, mean + sigma
     ax.fill_between(time, lower, upper, step="post", color=LOWER_COLOR, alpha=0.12)
     ax.step(
@@ -105,12 +102,7 @@ def plot_temporal_example(
     inner_trace=None,
     show=True,
 ):
-    """Plot the state signal, its atomic bounds, and the temporal outputs.
-
-    All panels share one time axis. Temporal traces are drawn only at their
-    valid evaluation origins, so a shorter trace ends early rather than being
-    stretched across the horizon.
-    """
+    """State, atomic bounds and temporal traces on one time axis (traces end at their last origin)."""
     time, mean, sigma = _numpy(time), _numpy(mean), _numpy(sigma)
     atomic = _trace(atomic_trace, "atomic_trace")
     if not (time.shape == mean.shape == sigma.shape) or len(time) != len(atomic):

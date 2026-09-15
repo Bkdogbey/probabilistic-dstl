@@ -100,7 +100,7 @@ def test_pdstl_imports_no_model_implementation():
             else:
                 continue
             assert not any(
-                name.split(".")[0] in {"models", "planning", "baselines", "experiments"}
+                name.split(".")[0] in {"models", "planning", "baselines"}
                 or "Gaussian" in name
                 for name in names
             ), path
@@ -214,6 +214,39 @@ def _smooth_problem(**config):
     spec = Eventually(GreaterThan(0.5), interval=[0, 3])
     rollout = gaussian_rollout(planner.dyn, torch.zeros(2), torch.eye(2) * 0.01)
     return planner, spec, rollout
+
+
+def test_planner_handles_one_dimensional_controls():
+    dyn = SingleIntegrator(state_dim=1)
+    planner = Planner(dyn, None, 3, config={
+        "max_iters": 5, "scale": -1, "alpha": 2.0, "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
+    })
+    rollout = gaussian_rollout(dyn, torch.zeros(1), torch.eye(1) * 0.01)
+    spec = Eventually(GreaterThan(0.1), interval=[0, 3])
+
+    best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 1))
+
+    assert best.controls.shape == (3, 1)
+    assert planner._init_controls(None).shape == (3, 1)
+    assert planner._empty_u_trace().shape == (1, 0, 1)
+
+
+def test_on_iteration_observes_every_iterate_without_changing_the_result():
+    planner, spec, rollout = _smooth_problem()
+    seen = []
+
+    best, history = planner.optimize_window(
+        rollout, spec=spec, init_guess=torch.zeros(3, 2),
+        on_iteration=lambda k, candidate: seen.append((k, candidate.objective)),
+    )
+    plain, plain_history = planner.optimize_window(
+        rollout, spec=spec, init_guess=torch.zeros(3, 2)
+    )
+
+    assert [k for k, _ in seen] == list(range(len(history)))
+    assert [objective for _, objective in seen] == history
+    assert history == plain_history
+    assert best.hard_interval == plain.hard_interval
 
 
 def test_evaluate_controls_scores_returned_controls_like_the_optimiser():

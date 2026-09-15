@@ -1,18 +1,10 @@
-"""Belief contract and trajectory containers for pdSTL.
-
-A formula states a requirement; a belief evaluates it under its own uncertainty
-model. Shapes: B batch, T trajectory length, D state dimension.
-
-    Belief.probability_bounds(predicate) -> [B, 2]     lower, upper in [0, 1]
-    Predicate.robustness_trace(trajectory) -> [B, T, 2]
-"""
+"""Belief contract and trajectory containers: Belief.probability_bounds(event) -> [B, 2]."""
 
 from abc import ABC, abstractmethod
 
 import torch
 
-# A CDF evaluation may land this far outside [0, 1] through round-off.
-_ATOL = 1e-6
+_ATOL = 1e-6  # round-off allowed outside [0, 1]
 
 
 class Belief(ABC):
@@ -20,18 +12,15 @@ class Belief(ABC):
 
     @abstractmethod
     def probability_bounds(self, predicate):
-        """Lower and upper probability of the predicate's event, [B, 2].
-
-        Raise ValueError naming the predicate if this model cannot evaluate it.
-        """
+        """[B, 2] lower/upper probability of the event; ValueError if unsupported."""
 
     def value(self):
-        """Point estimate [B, D], for consumers that need a representative state."""
+        """Representative state [B, D]."""
         raise NotImplementedError(f"{type(self).__name__} has no value()")
 
 
 class BeliefTrajectory:
-    """Ordered per-step beliefs. Organizes steps; computes nothing."""
+    """Ordered per-step beliefs."""
 
     def __init__(self, beliefs):
         self.beliefs = list(beliefs)
@@ -50,12 +39,7 @@ class BeliefTrajectory:
 
 
 class OnlineBeliefTrajectory(BeliefTrajectory):
-    """Appendable container for streaming predictions.
-
-    Not an incremental monitor: append() adds an input element, it does not
-    advance any temporal-operator state, and re-evaluating a formula recomputes
-    the whole trace.
-    """
+    """Appendable trajectory; formulas re-evaluate the whole trace (not incremental)."""
 
     def __init__(self, beliefs=None):
         super().__init__([] if beliefs is None else beliefs)
@@ -69,11 +53,7 @@ class OnlineBeliefTrajectory(BeliefTrajectory):
 
 
 class ProbabilityBelief(Belief):
-    """A step whose bounds are supplied already computed, keyed by event name.
-
-    bounds: {event name: [B, 2] tensor}. Tensors are kept as-is, so a tensor
-    that requires grad keeps its graph.
-    """
+    """Precomputed bounds per event name: {name: [B, 2] tensor}, graphs kept."""
 
     def __init__(self, bounds, value=None):
         self.bounds = {}
@@ -99,11 +79,7 @@ class ProbabilityBelief(Belief):
 
 
 def create_probability_belief_trajectory(predicate, bounds, dtype=None, device=None):
-    """Build a trajectory from a supplied ``[T, 2]`` probability-bound trace.
-
-    Column 0 is the lower and column 1 the upper probability of the predicate's
-    event. Tensors are passed through rather than copied, so gradients survive.
-    """
+    """Trajectory from a [T, 2] (lower, upper) trace for one event; gradients kept."""
     bounds = torch.as_tensor(bounds, dtype=dtype, device=device)
     if bounds.ndim != 2 or bounds.shape[-1] != 2:
         raise ValueError(
@@ -122,12 +98,7 @@ def create_probability_belief_trajectory(predicate, bounds, dtype=None, device=N
 
 
 def check_probability_bounds(trace, predicate=None):
-    """Reject malformed bounds: non-finite, unordered, or outside [0, 1].
-
-    Raises rather than clamping, which would silently change both the value and
-    its gradient. Well-formedness is not coverage -- that claim belongs to
-    whoever produced the numbers.
-    """
+    """Raise (never clamp) on non-finite, unordered, or out-of-[0, 1] bounds."""
     who = "predicate"
     if predicate is not None:
         who = getattr(predicate, "name", None) or type(predicate).__name__

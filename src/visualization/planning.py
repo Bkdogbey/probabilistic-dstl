@@ -6,19 +6,15 @@ import matplotlib.transforms as transforms
 import numpy as np
 import torch
 
-# Tableau 10 colors
-PALETTE = {
-    "ego": {"fill": "#1f77b4", "stroke": "#1f77b4"},  # Tableau Blue
-    "plan": {"fill": "#ff7f0e", "stroke": "#ff7f0e"},  # Tableau Orange
-    "visit": {"fill": "#c5b0d5", "stroke": "#9467bd"},  # Tableau Green (Light/Dark)
-    "obs_static": {"fill": "#ff9896", "stroke": "#d62728"},  # Tableau Red (Light/Dark)
-    "obs_moving": {
-        "fill": "#ff9896",
-        "stroke": "#d62728",
-    },  # Tableau Purple (Light/Dark)
-    "lane": {"fill": "#c7c7c7", "stroke": "#7f7f7f"},  # Tableau Gray (Light/Dark)
-    "goal": {"fill": "#98df8a", "stroke": "#2ca02c"},  # Tableau Green (Light/Dark)
-    "road": {"fill": "#F2F2F7"},  # Light Gray Background
+PALETTE = {  # Tableau 10
+    "ego": {"fill": "#1f77b4", "stroke": "#1f77b4"},
+    "plan": {"fill": "#ff7f0e", "stroke": "#ff7f0e"},
+    "visit": {"fill": "#c5b0d5", "stroke": "#9467bd"},
+    "obs_static": {"fill": "#ff9896", "stroke": "#d62728"},
+    "obs_moving": {"fill": "#ff9896", "stroke": "#d62728"},
+    "lane": {"fill": "#c7c7c7", "stroke": "#7f7f7f"},
+    "goal": {"fill": "#98df8a", "stroke": "#2ca02c"},
+    "road": {"fill": "#F2F2F7"},
 }
 
 
@@ -61,10 +57,7 @@ def plot_covariance_ellipse(
 
 
 def draw_road_backdrop(ax, env):
-    """Draw road background, goal lane fill, and lane markings onto ax.
-
-    Returns (road_lo, road_hi) so callers can set ylim from road extent.
-    """
+    """Road, goal lane and lane markings; returns (road_lo, road_hi)."""
     road_lo = min(lm["y"] for lm in env.lane_markings) if env.lane_markings else -2.0
     road_hi = max(lm["y"] for lm in env.lane_markings) if env.lane_markings else 6.0
     ax.axhspan(road_lo, road_hi, color=PALETTE["road"]["fill"], zorder=0)
@@ -392,12 +385,7 @@ def plot_reach_avoid(
     save_path=None,
     show=True,
 ):
-    """Initial vs optimized predicted belief sequence in the workspace.
-
-    Each belief b_k = N(mu_k, Sigma_k) is drawn as its predicted mean and, every
-    ``ellipse_every`` steps, its 95% covariance ellipse. Means are [1, T+1, 2]
-    or [T+1, 2]; covariances [1, T+1, 2, 2] or [T+1, 2, 2].
-    """
+    """Initial vs optimized predicted means with 95% covariance ellipses every ellipse_every steps."""
     runs = (
         (_to_np(mean_initial), _to_np(cov_initial), PALETTE["lane"]["stroke"], "--",
          "Initial"),
@@ -457,11 +445,82 @@ def plot_reach_avoid(
     return fig, ax
 
 
-def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=True):
-    """Event probability intervals over time, as returned by the belief.
+def _altitude_axes(dt, H, threshold, u_max, state_ylim=None):
+    """Three panels on one time axis: belief, event probability, controls."""
+    fig, axes = plt.subplots(
+        3, 1, figsize=(11, 8.5), sharex=True, gridspec_kw={"height_ratios": [3, 2, 2]}
+    )
+    ax_state, ax_prob, ax_u = axes
+    red, gray = PALETTE["obs_static"]["stroke"], PALETTE["lane"]["stroke"]
 
-    traces: {label: [T+1, 2] (lower, upper)}. Coincident endpoints draw as one line.
-    """
+    ax_state.axhline(threshold, color=red, linestyle="--", linewidth=1.5,
+                     label=f"{threshold:g} m threshold")
+    ax_state.set_ylabel("altitude [m]", fontsize=12, fontweight="bold")
+    ax_state.set_title(r"Predicted Gaussian belief $N(\mu_k, \sigma_k^2)$",
+                       loc="left", fontsize=12, fontweight="bold")
+    if state_ylim is not None:
+        ax_state.set_ylim(*state_ylim)
+
+    ax_prob.set_ylim(-0.05, 1.05)
+    ax_prob.set_ylabel("probability", fontsize=12, fontweight="bold")
+    ax_prob.set_title(rf"$P(Z_k \geq {threshold:g}$ m$)$ and lower score R of "
+                      rf"Always$_{{[1,H]}}$", loc="left", fontsize=12, fontweight="bold")
+
+    for bound in (-u_max, u_max):
+        ax_u.axhline(bound, color=gray, linestyle=":", linewidth=1.2)
+    ax_u.set_ylim(-1.15 * u_max, 1.15 * u_max)
+    ax_u.set_ylabel("u [m/s]", fontsize=12, fontweight="bold")
+    ax_u.set_xlabel("time [s]", fontsize=12, fontweight="bold")
+    ax_u.set_title(rf"Controls $u_k$ (bounds $\pm${u_max:g})", loc="left",
+                   fontsize=12, fontweight="bold")
+
+    ax_u.set_xlim(-0.2 * dt, (H + 0.2) * dt)
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+    return fig, axes
+
+
+def _draw_altitude_plan(axes, plan, *, dt, name, color, style, alpha=1.0):
+    """One plan: +/-2 sigma band and mean, P(Z_k >= threshold), controls."""
+    ax_state, ax_prob, ax_u = axes
+    mean = _to_np(plan["mean"])[:, 0]
+    sigma = np.sqrt(_to_np(plan["cov"])[:, 0, 0])
+    time = np.arange(len(mean)) * dt
+
+    ax_state.fill_between(time, mean - 2 * sigma, mean + 2 * sigma, color=color,
+                          alpha=0.18 * alpha, label=f"{name} ±2σ band (Gaussian belief)")
+    ax_state.plot(time, mean, color=color, linestyle=style, linewidth=2.2, alpha=alpha,
+                  label=f"{name} predicted mean")
+    ax_prob.plot(time, _to_np(plan["atomic"])[:, 0], color=color, linestyle=style,
+                 linewidth=2.2, marker="o", markersize=3, alpha=alpha,
+                 label=f"{name}: R = {plan['interval'][0]:.4f}")
+    u = _to_np(plan["controls"])[:, 0]  # u_k holds over [t_k, t_k+1)
+    ax_u.step(time, np.append(u, u[-1]), where="post", color=color, linestyle=style,
+              linewidth=2.2, alpha=alpha, label=f"{name} controls")
+
+
+def _plan(result, tag):
+    keys = ("mean", "cov", "atomic", "interval", "controls")
+    return {key: result[f"{key}_{tag}"] for key in keys}
+
+
+def plot_altitude_safety(result, *, dt, threshold, u_max, save_path=None, show=True):
+    """Initial vs optimized plan for Always_[1,H](Z >= threshold)."""
+    H = len(_to_np(result["controls_final"]))
+    fig, axes = _altitude_axes(dt, H, threshold, u_max)
+    _draw_altitude_plan(axes, _plan(result, "initial"), dt=dt, name="Initial",
+                        color=PALETTE["lane"]["stroke"], style="--")
+    _draw_altitude_plan(axes, _plan(result, "final"), dt=dt, name="Optimized",
+                        color=PALETTE["ego"]["stroke"], style="-")
+    for ax in axes:
+        ax.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+
+    _finish(fig, save_path, show)
+    return fig, axes
+
+
+def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=True):
+    """Event probability intervals over time; traces is {label: [T+1, 2]}."""
     colors = (PALETTE["goal"]["stroke"], PALETTE["obs_static"]["stroke"],
               PALETTE["ego"]["stroke"])
     fig, ax = plt.subplots(figsize=(9, 3.6))

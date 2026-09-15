@@ -32,7 +32,7 @@ class Planner:
         self.cfg = {**load_config("configs/planning.yaml"), **(config or {})}
 
     def _control_parameters(self, controls):
-        """Unconstrained v with bound_control(v) ~= controls (clipped inside the bound)."""
+        """Inverse of bound_control, clipped inside the bound."""
         u_norm = torch.clamp(controls / (self.dyn.u_max + 1e-6), -0.99, 0.99)
         return 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
 
@@ -40,11 +40,18 @@ class Planner:
         if init_guess is not None:
             v_init = self._control_parameters(init_guess)
             return nn.Parameter(v_init.to(self.device), requires_grad=True)
+        offset = torch.zeros(self._control_dim, device=self.device)
+        offset[0] = 0.5
         return nn.Parameter(
-            torch.randn(self.T, 2, device=self.device) * 0.1
-            + torch.tensor([0.5, 0.0], device=self.device),
+            torch.randn(self.T, self._control_dim, device=self.device) * 0.1 + offset,
             requires_grad=True,
         )
+
+    @property
+    def _control_dim(self):
+        return self.dyn.B.shape[1]
+
+    # --- Optional shaping heuristics (legacy; off in the pdSTL demos) -----------
 
     def _goal_dist_loss(self, mean_trace):
         """Squared distance from final position to goal centre."""
@@ -130,7 +137,7 @@ class Planner:
         return smooth[0], hard
 
     def _candidate(self, phi, rollout, v):
-        """Score one parameter sequence v; returns (PlanCandidate, live objective)."""
+        """Score parameters v; returns (PlanCandidate, objective with graph)."""
         predicted = rollout(v)
         controls = self.dyn.bound_control(v)
         smooth_score, hard_interval = self._scores(phi, predicted.belief_trajectory)
@@ -147,17 +154,18 @@ class Planner:
         return candidate, objective
 
     def evaluate_controls(self, rollout, controls, *, spec):
-        """Score physical controls [T, 2] without optimising, as the planner would."""
+        """Score given controls [T, m] exactly as an optimizer iterate is scored."""
         v = self._control_parameters(controls.to(self.device))
         candidate, _ = self._candidate(spec, rollout, v)
         return candidate
 
-    def optimize_window(self, rollout, *, spec=None, env=None, init_guess=None, verbose=False):
-        """Optimise rollout(v) -> BeliefRollout for one window.
+    def optimize_window(
+        self, rollout, *, spec=None, env=None, init_guess=None, verbose=False,
+        on_iteration=None,
+    ):
+        """Optimise rollout(v) -> BeliefRollout; returns (best candidate, objective history).
 
-        pdSTL evaluates only the belief trajectory. A nominal trace is required
-        only for enabled heuristic shaping. Returns (best candidate, history).
-        """
+        on_iteration(k, candidate) observes each iterate without affecting the run."""
         saved_env = self.env
         if env is not None:
             self.env = env
@@ -174,6 +182,8 @@ class Planner:
             optimizer.zero_grad()
             candidate, objective = self._candidate(phi, rollout, v)
             history.append(candidate.objective)
+            if on_iteration is not None:
+                on_iteration(k, candidate)
             if best is None or candidate.objective < best.objective:
                 best = candidate
 
@@ -206,10 +216,7 @@ class Planner:
     def run_receding_horizon(
         self, state, *, make_rollout, execute, is_done, spec, max_steps, init_guess=None
     ):
-        """Plan a window, execute its first control, observe the next state, replan.
-
-        make_rollout(state) -> rollout;  execute(state, u) -> next state.
-        """
+        """Plan, execute the first control, observe, replan until is_done or max_steps."""
         states, applied, candidates, warm_starts = [state], [], [], []
         guess = init_guess
         while not is_done(state) and len(applied) < max_steps:
@@ -223,44 +230,100 @@ class Planner:
 
         return {
             "states": states,
-            "u_trace": torch.stack(applied).unsqueeze(0) if applied else self._empty_u_trace(),
+            "u_trace": self._stack_controls(applied),
             "candidates": candidates,
             "warm_starts": warm_starts,
             "stopped_reason": "goal_reached" if is_done(state) else "max_steps",
         }
 
     def _empty_u_trace(self):
-        return torch.empty(1, 0, 2, device=self.device)
+        return torch.empty(1, 0, self._control_dim, device=self.device)
+
+    def _stack_controls(self, controls):
+        return torch.stack(controls).unsqueeze(0) if controls else self._empty_u_trace()
 
     def _shift_controls(self, prev_u_sol):
         if prev_u_sol is None:
             return None
         return torch.cat([prev_u_sol[1:], prev_u_sol[-1:]], dim=0)
 
-    # --- Legacy environment scenarios (Gaussian), used by experiments/planning.py
+    # --- Legacy environment scenarios (single shot, MPC, lane change) -------------
 
-    def _gaussian_window(self, mean, cov, **kwargs):
-        best, history = self.optimize_window(gaussian_rollout(self.dyn, mean, cov), **kwargs)
-        return best.rollout.aux["mean_trace"], best.rollout.aux["cov_trace"], best.controls, best.hard_score, history
+    def _goal_center(self, env):
+        if env.goal is None:
+            return None
+        gx, gy = env.goal["x"], env.goal["y"]
+        return torch.tensor([(gx[0] + gx[1]) / 2, (gy[0] + gy[1]) / 2], device=self.device)
 
-    def _pack_result(
-        self,
-        *,
-        mean_trace,
-        cov_trace,
-        u_trace,
-        p_sat_trace=None,
-        loss_trace=None,
-        all_plans=None,
-        best_p=None,
-        mode,
-        stopped_reason=None,
-    ):
-        p_sat_trace = [] if p_sat_trace is None else p_sat_trace
-        loss_trace = [] if loss_trace is None else loss_trace
-        all_plans = [] if all_plans is None else all_plans
-        if best_p is None and p_sat_trace:
-            best_p = max(p_sat_trace)
+    def _log_lane_change_step(self, step, curr_mean, best_p):
+        obs_pos = self.env.moving_obstacle_position(step)
+        if obs_pos is None or step % 5:
+            return
+        obs = torch.as_tensor(obs_pos, device=self.device, dtype=curr_mean.dtype)
+        dist = torch.linalg.norm(curr_mean[:2] - obs).item()
+        log_utils.log_lane_step(step, curr_mean.detach().cpu().numpy(), obs_pos[0], dist, best_p)
+
+    def _lane_change_success(self, curr_mean, success_counter):
+        if self.env.success is None:
+            return success_counter, False
+        success = self.env.success
+        success_counter = success_counter + 1 if success["y_min"] <= curr_mean[1].item() <= success["y_max"] else 0
+        return success_counter, success_counter >= success["consecutive_steps"]
+
+    def _run_mpc(self, x0_mean, x0_cov, *, step_callback=None):
+        """MPC with sampled execution: T_SIM fixed steps (optionally lane change) or MAX_STEPS to goal."""
+        fixed = "T_SIM" in self.cfg
+        lane_change = self.cfg.get("mpc_mode") == "lane_change"
+        goal_center = None if fixed else self._goal_center(self.env)
+        stopped_reason = "T_SIM" if fixed else "MAX_STEPS"
+
+        mean, cov = x0_mean, x0_cov
+        means, covs, controls, p_sat, losses, plans = [mean], [cov], [], [], [], []
+        prev_u, success_counter = None, 0
+
+        for step in range(self.cfg["T_SIM"] if fixed else self.cfg["MAX_STEPS"]):
+            dist = None
+            if goal_center is not None:
+                dist = torch.norm(mean[:2] - goal_center)
+                if dist < self.cfg.get("goal_reached_dist", 1.0):
+                    stopped_reason = "goal_reached"
+                    log_utils.log_goal_reached(step)
+                    break
+
+            env = self.env.make_local_lane_change_window(step, mean, self.cfg) if lane_change else None
+            best, history = self.optimize_window(
+                gaussian_rollout(self.dyn, mean, cov), env=env, init_guess=self._shift_controls(prev_u)
+            )
+            prev_u, plan = best.controls, best.rollout.aux["mean_trace"]
+            plans.append(plan)
+            p_sat.append(best.hard_score)
+            losses.append(history[-1] if history else 0.0)
+
+            mean, cov = self.dyn.sample_step(mean, cov, best.controls[0])
+            means.append(mean)
+            covs.append(cov)
+            controls.append(best.controls[0])
+
+            if step_callback is not None:
+                step_callback(step, mean, cov, plan, best.hard_score)
+
+            if lane_change:
+                self._log_lane_change_step(step, mean, best.hard_score)
+                success_counter, done = self._lane_change_success(mean, success_counter)
+                if done:
+                    stopped_reason = "lane_change_success"
+                    log_utils.log_lane_change_done(self.env.label, step)
+                    break
+            elif not fixed:
+                distance = dist.item() if dist is not None else 0.0
+                log_utils.log_mpc_step(step, mean.cpu().numpy(), distance, best.hard_score)
+
+        return self._pack_result(
+            torch.stack(means).unsqueeze(0), torch.stack(covs).unsqueeze(0), self._stack_controls(controls),
+            p_sat, losses, plans, mode="mpc_fixed" if fixed else "mpc_goal", stopped_reason=stopped_reason,
+        )
+
+    def _pack_result(self, mean_trace, cov_trace, u_trace, p_sat_trace, loss_trace, all_plans, *, mode, stopped_reason):
         return {
             "mean_trace": mean_trace,
             "cov_trace": cov_trace,
@@ -269,197 +332,17 @@ class Planner:
             "loss_trace": loss_trace,
             "history": loss_trace,
             "all_plans": all_plans,
-            "best_p": 0.0 if best_p is None else best_p,
+            "best_p": max(p_sat_trace) if p_sat_trace else 0.0,
             "mode": mode,
             "stopped_reason": stopped_reason,
         }
 
-    def _goal_center(self, env):
-        if env.goal is None:
-            return None
-        gx, gy = env.goal["x"], env.goal["y"]
-        return torch.tensor(
-            [(gx[0] + gx[1]) / 2, (gy[0] + gy[1]) / 2],
-            device=self.device,
-        )
-
-    def _mpc_env_for_step(self, step, curr_mean):
-        if self.cfg.get("mpc_mode") == "lane_change":
-            return self.env.make_local_lane_change_window(step, curr_mean, self.cfg)
-        return self.env
-
-    def _log_lane_change_step(self, step, curr_mean, best_p):
-        obs_pos = self.env.moving_obstacle_position(step)
-        if obs_pos is None:
-            return
-        ego_pos = curr_mean.detach().cpu().numpy()
-        dist = torch.linalg.norm(
-            curr_mean[:2] - torch.as_tensor(obs_pos, device=self.device, dtype=curr_mean.dtype)
-        ).item()
-        if step % 5 == 0:
-            log_utils.log_lane_step(step, ego_pos, obs_pos[0], dist, best_p)
-
-    def _lane_change_success(self, curr_mean, success_counter):
-        if self.env.success is None:
-            return success_counter, False
-        ego_y = curr_mean[1].item()
-        if self.env.success["y_min"] <= ego_y <= self.env.success["y_max"]:
-            success_counter += 1
-        else:
-            success_counter = 0
-        done = success_counter >= self.env.success["consecutive_steps"]
-        return success_counter, done
-
-    def _run_mpc_fixed(self, x0_mean, x0_cov, *, verbose, step_callback=None):
-        """Fixed-length MPC loop (T_SIM steps); lane-change builds a local env per step."""
-        T_SIM = self.cfg["T_SIM"]
-        curr_mean, curr_cov = x0_mean, x0_cov
-        mean_trace_list = [curr_mean]
-        cov_trace_list = [curr_cov]
-        u_trace_list = []
-        p_sat_trace = []
-        loss_trace = []
-        all_plans = []
-        prev_u_sol = None
-        success_counter = 0
-        stopped_reason = "T_SIM"
-
-        for t in range(T_SIM):
-            env_t = self._mpc_env_for_step(t, curr_mean)
-
-            win_guess = self._shift_controls(prev_u_sol)
-
-            best_mean, best_cov, best_u, best_p, history = self._gaussian_window(
-                curr_mean, curr_cov, env=env_t, init_guess=win_guess
-            )
-
-            prev_u_sol = best_u.detach()
-            all_plans.append(best_mean)
-            p_sat_trace.append(best_p)
-            loss_trace.append(history[-1] if history else 0.0)
-
-            u_curr = best_u[0]
-            next_mean, next_cov = self.dyn.sample_step(curr_mean, curr_cov, u_curr)
-
-            mean_trace_list.append(next_mean)
-            cov_trace_list.append(next_cov)
-            u_trace_list.append(u_curr)
-            curr_mean = next_mean
-            curr_cov = next_cov
-
-            if step_callback is not None:
-                step_callback(t, curr_mean, curr_cov, best_mean, best_p)
-
-            if self.cfg.get("mpc_mode") == "lane_change":
-                self._log_lane_change_step(t, curr_mean, best_p)
-                success_counter, done = self._lane_change_success(curr_mean, success_counter)
-                if done:
-                    stopped_reason = "lane_change_success"
-                    log_utils.log_lane_change_done(self.env.label, t)
-                    break
-
-        u_trace = (
-            torch.stack(u_trace_list).unsqueeze(0)
-            if u_trace_list
-            else self._empty_u_trace()
-        )
-        return self._pack_result(
-            mean_trace=torch.stack(mean_trace_list).unsqueeze(0),
-            cov_trace=torch.stack(cov_trace_list).unsqueeze(0),
-            u_trace=u_trace,
-            p_sat_trace=p_sat_trace,
-            loss_trace=loss_trace,
-            all_plans=all_plans,
-            mode="mpc_fixed",
-            stopped_reason=stopped_reason,
-        )
-
-    def _run_mpc_goal(self, x0_mean, x0_cov, *, verbose, step_callback=None):
-        """Goal-distance MPC loop; terminates when ego reaches goal or MAX_STEPS exceeded."""
-        MAX_STEPS = self.cfg["MAX_STEPS"]
-        curr_mean, curr_cov = x0_mean, x0_cov
-        mean_trace_list = [curr_mean]
-        cov_trace_list = [curr_cov]
-        u_trace_list = []
-        p_sat_trace = []
-        loss_trace = []
-        all_plans = []
-        prev_u_sol = None
-        stopped_reason = "MAX_STEPS"
-
-        goal_center = self._goal_center(self.env)
-
-        step = 0
-        while step < MAX_STEPS:
-            dist_to_goal = None
-            if goal_center is not None:
-                dist_to_goal = torch.norm(curr_mean[:2] - goal_center)
-                if dist_to_goal < self.cfg.get("goal_reached_dist", 1.0):
-                    stopped_reason = "goal_reached"
-                    log_utils.log_goal_reached(step)
-                    break
-
-            win_guess = self._shift_controls(prev_u_sol)
-
-            best_mean, best_cov, best_u, best_p, history = self._gaussian_window(
-                curr_mean, curr_cov, init_guess=win_guess
-            )
-
-            prev_u_sol = best_u.detach()
-            all_plans.append(best_mean)
-            p_sat_trace.append(best_p)
-            loss_trace.append(history[-1] if history else 0.0)
-
-            u_curr = best_u[0]
-            next_mean, next_cov = self.dyn.sample_step(curr_mean, curr_cov, u_curr)
-
-            mean_trace_list.append(next_mean)
-            cov_trace_list.append(next_cov)
-            u_trace_list.append(u_curr)
-            curr_mean = next_mean
-            curr_cov = next_cov
-
-            if step_callback is not None:
-                step_callback(step, curr_mean, curr_cov, best_mean, best_p)
-
-            dist_value = dist_to_goal.item() if dist_to_goal is not None else 0.0
-            log_utils.log_mpc_step(step, curr_mean.cpu().numpy(), dist_value, best_p)
-
-            step += 1
-
-        u_trace = (
-            torch.stack(u_trace_list).unsqueeze(0)
-            if u_trace_list
-            else self._empty_u_trace()
-        )
-        return self._pack_result(
-            mean_trace=torch.stack(mean_trace_list).unsqueeze(0),
-            cov_trace=torch.stack(cov_trace_list).unsqueeze(0),
-            u_trace=u_trace,
-            p_sat_trace=p_sat_trace,
-            loss_trace=loss_trace,
-            all_plans=all_plans,
-            mode="mpc_goal",
-            stopped_reason=stopped_reason,
-        )
-
     def solve(self, x0_mean, x0_cov, *, verbose=True, step_callback=None):
-        """Optimise controls; MPC mode triggered by 'T_SIM' or 'MAX_STEPS' in config."""
-        if "T_SIM" in self.cfg:
-            return self._run_mpc_fixed(x0_mean, x0_cov, verbose=verbose, step_callback=step_callback)
-        elif "MAX_STEPS" in self.cfg:
-            return self._run_mpc_goal(x0_mean, x0_cov, verbose=verbose, step_callback=step_callback)
-        else:
-            mean_trace, cov_trace, u_trace, best_p, history = self._gaussian_window(
-                x0_mean, x0_cov, verbose=verbose
-            )
-            return self._pack_result(
-                mean_trace=mean_trace,
-                cov_trace=cov_trace,
-                u_trace=u_trace,
-                p_sat_trace=[best_p],
-                loss_trace=history,
-                best_p=best_p,
-                mode="single_shot",
-                stopped_reason="optimized",
-            )
+        """Legacy entry: MPC if the config has T_SIM or MAX_STEPS, else one window."""
+        if "T_SIM" in self.cfg or "MAX_STEPS" in self.cfg:
+            return self._run_mpc(x0_mean, x0_cov, step_callback=step_callback)
+        best, history = self.optimize_window(gaussian_rollout(self.dyn, x0_mean, x0_cov), verbose=verbose)
+        return self._pack_result(
+            best.rollout.aux["mean_trace"], best.rollout.aux["cov_trace"], best.controls,
+            [best.hard_score], history, [], mode="single_shot", stopped_reason="optimized",
+        )

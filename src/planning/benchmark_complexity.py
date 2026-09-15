@@ -1,12 +1,6 @@
-"""
-Empirical O(T) complexity benchmark for the Probabilistic STL planner.
+"""Wall-clock time of one planner pass versus horizon T.
 
-Measures wall-clock time for a single forward-backward pass as a function
-of the planning horizon T, and plots the result with a linear fit.
-
-Run from the src/ directory:
-    python -m planning.benchmark_complexity
-"""
+Run from src/: python -m planning.benchmark_complexity"""
 
 import os
 import time
@@ -22,7 +16,7 @@ import torch.optim as optim
 
 from models.dynamics import SingleIntegrator
 from models.beliefs import create_gaussian_belief_trajectory
-from experiments.planning import build_environment, load_scenario_config
+from planning.runners import build_environment, load_scenario_config
 
 
 def build_spec_and_env(T, device):

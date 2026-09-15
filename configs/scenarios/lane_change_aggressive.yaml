@@ -1,6 +1,5 @@
-# Aggressive lane change scenario.
-# Obstacle starts close ahead and moves quickly, forcing an immediate, sharp merge.
-# Same road geometry as lane_change.yaml — only obstacle position and planner tuning differ.
+# Aggressive lane change: obstacle starts close and fast, forcing a sharp merge.
+# Same road as lane_change.yaml; only the obstacle and planner tuning differ.
 
 # --- Dynamics (identical to normal lane change) ---
 dynamics: double_integrator

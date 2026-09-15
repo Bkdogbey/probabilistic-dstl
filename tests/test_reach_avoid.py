@@ -19,8 +19,8 @@ import matplotlib.pyplot as plt
 import pytest
 import torch
 
-import experiments.planning as experiments_planning
-from experiments.planning import (
+import planning.runners as runners
+from planning.runners import (
     build_dynamics,
     build_environment,
     build_initial_belief,
@@ -44,7 +44,7 @@ def problem():
     dyn = build_dynamics(cfg, "cpu")
     env = build_environment(cfg, "cpu")
     x0_mean, x0_cov = build_initial_belief(cfg, "cpu")
-    rollout = experiments_planning.gaussian_rollout(dyn, x0_mean, x0_cov)
+    rollout = runners.gaussian_rollout(dyn, x0_mean, x0_cov)
     spec = env.get_specification(cfg["H"], t_goal_start=1)
     planner = Planner(dyn, env, cfg["H"], config=planner_cfg)
     return cfg, planner_cfg, dyn, env, rollout, spec, planner
@@ -67,7 +67,7 @@ def _inside(points, x_range, y_range, strict):
 
 def test_runner_uses_the_scenario_model_environment_and_rollout(monkeypatch):
     calls = {"rollout": [], "spec": 0}
-    real_rollout = experiments_planning.gaussian_rollout
+    real_rollout = runners.gaussian_rollout
     real_spec = Environment.get_specification
 
     def rollout_spy(dynamics, mean0, cov0):
@@ -78,7 +78,7 @@ def test_runner_uses_the_scenario_model_environment_and_rollout(monkeypatch):
         calls["spec"] += 1
         return real_spec(self, *args, **kwargs)
 
-    monkeypatch.setattr(experiments_planning, "gaussian_rollout", rollout_spy)
+    monkeypatch.setattr(runners, "gaussian_rollout", rollout_spy)
     monkeypatch.setattr(Environment, "get_specification", spec_spy)
     run_reach_avoid(show=False, save=False)
 
@@ -101,7 +101,7 @@ def test_runner_contains_no_optimisation_or_probability_code():
     for forbidden in ("backward", "optim", "Adam", "normal_cdf", "cdf", "erf", "step"):
         assert forbidden not in names
 
-    module = ast.parse(inspect.getsource(experiments_planning))
+    module = ast.parse(inspect.getsource(runners))
     imported = {n.module for n in ast.walk(module) if isinstance(n, ast.ImportFrom)}
     imported |= {a.name for n in ast.walk(module) if isinstance(n, ast.Import) for a in n.names}
     assert not any("optim" in m for m in imported)

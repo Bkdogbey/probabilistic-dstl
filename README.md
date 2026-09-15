@@ -54,18 +54,18 @@ src/
     dynamics.py   Linear dynamics and bounded controls
     beliefs.py    Precise Gaussian beliefs, helpers, and trajectory factory
     rollouts.py   BeliefRollout and Gaussian rollout adapter
-  experiments/
-    signals.py    Scalar example data
-    planning.py   Environment-driven planning experiments
-  planning/       Optimization, MPC, and Gaussian planning examples
+  planning/
+    planner.py      Planner: how controls are optimized
+    environment.py  Planning world and its pdSTL specification
+    runners.py      Which experiment runs (altitude safety, reach-avoid, ...)
   baselines/      Deterministic STL comparison
   visualization/  Reusable plots
-  main.py         Offline operator and Gaussian planning examples
+  main.py         AltitudeSafety and ReachAvoid demonstrations
 configs/          Example and planning configuration
 ```
 
 Import `GaussianBelief` and `create_gaussian_belief_trajectory` from
-`models.beliefs`, and `piecewise_signal` from `experiments.signals`.
+`models.beliefs`.
 These names are no longer exported by `models.dynamics`. The enclosure demo
 and its implementation have been removed; no replacement uncertainty model
 is introduced.

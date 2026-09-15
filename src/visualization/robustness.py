@@ -1,11 +1,4 @@
-"""Plots for pdSTL example cases.
-
-Traces are indexed from origin 0 and contain only origins whose window is
-complete (see pdstl.operators), so a formula trace of length K is shorter than
-the state trace. K values are drawn at the first K origin timestamps -- never
-shifted by the interval's lower bound, and never padded with repeated terminal
-values. Origins past K have no evaluation and are shown as absent.
-"""
+"""Plots for the scalar pdSTL cases; a formula trace of K origins is drawn at the first K timestamps."""
 
 import os
 
@@ -54,11 +47,7 @@ def _finish(fig, save_path=None, show=False):
 
 
 def _draw_bounds(ax, time, bounds, label_lower, label_upper):
-    """Draw a [K, 2] bound trace at the first K origin timestamps.
-
-    Coincident endpoints (an exactly known probability) are drawn as a single
-    marked series rather than a zero-height band that would be invisible.
-    """
+    """Draw a [K, 2] bound trace; coincident endpoints become a single marked line."""
     k = len(bounds)
     t = np.asarray(time)[:k]
     lower, upper = bounds[:, 0], bounds[:, 1]
@@ -111,19 +100,7 @@ def plot_case(
     save_path=None,
     show=False,
 ):
-    """Three-panel view of one case: state, atom probabilities, formula interval.
-
-    time             : [T] physical timestamps of prediction steps 0..T-1
-    formula_trace    : [B, K, 2] or [K, 2] formula bounds, K <= T
-    mean_trace       : [T] mean of the constrained state component
-    var_trace        : [T] variance of that component
-    lower_trace, upper_trace : [T] optional, explicitly supplied state bands.
-        Takes precedence over mean_trace for panel (a); var_trace
-        may still be given alongside them and is drawn as a separate,
-        visually distinct residual-spread envelope, not folded into the
-        descriptor band.
-    predicate_traces : {label: [B, T, 2]} atomic probabilities
-    """
+    """Three panels for one case: state, atom probabilities, formula interval."""
     time = np.asarray(time)
     formula = _to_numpy(formula_trace)
 
@@ -214,14 +191,7 @@ def plot_synthesis(
     save_path=None,
     show=False,
 ):
-    """Initial vs optimized behaviour plus a compact objective history.
-
-    `initial` and `optimized` are dicts with a ``formula`` key (the directly
-    evaluated bound trace) plus either ``mean``/``var`` (a Gaussian mean with
-    a mean +- sigma band) or ``lower``/``upper`` (explicit state bands,
-    drawn from the supplied bounds directly; ``var`` may
-    still be given alongside them for a separate residual-spread envelope).
-    """
+    """Initial vs optimized state and formula traces, plus the objective history."""
     time = np.asarray(time)
     fig, ((ax_state, ax_form), (ax_obj, ax_blank)) = plt.subplots(
         2, 2, figsize=figsize
@@ -297,13 +267,7 @@ def plot_end_to_end(
     save_path=None,
     show=False,
 ):
-    """Diagnostic view of the end-to-end smoke test, initial vs optimized.
-
-    `initial` and `optimized` are dicts with ``mean`` [T] and ``var`` [T] of the
-    constrained state component, ``atomic`` [B, T, 2] (or [T, 2]) atomic
-    probabilities, and ``score`` the directly evaluated pdSTL lower endpoint.
-    The mean +- sigma band is visualization only, not a probability bound.
-    """
+    """Initial vs optimized mean +/- sigma and atomic probability for the end-to-end reach."""
     time = np.asarray(time)
     fig, (ax_state, ax_prob) = plt.subplots(2, 1, figsize=figsize, sharex=True)
 
@@ -355,13 +319,7 @@ def plot_mpc_reach(
     save_path=None,
     show=False,
 ):
-    """Closed-loop view of a receding-horizon run: plan -> execute u_0 -> replan.
-
-    `result` is the dict returned by ``Planner.run_receding_horizon``: the
-    executed ``mean_trace`` [1, N+1, D], applied ``u_trace`` [1, N, 2], one
-    predicted plan per replan in ``plan_mean_traces`` ([1, H+1, D] each), and the
-    per-window hard pdSTL score in ``hard_scores``.
-    """
+    """Receding-horizon run: executed state, per-window plans, scores and applied controls."""
     executed = _to_array(result["mean_trace"])[0, :, dim]
     controls = _to_array(result["u_trace"])[0]
     scores = np.asarray(result["hard_scores"])

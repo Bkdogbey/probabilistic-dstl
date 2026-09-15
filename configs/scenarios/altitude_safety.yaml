@@ -1,0 +1,35 @@
+# Altitude safety: Z_{k+1} = Z_k + dt u_k + W_k must satisfy Always_[1,H](Z >= 50).
+
+# --- Dynamics ---
+dynamics: single_integrator
+state_dim: 1
+H: 20            # Planning horizon (time steps)
+dt: 0.2          # Time step [s]
+u_max: 1.0       # Maximum climb/descent rate [m/s]
+q_std: 0.08      # Process noise standard deviation [m]
+
+# --- Initial belief ---
+x0_mean: [52.0]
+x0_cov_scale: 0.25
+
+# --- Specification ---
+threshold: 50.0
+
+# Initial guess only: a steady descent through the threshold.
+init_control: [-0.6]
+
+# --- Planner overrides (on top of configs/planning.yaml); shaping off ---
+planner:
+  w_phi: 10.0
+  w_u: 0.01
+  w_du: 0.01
+  w_dist: 0.0
+  w_obs: 0.0
+  w_visit: 0.0
+  scale: -1
+
+# --- Output ---
+figure: altitude_safety.png
+animation:
+  filename: altitude_safety_optimization.gif
+  fps: 6

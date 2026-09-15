@@ -7,34 +7,22 @@ from pdstl.base import BeliefTrajectory
 
 
 class BeliefRollout(NamedTuple):
-    """Predicted beliefs, with optional traces for costs and plots.
-
-    Only belief_trajectory defines the semantics consumed by pdSTL. Diagnostics
-    neither identify the belief representation nor replace its probability bounds.
-    """
+    """Predicted beliefs (what pdSTL reads) plus optional traces for costs and plots."""
 
     belief_trajectory: BeliefTrajectory
-    nominal_trace: torch.Tensor | None = None  # [1, T+1, D], when supplied
+    nominal_trace: torch.Tensor | None = None  # [1, T+1, D]
     aux: dict[str, torch.Tensor] | None = None
 
     def detach_diagnostics(self):
-        """Detach optional tensors, preserving the original belief trajectory.
-
-        This does not detach beliefs or promise a graph-free rollout.
-        """
+        """Detach nominal_trace and aux; the belief trajectory is kept as is."""
         return self._replace(
-            nominal_trace=(
-                None if self.nominal_trace is None else self.nominal_trace.detach()
-            ),
-            aux=(
-                None if self.aux is None
-                else {name: trace.detach() for name, trace in self.aux.items()}
-            ),
+            nominal_trace=None if self.nominal_trace is None else self.nominal_trace.detach(),
+            aux=None if self.aux is None else {k: t.detach() for k, t in self.aux.items()},
         )
 
 
 def gaussian_rollout(dynamics, mean0, cov0):
-    """v -> BeliefRollout of precise Gaussian beliefs; nominal trace is the mean."""
+    """Return rollout(v) -> BeliefRollout of Gaussian beliefs from (mean0, cov0)."""
 
     def rollout(v):
         mean_trace, cov_trace = dynamics(v, mean0, cov0)
