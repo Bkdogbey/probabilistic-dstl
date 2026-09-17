@@ -1,7 +1,3 @@
-"""pdSTL planning demos.
-
-scenario -> dynamics -> Gaussian beliefs b_0:H(u) -> event probabilities -> pdSTL interval -> Planner"""
-
 from planning.runners import run_altitude_safety, run_reach_avoid
 from utils import load_config, skip_run
 

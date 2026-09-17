@@ -1,4 +1,4 @@
-"""Single-shot reach-and-avoid through the environment-driven pipeline:
+"""Single-shot reach-and-avoid through a double-slit barrier, environment-driven:
 
     scenario -> SingleIntegrator, Environment, b_0
     -> gaussian_rollout: u -> b_0:H(u) -> InsideRectangle / OutsideRectangle events
@@ -88,9 +88,14 @@ def test_runner_uses_the_scenario_model_environment_and_rollout(monkeypatch):
 
 
 def test_spec_is_built_from_spatial_events(problem):
-    *_, spec, _ = problem
+    cfg, *_, spec, _ = problem
     events = [m for m in spec.modules() if isinstance(m, (InsideRectangle, OutsideRectangle))]
-    assert [type(e) for e in events] == [OutsideRectangle, InsideRectangle]
+    outside = [e for e in events if isinstance(e, OutsideRectangle)]
+    inside = [e for e in events if isinstance(e, InsideRectangle)]
+
+    assert len(outside) == len(cfg["obstacles"])   # one avoid event per barrier block
+    assert len(inside) == 2                        # goal and workspace
+    assert len(events) == len(outside) + len(inside)
 
 
 def test_runner_contains_no_optimisation_or_probability_code():
@@ -129,7 +134,8 @@ def test_pdstl_lower_score_improves_from_a_poor_start(result):
     lower_initial, lower_final = result["interval_initial"][0], result["interval_final"][0]
     assert lower_initial < 0.1
     assert lower_final > lower_initial + 0.5
-    assert lower_final > 0.9
+    # The Frechet conjunction bound caps this near 0.945; do not pin it tighter.
+    assert lower_final > 0.85
     assert lower_final <= result["interval_final"][1] + 1e-6
 
 
@@ -138,6 +144,18 @@ def test_plan_has_useful_goal_and_safety_probabilities(result):
     assert result["min_safe_interval"][0] > 0.9
     assert result["safe_trace"][1:, 0].min() == pytest.approx(result["min_safe_interval"][0])
     assert result["goal_trace"][1:, 0].max() == pytest.approx(result["goal_interval"][0])
+
+
+def test_safety_trace_is_the_conjunction_over_every_block(result, problem):
+    cfg, *_ = problem
+    per_obstacle = result["obstacle_traces"]
+    assert len(per_obstacle) == len(cfg["obstacles"])
+
+    # Frechet: the joint lower bound never exceeds any single block's, and the joint
+    # upper bound never exceeds the tightest single upper bound.
+    for trace in per_obstacle:
+        assert (result["safe_trace"][:, 0] <= trace[:, 0] + 1e-6).all()
+        assert (result["safe_trace"][:, 1] <= trace[:, 1] + 1e-6).all()
 
 
 def test_returned_controls_replay_to_the_stored_pdstl_interval(result, problem):
@@ -164,17 +182,34 @@ def test_gradients_flow_from_controls_through_beliefs_and_events_to_the_objectiv
     assert v.grad.abs().sum() > 0
 
 
-def test_post_hoc_mean_avoids_the_obstacle_and_reaches_the_goal(result, problem):
+def test_post_hoc_mean_avoids_every_block_and_reaches_the_goal(result, problem):
     cfg, *_ = problem
     path = result["mean_trace"][0, 1:]
-    obstacle = cfg["obstacles"][0]
 
-    assert not _inside(path, obstacle["x_range"], obstacle["y_range"], strict=True).any()
+    for obstacle in cfg["obstacles"]:
+        assert not _inside(path, obstacle["x_range"], obstacle["y_range"], strict=True).any()
     assert result["min_mean_clearance"] > 0
+    assert _inside(path, cfg["bounds"]["x_range"], cfg["bounds"]["y_range"], strict=False).all()
     assert _inside(path, cfg["goal"]["x_range"], cfg["goal"]["y_range"], strict=False).any()
-    # and the initial guess did not: it cuts through the obstacle
+
+    # and the initial guess did not: it runs straight into the middle block
     initial = result["mean_initial"][0, 1:]
-    assert _inside(initial, obstacle["x_range"], obstacle["y_range"], strict=True).any()
+    hits = [_inside(initial, o["x_range"], o["y_range"], strict=True).any() for o in cfg["obstacles"]]
+    assert any(hits)
+
+
+def test_optimized_mean_crosses_the_barrier_only_through_a_slit(result, problem):
+    """The blocks tile the barrier's y-extent apart from the slits, so clearing every
+    block inside the barrier x-span is exactly 'the plan went through a gap'."""
+    cfg, *_ = problem
+    path = result["mean_trace"][0, 1:]
+    span = cfg["obstacles"][0]["x_range"]
+    crossing = path[_inside(path, span, cfg["bounds"]["y_range"], strict=False)]
+
+    assert len(crossing) > 0, "the plan never reaches the barrier"
+    for obstacle in cfg["obstacles"]:
+        blocked = (crossing[:, 1] > obstacle["y_range"][0]) & (crossing[:, 1] < obstacle["y_range"][1])
+        assert not blocked.any()
 
 
 # --- Visualization -------------------------------------------------------------
@@ -189,16 +224,18 @@ def test_plots_draw_the_belief_sequence_and_event_probabilities(result, problem)
     )
     ellipses = [p for p in ax.patches if isinstance(p, patches.Ellipse)]
     rectangles = [p for p in ax.patches if isinstance(p, patches.Rectangle)]
-    assert len(rectangles) >= 2
+    assert len(rectangles) == len(cfg["obstacles"]) + 2   # blocks, goal, workspace
     assert len(ellipses) == 2 * len(range(0, cfg["H"] + 1, cfg["ellipse_every"]))
     labels = ax.get_legend_handles_labels()[1]
     assert "Optimized predicted mean" in labels
     fig.canvas.draw()
     plt.close(fig)
 
-    fig, ax = plot_event_probabilities(
-        cfg["dt"], {"P(goal)": result["goal_trace"], "P(safe)": result["safe_trace"]},
-        show=False,
-    )
-    assert len(ax.lines) == 4
+    traces = {
+        "P(goal)": result["goal_trace"],
+        "P(safe)": result["safe_trace"],
+        "P(workspace)": result["bounds_trace"],
+    }
+    fig, ax = plot_event_probabilities(cfg["dt"], traces, show=False)
+    assert len(ax.lines) == 2 * len(traces)   # a lower and an upper curve per event
     plt.close(fig)

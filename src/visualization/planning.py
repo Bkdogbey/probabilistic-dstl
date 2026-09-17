@@ -1,4 +1,5 @@
 import os
+from itertools import cycle
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
@@ -96,7 +97,23 @@ def draw_env_on_ax(
     moving_obs_snapshots=False,
     x_mask=None,
 ):
-    """Render environment geometry: road, goal, obstacles, visit regions, moving paths."""
+    """Render environment geometry: workspace, goal, obstacles, visit regions, moving paths."""
+    if env.bounds is not None:
+        bx, by = env.bounds["x"], env.bounds["y"]
+        ax.add_patch(
+            patches.Rectangle(
+                (bx[0], by[0]),
+                bx[1] - bx[0],
+                by[1] - by[0],
+                facecolor="none",
+                edgecolor=PALETTE["lane"]["stroke"],
+                linestyle="--",
+                linewidth=1.5,
+                zorder=2,
+                label="Workspace",
+            )
+        )
+
     if env.lane_markings:
         draw_road_backdrop(ax, env)
     else:
@@ -209,6 +226,11 @@ def _compute_env_bounds(mean_np, env):
         x_max = max(x_max, max(lane["x"]))
         y_min = min(y_min, lane["y"])
         y_max = max(y_max, lane["y"])
+    if env.bounds is not None:
+        x_min = min(x_min, env.bounds["x"][0])
+        x_max = max(x_max, env.bounds["x"][1])
+        y_min = min(y_min, env.bounds["y"][0])
+        y_max = max(y_max, env.bounds["y"][1])
     if env.goal:
         x_min = min(x_min, env.goal["x"][0])
         x_max = max(x_max, env.goal["x"][1])
@@ -436,8 +458,8 @@ def plot_reach_avoid(
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax.legend(
-        by_label.values(), by_label.keys(), loc="upper right", fontsize=9,
-        framealpha=0.95, edgecolor="#cccccc",
+        by_label.values(), by_label.keys(), loc="upper left", bbox_to_anchor=(1.01, 1.0),
+        fontsize=9, framealpha=0.95, edgecolor="#cccccc",
     )
     ax.set_title(title or "Predicted belief trajectory", fontsize=13, fontweight="bold")
 
@@ -521,8 +543,9 @@ def plot_altitude_safety(result, *, dt, threshold, u_max, save_path=None, show=T
 
 def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=True):
     """Event probability intervals over time; traces is {label: [T+1, 2]}."""
-    colors = (PALETTE["goal"]["stroke"], PALETTE["obs_static"]["stroke"],
-              PALETTE["ego"]["stroke"])
+    colors = cycle((PALETTE["goal"]["stroke"], PALETTE["obs_static"]["stroke"],
+                    PALETTE["ego"]["stroke"], PALETTE["visit"]["stroke"],
+                    PALETTE["plan"]["stroke"]))
     fig, ax = plt.subplots(figsize=(9, 3.6))
     for (label, trace), color in zip(traces.items(), colors):
         trace = _to_np(trace)
@@ -558,7 +581,12 @@ def visualize_reach_avoid(result, env, *, dt, ellipse_every=10, save_path=None,
         root, ext = os.path.splitext(save_path)
         probability_path = f"{root}_probabilities{ext}"
     plot_event_probabilities(
-        dt, {"P(goal)": result["goal_trace"], "P(safe)": result["safe_trace"]},
+        dt,
+        {
+            "P(goal)": result["goal_trace"],
+            "P(safe)": result["safe_trace"],
+            "P(workspace)": result["bounds_trace"],
+        },
         save_path=probability_path, show=show,
     )
     if show:

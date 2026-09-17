@@ -68,10 +68,12 @@ class Environment:
         obstacles += [
             MovingRectangularObstaclePredicate(o, device=self.device) for o in self.moving_obstacles
         ]
+        bounds = self.bounds
         return {
             "goal": InsideRectangle(self.goal["x"], self.goal["y"]) if self.goal else None,
             "visit": [InsideRectangle(r["x"], r["y"]) for r in self.visit_regions],
             "obstacles": obstacles,
+            "workspace": InsideRectangle(bounds["x"], bounds["y"]) if bounds else None,
         }
 
     def get_specification(self, T, t_goal_start=0, t_constraints_start=1):
@@ -83,9 +85,8 @@ class Environment:
         if preds["goal"] is not None:
             specs.append(Eventually(preds["goal"], interval=[t_goal_start, T]))
         specs += [Eventually(visit, interval=[0, T]) for visit in preds["visit"]]
-        if self.bounds is not None:
-            inside = InsideRectangle(self.bounds["x"], self.bounds["y"])
-            specs.append(Always(inside, interval=[t_constraints_start, T]))
+        if preds["workspace"] is not None:
+            specs.append(Always(preds["workspace"], interval=[t_constraints_start, T]))
         if not specs:
             raise ValueError("No constraints defined in environment.")
         return reduce(And, specs)

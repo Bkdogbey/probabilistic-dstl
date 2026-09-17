@@ -35,14 +35,19 @@ class Planner:
         self.cfg = {**defaults, **config}
         self.cfg["smoothing"] = {**defaults["smoothing"], **config.get("smoothing", {})}
 
-    def _control_parameters(self, controls):
-        """Inverse of bound_control, clipped inside the bound."""
-        u_norm = torch.clamp(controls / (self.dyn.u_max + 1e-6), -0.99, 0.99)
+    # Warm starts trade round-trip fidelity for gradient: atanh of a saturated control
+    # lands in the flat tail of tanh, so a warm start is pulled back inside the bound.
+    WARM_START_MARGIN = 1e-2
+    REPLAY_MARGIN = 1e-6
+
+    def _control_parameters(self, controls, margin=REPLAY_MARGIN):
+        """Inverse of bound_control, clipped to within margin of the bound."""
+        u_norm = torch.clamp(controls / (self.dyn.u_max + 1e-6), -1.0 + margin, 1.0 - margin)
         return 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
 
     def _init_controls(self, init_guess):
         if init_guess is not None:
-            v_init = self._control_parameters(init_guess)
+            v_init = self._control_parameters(init_guess, margin=self.WARM_START_MARGIN)
             return nn.Parameter(v_init.to(self.device), requires_grad=True)
         offset = torch.zeros(self._control_dim, device=self.device)
         offset[0] = 0.5
