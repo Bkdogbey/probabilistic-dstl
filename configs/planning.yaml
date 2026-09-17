@@ -12,7 +12,8 @@ w_obs: 5.0        # Obstacle repulsion heuristic weight
 w_visit: 5.0      # Visit-region heuristic weight
 loss_tol: 1.0e-4  # Loss convergence tolerance (unsmoothed runs only)
 
-# Smooth lower-score surrogate for gradients; exact pdSTL is always used for reporting and selection
+# Differentiable pdSTL lower semantics supply gradients; hard semantics monitor,
+# checkpoint, stop, and report the final stochastic robustness interval.
 smoothing:
   enabled: true
   beta_start: 2.0
@@ -20,7 +21,7 @@ smoothing:
 
 # Planner convergence internals
 obs_margin: 0.75       # Safety margin (m) added to obstacle radius in repulsion loss
-converge_patience: 50  # Consecutive iters at P≥alpha before early stopping
+converge_patience: 50  # Consecutive iters with hard lower >= alpha before stopping
 min_iters: 10          # Min iters before loss-tolerance check activates
 
 # Lane-change MPC local-window parameters (shared across all lane-change scenarios)

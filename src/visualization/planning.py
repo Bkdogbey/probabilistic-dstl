@@ -403,17 +403,21 @@ def plot_reach_avoid(
     env,
     ellipse_every=10,
     *,
+    show_initial=False,
     title=None,
     save_path=None,
     show=True,
 ):
-    """Initial vs optimized predicted means with 95% covariance ellipses every ellipse_every steps."""
-    runs = (
-        (_to_np(mean_initial), _to_np(cov_initial), PALETTE["lane"]["stroke"], "--",
-         "Initial"),
+    """Predicted stochastic plan; initial beliefs are an optional comparison."""
+    runs = [
         (_to_np(mean_final), _to_np(cov_final), PALETTE["ego"]["stroke"], "-",
-         "Optimized"),
-    )
+         "Predicted belief mean", "95% covariance ellipse"),
+    ]
+    if show_initial:
+        runs.insert(0, (
+            _to_np(mean_initial), _to_np(cov_initial), PALETTE["lane"]["stroke"], "--",
+            "Initial predicted belief mean", "Initial 95% covariance ellipse",
+        ))
     all_means = np.concatenate([mean for mean, *_ in runs], axis=0)
     x_min, x_max, y_min, y_max = _compute_env_bounds(all_means, env)
 
@@ -435,17 +439,18 @@ def plot_reach_avoid(
             color=PALETTE["goal"]["stroke"], zorder=30,
         )
 
-    for mean, cov, color, style, label in runs:
+    for mean, cov, color, style, label, ellipse_label in runs:
         ax.plot(
             mean[:, 0], mean[:, 1], color=color, linestyle=style, linewidth=2.2,
-            alpha=0.9, label=f"{label} predicted mean", zorder=25,
+            alpha=0.9, label=label, zorder=25,
         )
         steps = list(range(0, len(mean), ellipse_every))
         for i, t in enumerate(steps):
             plot_covariance_ellipse(
                 ax, mean[t, :2], cov[t, :2, :2],
+                k=np.sqrt(-2 * np.log(0.05)),  # 95% joint mass in two dimensions
                 facecolor=color, edgecolor=color, alpha=0.15, zorder=15,
-                label=f"{label} 95% covariance ellipse" if i == 0 else None,
+                label=ellipse_label if i == 0 else None,
             )
 
     start = runs[0][0][0, :2]
@@ -550,10 +555,9 @@ def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=Tru
     for (label, trace), color in zip(traces.items(), colors):
         trace = _to_np(trace)
         time = np.arange(len(trace)) * dt
-        ax.fill_between(time, trace[:, 0], trace[:, 1], color=color, alpha=0.25)
-        ax.plot(time, trace[:, 0], color=color, linewidth=2, label=f"{label} lower")
-        ax.plot(time, trace[:, 1], color=color, linewidth=1, linestyle="--",
-                label=f"{label} upper")
+        ax.fill_between(time, trace[:, 0], trace[:, 1], color=color, alpha=0.25, label=label)
+        ax.plot(time, trace[:, 0], color=color, linewidth=0.9, alpha=0.8)
+        ax.plot(time, trace[:, 1], color=color, linewidth=0.9, alpha=0.8)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("time [s]", fontsize=12, fontweight="bold")
     ax.set_ylabel("probability", fontsize=12, fontweight="bold")
@@ -565,33 +569,57 @@ def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=Tru
     return fig, ax
 
 
+def plot_pdstl_optimization(result, *, save_path=None, show=True):
+    """Differentiable lower semantics at each iteration's annealed beta."""
+    records = result["optimization_trace"]
+    iterations = [record["iteration"] for record in records]
+    smooth_lower = [record["smooth_lower"] for record in records]
+    fig, ax = plt.subplots(figsize=(9, 3.6))
+    ax.plot(iterations, smooth_lower, color=PALETTE["ego"]["stroke"], linewidth=2)
+    selected = result["returned_iteration"]
+    record = next(record for record in records if record["iteration"] == selected)
+    ax.plot(selected, record["smooth_lower"], "o", color=PALETTE["ego"]["stroke"],
+            label="Returned checkpoint")
+    lo, hi = result["hard_interval"]
+    ax.text(0.98, 0.05, f"Returned plan: hard pdSTL interval [{lo:.4f}, {hi:.4f}]",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=10,
+            bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "none"})
+    ax.set_xlabel("Optimization iteration")
+    ax.set_ylabel("Differentiable pdSTL lower robustness")
+    ax.set_title("Differentiable pdSTL optimization (annealed beta)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", fontsize=9)
+    _finish(fig, save_path, show)
+    return fig, ax
+
+
 def visualize_reach_avoid(result, env, *, dt, ellipse_every=10, save_path=None,
-                          show=True):
-    """Workspace with predicted beliefs, event probabilities, controls, objective."""
-    lo, hi = result["interval_final"]
-    plot_reach_avoid(
+                          show=True, show_initial=False, show_workspace=False):
+    """Three scientific views; initial beliefs/workspace bounds are opt-in diagnostics."""
+    spatial = plot_reach_avoid(
         result["mean_initial"], result["cov_initial"],
         result["mean_trace"], result["cov_trace"],
         env, ellipse_every,
-        title=f"Reach-avoid: pdSTL interval [{lo:.3f}, {hi:.3f}]",
+        title="Reach-avoid: predicted stochastic trajectory", show_initial=show_initial,
         save_path=save_path, show=show,
     )
-    probability_path = None
+    probability_path = optimization_path = None
     if save_path:
         root, ext = os.path.splitext(save_path)
         probability_path = f"{root}_probabilities{ext}"
-    plot_event_probabilities(
-        dt,
-        {
-            "P(goal)": result["goal_trace"],
-            "P(safe)": result["safe_trace"],
-            "P(workspace)": result["bounds_trace"],
-        },
+        optimization_path = f"{root}_optimization{ext}"
+    traces = {
+        r"$P(X_k \in G)$": result["goal_trace"],
+        r"$P(\mathrm{safe\ at\ }k)$": result["safe_trace"],
+    }
+    if show_workspace:
+        traces[r"$P(X_k \in \mathcal{X})$"] = result["bounds_trace"]
+    probabilities = plot_event_probabilities(
+        dt, traces,
         save_path=probability_path, show=show,
     )
-    if show:
-        plot_controls(_to_np(result["controls"]))
-        plot_metrics(result["history"], None)
+    optimization = plot_pdstl_optimization(result, save_path=optimization_path, show=show)
+    return spatial, probabilities, optimization
 
 
 def plot_controls(u_np):

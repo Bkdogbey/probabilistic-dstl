@@ -3,7 +3,7 @@
 import torch
 
 from pdstl.base import Belief, BeliefTrajectory
-from pdstl.predicates import InsideRectangle, OutsideRectangle
+from pdstl.predicates import HalfSpace, InsideRectangle, OutsideRectangle
 
 
 def _validate_covariance(covariance, batch, state_dim):
@@ -86,12 +86,29 @@ class GaussianBelief(Belief):
         return self.mean
 
     def probability_bounds(self, predicate):
-        """[B,2] interval: exact [p, p] for thresholds, Frechet bounds for rectangles."""
+        """Exact [p,p] for affine/threshold events; Frechet bounds for rectangles."""
+        if isinstance(predicate, HalfSpace):
+            return self._half_space_bounds(predicate)
         if isinstance(predicate, (InsideRectangle, OutsideRectangle)):
             return self._rectangle_bounds(predicate)
         dim = getattr(predicate, "dim", 0)
         variance = self._variance(dim)
         p = _tail_probability(predicate, self.mean[:, dim], variance)
+        return torch.stack((p, p), dim=-1)
+
+    def _half_space_bounds(self, predicate):
+        """P(a^T X <= b) = Phi((b - a^T mu) / sqrt(a^T Sigma a))."""
+        a = self.mean.new_tensor(predicate.a)
+        if a.shape != (self.mean.shape[1],):
+            raise ValueError("half-space normal must match the state dimension")
+        location = self.mean @ a
+        if self.covariance.ndim == 2:
+            variance = (self.covariance * a.square()).sum(dim=-1)
+        else:
+            variance = torch.einsum("i,bij,j->b", a, self.covariance, a)
+        # A PSD covariance can produce tiny negative projections by round-off.
+        positive, (z,) = _standard_scores(location, variance.clamp_min(0), predicate.b)
+        p = torch.where(positive, _normal_cdf(z), (location <= predicate.b).to(location.dtype))
         return torch.stack((p, p), dim=-1)
 
     def _rectangle_bounds(self, predicate):

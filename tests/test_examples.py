@@ -334,7 +334,7 @@ def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
         env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "MPLBACKEND": "Agg"},
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=300,  # Two full CPU optimizations, figures, and the altitude GIF.
     )
 
     assert result.returncode == 0, result.stderr

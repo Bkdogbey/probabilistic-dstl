@@ -97,16 +97,19 @@ def _setup(config_path, with_environment=False):
 
 
 def _log_intervals(name, spec, result):
-    """Hard pdSTL intervals; the smooth score and control cost are optimiser-side only."""
+    """Report the hard pdSTL outcome separately from differentiable semantics."""
     (lo_i, hi_i), (lo_f, hi_f) = result["interval_initial"], result["interval_final"]
     extra = ""
-    if "optimization_score" in result:
+    if "smooth_lower" in result:
         extra = (
-            f" | smooth score {result['optimization_score']:.4f}"
+            f" | smooth lower {result['smooth_lower']:.4f}"
+            f" (beta={result['smooth_beta']})"
             f" | control cost {result['control_cost']:.4f}"
         )
+    log_utils._log.debug(f"[{name}] specification: {spec}")
     log_utils._log.info(
-        f"[{name}] {spec}: initial [{lo_i:.4f}, {hi_i:.4f}] -> final [{lo_f:.4f}, {hi_f:.4f}]"
+        f"[{name}] Hard pdSTL interval: [{lo_f:.4f}, {hi_f:.4f}]"
+        f" | initial [{lo_i:.4f}, {hi_i:.4f}]"
         f"{extra} | iterations {result['iterations']}"
     )
 
@@ -119,7 +122,7 @@ def _event_trace(event, rollout):
 def _plan_summary(candidate, atom):
     with torch.no_grad():
         return {
-            "interval": list(candidate.pdstl_interval),
+            "interval": list(candidate.hard_interval),
             "objective": candidate.objective,
             "atomic": _event_trace(atom, candidate.rollout),
             "mean": candidate.rollout.aux["mean_trace"],
@@ -145,7 +148,7 @@ def run_altitude_safety(config_path="configs/scenarios/altitude_safety.yaml", *,
     result = {
         **{f"{key}_initial": value for key, value in initial.items()},
         **{f"{key}_final": value for key, value in final.items()},
-        "stored_interval": list(best.pdstl_interval),
+        "stored_interval": list(best.hard_interval),
         "returned_iteration": best.iteration,
         "controls": final["controls"],
         "history": history,
@@ -184,13 +187,29 @@ def _obstacle_traces(events, rollout):
     return [_event_trace(event, rollout) for event in events["obstacles"]]
 
 
+def _iteration_record(candidate):
+    """Scalar diagnostics only; retain no rollout or autograd graph."""
+    return {
+        "iteration": candidate.iteration,
+        "beta": candidate.beta,
+        "smooth_lower": candidate.smooth_lower,
+        "hard_interval": candidate.hard_interval,
+        "control_cost": candidate.control_cost,
+        "objective": candidate.objective,
+    }
+
+
 def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=True, save=True):
     """Always(outside every obstacle) ∧ Eventually(inside goal) ∧ Always(inside workspace)."""
     s = _setup(config_path, with_environment=True)
     spec = s.env.get_specification(s.H, t_goal_start=1)
 
     initial = s.planner.evaluate_controls(s.rollout, s.u_init, spec=spec)
-    best, history = s.planner.optimize_window(s.rollout, spec=spec, init_guess=s.u_init, verbose=True)
+    optimization_trace = []
+    best, history = s.planner.optimize_window(
+        s.rollout, spec=spec, init_guess=s.u_init, verbose=True,
+        on_iteration=lambda k, candidate: optimization_trace.append(_iteration_record(candidate)),
+    )
     final = s.planner.evaluate_controls(s.rollout, best.controls, spec=spec)
 
     events = s.env.get_predicates()
@@ -199,11 +218,14 @@ def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=Tr
     goal_step, safe_step = int(goal[1:, 0].argmax()) + 1, int(safe[1:, 0].argmin()) + 1
     mean_trace = final.rollout.aux["mean_trace"]
     result = {
-        "interval_initial": list(initial.pdstl_interval),
-        "interval_final": list(final.pdstl_interval),
-        "stored_interval": list(best.pdstl_interval),
+        "interval_initial": list(initial.hard_interval),
+        "interval_final": list(final.hard_interval),
+        "stored_interval": list(best.hard_interval),
         "returned_iteration": best.iteration,
-        "optimization_score": final.optimization_score,
+        "smooth_lower": final.smooth_lower,
+        "smooth_beta": final.beta,  # final replay uses beta_end, not the checkpoint's beta
+        "hard_interval": list(final.hard_interval),
+        "optimization_trace": optimization_trace,
         "control_cost": final.control_cost,
         "controls": final.controls,
         "history": history,

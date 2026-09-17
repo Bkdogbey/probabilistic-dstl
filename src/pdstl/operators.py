@@ -1,6 +1,8 @@
 """pdSTL operators on [B, N, 2] probability-interval traces (Frechet Boolean, windowed temporal).
 
-scale <= 0 gives the exact semantics; scale = beta > 0 gives a smooth optimization surrogate.
+scale <= 0 gives hard StoRI semantics; scale = beta > 0 gives the differentiable
+semantics used for optimization (softplus conjunction lower, smooth temporal
+min/max). Smooth values need not be valid probability enclosures.
 """
 
 import math

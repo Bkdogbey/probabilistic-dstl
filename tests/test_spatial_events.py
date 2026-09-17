@@ -24,7 +24,7 @@ from pdstl.operators import (
     Predicate,
     _conjunction,
 )
-from pdstl.predicates import InsideRectangle, OutsideRectangle
+from pdstl.predicates import HalfSpace, InsideRectangle, OutsideRectangle
 from planning.environment import (
     CircularObstaclePredicate,
     Environment,
@@ -82,6 +82,53 @@ def test_predicates_module_imports_no_gaussian_or_model_code():
 
 
 # --- GaussianBelief evaluates the events ------------------------------------
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_affine_probability_uses_projected_gaussian_in_three_dimensions(full):
+    mean = torch.tensor([[0.2, -0.4, 0.6], [-0.3, 0.5, 0.8]], dtype=torch.float64)
+    covariance = torch.tensor([[0.4, 0.1, -0.05], [0.1, 0.6, 0.2], [-0.05, 0.2, 0.8]],
+                              dtype=torch.float64)
+    cov = covariance.expand(2, 3, 3) if full else covariance.diag().expand(2, 3)
+    a, b = np.array([1.0, -2.0, 0.5]), 0.3
+    projected_cov = covariance.numpy() if full else np.diag(covariance.diag().numpy())
+    expected = norm.cdf((b - mean.numpy() @ a) / np.sqrt(a @ projected_cov @ a))
+    bounds = GaussianBelief(mean, cov).probability_bounds(HalfSpace(a, b))
+    np.testing.assert_allclose(bounds.numpy(), np.repeat(expected[:, None], 2, axis=1))
+
+
+def test_affine_singular_covariance_uses_closed_inequality_and_finite_gradients():
+    mean = torch.tensor([[1.0, 1.0], [2.0, 1.0], [0.0, 1.0]], requires_grad=True)
+    covariance = torch.ones(3, 2, 2, requires_grad=True)
+    bounds = GaussianBelief(mean, covariance).probability_bounds(HalfSpace([1, -1], 0))
+    assert bounds.tolist() == [[1.0, 1.0], [0.0, 0.0], [1.0, 1.0]]
+    bounds.sum().backward()
+    assert torch.isfinite(mean.grad).all() and torch.isfinite(covariance.grad).all()
+
+
+def test_affine_probability_gradients_reach_mean_and_covariance():
+    mean = torch.tensor([[0.2, -0.1]], dtype=torch.float64, requires_grad=True)
+    factor = torch.tensor([[[0.8, 0.0], [0.2, 0.6]]], dtype=torch.float64, requires_grad=True)
+    event = HalfSpace([1, -2], 0.7)
+
+    def probability(mu, chol):
+        return GaussianBelief(mu, chol @ chol.transpose(-1, -2)).probability_bounds(event)
+
+    assert torch.autograd.gradcheck(probability, (mean, factor))
+    probability(mean, factor).sum().backward()
+    assert mean.grad.abs().sum() > 0 and factor.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("a,b", [([], 0), ([0, 0], 1), ([float("nan"), 1], 0),
+                                  ([1, float("inf")], 0), ([1], float("inf"))])
+def test_half_space_rejects_invalid_geometry(a, b):
+    with pytest.raises(ValueError):
+        HalfSpace(a, b)
+
+
+def test_half_space_rejects_wrong_state_dimension():
+    with pytest.raises(ValueError, match="state dimension"):
+        GaussianBelief(torch.zeros(1, 2), torch.ones(1, 2)).probability_bounds(HalfSpace([1], 0))
 
 
 def test_scalar_predicates_are_unchanged():

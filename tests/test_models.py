@@ -128,7 +128,7 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     assert best.rollout.aux["mean_trace"].shape == (1, 4, 2)
     assert best.rollout.aux["cov_trace"].shape == (1, 4, 2, 2)
     assert best.controls.shape == (3, 2)
-    assert 0 <= best.exact_lower <= 1
+    assert 0 <= best.hard_lower <= 1
     assert len(history) == 1
     assert torch.isfinite(torch.tensor(history)).all()
 

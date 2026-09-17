@@ -66,7 +66,7 @@ def test_planner_optimises_a_belief_rollout_it_knows_nothing_about():
 
     best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(5, 2))
 
-    assert best.exact_lower > initial + 0.5
+    assert best.hard_lower > initial + 0.5
 
 
 def test_planner_source_builds_no_concrete_beliefs():
@@ -120,12 +120,12 @@ def test_planner_optimises_without_diagnostics_with_control_regularisation():
     assert planner.cfg["w_u"] > 0 and planner.cfg["w_du"] > 0
     assert best.rollout.nominal_trace is None
     assert best.rollout.aux is None
-    assert best.exact_lower > initial + 0.2
+    assert best.hard_lower > initial + 0.2
     replay = rollout(torch.atanh(best.controls / planner.dyn.u_max))
     score, exact = planner._scores(spec, replay.belief_trajectory)
     objective = planner._objective(None, best.controls, score)
     assert objective.item() == pytest.approx(best.objective, abs=1e-5)
-    torch.testing.assert_close(exact, torch.tensor(best.pdstl_interval))
+    torch.testing.assert_close(exact, torch.tensor(best.hard_interval))
 
 
 @pytest.mark.parametrize("beta", [None, 5.0])
@@ -246,7 +246,7 @@ def test_on_iteration_observes_every_iterate_without_changing_the_result():
     assert [k for k, _ in seen] == list(range(len(history)))
     assert [objective for _, objective in seen] == history
     assert history == plain_history
-    assert best.pdstl_interval == plain.pdstl_interval
+    assert best.hard_interval == plain.hard_interval
 
 
 def test_evaluate_controls_scores_returned_controls_like_the_optimiser():
@@ -256,12 +256,12 @@ def test_evaluate_controls_scores_returned_controls_like_the_optimiser():
     replay = planner.evaluate_controls(rollout, best.controls, spec=spec)
 
     torch.testing.assert_close(
-        torch.tensor(replay.pdstl_interval), torch.tensor(best.pdstl_interval), atol=1e-5, rtol=0
+        torch.tensor(replay.hard_interval), torch.tensor(best.hard_interval), atol=1e-5, rtol=0
     )
     torch.testing.assert_close(replay.controls, best.controls, atol=1e-5, rtol=0)
 
 
-def test_returned_candidate_has_the_best_exact_lower_score():
+def test_checkpoint_selection_uses_hard_lower_and_control_cost():
     planner, spec, rollout = _smooth_problem()
     seen = []
 
@@ -270,13 +270,13 @@ def test_returned_candidate_has_the_best_exact_lower_score():
         on_iteration=lambda k, candidate: seen.append(candidate),
     )
 
-    top = max(c.exact_lower for c in seen)
-    assert best.exact_lower == top
-    assert best.control_cost == min(c.control_cost for c in seen if c.exact_lower == top)
+    top = max(c.hard_lower for c in seen)
+    assert best.hard_lower == top
+    assert best.control_cost == min(c.control_cost for c in seen if c.hard_lower == top)
     assert seen[best.iteration] == best
 
 
-def test_optimization_score_carries_gradients_and_the_interval_is_exact():
+def test_smooth_lower_carries_gradients_and_hard_interval_is_detached():
     planner, spec, rollout = _smooth_problem()
     v = torch.zeros(3, 2, requires_grad=True)
     predicted = rollout(v)
@@ -299,7 +299,7 @@ def test_beta_anneals_geometrically_and_is_none_when_smoothing_is_off():
     assert _planner()._beta(0) is None
 
 
-def test_alpha_stopping_uses_the_exact_lower_score():
+def test_alpha_stopping_uses_hard_lower():
     planner, spec, rollout = _smooth_problem()
     smooth, exact = planner._scores(spec, rollout(torch.zeros(3, 2)).belief_trajectory, planner._beta(0))
     assert smooth < exact[0]  # the normalized smooth max underestimates the max

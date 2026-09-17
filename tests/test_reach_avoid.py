@@ -32,7 +32,7 @@ from models.dynamics import SingleIntegrator
 from pdstl.predicates import InsideRectangle, OutsideRectangle
 from planning.environment import Environment
 from planning.planner import Planner
-from visualization.planning import plot_event_probabilities, plot_reach_avoid
+from visualization.planning import plot_event_probabilities, plot_reach_avoid, visualize_reach_avoid
 
 CONFIG = "configs/scenarios/reach_avoid.yaml"
 
@@ -163,7 +163,7 @@ def test_returned_controls_replay_to_the_stored_pdstl_interval(result, problem):
     replay = planner.evaluate_controls(rollout, result["controls"], spec=spec)
 
     assert all(isinstance(b, GaussianBelief) for b in replay.rollout.belief_trajectory)
-    assert list(replay.pdstl_interval) == pytest.approx(result["interval_final"], abs=1e-4)
+    assert list(replay.hard_interval) == pytest.approx(result["interval_final"], abs=1e-4)
     assert result["interval_final"] == pytest.approx(result["stored_interval"], abs=1e-4)
 
 
@@ -225,9 +225,10 @@ def test_plots_draw_the_belief_sequence_and_event_probabilities(result, problem)
     ellipses = [p for p in ax.patches if isinstance(p, patches.Ellipse)]
     rectangles = [p for p in ax.patches if isinstance(p, patches.Rectangle)]
     assert len(rectangles) == len(cfg["obstacles"]) + 2   # blocks, goal, workspace
-    assert len(ellipses) == 2 * len(range(0, cfg["H"] + 1, cfg["ellipse_every"]))
+    assert len(ellipses) == len(range(0, cfg["H"] + 1, cfg["ellipse_every"]))
     labels = ax.get_legend_handles_labels()[1]
-    assert "Optimized predicted mean" in labels
+    assert "Predicted belief mean" in labels
+    assert not any("Initial" in label for label in labels)
     fig.canvas.draw()
     plt.close(fig)
 
@@ -238,4 +239,42 @@ def test_plots_draw_the_belief_sequence_and_event_probabilities(result, problem)
     }
     fig, ax = plot_event_probabilities(cfg["dt"], traces, show=False)
     assert len(ax.lines) == 2 * len(traces)   # a lower and an upper curve per event
+    assert ax.get_legend_handles_labels()[1] == list(traces)
+    assert len(ax.collections) == len(traces)
     plt.close(fig)
+
+
+def test_optimization_trace_records_the_actual_semantics_and_checkpoint(result, problem):
+    *_, rollout, spec, planner = problem
+    records = result["optimization_trace"]
+    assert [r["iteration"] for r in records] == list(range(result["iterations"]))
+    assert [r["objective"] for r in records] == result["history"]
+    for record in records:
+        assert record["beta"] == pytest.approx(planner._beta(record["iteration"]))
+        assert record["objective"] == pytest.approx(
+            -planner.cfg["w_phi"] * record["smooth_lower"] + record["control_cost"], abs=1e-5
+        )
+    selected = records[result["returned_iteration"]]
+    assert selected["hard_interval"] == pytest.approx(result["hard_interval"], abs=1e-4)
+    predicted = rollout(planner._control_parameters(result["controls"]))
+    smooth = spec(predicted.belief_trajectory, scale=selected["beta"])[0, 0, 0].item()
+    assert selected["smooth_lower"] == pytest.approx(smooth, abs=1e-4)
+
+
+def test_default_presentation_saves_three_views_and_debug_is_opt_in(result, problem, tmp_path):
+    cfg, _, _, env, *_ = problem
+    views = visualize_reach_avoid(result, env, dt=cfg["dt"], show=False,
+                                  save_path=str(tmp_path / "reach.png"))
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "reach.png", "reach_probabilities.png", "reach_optimization.png"
+    }
+    assert len(views[1][1].collections) == 2
+    curve = views[2][1].lines[0]
+    assert list(curve.get_ydata()) == [r["smooth_lower"] for r in result["optimization_trace"]]
+    debug_views = visualize_reach_avoid(result, env, dt=cfg["dt"], show=False,
+                                        show_initial=True, show_workspace=True)
+    assert "Initial predicted belief mean" in debug_views[0][1].get_legend_handles_labels()[1]
+    assert len(debug_views[1][1].collections) == 3
+    for fig, _ in (*views, *debug_views):
+        fig.canvas.draw()
+        plt.close(fig)

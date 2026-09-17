@@ -3,6 +3,23 @@
 from pdstl.operators import Predicate
 
 
+class HalfSpace(Predicate):
+    """Closed affine event a^T X <= b over the full state vector.
+
+    Geometry only: the belief supplies the event probability. Coefficients are
+    fixed, finite scalars; the normal must be nonzero.
+    """
+
+    def __init__(self, a, b, name=None):
+        a, b = tuple(float(value) for value in a), float(b)
+        if not a or not any(a):
+            raise ValueError("a must be a nonempty, nonzero normal vector")
+        if not all(-float("inf") < value < float("inf") for value in (*a, b)):
+            raise ValueError("half-space coefficients must be finite")
+        super().__init__(name=name or f"HalfSpace({a} @ X <= {b})")
+        self.a, self.b = a, b
+
+
 def _ordered(label, bounds):
     low, high = (float(b) for b in bounds)
     if not low < high:
