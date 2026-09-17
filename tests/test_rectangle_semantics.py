@@ -21,10 +21,10 @@ from pdstl.predicates import AxisInterval, InsideRectangle, OutsideRectangle
 RECT = ([4.0, 6.0], [3.0, 5.0])
 
 
-def evaluate(rectangle, mean, covariance, scale=-1):
+def evaluate(rectangle, mean, covariance, beta=None):
     """Probability interval [B, 2] of a rectangle event under one belief."""
     belief = GaussianBelief(mean, covariance)
-    return rectangle(BeliefTrajectory([belief]), scale=scale)[:, 0]
+    return rectangle(BeliefTrajectory([belief]), beta=beta)[:, 0]
 
 
 # --- Hard semantics ---------------------------------------------------------
@@ -120,15 +120,15 @@ def test_rectangle_over_non_default_state_dimensions():
 # --- Gradients --------------------------------------------------------------
 
 
-def _goal_gradient(mean_value, scale, goal=([8.5, 9.5], [8.5, 9.5]), sigma_sq=0.04):
+def _goal_gradient(mean_value, beta, goal=([8.5, 9.5], [8.5, 9.5]), sigma_sq=0.04):
     mean = torch.tensor([[mean_value, mean_value]], requires_grad=True)
-    lower = evaluate(InsideRectangle(*goal), mean, torch.tensor([[sigma_sq, sigma_sq]]), scale)[0, 0]
+    lower = evaluate(InsideRectangle(*goal), mean, torch.tensor([[sigma_sq, sigma_sq]]), beta)[0, 0]
     lower.backward()
     return lower.item(), mean.grad.abs().sum().item()
 
 
 def test_smooth_inside_goal_score_has_a_finite_gradient():
-    value, gradient = _goal_gradient(8.4, scale=1.0)
+    value, gradient = _goal_gradient(8.4, beta=1.0)
     assert torch.isfinite(torch.tensor([value, gradient])).all()
     assert gradient > 0.0
 
@@ -141,12 +141,12 @@ def test_smooth_goal_gradient_is_an_approach_phase_fix():
     smoothing can help; the goal-directed initialisation is what covers that regime. This test
     documents both halves so nobody mistakes the far-field zero for a regression.
     """
-    _, near_hard = _goal_gradient(8.4, scale=-1)
-    _, near_smooth = _goal_gradient(8.4, scale=1.0)
+    _, near_hard = _goal_gradient(8.4, beta=None)
+    _, near_smooth = _goal_gradient(8.4, beta=1.0)
     assert near_hard == 0.0, "hard clamp gives no gradient on approach"
     assert near_smooth > 1e-3, "softplus must revive it"
 
-    _, far_smooth = _goal_gradient(1.0, scale=1.0)
+    _, far_smooth = _goal_gradient(1.0, beta=1.0)
     assert far_smooth == 0.0, "far field is lost to CDF underflow, not to the clamp"
 
 

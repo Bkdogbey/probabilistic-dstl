@@ -2,6 +2,10 @@
 # Robot re-plans at every step using a receding horizon.
 
 # --- Dynamics ---
+# --- Scenario ---
+scenario:
+  type: reach_avoid
+
 dynamics: single_integrator
 H: 100           # Planning horizon per MPC window (time steps)
 MAX_STEPS: 300   # Maximum simulation steps (safety limit)

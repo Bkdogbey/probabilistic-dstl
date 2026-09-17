@@ -9,9 +9,16 @@ import torch
 
 from models.dynamics import DoubleIntegrator, SingleIntegrator
 from models.rollouts import gaussian_rollout
-from pdstl.operators import Always, And, GreaterThan
+from pdstl.operators import Always, And
+from pdstl.predicates import GreaterThan, InsideRectangle, OutsideRectangle
 from planning import log_utils
-from planning.environment import Environment
+from planning.environment import RectangleRegion
+from planning.scenarios.lane_merge import (
+    MovingRectangleRegion,
+    build_lane_merge_environment,
+    clip_moving_obstacles,
+)
+from planning.scenarios.reach_avoid import build_reach_avoid_environment
 from planning.planner import Planner
 from utils import get_device, load_config
 from visualization.animation import animate_altitude_optimization, animate_results
@@ -47,27 +54,14 @@ def build_initial_belief(cfg, device):
     return x0_mean, torch.eye(len(x0_mean), device=device) * cfg["x0_cov_scale"]
 
 
-def build_environment(cfg, device):
-    env = Environment(device=device)
-    if "road" in cfg and "obstacle" in cfg:
-        env.configure_lane_change(
-            road=cfg["road"], obstacle=cfg["obstacle"], goal=cfg["goal"], success=cfg["success"],
-            horizon=cfg["H"], total_steps=cfg["T_SIM"], dt=cfg["dt"], label=cfg.get("label", ""),
-            plot_xlim=cfg.get("plot_xlim"), robot_dims=cfg.get("robot_dims"),
-        )
-        return env
-    if "goal" in cfg:
-        env.set_goal(**cfg["goal"])
-    if "bounds" in cfg:
-        env.set_bounds(**cfg["bounds"])
-    for region in cfg.get("visit_regions", []):
-        env.add_visit_region(**region)
-    for obs in cfg.get("obstacles", []):
-        if obs["type"] == "circle":
-            env.add_circle_obstacle(center=obs["center"], radius=obs["radius"])
-        else:
-            env.add_obstacle(x_range=obs["x_range"], y_range=obs["y_range"])
-    return env
+def build_environment(cfg, device="cpu"):
+    """Pick the scenario's builder from `scenario: {type: ...}`."""
+    scenario = (cfg.get("scenario") or {}).get("type", "reach_avoid")
+    if scenario == "lane_merge":
+        return build_lane_merge_environment(cfg, device=device)
+    if scenario == "reach_avoid":
+        return build_reach_avoid_environment(cfg)
+    raise ValueError(f"unknown scenario type {scenario!r}")
 
 
 def _output_path(filename):
@@ -84,7 +78,7 @@ def _setup(config_path, with_environment=False):
     log_utils.log_device(device)
     cfg, planner_cfg = load_scenario_config(config_path)
     dyn = build_dynamics(cfg, device)
-    env = build_environment(cfg, device) if with_environment else None
+    env = build_environment(cfg, device=device) if with_environment else None
     return SimpleNamespace(
         cfg=cfg,
         H=cfg["H"],
@@ -173,7 +167,7 @@ def _mean_clearance(mean_trace, obstacles):
     """Post-hoc diagnostic: smallest mean-to-rectangle distance over all obstacles."""
     points = mean_trace[0, 1:]
     corners = torch.tensor(
-        [[o["x"][0], o["y"][0], o["x"][1], o["y"][1]] for o in obstacles],
+        [[o.x[0], o.y[0], o.x[1], o.y[1]] for o in obstacles],
         device=points.device,
         dtype=points.dtype,
     )
@@ -185,6 +179,19 @@ def _mean_clearance(mean_trace, obstacles):
 def _obstacle_traces(events, rollout):
     """Per-obstacle probability intervals, for inspection alongside their conjunction."""
     return [_event_trace(event, rollout) for event in events["obstacles"]]
+
+
+def reach_avoid_events(environment):
+    """The named events a reach-avoid report inspects, rebuilt from the environment's regions."""
+    workspace, goal = environment.region("workspace"), environment.region("goal")
+    return {
+        "workspace": InsideRectangle(workspace.x, workspace.y, name=workspace.name),
+        "goal": InsideRectangle(goal.x, goal.y, name=goal.name),
+        "obstacles": [
+            OutsideRectangle(o.x, o.y, name=o.name)
+            for o in environment.by_role("obstacle")
+        ],
+    }
 
 
 def _iteration_record(candidate):
@@ -202,7 +209,7 @@ def _iteration_record(candidate):
 def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=True, save=True):
     """Always(outside every obstacle) ∧ Eventually(inside goal) ∧ Always(inside workspace)."""
     s = _setup(config_path, with_environment=True)
-    spec = s.env.get_specification(s.H, t_goal_start=1)
+    spec = s.env.get_specification(s.H)
 
     initial = s.planner.evaluate_controls(s.rollout, s.u_init, spec=spec)
     optimization_trace = []
@@ -212,7 +219,7 @@ def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=Tr
     )
     final = s.planner.evaluate_controls(s.rollout, best.controls, spec=spec)
 
-    events = s.env.get_predicates()
+    events = reach_avoid_events(s.env)
     goal = _event_trace(events["goal"], final.rollout)
     safe = _event_trace(reduce(And, events["obstacles"]), final.rollout)
     goal_step, safe_step = int(goal[1:, 0].argmax()) + 1, int(safe[1:, 0].argmin()) + 1
@@ -244,7 +251,7 @@ def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=Tr
         "mean_initial": initial.rollout.aux["mean_trace"],
         "cov_initial": initial.rollout.aux["cov_trace"],
         "final_mean": mean_trace[0, -1].tolist(),
-        "min_mean_clearance": _mean_clearance(mean_trace, s.env.obstacles),
+        "min_mean_clearance": _mean_clearance(mean_trace, s.env.by_role("obstacle")),
     }
     _log_intervals("reach_avoid", spec, result)
 
@@ -270,22 +277,22 @@ def check_collision(mean_trace, env, r_robot=1.0, moving_obs_dist=2.25):
 
     for t in range(traj.shape[0]):
         ego_pos = traj[t].cpu().numpy()
-        for obs in env.obstacles:
-            (x_min, x_max), (y_min, y_max) = obs["x"], obs["y"]
-            if (x_min - r_robot <= ego_pos[0] <= x_max + r_robot) and (
-                y_min - r_robot <= ego_pos[1] <= y_max + r_robot
-            ):
-                log_utils.log_collision_event(t, "Static obstacle", f"ego={ego_pos}")
-                is_safe = False
-        for obs in env.moving_obstacles:
-            xt, yt = obs["x_traj"], obs["y_traj"]
-            if t < len(xt):
-                ox = xt[t].item() if isinstance(xt, torch.Tensor) else xt[t]
-                oy = yt[t].item() if isinstance(yt, torch.Tensor) else yt[t]
-                dist = np.linalg.norm(ego_pos[:2] - np.array([ox, oy]))
+        for region in env.by_role("obstacle"):
+            if isinstance(region, MovingRectangleRegion):
+                centers = torch.as_tensor(region.centers)
+                if t >= len(centers):
+                    continue
+                dist = float(np.linalg.norm(ego_pos[:2] - centers[t].cpu().numpy()))
                 min_sep = min(min_sep, dist)
                 if dist < moving_obs_dist:
                     log_utils.log_collision_event(t, "Moving obstacle", f"dist={dist:.2f}")
+                    is_safe = False
+            elif isinstance(region, RectangleRegion):
+                (x_min, x_max), (y_min, y_max) = region.x, region.y
+                if (x_min - r_robot <= ego_pos[0] <= x_max + r_robot) and (
+                    y_min - r_robot <= ego_pos[1] <= y_max + r_robot
+                ):
+                    log_utils.log_collision_event(t, "Static obstacle", f"ego={ego_pos}")
                     is_safe = False
 
     log_utils.log_safety(is_safe, min_sep)
@@ -306,17 +313,17 @@ def _normalise_result(data):
     return result
 
 
-def _load_or_solve(cfg, planner_cfg, env, *, horizon, load_from=None, force_run=False,
-                   make_callback=None):
+def _load_or_solve(cfg, planner_cfg, env, *, horizon, device="cpu", load_from=None,
+                   force_run=False, make_callback=None):
     """Load a saved result if present, else run Planner.solve and save it."""
     result_path = load_from or (str(RESULTS_DIR / cfg["save_file"]) if "save_file" in cfg else None)
     if not force_run and result_path and Path(result_path).exists():
         log_utils.log_load(result_path)
-        return _normalise_result(torch.load(result_path, map_location=env.device, weights_only=False))
+        return _normalise_result(torch.load(result_path, map_location=device, weights_only=False))
 
-    planner = Planner(build_dynamics(cfg, env.device), env, horizon, config=planner_cfg)
+    planner = Planner(build_dynamics(cfg, device), env, horizon, config=planner_cfg)
     step_callback = make_callback(env) if make_callback is not None else None
-    result = planner.solve(*build_initial_belief(cfg, env.device), step_callback=step_callback)
+    result = planner.solve(*build_initial_belief(cfg, device), step_callback=step_callback)
 
     if result_path:
         Path(result_path).parent.mkdir(parents=True, exist_ok=True)
@@ -339,11 +346,12 @@ def run_single_shot(max_iterations=1000, load_from=None, force_run=False, *,
     log_utils.log_device(device)
     cfg, planner_cfg = load_scenario_config(config_path)
     planner_cfg["max_iters"] = max_iterations
-    env = build_environment(cfg, device)
+    env = build_environment(cfg, device=device)
 
     log_utils._log.info("Starting single-shot optimisation...")
     result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=cfg["T"], load_from=load_from, force_run=force_run
+        cfg, planner_cfg, env, horizon=cfg["T"], device=device,
+        load_from=load_from, force_run=force_run
     )
     log_utils._log.info(f"Done. Final stochastic robustness: {result['best_p']:.4f}")
 
@@ -358,12 +366,12 @@ def run_mpc(load_from=None, force_run=False, *, config_path="configs/scenarios/m
     device = get_device()
     log_utils.log_device(device)
     cfg, planner_cfg = load_scenario_config(config_path)
-    env = build_environment(cfg, device)
+    env = build_environment(cfg, device=device)
 
     log_utils._log.info(f"Starting MPC execution (horizon={cfg['H']})...")
     result = _load_or_solve(
         cfg, {**planner_cfg, "MAX_STEPS": cfg["MAX_STEPS"]}, env, horizon=cfg["H"],
-        load_from=load_from, force_run=force_run,
+        device=device, load_from=load_from, force_run=force_run,
         make_callback=make_mpc_live_callback if show else None,
     )
 
@@ -380,22 +388,21 @@ def run_lane_change(config_path="configs/scenarios/lane_change.yaml", *, show=Tr
     cfg, planner_cfg = load_scenario_config(config_path)
     log_utils.log_scenario_start(cfg.get("label", ""))
 
-    env = build_environment(cfg, device)
+    env = build_environment(cfg, device=device)
     planner_cfg = {**planner_cfg, "T_SIM": cfg["T_SIM"], "mpc_mode": "lane_change"}
     result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=cfg["H"], force_run=True,
+        cfg, planner_cfg, env, horizon=cfg["H"], device=device, force_run=True,
         make_callback=make_lane_change_live_callback if show else None,
     )
-    if env.moving_obstacles:
-        env.clip_moving_obstacles(result["mean_trace"].shape[1])
+    clip_moving_obstacles(env, result["mean_trace"].shape[1])
     check_collision(result["mean_trace"], env, r_robot=planner_cfg["r_robot"],
                     moving_obs_dist=planner_cfg["moving_obs_dist"])
 
     if show:
         visualize_lane_change(
             result["mean_trace"], result["cov_trace"], result["u_trace"], env,
-            p_sat_trace=result["p_sat_trace"], dt=cfg["dt"], robot_dims=env.robot_dims,
-            xlim=env.plot_xlim,
+            p_sat_trace=result["p_sat_trace"], dt=cfg["dt"], robot_dims=env.metadata.get("robot_dims"),
+            xlim=env.metadata.get("plot_xlim"),
         )
-        _animate(result, env, cfg, plan_traces=result["all_plans"], robot_dims=env.robot_dims)
+        _animate(result, env, cfg, plan_traces=result["all_plans"], robot_dims=env.metadata.get("robot_dims"))
     return result

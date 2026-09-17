@@ -5,7 +5,9 @@ import torch.nn as nn
 import torch.optim as optim
 
 from models.rollouts import BeliefRollout, gaussian_rollout
+from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
 from planning import log_utils
+from planning.scenarios import lane_merge
 from utils import load_config
 
 
@@ -70,54 +72,46 @@ class Planner:
 
     # --- Optional shaping heuristics (legacy; off in the pdSTL demos) -----------
 
+    def _center(self, region):
+        return torch.tensor(
+            [[sum(region.x) / 2.0, sum(region.y) / 2.0]], device=self.device
+        )
+
     def _goal_dist_loss(self, mean_trace):
-        """Squared distance from final position to goal centre."""
-        if self.env.goal is None:
+        """Squared distance from the final position to the goal centre."""
+        if self.env is None or "goal" not in self.env.regions:
             return torch.tensor(0.0, device=self.device)
-        gx = sum(self.env.goal["x"]) / 2.0
-        gy = sum(self.env.goal["y"]) / 2.0
-        goal_center = torch.tensor([[gx, gy]], device=self.device)
-        return torch.sum((mean_trace[:, -1, :2] - goal_center) ** 2)
+        return torch.sum((mean_trace[:, -1, :2] - self._center(self.env.region("goal"))) ** 2)
 
     def _obs_repulsion_loss(self, mean_trace):
-        """Penalise trajectory points that are too close to obstacle centres."""
+        """Penalise trajectory points that come too close to an obstacle."""
         loss = torch.tensor(0.0, device=self.device)
+        if self.env is None:
+            return loss
         margin = self.cfg["obs_margin"]
 
-        for obs in self.env.obstacles:
-            cx = (obs["x"][0] + obs["x"][1]) / 2.0
-            cy = (obs["y"][0] + obs["y"][1]) / 2.0
-            center = torch.tensor([[cx, cy]], device=self.device)
-            radius = max(obs["x"][1] - obs["x"][0], obs["y"][1] - obs["y"][0]) / 2.0 + margin
+        for region in self.env.by_role("obstacle"):
+            if isinstance(region, CircleRegion):
+                center = torch.tensor([region.center], device=self.device)
+                radius = region.radius + margin
+            elif isinstance(region, MovingRectangleRegion):
+                center = torch.as_tensor(region.centers, device=self.device).unsqueeze(0)
+                radius = max(region.width, region.height) / 2.0 + margin
+            else:
+                center = self._center(region)
+                radius = max(region.x[1] - region.x[0], region.y[1] - region.y[0]) / 2.0 + margin
             dists = torch.norm(mean_trace[:, :, :2] - center, dim=2)
             loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
-
-        for obs in self.env.circle_obstacles:
-            center = torch.tensor([obs["center"]], device=self.device)
-            radius = obs["radius"] + margin
-            dists = torch.norm(mean_trace[:, :, :2] - center, dim=2)
-            loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
-
-        for obs in self.env.moving_obstacles:
-            ox = torch.as_tensor(obs["x_traj"], device=self.device)
-            oy = torch.as_tensor(obs["y_traj"], device=self.device)
-            centers = torch.stack([ox, oy], dim=1).unsqueeze(0)  # [1, T+1, 2]
-            radius = max(obs["width"], obs["height"]) / 2.0 + margin
-            dists = torch.norm(mean_trace[:, :, :2] - centers, dim=2)
-            loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
-
         return loss
 
     def _visit_loss(self, mean_trace):
-        """Pull trajectory towards visit regions (Eventually semantics)."""
+        """Pull the trajectory towards visit regions (Eventually semantics)."""
         loss = torch.tensor(0.0, device=self.device)
-        for region in self.env.visit_regions:
-            vx = (region["x"][0] + region["x"][1]) / 2.0
-            vy = (region["y"][0] + region["y"][1]) / 2.0
-            v_center = torch.tensor([[vx, vy]], device=self.device)
-            dists_sq = torch.sum((mean_trace[:, :, :2] - v_center) ** 2, dim=2)
-            min_dist_sq, _ = torch.min(dists_sq, dim=1)
-            loss = loss + torch.sum(min_dist_sq)
+        if self.env is None:
+            return loss
+        for region in self.env.by_role("visit"):
+            dists_sq = torch.sum((mean_trace[:, :, :2] - self._center(region)) ** 2, dim=2)
+            loss = loss + torch.sum(torch.min(dists_sq, dim=1).values)
         return loss
 
     def _control_cost(self, controls):
@@ -151,18 +145,18 @@ class Planner:
         return start * (end / start) ** (k / max(self.cfg["max_iters"] - 1, 1))
 
     def _scores(self, phi, belief_trajectory, beta=None):
-        """Differentiable lower semantics and detached hard diagnostic interval.
+        """(score that carries the gradient, detached exact pdSTL interval).
 
-        With smoothing enabled, only the smooth lower supplies gradients. The
-        legacy beta=None mode differentiates the hard lower instead.
+        With smoothing on, only the smooth lower score supplies gradients. With beta=None
+        there is no surrogate, so the exact lower bound is differentiated instead.
         """
         if beta is None:
-            hard_interval = phi(belief_trajectory, scale=-1)[0, 0]
-            return hard_interval[0], hard_interval.detach()
-        smooth_lower = phi(belief_trajectory, scale=beta)[0, 0, 0]
+            exact = phi.probability_interval(belief_trajectory)
+            return exact[0], exact.detach()
+        smooth_lower = phi.smooth_lower(belief_trajectory, beta)
         with torch.no_grad():
-            hard_interval = phi(belief_trajectory, scale=-1)[0, 0]
-        return smooth_lower, hard_interval
+            exact = phi.probability_interval(belief_trajectory)
+        return smooth_lower, exact
 
     def _candidate(self, phi, rollout, v, beta=None):
         """Score parameters v; returns (PlanCandidate, objective with graph)."""
@@ -293,25 +287,20 @@ class Planner:
     # --- Legacy environment scenarios (single shot, MPC, lane change) -------------
 
     def _goal_center(self, env):
-        if env.goal is None:
+        if env is None or "goal" not in env.regions:
             return None
-        gx, gy = env.goal["x"], env.goal["y"]
-        return torch.tensor([(gx[0] + gx[1]) / 2, (gy[0] + gy[1]) / 2], device=self.device)
+        return self._center(env.region("goal"))[0]
 
     def _log_lane_change_step(self, step, curr_mean, best_p):
-        obs_pos = self.env.moving_obstacle_position(step)
-        if obs_pos is None or step % 5:
+        if step % 5:
             return
+        obs_pos = lane_merge.obstacle_position(self.env, step)
         obs = torch.as_tensor(obs_pos, device=self.device, dtype=curr_mean.dtype)
         dist = torch.linalg.norm(curr_mean[:2] - obs).item()
         log_utils.log_lane_step(step, curr_mean.detach().cpu().numpy(), obs_pos[0], dist, best_p)
 
     def _lane_change_success(self, curr_mean, success_counter):
-        if self.env.success is None:
-            return success_counter, False
-        success = self.env.success
-        success_counter = success_counter + 1 if success["y_min"] <= curr_mean[1].item() <= success["y_max"] else 0
-        return success_counter, success_counter >= success["consecutive_steps"]
+        return lane_merge.success_reached(self.env, curr_mean, success_counter)
 
     def _run_mpc(self, x0_mean, x0_cov, *, step_callback=None):
         """MPC with sampled execution: T_SIM fixed steps (optionally lane change) or MAX_STEPS to goal."""
@@ -333,7 +322,7 @@ class Planner:
                     log_utils.log_goal_reached(step)
                     break
 
-            env = self.env.make_local_lane_change_window(step, mean, self.cfg) if lane_change else None
+            env = lane_merge.local_window(self.env, step, mean, self.cfg) if lane_change else None
             best, history = self.optimize_window(
                 gaussian_rollout(self.dyn, mean, cov), env=env, init_guess=self._shift_controls(prev_u)
             )
@@ -355,7 +344,7 @@ class Planner:
                 success_counter, done = self._lane_change_success(mean, success_counter)
                 if done:
                     stopped_reason = "lane_change_success"
-                    log_utils.log_lane_change_done(self.env.label, step)
+                    log_utils.log_lane_change_done(self.env.metadata.get("label", ""), step)
                     break
             elif not fixed:
                 distance = dist.item() if dist is not None else 0.0

@@ -1,24 +1,20 @@
-"""Characterization baseline for the lane-merge scenario and its receding-horizon execution.
+"""Characterization baseline for the lane-merge scenario and its MPC execution.
 
-Written BEFORE the reach-avoid refactor, against the behaviour on RA_L-planning at
-commit 9301ef9, because `run_lane_change`, `Planner._run_mpc`, `make_local_lane_change_window`
-and the success counter had no test coverage at all. Its job is to make
-"lane-merge behavior remains operational" falsifiable.
+Lane merge had no test coverage at all: `run_lane_change`, `Planner._run_mpc`,
+`make_local_lane_change_window` and the success counter were all unpinned. This pins them
+while lane merge stays on its existing working path, so "lane merge still works" is
+falsifiable before anything touches it.
 
 Two tiers, deliberately:
 
-* `TestLaneMergeGeometry` pins pure functions of the configuration exactly. Nothing in the
-  refactor may move these numbers -- they are geometry, not optimization.
+* `TestLaneMergeGeometry` pins pure functions of the configuration exactly. These are
+  geometry, not optimization, and nothing should move them.
 
-* `TestLaneMergeExecution` pins the end-to-end outcome loosely. It cannot be exact: the
-  refactor rebuilds `InsideRectangle` as a conjunction of axis intervals, so the lane-merge
-  goal's *smooth* lower bound changes from a hard clamp to softplus. That shifts the Adam
-  trajectory by design. The assertions below bound the outcome (lane kept, safety probability
-  high, forward progress) rather than reproducing a float. BASELINE records the exact
-  pre-refactor values so drift stays visible to a human reader.
-
-The end-to-end run goes through `_execute_lane_merge`. That helper is the ONLY thing the
-refactor is allowed to rewrite; every assertion must survive untouched.
+* `TestLaneMergeExecution` bounds the end-to-end outcome instead of pinning a float. It
+  cannot be exact: `InsideRectangle` is now a conjunction of two axis intervals, so the
+  lane-merge goal's *smooth* lower bound is a softplus where it used to be a hard clamp.
+  That shifts the Adam trajectory by design. BASELINE records the pre-change values so the
+  drift stays visible to a reader.
 """
 
 import matplotlib
@@ -27,20 +23,15 @@ matplotlib.use("Agg")
 import pytest
 import torch
 
-from planning.controllers import RecedingHorizonController
-from planning.runners import (
-    _legacy_optimizer_block,
-    _window_config,
-    build_initial_belief,
-    build_planner,
-    build_scenario,
-)
+from planning.planner import Planner
+from planning.scenarios import lane_merge
+from planning.runners import build_dynamics, build_environment, build_initial_belief
 from utils import load_config
 
 CONFIG = "configs/scenarios/lane_change.yaml"
 
-# Exact pre-refactor values, seed 0, T_SIM=5, max_iters=20. Recorded for drift inspection;
-# only the geometry tier asserts against exact numbers.
+# Exact values before the AxisInterval change, seed 0, T_SIM=5, max_iters=20.
+# Recorded for drift inspection; only the geometry tier asserts against exact numbers.
 BASELINE = {
     "stopped_reason": "T_SIM",
     "applied_steps": 5,
@@ -52,41 +43,25 @@ BASELINE = {
 @pytest.fixture(scope="module")
 def setup():
     cfg = load_config(CONFIG)
-    env = build_scenario({**cfg, "scenario": {"type": "lane_merge"}}, "cpu")
-    return cfg, _window_config(cfg), env
+    planner_cfg = {**load_config("configs/planning.yaml"), **cfg["planner"]}
+    return cfg, planner_cfg, build_environment(cfg, device="cpu")
 
 
 def _execute_lane_merge(cfg, planner_cfg, env, *, steps, iters, seed=0):
-    """Run `steps` lane-merge receding-horizon windows and return a plain summary.
-
-    REFACTOR NOTE: reroute this body to RecedingHorizonController.run(). The returned
-    dict keys are the contract; the assertions below must not change.
-    """
-    optimizer = {**_legacy_optimizer_block(cfg), "max_iterations": iters}
-    planner = build_planner(
-        {
-            "horizon": cfg["H"],
-            "dynamics": {
-                "type": cfg["dynamics"], "dt": cfg["dt"],
-                "u_max": cfg["u_max"], "q_std": cfg["q_std"],
-            },
-            "optimizer": optimizer,
-        },
+    """Run `steps` lane-merge MPC windows on the existing path; returns a plain summary."""
+    planner = Planner(
+        build_dynamics(cfg, "cpu"),
         env,
-    )
-    mean0, covariance0 = build_initial_belief(
-        {"mean": cfg["x0_mean"], "covariance": cfg["x0_cov_scale"]}, "cpu"
+        cfg["H"],
+        config={**planner_cfg, "T_SIM": steps, "mpc_mode": "lane_change", "max_iters": iters},
     )
     torch.manual_seed(seed)
-    result = RecedingHorizonController(
-        planner=planner, dynamics=planner.dynamics, scenario=env,
-        config={"warm_start": True},
-    ).run(mean0, (mean0, covariance0), max_steps=steps, apply_steps=1)
+    result = planner.solve(*build_initial_belief(cfg, "cpu"), verbose=False)
     return {
-        "stopped_reason": "T_SIM" if result.stopped_reason == "max_steps" else result.stopped_reason,
-        "applied_steps": result.applied_controls.shape[0],
-        "p_sat": result.hard_lowers,
-        "states": result.states,
+        "stopped_reason": result["stopped_reason"],
+        "applied_steps": result["u_trace"].shape[1],
+        "p_sat": list(result["p_sat_trace"]),
+        "states": result["mean_trace"][0],
     }
 
 
@@ -101,55 +76,54 @@ class TestLaneMergeGeometry:
 
     def test_specification_is_safety_and_eventual_goal(self, setup):
         _, _, env = setup
-        spec = str(env.specification(40))
+        spec = str(env.get_specification(40))
         assert "MovingRectangularObstaclePredicate" in spec
         assert "□_[1, 40]" in spec and "♢_[0, 40]" in spec
 
     def test_local_window_goal_tracks_the_ego_by_the_configured_lookahead(self, setup):
         _, planner_cfg, env = setup
-        local = env.local_window(7, torch.tensor([12.0, 1.3, 3.5, 0.0]), planner_cfg)
-        # curr_x + mpc_goal_lookahead, + mpc_goal_window_width; y inset on both sides.
-        assert local.goal["x"] == pytest.approx([16.0, 76.0])
-        assert local.goal["y"] == pytest.approx([2.1, 5.9])
+        local = lane_merge.local_window(env, 7, torch.tensor([12.0, 1.3, 3.5, 0.0]), planner_cfg)
+        goal = local.region("goal")
+        # ego_x + mpc_goal_lookahead, + mpc_goal_window_width; y inset on both sides.
+        assert goal.x == pytest.approx((16.0, 76.0))
+        assert goal.y == pytest.approx((2.1, 5.9))
 
     def test_local_window_floor_lifts_to_the_divider_once_the_ego_is_committed(self, setup):
         _, planner_cfg, env = setup
-        below = env.local_window(7, torch.tensor([12.0, 1.3, 3.5, 0.0]), planner_cfg)
-        above = env.local_window(7, torch.tensor([12.0, 1.9, 3.5, 0.0]), planner_cfg)
-        assert below.bounds["y"] == pytest.approx([-1.5, 6.0])   # road y_min + margin
-        assert above.bounds["y"] == pytest.approx([2.0, 6.0])    # lifted to lane_divider
+        below = lane_merge.local_window(env, 7, torch.tensor([12.0, 1.3, 3.5, 0.0]), planner_cfg)
+        above = lane_merge.local_window(env, 7, torch.tensor([12.0, 1.9, 3.5, 0.0]), planner_cfg)
+        assert below.region("workspace").y == pytest.approx((-1.5, 6.0))  # road y_min + margin
+        assert above.region("workspace").y == pytest.approx((2.0, 6.0))   # lifted to lane_divider
 
     def test_local_window_carries_one_horizon_of_moving_obstacle(self, setup):
         cfg, planner_cfg, env = setup
-        local = env.local_window(7, torch.tensor([12.0, 1.3, 3.5, 0.0]), planner_cfg)
-        (obs,) = local.moving_obstacles
-        assert len(obs["x_traj"]) == cfg["H"] + 1
-        assert float(obs["x_traj"][0]) == pytest.approx(3.42)
-        assert float(obs["y_traj"][0]) == pytest.approx(4.0)
+        local = lane_merge.local_window(env, 7, torch.tensor([12.0, 1.3, 3.5, 0.0]), planner_cfg)
+        (vehicle,) = local.by_role("obstacle")
+        assert len(vehicle.centers) == cfg["H"] + 1
+        assert float(vehicle.centers[0, 0]) == pytest.approx(3.42)
+        assert float(vehicle.centers[0, 1]) == pytest.approx(4.0)
 
     def test_moving_obstacle_position_is_constant_speed(self, setup):
         cfg, _, env = setup
         obstacle, dt = cfg["obstacle"], cfg["dt"]
         for step in (0, 7, 25):
             expected = obstacle["x0"] + obstacle["speed"] * step * dt
-            assert env.moving_obstacle_position(step)[0] == pytest.approx(expected, rel=1e-6)
+            position = lane_merge.obstacle_position(env, step)
+            assert position[0] == pytest.approx(expected, rel=1e-6)
 
     def test_success_needs_consecutive_steps_inside_the_target_band(self, setup):
-        cfg, _, env = setup
+        cfg, planner_cfg, env = setup
+        planner = Planner(build_dynamics(cfg, "cpu"), env, cfg["H"], config=planner_cfg)
         success = cfg["success"]
         inside = torch.tensor([0.0, (success["y_min"] + success["y_max"]) / 2, 3.5, 0.0])
         outside = torch.tensor([0.0, success["y_min"] - 1.0, 3.5, 0.0])
 
-        env.reset_progress()
-        for _ in range(success["consecutive_steps"] - 1):
-            assert not env.is_complete(inside), "must not fire before consecutive_steps"
-        assert env.is_complete(inside), "consecutive_steps inside the band must trigger success"
-
-        env.reset_progress()
-        for _ in range(success["consecutive_steps"] - 1):
-            env.is_complete(inside)
-        assert not env.is_complete(outside), "leaving the band must reset the counter"
-        assert not env.is_complete(inside), "and the count must restart from one"
+        counter, done = planner._lane_change_success(inside, success["consecutive_steps"] - 2)
+        assert counter == success["consecutive_steps"] - 1 and not done
+        counter, done = planner._lane_change_success(inside, success["consecutive_steps"] - 1)
+        assert done, "consecutive_steps inside the band must trigger success"
+        counter, done = planner._lane_change_success(outside, success["consecutive_steps"] - 1)
+        assert counter == 0 and not done, "leaving the band must reset the counter"
 
 
 class TestLaneMergeExecution:

@@ -15,7 +15,7 @@ def get_device():
     if torch.cuda.is_available() and os.environ.get("PDSTL_USE_CUDA", "1") != "0":
         return torch.device("cuda")
     return torch.device("cpu")
-
+# to run gpu: PDSTL_DEVICE=cuda python src/main.py
 
 def load_config(path):
     """Load a YAML file; relative paths resolve from the project root."""

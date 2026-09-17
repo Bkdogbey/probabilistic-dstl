@@ -4,14 +4,8 @@ import os
 
 import torch
 
-from pdstl.operators import (
-    Always,
-    And,
-    Eventually,
-    GreaterThan,
-    LessThan,
-    Until,
-)
+from pdstl.operators import Always, And, Eventually, Until
+from pdstl.predicates import GreaterThan, LessThan
 from planning import log_utils
 from models.dynamics import SingleIntegrator
 from models.rollouts import gaussian_rollout
@@ -121,8 +115,8 @@ def controls_to_params(dyn, controls):
 
 
 def evaluate_direct(formula, traj):
-    """Hard pdSTL interval (scale <= 0) for formal evaluation."""
-    return formula(traj, scale=-1)
+    """Hard pdSTL interval (beta <= 0) for formal evaluation."""
+    return formula(traj, beta=None)
 
 
 def _initial_controls(cfg, device):

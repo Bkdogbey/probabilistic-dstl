@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.transforms as transforms
 import numpy as np
 import torch
+from types import SimpleNamespace
 
 PALETTE = {  # Tableau 10
     "ego": {"fill": "#1f77b4", "stroke": "#1f77b4"},
@@ -17,6 +18,54 @@ PALETTE = {  # Tableau 10
     "goal": {"fill": "#98df8a", "stroke": "#2ca02c"},
     "road": {"fill": "#F2F2F7"},
 }
+
+
+def geometry(environment):
+    """Adapt an Environment's named regions to the flat shapes the drawing code uses.
+
+    The translation lives here rather than on Environment: plotting is a consumer of the
+    geometry, so it is plotting's job to read regions in the form it wants.
+    """
+    from planning.environment import RectangleRegion
+    from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
+
+    if not hasattr(environment, "regions"):
+        return environment  # already a flat view
+
+    def rectangles(role):
+        return [
+            {"x": r.x, "y": r.y, "name": r.name, "style": r.style}
+            for r in environment.by_role(role)
+            if isinstance(r, RectangleRegion)
+        ]
+
+    metadata = getattr(environment, "metadata", {})
+    workspace = environment.regions.get("workspace")
+    goal = environment.regions.get("goal")
+    return SimpleNamespace(
+        bounds={"x": workspace.x, "y": workspace.y} if workspace is not None else None,
+        goal={"x": goal.x, "y": goal.y} if goal is not None else None,
+        obstacles=rectangles("obstacle"),
+        visit_regions=rectangles("visit"),
+        circle_obstacles=[
+            {"center": r.center, "radius": r.radius}
+            for r in environment.by_role("obstacle")
+            if isinstance(r, CircleRegion)
+        ],
+        moving_obstacles=[
+            {
+                "x_traj": r.centers[..., 0], "y_traj": r.centers[..., 1],
+                "width": r.width, "height": r.height,
+            }
+            for r in environment.by_role("obstacle")
+            if isinstance(r, MovingRectangleRegion)
+        ],
+        lane_markings=metadata.get("lane_markings", []),
+        success=metadata.get("success"),
+        label=metadata.get("label", ""),
+        plot_xlim=metadata.get("plot_xlim"),
+        robot_dims=metadata.get("robot_dims"),
+    )
 
 
 def cov_ellipse_params(cov, k=1.96):
@@ -58,6 +107,7 @@ def plot_covariance_ellipse(
 
 
 def draw_road_backdrop(ax, env):
+    env = geometry(env)
     """Road, goal lane and lane markings; returns (road_lo, road_hi)."""
     road_lo = min(lm["y"] for lm in env.lane_markings) if env.lane_markings else -2.0
     road_hi = max(lm["y"] for lm in env.lane_markings) if env.lane_markings else 6.0
@@ -98,6 +148,7 @@ def draw_env_on_ax(
     x_mask=None,
 ):
     """Render environment geometry: workspace, goal, obstacles, visit regions, moving paths."""
+    env = geometry(env)
     if env.bounds is not None:
         bx, by = env.bounds["x"], env.bounds["y"]
         ax.add_patch(
@@ -219,6 +270,7 @@ def draw_env_on_ax(
 
 
 def _compute_env_bounds(mean_np, env):
+    env = geometry(env)
     x_min, x_max = np.min(mean_np[:, 0]), np.max(mean_np[:, 0])
     y_min, y_max = np.min(mean_np[:, 1]), np.max(mean_np[:, 1])
     for lane in env.lane_markings:
@@ -283,6 +335,7 @@ def heading_deg(mean_np, t, T):
 
 
 def plot_trajectory(mean_np, cov_np, env):
+    env = geometry(env)
     T = mean_np.shape[0] - 1
     x_min, x_max, y_min, y_max = _compute_env_bounds(mean_np, env)
 
@@ -409,6 +462,7 @@ def plot_reach_avoid(
     show=True,
 ):
     """Predicted stochastic plan; initial beliefs are an optional comparison."""
+    env = geometry(env)
     runs = [
         (_to_np(mean_final), _to_np(cov_final), PALETTE["ego"]["stroke"], "-",
          "Predicted belief mean", "95% covariance ellipse"),
@@ -596,6 +650,7 @@ def plot_pdstl_optimization(result, *, save_path=None, show=True):
 def visualize_reach_avoid(result, env, *, dt, ellipse_every=10, save_path=None,
                           show=True, show_initial=False, show_workspace=False):
     """Three scientific views; initial beliefs/workspace bounds are opt-in diagnostics."""
+    env = geometry(env)
     spatial = plot_reach_avoid(
         result["mean_initial"], result["cov_initial"],
         result["mean_trace"], result["cov_trace"],
@@ -684,6 +739,7 @@ def visualize_results(
     p_sat_trace=None,
     robot_dims=None,
 ):
+    env = geometry(env)
     mean_np = mean_trace.cpu().squeeze().numpy()
     cov_np = cov_trace.cpu().squeeze().numpy()
     u_np = u_trace.cpu().squeeze().numpy()
@@ -703,6 +759,7 @@ def plot_lc_trajectory(
     show_legend=True,
     xlim=None,
 ):
+    env = geometry(env)
     mean_np = mean_trace.cpu().squeeze().numpy()  # [T+1, ≥2]
     cov_np = cov_trace.cpu().squeeze().numpy()  # [T+1, D, D]
     T = mean_np.shape[0] - 1
@@ -823,6 +880,7 @@ def plot_lc_snapshots(
     show_xlabel=True,
     xlim=None,
 ):
+    env = geometry(env)
     mean_np = mean_trace.cpu().squeeze().numpy()  # [T+1, ≥2]
     cov_np = cov_trace.cpu().squeeze().numpy()  # [T+1, D, D]
     T = mean_np.shape[0] - 1
@@ -1022,6 +1080,7 @@ def visualize_lane_change(
     robot_dims=None,
     xlim=None,
 ):
+    env = geometry(env)
     mean_np = mean_trace.cpu().squeeze().numpy()  # [T+1, ≥2]
     u_np = u_trace.cpu().squeeze().numpy()  # [T,  2]
     T = mean_np.shape[0] - 1

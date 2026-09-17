@@ -6,6 +6,7 @@ import matplotlib.transforms as transforms
 from matplotlib.animation import FuncAnimation
 
 from visualization.planning import (
+    geometry,
     PALETTE,
     _altitude_axes,
     _draw_altitude_plan,
@@ -50,7 +51,7 @@ def animate_results(
     draw_env_on_ax(ax, env, draw_moving_path=False)
 
     moving_patches = []
-    for obs in env.moving_obstacles:
+    for obs in geometry(env).moving_obstacles:
         w, h = obs["width"], obs["height"]
         xt = np.asarray(
             obs["x_traj"].detach().cpu() if isinstance(obs["x_traj"], torch.Tensor)

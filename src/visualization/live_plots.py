@@ -1,11 +1,19 @@
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.transforms import blended_transform_factory
 
-from visualization.planning import PALETTE, cov_ellipse_params, draw_env_on_ax, draw_road_backdrop
+from visualization.planning import (
+    PALETTE,
+    cov_ellipse_params,
+    draw_env_on_ax,
+    draw_road_backdrop,
+    geometry,
+)
 
 
 def setup_mpc_live_plot(env):
+    env = geometry(env)
     """Create the two-panel live figure for MPC execution."""
     plt.ion()
     fig = plt.figure(figsize=(14, 6))
@@ -38,6 +46,7 @@ def setup_mpc_live_plot(env):
 
 
 def setup_lane_change_live_plot(env, label="", xlim=None):
+    env = geometry(env)
     """Create the live-execution figure for lane-change MPC."""
     plt.ion()
     fig, ax = plt.subplots(figsize=(14, 4))
@@ -89,7 +98,7 @@ def setup_lane_change_live_plot(env, label="", xlim=None):
     ax.add_patch(ego_cov_patch)
 
     obs0 = env.moving_obstacles[0]
-    obs_pos0 = env.moving_obstacle_position(0)
+    obs_pos0 = np.asarray([obs0["x_traj"][0], obs0["y_traj"][0]])
     obs_rect = patches.Rectangle(
         (obs_pos0[0] - obs0["width"] / 2, obs_pos0[1] - obs0["height"] / 2),
         obs0["width"], obs0["height"],
@@ -162,7 +171,7 @@ def make_mpc_live_callback(env):
 
 def make_lane_change_live_callback(env):
     fig_live, _ax, ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect = (
-        setup_lane_change_live_plot(env, label=env.label, xlim=env.plot_xlim)
+        setup_lane_change_live_plot(env, label=geometry(env).label, xlim=geometry(env).plot_xlim)
     )
     real_trace = []
     obs0 = env.moving_obstacles[0]

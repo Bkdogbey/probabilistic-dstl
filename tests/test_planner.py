@@ -10,8 +10,9 @@ import torch
 from models.dynamics import SingleIntegrator
 from models.rollouts import BeliefRollout, gaussian_rollout
 from pdstl.base import create_probability_belief_trajectory
-from pdstl.operators import Eventually, GreaterThan, Predicate
-from planning.environment import Environment
+from pdstl.operators import Eventually, Predicate
+from pdstl.predicates import GreaterThan
+from planning.scenarios.reach_avoid import build_reach_avoid_environment
 from planning.planner import Planner
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -197,8 +198,10 @@ def test_detach_diagnostics_preserves_beliefs_and_handles_optional_fields(
 
 
 def test_legacy_environment_solve_modes_still_run():
-    environment = Environment()
-    environment.set_goal([0.5, 1.5], [-0.5, 0.5])
+    environment = build_reach_avoid_environment({
+        "workspace": {"x": [-5.0, 5.0], "y": [-5.0, 5.0]},
+        "goal": {"x": [0.5, 1.5], "y": [-0.5, 0.5]},
+    })
     x0_mean, x0_cov = torch.zeros(2), torch.eye(2) * 0.1
 
     for extra, mode in (({}, "single_shot"), ({"T_SIM": 2}, "mpc_fixed"), ({"MAX_STEPS": 2}, "mpc_goal")):
@@ -285,7 +288,7 @@ def test_smooth_lower_carries_gradients_and_hard_interval_is_detached():
     score.backward()
 
     assert not exact.requires_grad
-    torch.testing.assert_close(exact, spec(predicted.belief_trajectory, scale=-1)[0, 0].detach())
+    torch.testing.assert_close(exact, spec(predicted.belief_trajectory, beta=None)[0, 0].detach())
     assert score.item() != pytest.approx(exact[0].item())
     assert torch.isfinite(v.grad).all() and v.grad.abs().sum() > 0
 

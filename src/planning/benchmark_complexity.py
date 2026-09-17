@@ -22,7 +22,7 @@ from planning.runners import build_environment, load_scenario_config
 def build_spec_and_env(T, device):
     """Build the same environment and spec used in run_single_shot, parameterised by T."""
     cfg, _ = load_scenario_config("configs/scenarios/single_shot.yaml")
-    env = build_environment(cfg, device)
+    env = build_environment(cfg, device=device)
     return env, env.get_specification(T), cfg
 
 
@@ -116,7 +116,7 @@ def plot_results(T_values, means_ms, stds_ms, save_path="benchmark_complexity.pd
     T_fit = np.linspace(T_values[0], T_values[-1], 200)
     y_fit = slope * T_fit + intercept
 
-    # --- Left panel: linear scale ---
+    # --- Left panel: linear beta ---
     ax = axes[0]
     ax.errorbar(
         T_values, means_ms, yerr=stds_ms,
@@ -126,11 +126,11 @@ def plot_results(T_values, means_ms, stds_ms, save_path="benchmark_complexity.pd
             label=f"Linear fit  (slope={slope:.3f} ms/step)")
     ax.set_xlabel("Planning horizon $T$ (steps)", fontsize=12)
     ax.set_ylabel("Wall-clock time per iteration (ms)", fontsize=12)
-    ax.set_title("Computation time vs. $T$ (linear scale)", fontsize=12)
+    ax.set_title("Computation time vs. $T$ (linear beta)", fontsize=12)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.4)
 
-    # --- Right panel: log-log scale ---
+    # --- Right panel: log-log beta ---
     ax = axes[1]
     ax.errorbar(
         T_values, means_ms, yerr=stds_ms,
@@ -146,7 +146,7 @@ def plot_results(T_values, means_ms, stds_ms, save_path="benchmark_complexity.pd
               label=f"Power-law fit  (exponent={exponent:.2f})")
     ax.set_xlabel("Planning horizon $T$ (steps)", fontsize=12)
     ax.set_ylabel("Wall-clock time per iteration (ms)", fontsize=12)
-    ax.set_title("Computation time vs. $T$ (log-log scale)", fontsize=12)
+    ax.set_title("Computation time vs. $T$ (log-log beta)", fontsize=12)
     ax.legend(fontsize=10)
     ax.grid(True, which="both", alpha=0.4)
 

@@ -15,7 +15,7 @@ from pdstl.operators import Maxish, Minish
 class DetSTL_Formula(nn.Module):
     """Base deterministic formula: BeliefTrajectory (means only) -> [B, T+1, 1] robustness."""
 
-    def robustness_trace(self, mu, scale=-1, **kwargs):
+    def robustness_trace(self, mu, beta=None, **kwargs):
         """
         mu: [B, T+1, D] mean trajectory (forward time)
         Returns: [B, T+1, 1]
@@ -26,13 +26,13 @@ class DetSTL_Formula(nn.Module):
         means = [b.value() for b in belief_trajectory]
         return torch.stack(means, dim=1)  # [B, T+1, D]
 
-    def forward(self, belief_trajectory, scale=-1, **kwargs):
+    def forward(self, belief_trajectory, beta=None, **kwargs):
         mu = self._extract_mean(belief_trajectory)
-        return self.robustness_trace(mu, scale=scale, **kwargs)
+        return self.robustness_trace(mu, beta=beta, **kwargs)
 
-    def robustness(self, belief_trajectory, scale=-1, **kwargs):
+    def robustness(self, belief_trajectory, beta=None, **kwargs):
         """Robustness at t=0 (the planning-relevant quantity)."""
-        return self.forward(belief_trajectory, scale=scale, **kwargs)[:, :1, :]
+        return self.forward(belief_trajectory, beta=beta, **kwargs)[:, :1, :]
 
     def __and__(self, other):
         return DetAnd(self, other)
@@ -75,35 +75,35 @@ class DetTemporalOperator(DetSTL_Formula):
             return ((d0, h0), 0.0)
         return (h0, 0.0)
 
-    def _rnn_cell(self, x, hc, scale=-1):
+    def _rnn_cell(self, x, hc, beta=None):
         """Single RNN step. Mirrors stlcg's Always/Eventually._rnn_cell exactly."""
         h0, c = hc
         if self.interval is None:
             input_ = torch.cat([h0, x], dim=1)  # [B, rnn_dim+1, 1]
-            output = self.operation(input_, scale, dim=1, keepdim=True)
+            output = self.operation(input_, beta, dim=1, keepdim=True)
             state = (output, None)
         elif (self._interval[1] == np.inf) and (self._interval[0] > 0):
             d0, h0 = h0
             dh = torch.cat([d0, h0[:, :1, :]], dim=1)  # [B, 2, 1]
-            output = self.operation(dh, scale, dim=1, keepdim=True)
+            output = self.operation(dh, beta, dim=1, keepdim=True)
             state = ((output, torch.matmul(self.M, h0) + self.b * x), None)
         else:  # [a, b]
             state = (torch.matmul(self.M, h0) + self.b * x, None)
             h0x = torch.cat([h0, x], dim=1)  # [B, rnn_dim+1, 1]
             input_ = h0x[:, : self.steps, :]
-            output = self.operation(input_, scale, dim=1, keepdim=True)
+            output = self.operation(input_, beta, dim=1, keepdim=True)
         return output, state
 
-    def robustness_trace(self, mu, scale=-1, **kwargs):
+    def robustness_trace(self, mu, beta=None, **kwargs):
         # 1. Subformula trace in forward time → [B, T+1, 1]
-        sub_fwd = self.subformula.robustness_trace(mu, scale=scale, **kwargs)
+        sub_fwd = self.subformula.robustness_trace(mu, beta=beta, **kwargs)
         # 2. Reverse → time-reversed (stlcg convention)
         sub_rev = torch.flip(sub_fwd, dims=[1])
         # 3. Run stlcg RNN
         outputs = []
         hc = self._initialize_rnn_cell(sub_rev)
         for xi in torch.split(sub_rev, 1, dim=1):
-            o, hc = self._rnn_cell(xi, hc, scale=scale)
+            o, hc = self._rnn_cell(xi, hc, beta=beta)
             outputs.append(o)
         out_rev = torch.cat(outputs, dim=1)  # [B, T+1, 1] reversed
         # 4. Flip back to forward time
@@ -138,11 +138,11 @@ class DetAnd(DetSTL_Formula):
         self.subformula2 = subformula2
         self.operation = Minish()
 
-    def robustness_trace(self, mu, scale=-1, **kwargs):
-        r1 = self.subformula1.robustness_trace(mu, scale=scale, **kwargs)  # [B, T+1, 1]
-        r2 = self.subformula2.robustness_trace(mu, scale=scale, **kwargs)
+    def robustness_trace(self, mu, beta=None, **kwargs):
+        r1 = self.subformula1.robustness_trace(mu, beta=beta, **kwargs)  # [B, T+1, 1]
+        r2 = self.subformula2.robustness_trace(mu, beta=beta, **kwargs)
         xx = torch.cat([r1, r2], dim=-1)  # [B, T+1, 2]
-        return self.operation(xx, scale, dim=-1, keepdim=True)  # [B, T+1, 1]
+        return self.operation(xx, beta, dim=-1, keepdim=True)  # [B, T+1, 1]
 
 
 class DetOr(DetSTL_Formula):
@@ -154,11 +154,11 @@ class DetOr(DetSTL_Formula):
         self.subformula2 = subformula2
         self.operation = Maxish()
 
-    def robustness_trace(self, mu, scale=-1, **kwargs):
-        r1 = self.subformula1.robustness_trace(mu, scale=scale, **kwargs)
-        r2 = self.subformula2.robustness_trace(mu, scale=scale, **kwargs)
+    def robustness_trace(self, mu, beta=None, **kwargs):
+        r1 = self.subformula1.robustness_trace(mu, beta=beta, **kwargs)
+        r2 = self.subformula2.robustness_trace(mu, beta=beta, **kwargs)
         xx = torch.cat([r1, r2], dim=-1)
-        return self.operation(xx, scale, dim=-1, keepdim=True)
+        return self.operation(xx, beta, dim=-1, keepdim=True)
 
 
 class DetNegation(DetSTL_Formula):
@@ -168,8 +168,8 @@ class DetNegation(DetSTL_Formula):
         super().__init__()
         self.subformula = subformula
 
-    def robustness_trace(self, mu, scale=-1, **kwargs):
-        return -self.subformula.robustness_trace(mu, scale=scale, **kwargs)
+    def robustness_trace(self, mu, beta=None, **kwargs):
+        return -self.subformula.robustness_trace(mu, beta=beta, **kwargs)
 
 
 # --- DETERMINISTIC PREDICATES (signed distance on mean trajectory) ---
@@ -300,26 +300,38 @@ class DetMovingRectangularObstaclePredicate(DetSTL_Formula):
 
 def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
     """Deterministic mirror of Environment.get_specification on the mean trajectory."""
+    from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
+
+    def box(region):
+        return {"x": region.x, "y": region.y}
+
     specs = []
 
-    # 1. Goal 
-    if env.goal:
-        goal_pred = DetRectangularGoalPredicate(env.goal)
-        specs.append(DetEventually(goal_pred, interval=[t_goal_start, T]))
+    # 1. Goal
+    if "goal" in env.regions:
+        specs.append(DetEventually(
+            DetRectangularGoalPredicate(box(env.region("goal"))), interval=[t_goal_start, T]
+        ))
 
     # 2. Visit regions (liveness)
-    for region in env.visit_regions:
-        visit_pred = DetRectangularGoalPredicate(region)
-        specs.append(DetEventually(visit_pred, interval=[0, T]))
+    for region in env.by_role("visit"):
+        specs.append(DetEventually(DetRectangularGoalPredicate(box(region)), interval=[0, T]))
 
     # 3. Obstacle safety
     obs_preds = []
-    for obs in env.obstacles:
-        obs_preds.append(DetRectangularObstaclePredicate(obs))
-    for obs in env.circle_obstacles:
-        obs_preds.append(DetCircularObstaclePredicate(obs, device=env.device))
-    for obs in env.moving_obstacles:
-        obs_preds.append(DetMovingRectangularObstaclePredicate(obs, device=env.device))
+    for region in env.by_role("obstacle"):
+        if isinstance(region, CircleRegion):
+            obs_preds.append(DetCircularObstaclePredicate(
+                {"center": region.center, "radius": region.radius}
+            ))
+        elif isinstance(region, MovingRectangleRegion):
+            centers = region.centers
+            obs_preds.append(DetMovingRectangularObstaclePredicate({
+                "x_traj": centers[..., 0], "y_traj": centers[..., 1],
+                "width": region.width, "height": region.height,
+            }))
+        else:
+            obs_preds.append(DetRectangularObstaclePredicate(box(region)))
 
     if obs_preds:
         safe_formula = obs_preds[0]
@@ -328,9 +340,11 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
         specs.append(DetAlways(safe_formula, interval=[t_constraints_start, T]))
 
     # 4. Workspace bounds
-    if env.bounds is not None:
-        bounds_pred = DetRectangularGoalPredicate(env.bounds)
-        specs.append(DetAlways(bounds_pred, interval=[t_constraints_start, T]))
+    if "workspace" in env.regions:
+        specs.append(DetAlways(
+            DetRectangularGoalPredicate(box(env.region("workspace"))),
+            interval=[t_constraints_start, T],
+        ))
 
     if not specs:
         raise ValueError("No constraints defined in environment.")

@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
-from pdstl.operators import LessThan
+from pdstl.predicates import LessThan
 from planning.examples import (
     end_to_end_setup,
     load_end_to_end_config,
@@ -53,7 +53,7 @@ def test_gradient_reaches_controls_through_the_whole_pipeline():
     assert all(isinstance(belief, GaussianBelief) for belief in traj)
 
     atomic = predicate(traj)
-    robustness = spec(traj, scale=-1)[0, 0, 0]
+    robustness = spec(traj, beta=None)[0, 0, 0]
     loss = Planner(dyn, None, cfg["H"], config=planner_cfg)._objective(
         mean, dyn.bound_control(v), robustness
     )

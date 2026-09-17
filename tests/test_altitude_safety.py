@@ -23,7 +23,8 @@ from planning.runners import (
 from models.beliefs import GaussianBelief
 from models.dynamics import SingleIntegrator
 from models.rollouts import gaussian_rollout
-from pdstl.operators import Always, GreaterThan
+from pdstl.operators import Always
+from pdstl.predicates import GreaterThan
 from planning.planner import Planner
 from visualization.animation import animate_altitude_optimization
 from visualization.planning import plot_altitude_safety

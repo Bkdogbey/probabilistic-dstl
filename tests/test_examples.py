@@ -19,7 +19,8 @@ import yaml
 
 import models.dynamics
 from models.beliefs import create_gaussian_belief_trajectory
-from pdstl.operators import Always, Eventually, GreaterThan
+from pdstl.operators import Always, Eventually
+from pdstl.predicates import GreaterThan
 from utils import to_steps
 from visualization.temporal import plot_temporal_example
 
@@ -118,12 +119,12 @@ def test_every_example_plots_aligned_panels_over_the_state_trace(name):
     if name == "nested":
         inner = Always(predicate, interval=config["always_interval_steps"])
         formula = Eventually(inner, interval=config["eventually_interval_steps"])
-        extra = {"inner_label": str(inner), "inner_trace": inner(beliefs, scale=-1)}
+        extra = {"inner_label": str(inner), "inner_trace": inner(beliefs, beta=None)}
     else:
         formula = Always(predicate, interval=config["interval_steps"])
         extra = {}
 
-    temporal = formula(beliefs, scale=-1)
+    temporal = formula(beliefs, beta=None)
     figure = plot_temporal_example(
         time, mean, sigma, config["threshold"],
         str(predicate), predicate(beliefs), str(formula), temporal,
@@ -155,7 +156,7 @@ def test_always_applies_the_endpointwise_minimum():
     config, (_, mean, variance), predicate, beliefs = _example("always")
     interval = config["interval_steps"]
 
-    temporal = Always(predicate, interval=interval)(beliefs, scale=-1)
+    temporal = Always(predicate, interval=interval)(beliefs, beta=None)
 
     expected = _reduce(_expected_atomic(config, mean, variance), interval, np.min)
     np.testing.assert_allclose(temporal[0].numpy(), expected, atol=1e-12)
@@ -170,7 +171,7 @@ def test_eventually_applies_the_endpointwise_maximum():
     config, (_, mean, variance), predicate, beliefs = _example("eventually")
     interval = config["interval_steps"]
 
-    temporal = Eventually(predicate, interval=interval)(beliefs, scale=-1)
+    temporal = Eventually(predicate, interval=interval)(beliefs, beta=None)
 
     expected = _reduce(_expected_atomic(config, mean, variance), interval, np.max)
     np.testing.assert_allclose(temporal[0].numpy(), expected, atol=1e-12)
@@ -188,8 +189,8 @@ def test_nested_eventually_always_matches_hand_computation():
 
     inner = Always(predicate, interval=always_interval)
     formula = Eventually(inner, interval=eventually_interval)
-    inner_trace = inner(beliefs, scale=-1)
-    temporal = formula(beliefs, scale=-1)
+    inner_trace = inner(beliefs, beta=None)
+    temporal = formula(beliefs, beta=None)
 
     atomic = _expected_atomic(config, mean, variance)
     expected_inner = _reduce(atomic, always_interval, np.min)
@@ -206,7 +207,7 @@ def test_only_complete_temporal_windows_are_returned():
     steps = len(config["values"])
 
     for interval in ([0, 1], [0, 2], [1, 3]):
-        temporal = Always(predicate, interval=interval)(beliefs, scale=-1)
+        temporal = Always(predicate, interval=interval)(beliefs, beta=None)
         assert temporal.shape == (1, steps - interval[1], 2)
 
 

@@ -19,6 +19,10 @@
 #        x=0      3    6    9.5  12
 
 # --- Dynamics ---
+# --- Scenario ---
+scenario:
+  type: reach_avoid
+
 dynamics: single_integrator
 H: 80            # Planning horizon (time steps); 16 m budget for a ~10.9 m path
 dt: 0.2          # Time step [s]
@@ -32,43 +36,49 @@ x0_cov_scale: 0.01   # Diagonal covariance initialised as I * x0_cov_scale
 # --- Environment ---
 # Workspace membership is another geometric predicate, not a clipping operation:
 # it is what stops the plan from going around the barrier instead of through it.
-bounds:
-  x_range: [0.0, 12.0]
-  y_range: [0.0, 10.0]
+# --- Environment: names, bounds and styles are all configuration ---
+# Workspace membership is a geometric predicate, not a clipping operation: it is what stops
+# the plan going around the barrier instead of through it.
+workspace:
+  name: workspace
+  x: [0.0, 12.0]
+  y: [0.0, 10.0]
 
 # Held clear of the x = 12 wall so reaching the goal does not fight the workspace.
 goal:
-  x_range: [9.5, 11.5]
-  y_range: [2.0, 4.0]
+  name: goal
+  x: [9.5, 11.5]
+  y: [4.0, 6.0]
 
-# Slit 1 (y in [2.8, 4.0]) is wider and lines up with the goal; slit 2 (y in
-# [6.5, 7.5]) is the narrower alternative. Both stay wide enough that the safety
-# bounds carry gradient instead of saturating at 0 or 1.
+# A barrier with two slits: y in [2.8, 4.0] and y in [6.5, 7.5]. Both stay wide enough that
+# the safety bounds carry gradient instead of saturating at 0 or 1.
 obstacles:
-  - type: rectangle
-    x_range: [3.0, 6.0]
-    y_range: [0.0, 2.8]
-  - type: rectangle
-    x_range: [3.0, 6.0]
-    y_range: [4.0, 6.5]
-  - type: rectangle
-    x_range: [3.0, 6.0]
-    y_range: [7.5, 10.0]
+  - name: lower_block
+    x: [3.0, 5.0]
+    y: [0.0, 2.8]
 
-# Initial guess only, not part of the objective: a rightward bias that runs
-# straight into block B, so the optimiser has to discover a slit for itself.
+  - name: middle_block
+    x: [3.0, 5.0]
+    y: [4.0, 6.5]
+
+  - name: upper_block
+    x: [3.0, 5.0]
+    y: [7.5, 10.0]
+
+# Initial guess only, not part of the objective: a rightward bias that runs straight into the
+# middle block, so the optimiser has to discover a slit for itself.
 init_control: [0.7, -0.05]
 
 # --- Planner overrides (on top of configs/planning.yaml); shaping off ---
 planner:
-  w_phi: 10.0
-  w_u: 0.01
-  w_du: 0.01
-  w_dist: 0.0
-  w_obs: 0.0
+  w_phi: 20.0
+  w_u: 0.1 # 
+  w_du: 0.01   
+  w_dist: 5.0
+  w_obs: 10.0
   w_visit: 0.0
   lr: 0.05
-  max_iters: 300
+  max_iters: 800
   alpha: 0.90    # Early-stop target, reached around iteration 130. The Frechet
                  # conjunction bound caps the attainable lower score near 0.945,
                  # so the 0.95 default would never stop early.

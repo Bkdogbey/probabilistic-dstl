@@ -2,6 +2,10 @@
 # Same road as lane_change.yaml; only the obstacle and planner tuning differ.
 
 # --- Dynamics (identical to normal lane change) ---
+# --- Scenario ---
+scenario:
+  type: lane_merge
+
 dynamics: double_integrator
 H: 40
 T_SIM: 100

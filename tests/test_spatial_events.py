@@ -15,20 +15,15 @@ from scipy.stats import norm
 
 from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import (
-    Always,
-    And,
-    Eventually,
-    GreaterThan,
-    LessThan,
-    Predicate,
-    _conjunction,
-    _negation,
+from pdstl.operators import Always, And, Eventually, Predicate, _conjunction, _negation
+from pdstl.predicates import GreaterThan, HalfSpace, InsideRectangle, LessThan, OutsideRectangle
+from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
+from planning.scenarios import moment_predicates
+from planning.scenarios.moment_predicates import (
+    CircularObstaclePredicate,
+    MovingRectangularObstaclePredicate,
 )
-from pdstl.predicates import HalfSpace, InsideRectangle, OutsideRectangle
-from planning.environment import Environment
-from planning.scenarios import lane_merge
-from planning.scenarios.lane_merge import MovingRectangularObstaclePredicate
+from planning.scenarios.reach_avoid import build_reach_avoid_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 GOAL = ([10.0, 12.0], [2.0, 4.0])
@@ -38,13 +33,13 @@ def _interval(low, high, mu, sigma):
     return norm.cdf((high - mu) / sigma) - norm.cdf((low - mu) / sigma)
 
 
-def rect_bounds(belief, rectangle, scale=-1):
+def rect_bounds(belief, rectangle, beta=None):
     """Probability interval [B, 2] of a rectangle event under one belief.
 
     Rectangles are conjunctions of axis intervals rather than atoms, so they are evaluated
     through the operator layer instead of by `GaussianBelief.probability_bounds`.
     """
-    return rectangle(BeliefTrajectory([belief]), scale=scale)[:, 0]
+    return rectangle(BeliefTrajectory([belief]), beta=beta)[:, 0]
 
 
 # --- Predicates: events, not probabilities ----------------------------------
@@ -63,7 +58,7 @@ def test_rectangle_events_store_geometry_only(event_type):
 
 @pytest.mark.parametrize("event_type", [InsideRectangle, OutsideRectangle])
 def test_rectangle_is_composed_of_two_exact_axis_intervals(event_type):
-    """The rectangle is a formula over two atoms, so `scale` reaches its conjunction."""
+    """The rectangle is a formula over two atoms, so `beta` reaches its conjunction."""
     event = event_type([4, 7], [3.8, 8.0])
 
     axis_x, axis_y = event.axes
@@ -254,7 +249,7 @@ def test_gradients_reach_the_mean_through_rectangle_events_and_pdstl():
         Eventually(InsideRectangle(*GOAL), interval=[1, 4]),
     )
 
-    score = spec(trajectory, scale=-1)[0, 0, 0]
+    score = spec(trajectory, beta=None)[0, 0, 0]
     score.backward()
 
     assert 0 < score.item() < 1
@@ -272,35 +267,40 @@ def test_gaussian_belief_rejects_rectangle_dimensions_outside_the_state():
 
 
 def _reach_avoid_environment():
-    env = Environment()
-    env.set_goal(*GOAL)
-    env.add_obstacle([4.0, 7.0], [3.8, 8.0])
-    return env
+    return build_reach_avoid_environment({
+        "workspace": {"x": [-50.0, 50.0], "y": [-50.0, 50.0]},
+        "goal": {"x": list(GOAL[0]), "y": list(GOAL[1])},
+        "obstacles": [{"name": "block", "x": [4.0, 7.0], "y": [3.8, 8.0]}],
+    })
 
 
 def test_environment_builds_always_outside_and_eventually_inside():
     H = 12
-    spec = _reach_avoid_environment().specification(H)
+    spec = _reach_avoid_environment().get_specification(H)
 
     assert isinstance(spec, And)
     safe, reach = spec.subformula1, spec.subformula2
     assert isinstance(safe, Always) and safe.interval == [1, H]
-    assert isinstance(reach, Eventually) and reach.interval == [1, H]
-    assert type(safe.subformula) is OutsideRectangle
-    assert (safe.subformula.x_range, safe.subformula.y_range) == ((4.0, 7.0), (3.8, 8.0))
+    assert isinstance(reach, Eventually) and reach.interval == [0, H]
+
+    # safety is one Always over the workspace conjoined with every obstacle
+    workspace, block = safe.subformula.subformula1, safe.subformula.subformula2
+    assert type(workspace) is InsideRectangle
+    assert type(block) is OutsideRectangle
+    assert (block.x_range, block.y_range) == ((4.0, 7.0), (3.8, 8.0))
     assert type(reach.subformula) is InsideRectangle
     assert (reach.subformula.x_range, reach.subformula.y_range) == ((10.0, 12.0), (2.0, 4.0))
 
 
 def test_environment_computes_no_probability_itself(monkeypatch):
     H = 4
-    spec = _reach_avoid_environment().specification(H)
+    spec = _reach_avoid_environment().get_specification(H)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("legacy Gaussian probability path used")
 
-    monkeypatch.setattr(lane_merge, "normal_cdf", forbidden)
-    monkeypatch.setattr(lane_merge, "extract_trajectory_stats", forbidden)
+    monkeypatch.setattr(moment_predicates, "normal_cdf", forbidden)
+    monkeypatch.setattr(moment_predicates, "extract_trajectory_stats", forbidden)
     evaluated = []
     original = GaussianBelief.probability_bounds
 
@@ -312,12 +312,13 @@ def test_environment_computes_no_probability_itself(monkeypatch):
 
     mean = torch.tensor([[0.0, 5.0], [3.0, 4.0], [6.0, 3.0], [9.0, 3.0], [11.0, 3.0]])
     trajectory = create_gaussian_belief_trajectory(mean, torch.eye(2).expand(5, 2, 2) * 0.1)
-    got = spec(trajectory, scale=-1)[0, 0]
+    got = spec(trajectory, beta=None)[0, 0]
 
     # Rectangles are no longer atoms: the belief only ever sees exact axis intervals, and
     # the Frechet conjunction that turns two of them into a rectangle lives in operators.py.
     assert sorted(set(t.__name__ for t in evaluated)) == ["AxisInterval"]
-    assert len(evaluated) == 4 * (H + 1)  # two rectangles, two axes each
+    # One call per axis interval, not one per step: the trajectory scores all T+1 at once.
+    assert len(evaluated) == 6  # three rectangles (workspace, block, goal), two axes each
 
     # Rebuild the value from the belief's own axis-interval bounds and the pdSTL rules:
     # conjoin the two axes, negate for "outside", then apply the temporal reductions.
@@ -328,21 +329,22 @@ def test_environment_computes_no_probability_itself(monkeypatch):
         inside = _conjunction(px, py)
         return _negation(inside) if isinstance(rectangle, OutsideRectangle) else inside
 
-    safe = rect(OutsideRectangle([4.0, 7.0], [3.8, 8.0]))
-    goal = rect(InsideRectangle(*GOAL))
-    expected = _conjunction(
-        safe[:, 1:].min(dim=1).values, goal[:, 1:].max(dim=1).values
-    )[0]
-    torch.testing.assert_close(got, expected)
+    # safety conjoins the workspace with the block at each step, THEN takes the temporal min
+    workspace = rect(InsideRectangle([-50.0, 50.0], [-50.0, 50.0]))
+    block = rect(OutsideRectangle([4.0, 7.0], [3.8, 8.0]))
+    safe = _conjunction(workspace, block)[:, 1:].min(dim=1).values
+    goal = rect(InsideRectangle(*GOAL)).max(dim=1).values
+    torch.testing.assert_close(got, _conjunction(safe, goal)[0])
 
 
-def test_moving_obstacles_belong_to_the_lane_merge_scenario_only():
-    """The static environment knows rectangles; moving obstacles live with lane merge."""
-    from planning.scenarios.lane_merge import LaneMergeEnvironment
+def test_moment_predicates_are_built_from_their_regions():
+    """Circles and moving rectangles are regions like any other; only their event differs."""
+    import torch as _torch
 
-    assert not hasattr(Environment(), "moving_obstacles")
-    lane = LaneMergeEnvironment()
-    lane.add_moving_obstacle([0.0, 1.0], [0.0, 0.0], 1.0, 1.0)
-    assert [type(p) for p in lane.predicates()["obstacles"]] == [
-        MovingRectangularObstaclePredicate
-    ]
+    circle = CircleRegion(name="c", role="obstacle", center=(1.0, 1.0), radius=0.5)
+    moving = MovingRectangleRegion(
+        name="v", role="obstacle",
+        centers=_torch.tensor([[0.0, 0.0], [1.0, 0.0]]), width=1.0, height=1.0,
+    )
+    assert CircularObstaclePredicate(circle).radius == 0.5
+    assert MovingRectangularObstaclePredicate(moving).width == 1.0

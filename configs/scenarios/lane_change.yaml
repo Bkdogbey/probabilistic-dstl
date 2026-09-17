@@ -2,6 +2,10 @@
 # Ego vehicle must overtake a slower moving obstacle by changing lanes.
 
 # --- Dynamics ---
+# --- Scenario ---
+scenario:
+  type: lane_merge
+
 dynamics: double_integrator
 H: 40            # Planning horizon per MPC window (time steps)
 T_SIM: 100       # Total simulation steps

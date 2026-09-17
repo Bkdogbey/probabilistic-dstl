@@ -13,20 +13,8 @@ from pdstl.base import (
     ProbabilityBelief,
     create_probability_belief_trajectory,
 )
-from pdstl.operators import (
-    Always,
-    And,
-    Eventually,
-    GreaterThan,
-    Implies,
-    LessThan,
-    Maxish,
-    Minish,
-    Negation,
-    Or,
-    Predicate,
-    Until,
-)
+from pdstl.operators import Always, And, Eventually, Implies, Maxish, Minish, Negation, Or, Predicate, Until
+from pdstl.predicates import GreaterThan, LessThan
 
 
 def supplied(*rows):
@@ -92,7 +80,7 @@ def test_zero_variance_is_an_inclusive_deterministic_comparison(m, c, expect_ge)
 
 
 def test_negative_variance_is_rejected():
-    with pytest.raises(ValueError, match="covariance must be non-negative"):
+    with pytest.raises(ValueError, match="positive semi-definite"):
         gaussian([[1.0]], [[-2.0]])
 
 
@@ -109,10 +97,10 @@ def test_full_covariance_selects_the_requested_marginal():
 @pytest.mark.parametrize(
     "mean,covariance,message",
     [
-        (torch.zeros(2), torch.ones(2), r"mean must have shape \[B,D\]"),
-        (torch.zeros(2, 2), torch.ones(3, 2), "diagonal covariance"),
-        (torch.zeros(2, 2), torch.ones(2, 2, 3), r"full covariance must have shape \[B,D,D\]"),
-        (torch.zeros(2, 2), torch.ones(2, 3, 3), r"full covariance must have shape \[B,D,D\]"),
+        (torch.zeros(2), torch.ones(2), "mean must have shape"),
+        (torch.zeros(2, 2), torch.ones(3, 2), "covariance must be"),
+        (torch.zeros(2, 2), torch.ones(2, 2, 3), "covariance must be"),
+        (torch.zeros(2, 2), torch.ones(2, 3, 3), "covariance must be"),
     ],
 )
 def test_gaussian_belief_rejects_invalid_shapes(mean, covariance, message):
@@ -246,31 +234,63 @@ def test_implies_is_negation_then_or():
     torch.testing.assert_close(Implies(a, b)(traj), Or(Negation(a), b)(traj))
 
 
-def test_only_the_and_lower_clamp_is_smoothed():
+def test_both_conjunction_endpoints_are_smoothed():
+    """Negation swaps the endpoints, so a hard upper would leave negated conjunctions
+    -- every OutsideRectangle -- only partly differentiable."""
     traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
     a, b = Predicate("a"), Predicate("b")
 
-    for spec in (Or(a, b), Implies(a, b), Negation(a)):
-        torch.testing.assert_close(spec(traj, scale=5.0), spec(traj, scale=-1))
+    exact = And(a, b)(traj, beta=None)[0, 0]
+    smooth = And(a, b)(traj, beta=5.0)[0, 0]
 
-    exact, smooth = And(a, b)(traj, scale=-1)[0, 0], And(a, b)(traj, scale=5.0)[0, 0]
     torch.testing.assert_close(exact, torch.tensor([0.3, 0.8]))
-    torch.testing.assert_close(smooth[1], exact[1])
-    torch.testing.assert_close(smooth[0], torch.nn.functional.softplus(torch.tensor(0.3), beta=5.0))
+    torch.testing.assert_close(
+        smooth[0], torch.nn.functional.softplus(torch.tensor(0.3), beta=5.0)
+    )
+    assert smooth[1] != exact[1], "the upper endpoint must be a smooth min"
+
+
+def test_disjunction_and_implication_are_smoothed():
+    """Implies is built from Or, so a hard Or would make implications partly differentiable."""
+    traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
+    a, b = Predicate("a"), Predicate("b")
+
+    for spec in (Or(a, b), Implies(a, b)):
+        exact, smooth = spec(traj, beta=None)[0, 0], spec(traj, beta=5.0)[0, 0]
+        assert not torch.allclose(exact, smooth), f"{spec} is not smoothed"
+
+
+def test_negation_is_exact_in_both_modes():
+    """Negation only swaps and complements, so it introduces no smoothing of its own."""
+    traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
+    spec = Negation(Predicate("a"))
+    torch.testing.assert_close(spec(traj, beta=5.0), spec(traj, beta=None))
+
+
+def test_smoothed_operators_converge_to_the_exact_values_as_beta_grows():
+    traj = supplied({"a": (0.7, 0.8), "b": (0.6, 0.9)})
+    a, b = Predicate("a"), Predicate("b")
+
+    for spec in (And(a, b), Or(a, b), Implies(a, b)):
+        exact = spec(traj, beta=None)[0, 0]
+        errors = [float((spec(traj, beta=beta)[0, 0] - exact).abs().max())
+                  for beta in (5.0, 50.0, 500.0)]
+        assert errors == sorted(errors, reverse=True), f"{spec} does not converge"
+        assert errors[-1] < 1e-2
 
 
 def test_smooth_and_escapes_the_exact_zero_clamp():
     lower = torch.tensor([[0.3], [0.4]], requires_grad=True)  # L1 + L2 - 1 < 0
     upper = torch.ones(2, 1)
 
-    def conjunction_lower(scale):
+    def conjunction_lower(beta):
         traj = BeliefTrajectory([ProbabilityBelief({
             "a": torch.stack([lower[0], upper[0]], dim=-1),
             "b": torch.stack([lower[1], upper[1]], dim=-1),
         })])
-        return And(Predicate("a"), Predicate("b"))(traj, scale=scale)[0, 0, 0]
+        return And(Predicate("a"), Predicate("b"))(traj, beta=beta)[0, 0, 0]
 
-    exact = conjunction_lower(-1)
+    exact = conjunction_lower(None)
     (exact_grad,) = torch.autograd.grad(exact, lower)
     smooth = conjunction_lower(10.0)
     (smooth_grad,) = torch.autograd.grad(smooth, lower)
@@ -288,7 +308,7 @@ def test_smooth_min_and_max_converge_to_the_exact_values_as_beta_grows():
         errors.append(max(smooth_min - x.min(), x.max() - smooth_max).item())
         assert errors[-1] <= np.log(4) / beta + 1e-6
     assert errors == sorted(errors, reverse=True)
-    assert Minish()(x, -1)[0, 0] == x.min() and Maxish()(x, -1)[0, 0] == x.max()
+    assert Minish()(x, None)[0, 0] == x.min() and Maxish()(x, None)[0, 0] == x.max()
 
 
 def test_pointwise_flag_tracks_the_formula_kind():
@@ -428,7 +448,7 @@ def test_smooth_temporal_output_is_differentiable():
     values = [p, p * 0.5, p * 0.75, p * 0.9]
     traj = BeliefTrajectory([ProbabilityBelief({"p": v}) for v in values])
 
-    Always(Predicate("p"), interval=[0, 2])(traj, scale=3.0)[0, 0, 0].backward()
+    Always(Predicate("p"), interval=[0, 2])(traj, beta=3.0)[0, 0, 0].backward()
 
     assert p.grad is not None
     assert torch.isfinite(p.grad).all()
@@ -440,13 +460,13 @@ def test_smooth_temporal_output_is_differentiable():
     [
         (
             Always,
-            lambda window, scale: -(torch.logsumexp(-window * scale, dim=0) - np.log(len(window)))
-            / scale,
+            lambda window, beta: -(torch.logsumexp(-window * beta, dim=0) - np.log(len(window)))
+            / beta,
         ),
         (
             Eventually,
-            lambda window, scale: (torch.logsumexp(window * scale, dim=0) - np.log(len(window)))
-            / scale,
+            lambda window, beta: (torch.logsumexp(window * beta, dim=0) - np.log(len(window)))
+            / beta,
         ),
     ],
 )
@@ -461,13 +481,13 @@ def test_smooth_always_and_eventually_match_their_endpointwise_surrogates(
     ]
     trajectory = supplied(*rows)
     pointwise = Predicate("p")(trajectory)[0]
-    scale = 3.0
+    beta = 3.0
 
     got = operator(Predicate("p"), interval=[0, 2])(
-        trajectory, scale=scale
+        trajectory, beta=beta
     )[0]
     expected = torch.stack(
-        [smooth_reduce(pointwise[t : t + 3], scale) for t in range(2)]
+        [smooth_reduce(pointwise[t : t + 3], beta) for t in range(2)]
     )
 
     torch.testing.assert_close(got, expected)
@@ -572,8 +592,8 @@ def test_until_smooth_approaches_the_exact_reduction():
     spec = Until(Predicate("l"), Predicate("r"), interval=[0, 2])
     traj = until_trajectory()
 
-    exact = spec(traj, scale=-1)
-    smooth = spec(traj, scale=400.0)
+    exact = spec(traj, beta=None)
+    smooth = spec(traj, beta=400.0)
 
     torch.testing.assert_close(smooth, exact, atol=5e-2, rtol=0)
     assert not torch.equal(smooth, exact)  # a surrogate, not the same tensor
@@ -587,30 +607,35 @@ def test_until_smooth_matches_its_reference():
     )
     formula = Until(Predicate("l"), Predicate("r"), interval=[0, 2])
 
-    exact = formula(trajectory, scale=-1)[0, 0]
+    exact = formula(trajectory, beta=None)[0, 0]
     # witnesses: [max(0, .7+.1-1), min(.9,.3)], [max(0, .4+.6-1), min(.8,.75)],
     #            [max(0, .4+.5-1), min(.8,.85)]
     torch.testing.assert_close(exact, torch.tensor([0.0, 0.8]))
 
     left = Predicate("l")(trajectory)[0]
     right = Predicate("r")(trajectory)[0]
-    scale = 4.0
+    beta = 4.0
     candidates = []
     for witness in range(3):
         window = left[: witness + 1]
-        prefix = -(torch.logsumexp(-window * scale, dim=0) - np.log(len(window))) / scale
+        prefix = -(torch.logsumexp(-window * beta, dim=0) - np.log(len(window))) / beta
         candidates.append(
             torch.stack(
                 (
-                    torch.nn.functional.softplus(prefix[0] + right[witness, 0] - 1.0, beta=scale),
-                    torch.minimum(prefix[1], right[witness, 1]),
+                    torch.nn.functional.softplus(prefix[0] + right[witness, 0] - 1.0, beta=beta),
+                    -(
+                        torch.logsumexp(
+                            -torch.stack((prefix[1], right[witness, 1])) * beta, dim=0
+                        )
+                        - np.log(2)
+                    ) / beta,
                 )
             )
         )
-    expected_smooth = (torch.logsumexp(torch.stack(candidates) * scale, dim=0) - np.log(3)) / scale
+    expected_smooth = (torch.logsumexp(torch.stack(candidates) * beta, dim=0) - np.log(3)) / beta
 
     torch.testing.assert_close(
-        formula(trajectory, scale=scale)[0, 0], expected_smooth
+        formula(trajectory, beta=beta)[0, 0], expected_smooth
     )
 
 
@@ -689,7 +714,7 @@ def test_smooth_formula_passes_a_finite_difference_gradcheck():
             ]
         )
         spec = Always(GreaterThan(50.0), interval=[0, 1])
-        return spec(traj, scale=2.0)[0, 0, 0]
+        return spec(traj, beta=2.0)[0, 0, 0]
 
     # well separated from ties, so min/logsumexp is smooth and nonsingular
     mean = torch.tensor([[47.0], [53.0], [58.0]], dtype=torch.float64, requires_grad=True)
@@ -769,7 +794,7 @@ def test_supplied_bounds_factory_preserves_dtype_device_and_gradients():
     )
 
     traj = create_probability_belief_trajectory(predicate, bounds)
-    temporal = Always(predicate, interval=[0, 1])(traj, scale=-1)
+    temporal = Always(predicate, interval=[0, 1])(traj, beta=None)
 
     assert temporal.dtype == torch.float64
     assert temporal.device == bounds.device

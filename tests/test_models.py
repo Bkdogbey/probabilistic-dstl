@@ -8,9 +8,10 @@ import torch
 from models.dynamics import DoubleIntegrator, SingleIntegrator
 from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
 from pdstl.base import BeliefTrajectory
-from pdstl.operators import GreaterThan, LessThan
+from pdstl.predicates import GreaterThan, LessThan
 from scipy.stats import norm
-from planning.environment import Environment, extract_trajectory_stats
+from planning.scenarios.reach_avoid import build_reach_avoid_environment
+from planning.scenarios.moment_predicates import extract_trajectory_stats
 from models.rollouts import gaussian_rollout
 from planning.planner import Planner
 
@@ -116,8 +117,10 @@ def test_planning_extracts_the_same_gaussian_beliefs():
 
 
 def test_planner_accepts_the_shared_belief_in_a_small_window():
-    environment = Environment()
-    environment.set_goal([0.5, 1.5], [-0.5, 0.5])
+    environment = build_reach_avoid_environment({
+        "workspace": {"x": [-5.0, 5.0], "y": [-5.0, 5.0]},
+        "goal": {"x": [0.5, 1.5], "y": [-0.5, 0.5]},
+    })
     planner = Planner(
         SingleIntegrator(), environment, 3, config={"max_iters": 1}
     )

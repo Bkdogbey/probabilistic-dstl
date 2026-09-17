@@ -78,23 +78,42 @@ class ProbabilityBelief(Belief):
         return super().value() if self._value is None else self._value
 
 
-def create_probability_belief_trajectory(predicate, bounds, dtype=None, device=None):
-    """Trajectory from a [T, 2] (lower, upper) trace for one event; gradients kept."""
-    bounds = torch.as_tensor(bounds, dtype=dtype, device=device)
-    if bounds.ndim != 2 or bounds.shape[-1] != 2:
-        raise ValueError(
-            f"probability bounds must have shape [T, 2], got {tuple(bounds.shape)}"
-        )
-    if bounds.shape[0] < 1:
-        raise ValueError("probability bounds must cover at least one step")
-    check_probability_bounds(bounds.unsqueeze(0), predicate)
+def create_belief_trajectory(traces, dtype=None, device=None):
+    """Trajectory from precomputed probability intervals, one [T, 2] trace per named event.
+
+        create_belief_trajectory({"goal": goal_intervals, "safe": safe_intervals})
+
+    Every trace must cover the same number of steps. Gradients are kept.
+    """
+    if not traces:
+        raise ValueError("at least one event trace is required")
+
+    tensors = {}
+    for name, trace in traces.items():
+        tensor = torch.as_tensor(trace, dtype=dtype, device=device)
+        if tensor.ndim != 2 or tensor.shape[-1] != 2:
+            raise ValueError(
+                f"probability bounds for {name!r} must have shape [T, 2], "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.shape[0] < 1:
+            raise ValueError("probability bounds must cover at least one step")
+        check_probability_bounds(tensor.unsqueeze(0))
+        tensors[name] = tensor
+
+    steps = {name: tensor.shape[0] for name, tensor in tensors.items()}
+    if len(set(steps.values())) > 1:
+        raise ValueError(f"every trace must cover the same number of steps, got {steps}")
 
     return BeliefTrajectory(
-        [
-            ProbabilityBelief({predicate.name: bounds[t : t + 1]})
-            for t in range(bounds.shape[0])
-        ]
+        ProbabilityBelief({name: tensor[t : t + 1] for name, tensor in tensors.items()})
+        for t in range(next(iter(steps.values())))
     )
+
+
+def create_probability_belief_trajectory(predicate, bounds, dtype=None, device=None):
+    """Trajectory from a [T, 2] (lower, upper) trace for one event; gradients kept."""
+    return create_belief_trajectory({predicate.name: bounds}, dtype=dtype, device=device)
 
 
 def check_probability_bounds(trace, predicate=None):

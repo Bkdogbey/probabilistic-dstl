@@ -1,8 +1,14 @@
-"""pdSTL operators on [B, N, 2] probability-interval traces (Frechet Boolean, windowed temporal).
+"""pdSTL operators on [B, N, 2] traces: Frechet Boolean, windowed temporal.
 
-scale <= 0 gives hard StoRI semantics; scale = beta > 0 gives the differentiable
-semantics used for optimization (softplus conjunction lower, smooth temporal
-min/max). Smooth values need not be valid probability enclosures.
+Two evaluation modes, selected by `beta`:
+
+* `beta=None` -- exact. The pair is a StoRI probability interval [lower, upper].
+* `beta > 0`  -- smooth. The pair is a differentiable surrogate for optimization. It is NOT
+  a probability interval: the endpoints need not lie in [0, 1] and need not be ordered. Only
+  its lower value is meant to be read, through `smooth_lower()`.
+
+Use `probability_interval()` for the exact result and `smooth_lower()` for the scalar a
+planner descends.
 """
 
 import math
@@ -14,6 +20,16 @@ import torch.nn.functional as F
 from pdstl.base import check_probability_bounds
 
 
+def _checked_beta(beta):
+    """None for exact evaluation, else a finite positive smoothing strength."""
+    if beta is None:
+        return None
+    beta = float(beta)
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError(f"beta must be a finite positive number or None, got {beta}")
+    return beta
+
+
 class STL_Formula(torch.nn.Module):
     """Base formula: robustness_trace(beliefs) -> [B, N, 2] at complete origins."""
 
@@ -21,11 +37,22 @@ class STL_Formula(torch.nn.Module):
     def is_pointwise(self) -> bool:
         return False
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
+    def robustness_trace(self, belief_trajectory, beta=None, keepdim=True, **kwargs):
         raise NotImplementedError("robustness_trace not yet implemented")
 
-    def forward(self, belief_trajectory, **kwargs):
-        return self.robustness_trace(belief_trajectory, **kwargs)
+    def forward(self, belief_trajectory, beta=None, **kwargs):
+        return self.robustness_trace(belief_trajectory, beta=_checked_beta(beta), **kwargs)
+
+    def probability_interval(self, belief_trajectory, origin=0, **kwargs):
+        """The exact pdSTL probability interval [lower, upper] at one origin.
+
+        Named in full because `interval` on a temporal operator is its window [a, b].
+        """
+        return self(belief_trajectory, beta=None, **kwargs)[0, origin]
+
+    def smooth_lower(self, belief_trajectory, beta, origin=0, **kwargs):
+        """The differentiable lower score at one origin: the scalar a planner descends."""
+        return self(belief_trajectory, beta=beta, **kwargs)[0, origin, 0]
 
     def __and__(self, other):
         return And(self, other)
@@ -43,21 +70,21 @@ def _smooth_max(x, beta, dim, keepdim):
 
 
 class Minish(torch.nn.Module):
-    """Exact min (scale <= 0) or normalized smooth min along dim."""
+    """Exact min (beta is None) or normalized smooth min along dim."""
 
-    def forward(self, x, scale, dim=1, keepdim=True):
-        if scale > 0:
-            return -_smooth_max(-x, scale, dim, keepdim)
-        return x.min(dim=dim, keepdim=keepdim)[0]
+    def forward(self, x, beta=None, dim=1, keepdim=True):
+        if beta is None:
+            return x.min(dim=dim, keepdim=keepdim)[0]
+        return -_smooth_max(-x, beta, dim, keepdim)
 
 
 class Maxish(torch.nn.Module):
-    """Exact max (scale <= 0) or normalized smooth max along dim."""
+    """Exact max (beta is None) or normalized smooth max along dim."""
 
-    def forward(self, x, scale, dim=1, keepdim=True):
-        if scale > 0:
-            return _smooth_max(x, scale, dim, keepdim)
-        return x.max(dim=dim, keepdim=keepdim)[0]
+    def forward(self, x, beta=None, dim=1, keepdim=True):
+        if beta is None:
+            return x.max(dim=dim, keepdim=keepdim)[0]
+        return _smooth_max(x, beta, dim, keepdim)
 
 
 # --- Atomic events ------------------------------------------------------------
@@ -75,7 +102,12 @@ class Predicate(STL_Formula):
         return True
 
     def robustness_trace(self, belief_trajectory, validate=True, **kwargs):
-        trace = torch.stack([b.probability_bounds(self) for b in belief_trajectory], dim=1)
+        # A trajectory that can score every step at once does so; otherwise, step by step.
+        score_all = getattr(belief_trajectory, "probability_bounds", None)
+        if score_all is not None:
+            trace = score_all(self)
+        else:
+            trace = torch.stack([b.probability_bounds(self) for b in belief_trajectory], dim=1)
         if validate:
             check_probability_bounds(trace, self)
         return trace
@@ -84,28 +116,10 @@ class Predicate(STL_Formula):
         return self.name if self.name is not None else type(self).__name__
 
 
-class _Threshold(Predicate):
-    sense = None
-
-    def __init__(self, threshold, dim=0, name=None):
-        super().__init__(name=name or f"x[{dim}] {self.sense} {threshold}")
-        self.threshold = threshold
-        self.dim = dim
-
-
-class GreaterThan(_Threshold):
-    """Event x[dim] >= threshold."""
-
-    sense = ">="
-
-
-class LessThan(_Threshold):
-    """Event x[dim] <= threshold."""
-
-    sense = "<="
-
-
 # --- Boolean operators ----------------------------------------------------------
+
+
+_MIN, _MAX = Minish(), Maxish()
 
 
 def _align(*traces):
@@ -114,30 +128,34 @@ def _align(*traces):
     return tuple(t[:, :n] for t in traces)
 
 
-def _conjunction(trace1, trace2, scale=-1):
-    """[max(0, L1 + L2 - 1), min(U1, U2)]; the lower clamp becomes softplus when scale > 0.
+def _pair(lower, upper):
+    return torch.stack([lower, upper], dim=-1)
 
-    The upper stays an exact `minimum` in both modes. OutsideRectangle negates this
-    conjunction, so this upper becomes the lower its objective differentiates -- but the
-    exact min already carries gradient wherever moving along that axis changes the marginal,
-    so smoothing it only perturbs every formula's smooth values for no gain.
+
+def _conjunction(trace1, trace2, beta=None):
+    """[max(0, L1 + L2 - 1), min(U1, U2)]; both endpoints smooth when beta is set.
+
+    The upper is smoothed as well as the lower because `Negation` swaps them: without it a
+    negated conjunction -- every OutsideRectangle -- would carry a hard minimum in the very
+    value the objective differentiates.
     """
     excess = trace1[..., 0] + trace2[..., 0] - 1.0
-    lower = F.softplus(excess, beta=scale) if scale > 0 else torch.clamp(excess, min=0.0)
-    upper = torch.minimum(trace1[..., 1], trace2[..., 1])
-    return torch.stack([lower, upper], dim=-1)
+    lower = torch.clamp(excess, min=0.0) if beta is None else F.softplus(excess, beta=beta)
+    upper = _MIN(_pair(trace1[..., 1], trace2[..., 1]), beta, dim=-1, keepdim=False)
+    return _pair(lower, upper)
 
 
-def _disjunction(trace1, trace2, scale=-1):
-    """[max(L1, L2), min(1, U1 + U2)]"""
-    lower = torch.maximum(trace1[..., 0], trace2[..., 0])
-    upper = torch.clamp(trace1[..., 1] + trace2[..., 1], max=1.0)
-    return torch.stack([lower, upper], dim=-1)
+def _disjunction(trace1, trace2, beta=None):
+    """[max(L1, L2), min(1, U1 + U2)]; both endpoints smooth when beta is set."""
+    lower = _MAX(_pair(trace1[..., 0], trace2[..., 0]), beta, dim=-1, keepdim=False)
+    total = trace1[..., 1] + trace2[..., 1]
+    upper = _MIN(_pair(total, torch.ones_like(total)), beta, dim=-1, keepdim=False)
+    return _pair(lower, upper)
 
 
 def _negation(trace):
-    """[1 - U, 1 - L]"""
-    return torch.stack([1.0 - trace[..., 1], 1.0 - trace[..., 0]], dim=-1)
+    """[1 - U, 1 - L]: exact in both modes, and it swaps which endpoint is the lower one."""
+    return _pair(1.0 - trace[..., 1], 1.0 - trace[..., 0])
 
 
 class Negation(STL_Formula):
@@ -170,10 +188,10 @@ class _Binary(STL_Formula):
     def is_pointwise(self):
         return self.subformula1.is_pointwise and self.subformula2.is_pointwise
 
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        trace1 = self.subformula1(belief_trajectory, **kwargs)
-        trace2 = self.subformula2(belief_trajectory, **kwargs)
-        return type(self).combine(*_align(trace1, trace2), scale=kwargs.get("scale", -1))
+    def robustness_trace(self, belief_trajectory, beta=None, **kwargs):
+        trace1 = self.subformula1(belief_trajectory, beta=beta, **kwargs)
+        trace2 = self.subformula2(belief_trajectory, beta=beta, **kwargs)
+        return type(self).combine(*_align(trace1, trace2), beta=beta)
 
     def __str__(self):
         return f"({self.subformula1}) {self.symbol} ({self.subformula2})"
@@ -214,16 +232,30 @@ class Implies(STL_Formula):
 # --- Temporal operators ---------------------------------------------------------
 
 
+def _checked_interval(interval):
+    """A temporal window [a, b]: whole numbers with 0 <= a <= b. b may be infinite."""
+    if interval is None:
+        return None
+    a, b = interval
+    if b != np.inf and (not np.isfinite(b) or b != int(b)):
+        raise ValueError(f"interval end must be a whole number or inf, got {list(interval)}")
+    if not np.isfinite(a) or a != int(a) or a < 0:
+        raise ValueError(f"interval must start at a whole number >= 0, got {list(interval)}")
+    if a > b:
+        raise ValueError(f"interval must satisfy a <= b, got {list(interval)}")
+    return [int(a), np.inf if b == np.inf else int(b)]
+
+
 class Temporal_Operator(STL_Formula):
-    """Window reduction (min: Always, max: Eventually) run backwards; scale > 0 smooths."""
+    """Window reduction (min: Always, max: Eventually) run backwards; beta > 0 smooths."""
 
     symbol = None  # subclasses set self.operation to Minish() or Maxish()
 
     def __init__(self, subformula, interval=None):
         super().__init__()
         self.subformula = subformula
-        self.interval = interval
-        self._interval = [0, np.inf] if interval is None else interval
+        self.interval = _checked_interval(interval)
+        self._interval = [0, np.inf] if self.interval is None else self.interval
 
         a, b = self._interval
         self._unbounded = np.isinf(b)
@@ -267,39 +299,39 @@ class Temporal_Operator(STL_Formula):
         shifted = torch.matmul(h0_flat, M.t()).reshape(batch, bounds, rnn_dim).permute(0, 2, 1)
         return shifted + b.view(1, -1, 1) * x.squeeze(1).unsqueeze(1)
 
-    def _rnn_cell(self, x, hc, scale=-1):
+    def _rnn_cell(self, x, hc, beta=None):
         h0, _ = hc
         if self._suffix:  # [t, end of trace]
-            output = self.operation(torch.cat([h0, x], dim=1), scale, dim=1, keepdim=True)
+            output = self.operation(torch.cat([h0, x], dim=1), beta, dim=1, keepdim=True)
             state = (output, None)
         elif self._unbounded:  # [a, inf), a > 0
             d0, h0 = h0
             dh = torch.cat([d0, h0[:, :1, :]], dim=1)
-            output = self.operation(dh, scale, dim=1, keepdim=True)
+            output = self.operation(dh, beta, dim=1, keepdim=True)
             state = ((output, self._apply_shift(h0, x)), None)
         else:  # [a, b]: slot rnn_dim-1-k holds the value k steps ahead
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
-            output = self.operation(new_h0[:, : b - a + 1, :], scale, dim=1, keepdim=True)
+            output = self.operation(new_h0[:, : b - a + 1, :], beta, dim=1, keepdim=True)
             state = (new_h0, None)
         return output, state
 
-    def _run_cell(self, x, scale):
+    def _run_cell(self, x, beta):
         outputs, hc = [], self._initialize_rnn_cell(x)
         for x_i in torch.split(x, 1, dim=1):
-            o, hc = self._rnn_cell(x_i, hc, scale)
+            o, hc = self._rnn_cell(x_i, hc, beta)
             outputs.append(o)
         return torch.cat(outputs, dim=1)
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        trace = self.subformula(belief_trajectory, scale=scale, keepdim=keepdim, **kwargs)
+    def robustness_trace(self, belief_trajectory, beta=None, keepdim=True, **kwargs):
+        trace = self.subformula(belief_trajectory, beta=beta, keepdim=keepdim, **kwargs)
         if trace.shape[1] - self.lookahead <= 0:
             raise ValueError(
                 f"{self}: one evaluation origin needs {self.lookahead + 1} steps, "
                 f"child trace has {trace.shape[1]}"
             )
         # Run backwards so each origin sees its future; drop incomplete windows.
-        output_reversed = self._run_cell(torch.flip(trace, dims=[1]), scale=scale)
+        output_reversed = self._run_cell(torch.flip(trace, dims=[1]), beta=beta)
         return torch.flip(output_reversed[:, self.lookahead :], dims=[1])
 
     def __str__(self):
@@ -335,7 +367,8 @@ class Until(STL_Formula):
         super().__init__()
         self.left = left
         self.right = right
-        self.interval = [0, np.inf] if interval is None else interval
+        checked = _checked_interval(interval)
+        self.interval = [0, np.inf] if checked is None else checked
         self._interval = self.interval
         self.min_op = Minish()
         self.max_op = Maxish()
@@ -345,9 +378,9 @@ class Until(STL_Formula):
         a, b = self._interval
         return int(a) if np.isinf(b) else int(b)
 
-    def robustness_trace(self, belief_trajectory, scale=-1, keepdim=True, **kwargs):
-        phi = self.left(belief_trajectory, scale=scale, keepdim=True, **kwargs)
-        psi = self.right(belief_trajectory, scale=scale, keepdim=True, **kwargs)
+    def robustness_trace(self, belief_trajectory, beta=None, keepdim=True, **kwargs):
+        phi = self.left(belief_trajectory, beta=beta, keepdim=True, **kwargs)
+        psi = self.right(belief_trajectory, beta=beta, keepdim=True, **kwargs)
         phi, psi = _align(phi, psi)
 
         T = phi.shape[1]
@@ -365,9 +398,9 @@ class Until(STL_Formula):
             candidates = []
             for tau in range(t + a, min(t + b, T - 1) + 1):
                 # Inclusive: φ must hold from t through the witness τ.
-                prefix = self.min_op(phi[:, t : tau + 1, :], scale, dim=1, keepdim=False)
-                candidates.append(_conjunction(prefix, psi[:, tau, :], scale))
-            results.append(self.max_op(torch.stack(candidates, dim=1), scale, dim=1, keepdim=False))
+                prefix = self.min_op(phi[:, t : tau + 1, :], beta, dim=1, keepdim=False)
+                candidates.append(_conjunction(prefix, psi[:, tau, :], beta))
+            results.append(self.max_op(torch.stack(candidates, dim=1), beta, dim=1, keepdim=False))
         return torch.stack(results, dim=1)
 
     def __str__(self):

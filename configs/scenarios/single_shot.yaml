@@ -2,6 +2,10 @@
 # Robot plans a full open-loop trajectory from start to goal in one optimisation pass.
 
 # --- Dynamics ---
+# --- Scenario ---
+scenario:
+  type: reach_avoid
+
 dynamics: single_integrator
 T: 130           # Planning horizon (time steps)
 dt: 0.2          # Time step [s]
