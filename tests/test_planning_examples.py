@@ -17,7 +17,6 @@ from planning.examples import (
     load_examples_config,
     run_always_step_zero,
     run_case,
-    run_mpc_check,
 )
 from utils import get_device
 from visualization.robustness import _to_numpy
@@ -220,33 +219,8 @@ def test_step_zero_bottleneck_is_not_improved():
     assert 0.0 < out["before"][0] < 1.0  # a real, non-degenerate bottleneck
 
 
-# --- 5. MPC consistency ----------------------------------------------------
-
-
-def test_mpc_deadline_decrements_and_belief_resets_to_the_observation():
-    steps = run_mpc_check(verbose=False)
-    assert len(steps) >= 3
-
-    # absolute deadline: strictly decreasing, never restarted
-    uppers = [s["window"][1] for s in steps]
-    assert uppers == sorted(uppers, reverse=True)
-    assert all(b >= 0 for b in uppers)
-    assert uppers[0] > uppers[-1]
-
-    for s in steps:
-        # belief is initialised at the observed state with zero covariance
-        assert s["belief_cov_trace"] == pytest.approx(0.0, abs=1e-12)
-        assert s["belief_mean"] == pytest.approx(s["true_state"], abs=1e-6)
-
-
-def test_mpc_simulated_state_advances_and_reaches_the_target():
-    steps = run_mpc_check(verbose=False)
-    xs = [s["true_state"][0] for s in steps]
-
-    assert xs[-1] > xs[0]  # the physical state actually moves
-    assert any(s["satisfied"] for s in steps)
-    # the physical trajectory is sampled, so it is not the belief mean path
-    assert all(np.isfinite(x) for x in xs)
+# MPC consistency now lives in tests/test_receding_horizon.py, against the generic
+# RecedingHorizonController that replaced run_mpc_check.
 
 
 def test_every_named_case_runs():

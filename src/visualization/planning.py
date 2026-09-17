@@ -59,8 +59,8 @@ def plot_covariance_ellipse(
 
 def draw_road_backdrop(ax, env):
     """Road, goal lane and lane markings; returns (road_lo, road_hi)."""
-    road_lo = min(lm["y"] for lm in env.lane_markings) if env.lane_markings else -2.0
-    road_hi = max(lm["y"] for lm in env.lane_markings) if env.lane_markings else 6.0
+    road_lo = min(lm["y"] for lm in getattr(env, "lane_markings", [])) if getattr(env, "lane_markings", []) else -2.0
+    road_hi = max(lm["y"] for lm in getattr(env, "lane_markings", [])) if getattr(env, "lane_markings", []) else 6.0
     ax.axhspan(road_lo, road_hi, color=PALETTE["road"]["fill"], zorder=0)
     if env.goal:
         gy0, gy1 = env.goal["y"]
@@ -72,7 +72,7 @@ def draw_road_backdrop(ax, env):
             zorder=1,
             label="Goal Lane",
         )
-    for lane in env.lane_markings:
+    for lane in getattr(env, "lane_markings", []):
         style = "--" if lane["style"] == "dashed" else "-"
         lw = 1.5 if lane["style"] == "dashed" else 2.0
         ax.axhline(
@@ -114,7 +114,7 @@ def draw_env_on_ax(
             )
         )
 
-    if env.lane_markings:
+    if getattr(env, "lane_markings", []):
         draw_road_backdrop(ax, env)
     else:
         if env.goal:
@@ -132,7 +132,7 @@ def draw_env_on_ax(
                 )
             )
 
-    for region in env.visit_regions:
+    for region in getattr(env, "visit_regions", []):
         vx, vy = region["x"], region["y"]
         ax.add_patch(
             patches.Rectangle(
@@ -163,7 +163,7 @@ def draw_env_on_ax(
             )
         )
 
-    for obs in env.circle_obstacles:
+    for obs in getattr(env, "circle_obstacles", []):
         ax.add_patch(
             patches.Circle(
                 obs["center"],
@@ -177,7 +177,7 @@ def draw_env_on_ax(
         )
 
     if draw_moving_path or moving_obs_snapshots:
-        for obs in env.moving_obstacles:
+        for obs in getattr(env, "moving_obstacles", []):
             xt = np.asarray(
                 obs["x_traj"].detach().cpu()
                 if isinstance(obs["x_traj"], torch.Tensor)
@@ -221,7 +221,7 @@ def draw_env_on_ax(
 def _compute_env_bounds(mean_np, env):
     x_min, x_max = np.min(mean_np[:, 0]), np.max(mean_np[:, 0])
     y_min, y_max = np.min(mean_np[:, 1]), np.max(mean_np[:, 1])
-    for lane in env.lane_markings:
+    for lane in getattr(env, "lane_markings", []):
         x_min = min(x_min, min(lane["x"]))
         x_max = max(x_max, max(lane["x"]))
         y_min = min(y_min, lane["y"])
@@ -241,12 +241,12 @@ def _compute_env_bounds(mean_np, env):
         x_max = max(x_max, obs["x"][1])
         y_min = min(y_min, obs["y"][0])
         y_max = max(y_max, obs["y"][1])
-    for obs in env.circle_obstacles:
+    for obs in getattr(env, "circle_obstacles", []):
         x_min = min(x_min, obs["center"][0] - obs["radius"])
         x_max = max(x_max, obs["center"][0] + obs["radius"])
         y_min = min(y_min, obs["center"][1] - obs["radius"])
         y_max = max(y_max, obs["center"][1] + obs["radius"])
-    for region in env.visit_regions:
+    for region in getattr(env, "visit_regions", []):
         x_min = min(x_min, region["x"][0])
         x_max = max(x_max, region["x"][1])
         y_min = min(y_min, region["y"][0])
@@ -312,7 +312,7 @@ def plot_trajectory(mean_np, cov_np, env):
             zorder=30,
         )
 
-    for region in env.visit_regions:
+    for region in getattr(env, "visit_regions", []):
         vx, vy = region["x"], region["y"]
         ax.text(
             (vx[0] + vx[1]) / 2,
@@ -707,8 +707,8 @@ def plot_lc_trajectory(
     cov_np = cov_trace.cpu().squeeze().numpy()  # [T+1, D, D]
     T = mean_np.shape[0] - 1
 
-    road_lo = min(lm["y"] for lm in env.lane_markings) if env.lane_markings else -2.0
-    road_hi = max(lm["y"] for lm in env.lane_markings) if env.lane_markings else 6.0
+    road_lo = min(lm["y"] for lm in getattr(env, "lane_markings", [])) if getattr(env, "lane_markings", []) else -2.0
+    road_hi = max(lm["y"] for lm in getattr(env, "lane_markings", [])) if getattr(env, "lane_markings", []) else 6.0
     x_lo = mean_np[:, 0].min() - 1.5
     x_hi = mean_np[:, 0].max() + 1.5
     y_lo, y_hi = road_lo - 1.2, road_hi + 1.2
@@ -827,8 +827,8 @@ def plot_lc_snapshots(
     cov_np = cov_trace.cpu().squeeze().numpy()  # [T+1, D, D]
     T = mean_np.shape[0] - 1
 
-    road_lo = min(lm["y"] for lm in env.lane_markings) if env.lane_markings else -2.0
-    road_hi = max(lm["y"] for lm in env.lane_markings) if env.lane_markings else 6.0
+    road_lo = min(lm["y"] for lm in getattr(env, "lane_markings", [])) if getattr(env, "lane_markings", []) else -2.0
+    road_hi = max(lm["y"] for lm in getattr(env, "lane_markings", [])) if getattr(env, "lane_markings", []) else 6.0
     x_lo = mean_np[:, 0].min() - 1.5
     x_hi = mean_np[:, 0].max() + 1.5
     y_lo, y_hi = road_lo - 1.2, road_hi + 1.2
@@ -901,7 +901,7 @@ def plot_lc_snapshots(
             label="Stopped Vehicle",
         )
         legend_handles.append(static_patch)
-    if env.visit_regions:
+    if getattr(env, "visit_regions", []):
         visit_patch = patches.Patch(
             facecolor=PALETTE["visit"]["fill"],
             edgecolor=PALETTE["visit"]["stroke"],
@@ -973,7 +973,7 @@ def plot_lc_snapshots(
             ),
         )
 
-        for obs in env.moving_obstacles:
+        for obs in getattr(env, "moving_obstacles", []):
             xt = np.asarray(
                 obs["x_traj"].detach().cpu()
                 if isinstance(obs["x_traj"], torch.Tensor)
@@ -1108,3 +1108,176 @@ def visualize_lane_change(
     plt.tight_layout()
     plt.show()
     plt.close(fig3)
+
+
+# --- Canonical reach-avoid figure ------------------------------------------------
+# Consumes PlanResult directly: no runner-built dictionary, no duplicated arrays.
+
+
+def _plan_geometry(result):
+    """Mean path [T+1, 2] and covariance trace [T+1, D, D] from a PlanResult."""
+    aux = result.rollout.aux   # _to_np already drops the leading batch axis
+    return _to_np(aux["mean_trace"]), _to_np(aux["cov_trace"])
+
+
+def _draw_reach_avoid_panel(ax, result, environment, options, initial_mean_path=None,
+                            plan_label="Optimized mean", mark_endpoints=True):
+    """Workspace, blocks, goal, the optimized mean path and its uncertainty."""
+    bounds = environment.bounds
+    mean_path, cov_trace = _plan_geometry(result)
+
+    if bounds is not None:
+        (x_lo, x_hi), (y_lo, y_hi) = bounds["x"], bounds["y"]
+        ax.add_patch(patches.Rectangle(
+            (x_lo, y_lo), x_hi - x_lo, y_hi - y_lo, facecolor="none",
+            edgecolor="0.35", linestyle="--", linewidth=1.4, zorder=2, label="Workspace",
+        ))
+        ax.set_xlim(x_lo - 0.3, x_hi + 0.3)
+        ax.set_ylim(y_lo - 0.3, y_hi + 0.3)
+
+    for index, obstacle in enumerate(environment.obstacles):
+        (x_lo, x_hi), (y_lo, y_hi) = obstacle["x"], obstacle["y"]
+        ax.add_patch(patches.Rectangle(
+            (x_lo, y_lo), x_hi - x_lo, y_hi - y_lo, facecolor="0.72", edgecolor="0.25",
+            linewidth=1.3, zorder=3,
+            label="Obstacle" if index == 0 else None,   # one legend entry for all blocks
+        ))
+        if options.get("annotate_obstacles", True) and obstacle.get("name"):
+            ax.text((x_lo + x_hi) / 2, (y_lo + y_hi) / 2, obstacle["name"],
+                    ha="center", va="center", fontsize=7, color="0.25", zorder=4)
+
+    if environment.goal is not None:
+        (x_lo, x_hi), (y_lo, y_hi) = environment.goal["x"], environment.goal["y"]
+        ax.add_patch(patches.Rectangle(
+            (x_lo, y_lo), x_hi - x_lo, y_hi - y_lo, facecolor="#2e9e5b", edgecolor="#1c6b3c",
+            alpha=0.35, linewidth=1.3, zorder=3, label="Goal",
+        ))
+
+    if initial_mean_path is not None:
+        ax.plot(initial_mean_path[:, 0], initial_mean_path[:, 1], "--",
+                color="#e08c2e", linewidth=1.6, zorder=5, label="Initial plan")
+
+    every = max(int(options.get("ellipse_every", 3)), 1)
+    confidence = float(options.get("confidence_level", 0.95))
+    # Joint confidence region for a 2-D Gaussian, not the per-axis quantile.
+    k = float(np.sqrt(-2.0 * np.log(1.0 - confidence)))
+    for step in range(0, len(mean_path), every):
+        plot_covariance_ellipse(
+            ax, mean_path[step, :2], cov_trace[step][:2, :2], k=k,
+            facecolor="none", edgecolor="#3b6fd4", alpha=0.55, zorder=6,
+            label=f"{int(confidence * 100)}% covariance" if step == 0 else None,
+        )
+
+    ax.plot(mean_path[:, 0], mean_path[:, 1], "-", color="#1f4fa8", linewidth=2.0,
+            zorder=7, label=plan_label)
+    if mark_endpoints:
+        ax.plot(*mean_path[0, :2], "*", color="black", markersize=14, zorder=8, label="Start")
+        ax.plot(*mean_path[-1, :2], "o", color="#1f4fa8", markersize=8, zorder=8,
+                label="Final mean")
+
+    ax.set_aspect("equal")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.grid(True, alpha=0.25, linewidth=0.6)
+
+
+def _draw_convergence_panel(ax, result):
+    """Smooth lower score and exact hard lower score against iteration."""
+    iterations = [record.iteration for record in result.history]
+    ax.plot(iterations, [r.smooth_lower for r in result.history], "-",
+            color="#e08c2e", linewidth=1.4, label="Smooth lower score (surrogate)")
+    ax.plot(iterations, [r.hard_lower for r in result.history], "-",
+            color="#1f4fa8", linewidth=1.8, label="Hard lower score (exact)")
+    ax.axvline(result.best_iteration, color="0.4", linestyle=":", linewidth=1.2,
+               label=f"Returned plan (iter {result.best_iteration})")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Lower score")
+    ax.set_ylim(-0.05, 1.05)   # a probability axis; the surrogate may leave it
+    ax.grid(True, alpha=0.25, linewidth=0.6)
+    ax.legend(fontsize=8, loc="best")
+
+
+def visualize_plan(result, environment, options=None, *, initial_controls=None,
+                   save_path=None, show=True):
+    """One figure for a PlanResult: the plan in its world, and how the scores converged."""
+    options = dict(options or {})
+    show_history = options.get("show_optimization_history", True)
+
+    initial_mean_path = None
+    if options.get("show_initial_plan", True) and initial_controls is not None:
+        initial_mean_path = options.get("initial_mean_path")
+
+    figure, axes = plt.subplots(
+        1, 2 if show_history else 1, figsize=(13, 6) if show_history else (7, 6)
+    )
+    environment_ax = axes[0] if show_history else axes
+    _draw_reach_avoid_panel(environment_ax, result, environment, options, initial_mean_path)
+
+    lower, upper = (float(v) for v in result.hard_interval)
+    environment_ax.set_title(f"Reach-avoid plan | hard pdSTL interval [{lower:.3f}, {upper:.3f}]")
+    handles, labels = environment_ax.get_legend_handles_labels()
+    unique = dict(zip(labels, handles))   # no duplicate legend entries
+    environment_ax.legend(unique.values(), unique.keys(), fontsize=8, loc="upper left")
+
+    if show_history:
+        _draw_convergence_panel(axes[1], result)
+        axes[1].set_title("Optimization")
+
+    figure.tight_layout()
+    return _finish(figure, save_path, show)
+
+
+def visualize_lane_merge(result, environment, config, *, show=True, save=True):
+    """Lane-merge execution trace, adapting RecedingHorizonResult to the existing figure.
+
+    The lane-merge plots are unchanged; only the shape of the data reaching them is.
+    """
+    states = result.states.unsqueeze(0)
+    covariances = torch.stack([covariance for _, covariance in result.beliefs]).unsqueeze(0)
+    controls = result.applied_controls.unsqueeze(0)
+    if environment.moving_obstacles:
+        environment.clip_moving_obstacles(states.shape[1])
+    return visualize_lane_change(
+        states, covariances, controls, environment,
+        p_sat_trace=result.hard_lowers, dt=config["dt"],
+        robot_dims=environment.robot_dims, xlim=environment.plot_xlim,
+    )
+
+
+def visualize_execution(result, environment, options=None, *, save_path=None, show=True):
+    """Figure for a RecedingHorizonResult: the executed path, and each window's hard score."""
+    options = dict(options or {})
+    figure, (world_ax, score_ax) = plt.subplots(1, 2, figsize=(13, 6))
+
+    # The blue path is the plan from the CURRENT belief, so it does not start where
+    # execution did; the star belongs to the executed path, not to that plan.
+    _draw_reach_avoid_panel(
+        world_ax, result.plans[-1], environment, options,
+        plan_label="Latest window plan", mark_endpoints=False,
+    )
+
+    executed = _to_np(result.states)
+    world_ax.plot(executed[:, 0], executed[:, 1], "-o", color="#b5342b", markersize=3.5,
+                  linewidth=1.8, zorder=9, label="Executed path")
+    world_ax.plot(*executed[0, :2], "*", color="black", markersize=14, zorder=10, label="Start")
+    world_ax.plot(*executed[-1, :2], "o", color="#b5342b", markersize=8, zorder=10,
+                  label="Current state")
+    world_ax.set_title(
+        f"Receding horizon | {len(result.plans)} windows | stopped: {result.stopped_reason}"
+    )
+    handles, labels = world_ax.get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    world_ax.legend(unique.values(), unique.keys(), fontsize=8, loc="upper left")
+
+    lowers = result.hard_lowers
+    score_ax.plot(range(len(lowers)), lowers, "-o", color="#1f4fa8", markersize=4,
+                  label="Hard lower score (exact), per window")
+    score_ax.set_xlabel("Replanning step")
+    score_ax.set_ylabel("Lower score")
+    score_ax.set_ylim(-0.05, 1.05)
+    score_ax.grid(True, alpha=0.25, linewidth=0.6)
+    score_ax.legend(fontsize=8, loc="best")
+    score_ax.set_title("Execution")
+
+    figure.tight_layout()
+    return _finish(figure, save_path, show)

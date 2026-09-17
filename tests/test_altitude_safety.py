@@ -14,12 +14,7 @@ import pytest
 import torch
 from PIL import Image
 
-from planning.runners import (
-    build_dynamics,
-    build_initial_belief,
-    load_scenario_config,
-    run_altitude_safety,
-)
+from planning.examples import _altitude_setup, _legacy_optimizer, run_altitude_safety
 from models.beliefs import GaussianBelief
 from models.dynamics import SingleIntegrator
 from models.rollouts import gaussian_rollout
@@ -33,11 +28,10 @@ CONFIG = "configs/scenarios/altitude_safety.yaml"
 
 @pytest.fixture(scope="module")
 def problem():
-    cfg, planner_cfg = load_scenario_config(CONFIG)
-    dyn = build_dynamics(cfg, "cpu")
-    rollout = gaussian_rollout(dyn, *build_initial_belief(cfg, "cpu"))
+    cfg, planner_cfg, dyn, x0_mean, x0_cov, _ = _altitude_setup(CONFIG)
+    rollout = gaussian_rollout(dyn, x0_mean, x0_cov)
     spec = Always(GreaterThan(cfg["threshold"], dim=0), interval=[1, cfg["H"]])
-    planner = Planner(dyn, None, cfg["H"], config=planner_cfg)
+    planner = Planner(dyn, None, cfg["H"], config=_legacy_optimizer(planner_cfg))
     return cfg, planner_cfg, dyn, rollout, spec, planner
 
 
@@ -90,11 +84,13 @@ def test_controls_are_bounded_one_dimensional(result, problem):
 def test_gradient_flows_from_controls_to_the_objective(problem):
     cfg, _, dyn, rollout, spec, planner = problem
     u_init = torch.tensor(cfg["init_control"]).repeat(cfg["H"], 1)
-    v = planner._control_parameters(u_init).clone().requires_grad_(True)
+    v = planner.control_parameters(u_init).clone().requires_grad_(True)
 
     predicted = rollout(v)
-    smooth, _ = planner._scores(spec, predicted.belief_trajectory, planner._beta(0))
-    planner._objective(predicted.nominal_trace, dyn.bound_control(v), smooth).backward()
+    smooth_lower = spec(predicted.belief_trajectory, scale=planner.beta_schedule(0))[0, 0, 0]
+    planner.objective(
+        smooth_lower=smooth_lower, controls=dyn.bound_control(v), rollout=predicted
+    ).backward()
 
     assert torch.isfinite(v.grad).all()
     assert v.grad.abs().sum() > 0

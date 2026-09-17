@@ -60,3 +60,25 @@ def log_safety(is_safe, min_sep):
             _log.info("Safety check: SAFE")
     else:
         _log.info("Safety check: UNSAFE — collisions detected")
+
+
+def log_plan_summary(name, result):
+    """One concise line per result: the exact hard pdSTL interval is the headline number."""
+    plans = getattr(result, "plans", None)
+    if plans is None:
+        lower, upper = (float(v) for v in result.hard_interval)
+        _log.info(
+            f"[{name}] hard pdSTL interval [{lower:.4f}, {upper:.4f}]"
+            f" | checkpoint iteration {result.best_iteration}"
+            f" | iterations {len(result.history)}"
+        )
+        return
+    if not plans:
+        _log.info(f"[{name}] no windows planned | stopped: {result.stopped_reason}")
+        return
+    lowers = result.hard_lowers
+    _log.info(
+        f"[{name}] {len(plans)} windows | stopped: {result.stopped_reason}"
+        f" | hard lower first {lowers[0]:.4f} -> last {lowers[-1]:.4f}"
+        f" | min {min(lowers):.4f}"
+    )

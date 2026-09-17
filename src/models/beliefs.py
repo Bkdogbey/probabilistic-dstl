@@ -3,7 +3,7 @@
 import torch
 
 from pdstl.base import Belief, BeliefTrajectory
-from pdstl.predicates import HalfSpace, InsideRectangle, OutsideRectangle
+from pdstl.predicates import AxisInterval, HalfSpace
 
 
 def _validate_covariance(covariance, batch, state_dim):
@@ -86,11 +86,19 @@ class GaussianBelief(Belief):
         return self.mean
 
     def probability_bounds(self, predicate):
-        """Exact [p,p] for affine/threshold events; Frechet bounds for rectangles."""
+        """Exact [p, p] for affine, threshold and axis-interval events.
+
+        Rectangles are not handled here: they are conjunctions of two AxisIntervals and are
+        combined by the pdSTL operators, which is what lets `scale` relax them.
+        """
         if isinstance(predicate, HalfSpace):
             return self._half_space_bounds(predicate)
-        if isinstance(predicate, (InsideRectangle, OutsideRectangle)):
-            return self._rectangle_bounds(predicate)
+        if isinstance(predicate, AxisInterval):
+            variance = self._variance(predicate.dim)  # validates the index first
+            p = _interval_probability(
+                predicate.lower, predicate.upper, self.mean[:, predicate.dim], variance
+            )
+            return torch.stack((p, p), dim=-1)
         dim = getattr(predicate, "dim", 0)
         variance = self._variance(dim)
         p = _tail_probability(predicate, self.mean[:, dim], variance)
@@ -110,20 +118,6 @@ class GaussianBelief(Belief):
         positive, (z,) = _standard_scores(location, variance.clamp_min(0), predicate.b)
         p = torch.where(positive, _normal_cdf(z), (location <= predicate.b).to(location.dtype))
         return torch.stack((p, p), dim=-1)
-
-    def _rectangle_bounds(self, predicate):
-        """Inside: [max(0, p_x + p_y - 1), min(p_x, p_y)]; Outside: [1 - U, 1 - L]."""
-        x_dim, y_dim = predicate.dims
-        p_x = self._interval(x_dim, predicate.x_range)
-        p_y = self._interval(y_dim, predicate.y_range)
-        lower, upper = torch.clamp(p_x + p_y - 1.0, min=0.0), torch.minimum(p_x, p_y)
-        if isinstance(predicate, OutsideRectangle):
-            lower, upper = 1.0 - upper, 1.0 - lower
-        return torch.stack((lower, upper), dim=-1)
-
-    def _interval(self, dim, bounds):
-        variance = self._variance(dim)
-        return _interval_probability(*bounds, self.mean[:, dim], variance)
 
     def _variance(self, dim):
         """[B] marginal variance of state component dim."""

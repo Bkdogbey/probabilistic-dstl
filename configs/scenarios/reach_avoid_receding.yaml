@@ -17,7 +17,10 @@ scenario:
   name: gate_corridor
 
 controller:
-  type: single_shot
+  type: receding_horizon
+  max_steps: 40
+  apply_steps: 1
+  warm_start: true
 
 horizon: 40
 
@@ -34,6 +37,8 @@ initial_belief:
     - [0.0, 0.04]
 
 environment:
+  goal_deadline: 40
+
   bounds:
     x_range: [0.0, 10.0]
     y_range: [0.0, 10.0]
@@ -76,4 +81,4 @@ visualization:
   show_optimization_history: true
 
 output:
-  figure: reach_avoid.png
+  figure: reach_avoid_receding.png

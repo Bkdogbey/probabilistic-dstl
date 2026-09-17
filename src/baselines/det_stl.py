@@ -308,7 +308,7 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
         specs.append(DetEventually(goal_pred, interval=[t_goal_start, T]))
 
     # 2. Visit regions (liveness)
-    for region in env.visit_regions:
+    for region in getattr(env, "visit_regions", []):
         visit_pred = DetRectangularGoalPredicate(region)
         specs.append(DetEventually(visit_pred, interval=[0, T]))
 
@@ -316,9 +316,9 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
     obs_preds = []
     for obs in env.obstacles:
         obs_preds.append(DetRectangularObstaclePredicate(obs))
-    for obs in env.circle_obstacles:
+    for obs in getattr(env, "circle_obstacles", []):
         obs_preds.append(DetCircularObstaclePredicate(obs, device=env.device))
-    for obs in env.moving_obstacles:
+    for obs in getattr(env, "moving_obstacles", []):
         obs_preds.append(DetMovingRectangularObstaclePredicate(obs, device=env.device))
 
     if obs_preds:

@@ -8,11 +8,11 @@ import yaml
 
 
 def get_device():
-    """CPU unless PDSTL_DEVICE is set or PDSTL_USE_CUDA=1 (some lab CUDA installs fail to initialise)."""
+    """Use the requested device, otherwise prefer CUDA when available, then CPU."""
     requested = os.environ.get("PDSTL_DEVICE")
     if requested:
         return torch.device(requested)
-    if os.environ.get("PDSTL_USE_CUDA") == "1" and torch.cuda.is_available():
+    if torch.cuda.is_available() and os.environ.get("PDSTL_USE_CUDA", "1") != "0":
         return torch.device("cuda")
     return torch.device("cpu")
 

@@ -115,7 +115,13 @@ def _align(*traces):
 
 
 def _conjunction(trace1, trace2, scale=-1):
-    """[max(0, L1 + L2 - 1), min(U1, U2)]; the lower clamp becomes softplus when scale > 0."""
+    """[max(0, L1 + L2 - 1), min(U1, U2)]; the lower clamp becomes softplus when scale > 0.
+
+    The upper stays an exact `minimum` in both modes. OutsideRectangle negates this
+    conjunction, so this upper becomes the lower its objective differentiates -- but the
+    exact min already carries gradient wherever moving along that axis changes the marginal,
+    so smoothing it only perturbs every formula's smooth values for no gain.
+    """
     excess = trace1[..., 0] + trace2[..., 0] - 1.0
     lower = F.softplus(excess, beta=scale) if scale > 0 else torch.clamp(excess, min=0.0)
     upper = torch.minimum(trace1[..., 1], trace2[..., 1])

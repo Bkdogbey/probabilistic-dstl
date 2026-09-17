@@ -1,401 +1,244 @@
-"""Experiment runners: load a scenario, build the problem, call the Planner, plot."""
+"""Scenario wiring: load configuration, build the pieces, run one controller, report.
 
-from functools import reduce
+Thin by design. Everything here is construction and dispatch; no planning mathematics, no
+result reshaping, no plotting logic. `PlanResult` and `RecedingHorizonResult` are returned
+exactly as the planner and controller produced them.
+"""
+
 from pathlib import Path
-from types import SimpleNamespace
 
-import numpy as np
 import torch
 
 from models.dynamics import DoubleIntegrator, SingleIntegrator
-from models.rollouts import gaussian_rollout
-from pdstl.operators import Always, And, GreaterThan
 from planning import log_utils
+from planning.controllers import RecedingHorizonController, normalize_controller_type
 from planning.environment import Environment
-from planning.planner import Planner
+from planning.scenarios.lane_merge import LaneMergeEnvironment
 from utils import get_device, load_config
-from visualization.animation import animate_altitude_optimization, animate_results
-from visualization.live_plots import make_lane_change_live_callback, make_mpc_live_callback
-from visualization.planning import (
-    plot_altitude_safety,
-    visualize_lane_change,
-    visualize_reach_avoid,
-    visualize_results,
-)
 
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "outputs"
 
 
-# --- Scenario builders ---------------------------------------------------------
-
-
-def load_scenario_config(cfg_path):
-    """Scenario dict and planner config (scenario overrides on planning.yaml)."""
-    cfg = load_config(cfg_path)
-    return cfg, {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
-
-
-def build_dynamics(cfg, device):
-    common = {"dt": cfg["dt"], "u_max": cfg["u_max"], "q_std": cfg["q_std"], "device": device}
-    if cfg.get("dynamics", "single_integrator") == "double_integrator":
-        return DoubleIntegrator(**common)
-    return SingleIntegrator(**common, state_dim=cfg.get("state_dim", 2))
-
-
-def build_initial_belief(cfg, device):
-    x0_mean = torch.tensor(cfg["x0_mean"], device=device)
-    return x0_mean, torch.eye(len(x0_mean), device=device) * cfg["x0_cov_scale"]
-
-
-def build_environment(cfg, device):
-    env = Environment(device=device)
-    if "road" in cfg and "obstacle" in cfg:
-        env.configure_lane_change(
-            road=cfg["road"], obstacle=cfg["obstacle"], goal=cfg["goal"], success=cfg["success"],
-            horizon=cfg["H"], total_steps=cfg["T_SIM"], dt=cfg["dt"], label=cfg.get("label", ""),
-            plot_xlim=cfg.get("plot_xlim"), robot_dims=cfg.get("robot_dims"),
-        )
-        return env
-    if "goal" in cfg:
-        env.set_goal(**cfg["goal"])
-    if "bounds" in cfg:
-        env.set_bounds(**cfg["bounds"])
-    for region in cfg.get("visit_regions", []):
-        env.add_visit_region(**region)
-    for obs in cfg.get("obstacles", []):
-        if obs["type"] == "circle":
-            env.add_circle_obstacle(center=obs["center"], radius=obs["radius"])
-        else:
-            env.add_obstacle(x_range=obs["x_range"], y_range=obs["y_range"])
-    return env
-
-
-def _output_path(filename):
+def output_path(filename):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     return str(RESULTS_DIR / filename)
 
 
-# --- pdSTL demonstrations --------------------------------------------------------
+# --- Construction ---------------------------------------------------------------
 
 
-def _setup(config_path, with_environment=False):
-    """Shared single-shot setup: dynamics, Gaussian rollout from b_0, planner, initial guess."""
-    device = get_device()
-    log_utils.log_device(device)
-    cfg, planner_cfg = load_scenario_config(config_path)
-    dyn = build_dynamics(cfg, device)
-    env = build_environment(cfg, device) if with_environment else None
-    return SimpleNamespace(
-        cfg=cfg,
-        H=cfg["H"],
-        dyn=dyn,
-        env=env,
-        rollout=gaussian_rollout(dyn, *build_initial_belief(cfg, device)),
-        planner=Planner(dyn, env, cfg["H"], config=planner_cfg),
-        u_init=torch.tensor(cfg["init_control"], device=device).repeat(cfg["H"], 1),
-    )
-
-
-def _log_intervals(name, spec, result):
-    """Report the hard pdSTL outcome separately from differentiable semantics."""
-    (lo_i, hi_i), (lo_f, hi_f) = result["interval_initial"], result["interval_final"]
-    extra = ""
-    if "smooth_lower" in result:
-        extra = (
-            f" | smooth lower {result['smooth_lower']:.4f}"
-            f" (beta={result['smooth_beta']})"
-            f" | control cost {result['control_cost']:.4f}"
-        )
-    log_utils._log.debug(f"[{name}] specification: {spec}")
-    log_utils._log.info(
-        f"[{name}] Hard pdSTL interval: [{lo_f:.4f}, {hi_f:.4f}]"
-        f" | initial [{lo_i:.4f}, {hi_i:.4f}]"
-        f"{extra} | iterations {result['iterations']}"
-    )
-
-
-def _event_trace(event, rollout):
-    """[H+1, 2] probability interval of one event along the predicted beliefs."""
-    return event(rollout.belief_trajectory).detach()[0]
-
-
-def _plan_summary(candidate, atom):
-    with torch.no_grad():
-        return {
-            "interval": list(candidate.hard_interval),
-            "objective": candidate.objective,
-            "atomic": _event_trace(atom, candidate.rollout),
-            "mean": candidate.rollout.aux["mean_trace"],
-            "cov": candidate.rollout.aux["cov_trace"],
-            "controls": candidate.controls,
-        }
-
-
-def run_altitude_safety(config_path="configs/scenarios/altitude_safety.yaml", *, show=True, save=True):
-    """Always_[1,H](Z >= threshold) for a 1-D stochastic altitude; every iterate kept as a frame."""
-    s = _setup(config_path)
-    atom = GreaterThan(s.cfg["threshold"], dim=0)
-    spec = Always(atom, interval=[1, s.H])
-
-    initial = _plan_summary(s.planner.evaluate_controls(s.rollout, s.u_init, spec=spec), atom)
-    frames = []
-    best, history = s.planner.optimize_window(
-        s.rollout, spec=spec, init_guess=s.u_init, verbose=True,
-        on_iteration=lambda k, candidate: frames.append(_plan_summary(candidate, atom)),
-    )
-    final = _plan_summary(s.planner.evaluate_controls(s.rollout, best.controls, spec=spec), atom)
-
-    result = {
-        **{f"{key}_initial": value for key, value in initial.items()},
-        **{f"{key}_final": value for key, value in final.items()},
-        "stored_interval": list(best.hard_interval),
-        "returned_iteration": best.iteration,
-        "controls": final["controls"],
-        "history": history,
-        "iterations": len(history),
-        "frames": frames,
+def build_dynamics(config, device):
+    """Dynamics from the `dynamics:` block."""
+    common = {
+        "dt": config["dt"], "u_max": config["u_max"],
+        "q_std": config["q_std"], "device": device,
     }
-    _log_intervals("altitude_safety", spec, result)
-
-    plot_args = {"dt": s.cfg["dt"], "threshold": s.cfg["threshold"], "u_max": s.dyn.u_max}
-    if save or show:
-        figure = _output_path(s.cfg["figure"]) if save else None
-        plot_altitude_safety(result, **plot_args, save_path=figure, show=show)
-    if save:
-        animation = s.cfg["animation"]
-        animate_altitude_optimization(
-            result, **plot_args, filename=_output_path(animation["filename"]), fps=animation["fps"]
-        )
-    return result
+    if config.get("type", "single_integrator") == "double_integrator":
+        return DoubleIntegrator(**common)
+    return SingleIntegrator(**common, state_dim=config.get("state_dim", 2))
 
 
-def _mean_clearance(mean_trace, obstacles):
-    """Post-hoc diagnostic: smallest mean-to-rectangle distance over all obstacles."""
-    points = mean_trace[0, 1:]
-    corners = torch.tensor(
-        [[o["x"][0], o["y"][0], o["x"][1], o["y"][1]] for o in obstacles],
-        device=points.device,
-        dtype=points.dtype,
+def build_initial_belief(config, device):
+    """(mean [D], covariance [D, D]) from the `initial_belief:` block."""
+    mean = torch.tensor(config["mean"], device=device, dtype=torch.float32)
+    covariance = config["covariance"]
+    if isinstance(covariance, (int, float)):
+        covariance = torch.eye(len(mean), device=device) * float(covariance)
+    else:
+        covariance = torch.tensor(covariance, device=device, dtype=torch.float32)
+        if covariance.ndim == 1:
+            covariance = torch.diag(covariance)
+    return mean, covariance
+
+
+def initialize_toward_goal(*, mean0, goal, dynamics, horizon):
+    """Constant control along the straight line from the initial mean to the goal centre.
+
+    Deliberately simple, and deliberately not optional for the gate corridor: the pdSTL goal
+    gradient is only alive within a few sigma of the goal rectangle, because further out the
+    Gaussian CDF underflows to exactly zero in float32. This initialisation is what carries
+    the plan into the region where the specification can steer it.
+    """
+    if goal is None:
+        return None
+    center = torch.tensor(
+        [sum(goal["x"]) / 2.0, sum(goal["y"]) / 2.0],
+        device=mean0.device, dtype=mean0.dtype,
     )
-    gap = torch.maximum(corners[:, None, :2] - points, points - corners[:, None, 2:])
-    outside = gap.clamp(min=0).norm(dim=2)
-    return torch.where(outside > 0, outside, gap.max(dim=2).values).min().item()
+    offset = center - mean0[:2]
+    distance = torch.linalg.norm(offset)
+    if float(distance) == 0.0:
+        return torch.zeros(horizon, dynamics.B.shape[1], device=mean0.device)
+
+    speed = min(float(dynamics.u_max), float(distance) / (horizon * dynamics.dt))
+    step = offset / distance * speed
+    control = torch.zeros(dynamics.B.shape[1], device=mean0.device, dtype=mean0.dtype)
+    control[: step.shape[0]] = step
+    return control.repeat(horizon, 1)
 
 
-def _obstacle_traces(events, rollout):
-    """Per-obstacle probability intervals, for inspection alongside their conjunction."""
-    return [_event_trace(event, rollout) for event in events["obstacles"]]
+SCENARIOS = {"reach_avoid": Environment, "lane_merge": LaneMergeEnvironment}
+SCENARIO_ALIASES = {"lane_change": "lane_merge"}
 
 
-def _iteration_record(candidate):
-    """Scalar diagnostics only; retain no rollout or autograd graph."""
-    return {
-        "iteration": candidate.iteration,
-        "beta": candidate.beta,
-        "smooth_lower": candidate.smooth_lower,
-        "hard_interval": candidate.hard_interval,
-        "control_cost": candidate.control_cost,
-        "objective": candidate.objective,
-    }
+def build_scenario(config, device):
+    """Environment for the configured scenario type."""
+    scenario = config.get("scenario") or {}
+    name = SCENARIO_ALIASES.get(scenario.get("type", "reach_avoid"), scenario.get("type", "reach_avoid"))
+    if name not in SCENARIOS:
+        raise ValueError(f"unknown scenario type {name!r}; known: {sorted(SCENARIOS)}")
+    if name == "lane_merge":
+        return LaneMergeEnvironment.from_config(
+            config, device=device, window_config=_window_config(config),
+        )
+    return Environment.from_config(config["environment"], device=device)
+
+
+def build_planner(config, environment):
+    """One reusable Planner. Every window, single-shot or receding, goes through it."""
+    from planning.planner import Planner  # local: keeps the import graph shallow
+
+    device = environment.device
+    dynamics = build_dynamics(config["dynamics"], device)
+    return Planner(dynamics, environment, config["horizon"], config=config.get("optimizer"))
+
+
+# --- Runners --------------------------------------------------------------------
 
 
 def run_reach_avoid(config_path="configs/scenarios/reach_avoid.yaml", *, show=True, save=True):
-    """Always(outside every obstacle) ∧ Eventually(inside goal) ∧ Always(inside workspace)."""
-    s = _setup(config_path, with_environment=True)
-    spec = s.env.get_specification(s.H, t_goal_start=1)
+    """Gate-corridor reach-avoid, single-shot or receding-horizon as the config selects."""
+    config = load_config(config_path)
+    device = get_device()
+    log_utils.log_device(device)
 
-    initial = s.planner.evaluate_controls(s.rollout, s.u_init, spec=spec)
-    optimization_trace = []
-    best, history = s.planner.optimize_window(
-        s.rollout, spec=spec, init_guess=s.u_init, verbose=True,
-        on_iteration=lambda k, candidate: optimization_trace.append(_iteration_record(candidate)),
+    environment = build_scenario(config, device)
+    planner = build_planner(config, environment)
+    mean0, covariance0 = build_initial_belief(config["initial_belief"], device)
+    initial_controls = initialize_toward_goal(
+        mean0=mean0, goal=environment.goal,
+        dynamics=planner.dynamics, horizon=config["horizon"],
     )
-    final = s.planner.evaluate_controls(s.rollout, best.controls, spec=spec)
 
-    events = s.env.get_predicates()
-    goal = _event_trace(events["goal"], final.rollout)
-    safe = _event_trace(reduce(And, events["obstacles"]), final.rollout)
-    goal_step, safe_step = int(goal[1:, 0].argmax()) + 1, int(safe[1:, 0].argmin()) + 1
-    mean_trace = final.rollout.aux["mean_trace"]
-    result = {
-        "interval_initial": list(initial.hard_interval),
-        "interval_final": list(final.hard_interval),
-        "stored_interval": list(best.hard_interval),
-        "returned_iteration": best.iteration,
-        "smooth_lower": final.smooth_lower,
-        "smooth_beta": final.beta,  # final replay uses beta_end, not the checkpoint's beta
-        "hard_interval": list(final.hard_interval),
-        "optimization_trace": optimization_trace,
-        "control_cost": final.control_cost,
-        "controls": final.controls,
-        "history": history,
-        "iterations": len(history),
-        "goal_trace": goal,
-        "safe_trace": safe,
-        "bounds_trace": _event_trace(events["workspace"], final.rollout),
-        "obstacle_traces": _obstacle_traces(events, final.rollout),
-        "goal_step": goal_step,
-        "goal_interval": goal[goal_step].tolist(),
-        "safe_step": safe_step,
-        "min_safe_interval": safe[safe_step].tolist(),
-        "mean_trace": mean_trace,
-        "cov_trace": final.rollout.aux["cov_trace"],
-        "u_trace": final.controls.unsqueeze(0),
-        "mean_initial": initial.rollout.aux["mean_trace"],
-        "cov_initial": initial.rollout.aux["cov_trace"],
-        "final_mean": mean_trace[0, -1].tolist(),
-        "min_mean_clearance": _mean_clearance(mean_trace, s.env.obstacles),
-    }
-    _log_intervals("reach_avoid", spec, result)
+    controller = normalize_controller_type((config.get("controller") or {}).get("type", "single_shot"))
+    if controller == "single_shot":
+        result = planner.solve(mean0, covariance0, initial_controls=initial_controls)
+    elif controller == "receding_horizon":
+        controller_config = config["controller"]
+        result = RecedingHorizonController(
+            planner=planner, dynamics=planner.dynamics,
+            scenario=environment, config=controller_config,
+        ).run(
+            mean0, (mean0, covariance0),
+            max_steps=controller_config["max_steps"],
+            apply_steps=controller_config.get("apply_steps", 1),
+            initial_controls=initial_controls,
+        )
+    else:
+        raise ValueError(f"unknown controller type {controller!r}")
 
-    if save:
-        torch.save(result, _output_path(s.cfg["save_file"]))
+    log_utils.log_plan_summary(config["scenario"].get("name", "reach_avoid"), result)
+
     if save or show:
-        visualize_reach_avoid(
-            result, s.env, dt=s.cfg["dt"], ellipse_every=s.cfg["ellipse_every"],
-            save_path=_output_path(s.cfg["figure"]) if save else None, show=show,
-        )
+        from visualization.planning import visualize_execution, visualize_plan
+
+        figure_path = output_path(config["output"]["figure"]) if save else None
+        if controller == "single_shot":
+            visualize_plan(
+                result, environment, config.get("visualization") or {},
+                initial_controls=initial_controls, save_path=figure_path, show=show,
+            )
+        else:
+            visualize_execution(
+                result, environment, config.get("visualization") or {},
+                save_path=figure_path, show=show,
+            )
     return result
 
 
-# --- Legacy scenarios (single shot, MPC, lane change) ------------------------------
-
-
-def check_collision(mean_trace, env, r_robot=1.0, moving_obs_dist=2.25):
-    """Log mean-path conflicts with static (inflated) and moving obstacles."""
-    traj = mean_trace.squeeze()
-    if traj.ndim == 1:
-        traj = traj.unsqueeze(0)
-    is_safe, min_sep = True, float("inf")
-
-    for t in range(traj.shape[0]):
-        ego_pos = traj[t].cpu().numpy()
-        for obs in env.obstacles:
-            (x_min, x_max), (y_min, y_max) = obs["x"], obs["y"]
-            if (x_min - r_robot <= ego_pos[0] <= x_max + r_robot) and (
-                y_min - r_robot <= ego_pos[1] <= y_max + r_robot
-            ):
-                log_utils.log_collision_event(t, "Static obstacle", f"ego={ego_pos}")
-                is_safe = False
-        for obs in env.moving_obstacles:
-            xt, yt = obs["x_traj"], obs["y_traj"]
-            if t < len(xt):
-                ox = xt[t].item() if isinstance(xt, torch.Tensor) else xt[t]
-                oy = yt[t].item() if isinstance(yt, torch.Tensor) else yt[t]
-                dist = np.linalg.norm(ego_pos[:2] - np.array([ox, oy]))
-                min_sep = min(min_sep, dist)
-                if dist < moving_obs_dist:
-                    log_utils.log_collision_event(t, "Moving obstacle", f"dist={dist:.2f}")
-                    is_safe = False
-
-    log_utils.log_safety(is_safe, min_sep)
-
-
-def _normalise_result(data):
-    """Fill keys missing from older saved results."""
-    result = dict(data)
-    if "loss_trace" not in result and "history" in result:
-        result["loss_trace"] = result["history"]
-    if "history" not in result and "loss_trace" in result:
-        result["history"] = result["loss_trace"]
-    result.setdefault("p_sat_trace", [result.get("best_p", 0.0)])
-    result.setdefault("all_plans", [])
-    result.setdefault("best_p", max(result["p_sat_trace"]) if result["p_sat_trace"] else 0.0)
-    result.setdefault("mode", "loaded")
-    result.setdefault("stopped_reason", None)
-    return result
-
-
-def _load_or_solve(cfg, planner_cfg, env, *, horizon, load_from=None, force_run=False,
-                   make_callback=None):
-    """Load a saved result if present, else run Planner.solve and save it."""
-    result_path = load_from or (str(RESULTS_DIR / cfg["save_file"]) if "save_file" in cfg else None)
-    if not force_run and result_path and Path(result_path).exists():
-        log_utils.log_load(result_path)
-        return _normalise_result(torch.load(result_path, map_location=env.device, weights_only=False))
-
-    planner = Planner(build_dynamics(cfg, env.device), env, horizon, config=planner_cfg)
-    step_callback = make_callback(env) if make_callback is not None else None
-    result = planner.solve(*build_initial_belief(cfg, env.device), step_callback=step_callback)
-
-    if result_path:
-        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(result, result_path)
-        log_utils.log_save(result_path)
-    return result
-
-
-def _animate(result, env, cfg, **kwargs):
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"], result["cov_trace"], env, filename=_output_path(anim["filename"]),
-        step=anim["step"], title=anim["title"], bounds=anim.get("bounds"), **kwargs,
-    )
-
-
-def run_single_shot(max_iterations=1000, load_from=None, force_run=False, *,
-                    config_path="configs/scenarios/single_shot.yaml", show=True):
+def run_lane_merge(config_path="configs/scenarios/lane_change.yaml", *, show=True, save=True):
+    """Existing lane-merge scenario, executed by the generic receding-horizon controller."""
+    config = load_config(config_path)
     device = get_device()
     log_utils.log_device(device)
-    cfg, planner_cfg = load_scenario_config(config_path)
-    planner_cfg["max_iters"] = max_iterations
-    env = build_environment(cfg, device)
+    log_utils.log_scenario_start(config.get("label", "lane merge"))
 
-    log_utils._log.info("Starting single-shot optimisation...")
-    result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=cfg["T"], load_from=load_from, force_run=force_run
+    environment = build_scenario({**config, "scenario": {"type": "lane_merge"}}, device)
+    planner = build_planner(
+        {
+            **config,
+            "horizon": config["H"],
+            "dynamics": _legacy_dynamics_block(config),
+            "optimizer": _legacy_optimizer_block(config),
+        },
+        environment,
     )
-    log_utils._log.info(f"Done. Final stochastic robustness: {result['best_p']:.4f}")
+    mean0, covariance0 = build_initial_belief(
+        {"mean": config["x0_mean"], "covariance": config["x0_cov_scale"]}, device
+    )
+    controller_config = config.get("controller") or {"max_steps": config["T_SIM"]}
+    result = RecedingHorizonController(
+        planner=planner, dynamics=planner.dynamics, scenario=environment, config=controller_config,
+    ).run(
+        mean0, (mean0, covariance0),
+        max_steps=controller_config.get("max_steps", config["T_SIM"]),
+        apply_steps=controller_config.get("apply_steps", 1),
+    )
+    log_utils.log_plan_summary(config.get("label", "lane_merge"), result)
 
-    if show:
-        visualize_results(result["mean_trace"], result["cov_trace"], result["u_trace"], env,
-                          result["loss_trace"])
-        _animate(result, env, cfg)
+    if show or save:
+        from visualization.planning import visualize_lane_merge
+
+        visualize_lane_merge(result, environment, config, show=show, save=save)
     return result
 
 
-def run_mpc(load_from=None, force_run=False, *, config_path="configs/scenarios/mpc.yaml", show=True):
-    device = get_device()
-    log_utils.log_device(device)
-    cfg, planner_cfg = load_scenario_config(config_path)
-    env = build_environment(cfg, device)
+# --- Legacy lane-merge configuration --------------------------------------------
+# lane_change*.yaml predate the scenario/controller/optimizer schema. Rather than rewriting
+# those files (and moving lane-merge behaviour with them), map their keys onto the new ones.
 
-    log_utils._log.info(f"Starting MPC execution (horizon={cfg['H']})...")
-    result = _load_or_solve(
-        cfg, {**planner_cfg, "MAX_STEPS": cfg["MAX_STEPS"]}, env, horizon=cfg["H"],
-        load_from=load_from, force_run=force_run,
-        make_callback=make_mpc_live_callback if show else None,
-    )
-
-    if show:
-        visualize_results(result["mean_trace"], result["cov_trace"], result["u_trace"], env,
-                          history=result["loss_trace"], p_sat_trace=result["p_sat_trace"])
-        _animate(result, env, cfg, plan_traces=result["all_plans"])
-    return result
+LEGACY_OPTIMIZER_KEYS = {
+    "lr": "learning_rate",
+    "max_iters": "max_iterations",
+    "alpha": "probability_target",
+    "converge_patience": "convergence_patience",
+}
+LEGACY_LOSS_KEYS = {
+    "w_phi": "pdstl_weight",
+    "w_u": "control_effort_weight",
+    "w_du": "control_smoothness_weight",
+    "w_dist": "terminal_goal_weight",
+}
 
 
-def run_lane_change(config_path="configs/scenarios/lane_change.yaml", *, show=True):
-    device = get_device()
-    log_utils.log_device(device)
-    cfg, planner_cfg = load_scenario_config(config_path)
-    log_utils.log_scenario_start(cfg.get("label", ""))
+def _legacy_dynamics_block(config):
+    """Lane-merge configs predate the `dynamics:` block and keep these keys at top level."""
+    return {
+        "type": config.get("dynamics", "single_integrator"),
+        "dt": config["dt"], "u_max": config["u_max"], "q_std": config["q_std"],
+    }
 
-    env = build_environment(cfg, device)
-    planner_cfg = {**planner_cfg, "T_SIM": cfg["T_SIM"], "mpc_mode": "lane_change"}
-    result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=cfg["H"], force_run=True,
-        make_callback=make_lane_change_live_callback if show else None,
-    )
-    if env.moving_obstacles:
-        env.clip_moving_obstacles(result["mean_trace"].shape[1])
-    check_collision(result["mean_trace"], env, r_robot=planner_cfg["r_robot"],
-                    moving_obs_dist=planner_cfg["moving_obs_dist"])
 
-    if show:
-        visualize_lane_change(
-            result["mean_trace"], result["cov_trace"], result["u_trace"], env,
-            p_sat_trace=result["p_sat_trace"], dt=cfg["dt"], robot_dims=env.robot_dims,
-            xlim=env.plot_xlim,
-        )
-        _animate(result, env, cfg, plan_traces=result["all_plans"], robot_dims=env.robot_dims)
-    return result
+def _legacy_planner_config(config):
+    """planning.yaml defaults overlaid with the scenario's own `planner:` block."""
+    return {**load_config("configs/planning.yaml"), **(config.get("planner") or {})}
+
+
+def _window_config(config):
+    """Local-window geometry and shaping parameters for the lane-merge scenario."""
+    return {**_legacy_planner_config(config), **(config.get("window") or {})}
+
+
+def _legacy_optimizer_block(config):
+    """Translate a legacy `planner:` block into the new `optimizer:` schema."""
+    legacy = _legacy_planner_config(config)
+    optimizer = {new: legacy[old] for old, new in LEGACY_OPTIMIZER_KEYS.items() if old in legacy}
+    optimizer["loss"] = {new: legacy[old] for old, new in LEGACY_LOSS_KEYS.items() if old in legacy}
+    optimizer["smoothing"] = dict(legacy.get("smoothing") or {})
+    # `extras` reaches the scenario's extra_loss hook; lane merge reads w_obs and obs_margin.
+    optimizer.update({k: legacy[k] for k in ("w_obs", "obs_margin") if k in legacy})
+    return optimizer
+
+
+# `mpc` was the old name for receding-horizon execution; both route here.
+run_lane_change = run_lane_merge
