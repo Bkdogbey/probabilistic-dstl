@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
-from models.rollouts import BeliefRollout
 from pdstl.operators import LessThan
 from planning.examples import (
     end_to_end_setup,
@@ -55,11 +54,8 @@ def test_gradient_reaches_controls_through_the_whole_pipeline():
 
     atomic = predicate(traj)
     robustness = spec(traj, scale=-1)[0, 0, 0]
-    planner = Planner(dyn, None, cfg["H"], config={"loss": {"pdstl_weight": planner_cfg["w_phi"]}})
-    loss = planner.objective(
-        smooth_lower=robustness,
-        controls=dyn.bound_control(v),
-        rollout=BeliefRollout(traj, mean),
+    loss = Planner(dyn, None, cfg["H"], config=planner_cfg)._objective(
+        mean, dyn.bound_control(v), robustness
     )
     loss.backward()
 

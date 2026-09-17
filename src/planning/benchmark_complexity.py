@@ -16,35 +16,30 @@ import torch.optim as optim
 
 from models.dynamics import SingleIntegrator
 from models.beliefs import create_gaussian_belief_trajectory
-from planning.runners import build_scenario
-from utils import load_config
+from planning.runners import build_environment, load_scenario_config
 
 
 def build_spec_and_env(T, device):
-    """Build the canonical reach-avoid environment and spec, parameterised by T."""
-    cfg = load_config("configs/scenarios/reach_avoid.yaml")
-    env = build_scenario(cfg, device)
-    return env, env.specification(T), cfg
+    """Build the same environment and spec used in run_single_shot, parameterised by T."""
+    cfg, _ = load_scenario_config("configs/scenarios/single_shot.yaml")
+    env = build_environment(cfg, device)
+    return env, env.get_specification(T), cfg
 
 
 def single_iteration_time(T, device, n_warmup=3, n_trials=10):
     """Return mean wall-clock time (seconds) for one forward+backward pass at horizon T."""
     _, spec, cfg = build_spec_and_env(T, device)
-    planner_cfg = load_config("configs/scenarios/reach_avoid.yaml")["optimizer"]
-    dynamics_cfg = cfg["dynamics"]
-    dyn = SingleIntegrator(
-        dt=dynamics_cfg["dt"], u_max=dynamics_cfg["u_max"],
-        q_std=dynamics_cfg["q_std"], device=device,
-    )
+    _, planner_cfg = load_scenario_config("configs/scenarios/single_shot.yaml")
+    dyn = SingleIntegrator(dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device)
 
-    x0_mean = torch.tensor(cfg["initial_belief"]["mean"], device=device)
-    x0_cov = torch.tensor(cfg["initial_belief"]["covariance"], device=device)
+    x0_mean = torch.tensor(cfg["x0_mean"], device=device)
+    x0_cov = torch.eye(len(cfg["x0_mean"]), device=device) * cfg["x0_cov_scale"]
 
     v_params = nn.Parameter(
         torch.randn(T, 2, device=device) * 0.1 + torch.tensor([0.5, 0.0], device=device),
         requires_grad=True,
     )
-    optimizer = optim.Adam([v_params], lr=planner_cfg["learning_rate"])
+    optimizer = optim.Adam([v_params], lr=planner_cfg["lr"])
 
     def one_pass():
         optimizer.zero_grad()
@@ -65,12 +60,7 @@ def single_iteration_time(T, device, n_warmup=3, n_trials=10):
         u_diff = u_seq[1:] - u_seq[:-1]
         loss_du = torch.sum(u_diff ** 2)
         loss_phi = -torch.log(p_all + 1e-4)
-        loss_cfg = planner_cfg["loss"]
-        J = (
-            loss_cfg["control_effort_weight"] * loss_u
-            + loss_cfg["control_smoothness_weight"] * loss_du
-            + loss_cfg["pdstl_weight"] * loss_phi
-        )
+        J = planner_cfg["w_u"] * loss_u + planner_cfg["w_du"] * loss_du + planner_cfg["w_phi"] * loss_phi
 
         # --- Backward ---
         J.backward()

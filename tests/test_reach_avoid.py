@@ -1,303 +1,280 @@
-"""Canonical gate-corridor reach-avoid, end to end:
+"""Single-shot reach-and-avoid through a double-slit barrier, environment-driven:
 
-    YAML -> SingleIntegrator, Environment, b_0
-    -> gaussian_rollout: u -> beliefs -> AxisInterval probabilities
-    -> pdSTL (Frechet Boolean, min/max temporal) -> smooth lower -> Adam
-    -> exact hard evaluation
+    scenario -> SingleIntegrator, Environment, b_0
+    -> gaussian_rollout: u -> b_0:H(u) -> InsideRectangle / OutsideRectangle events
+    -> GaussianBelief.probability_bounds -> pdSTL -> Planner.optimize_window
 
-Everything geometric is configuration-driven; these tests assert that, not coordinates.
+The planner optimises pdSTL robustness of the predicted belief trajectory with
+every shaping weight at zero; the mean path is only checked post hoc.
 """
+
+import ast
+import inspect
 
 import matplotlib
 
 matplotlib.use("Agg")
-import ast
-import copy
-from pathlib import Path
-
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 import pytest
 import torch
 
 import planning.runners as runners
-from pdstl.operators import Always, And, Eventually
-from pdstl.predicates import InsideRectangle, OutsideRectangle
-from planning.environment import DeadlineExpired, Environment
-from planning.planner import OptimizationRecord, PlanResult
 from planning.runners import (
+    build_dynamics,
+    build_environment,
     build_initial_belief,
-    build_planner,
-    build_scenario,
-    initialize_toward_goal,
+    load_scenario_config,
+    run_reach_avoid,
 )
-from utils import load_config
+from models.beliefs import GaussianBelief
+from models.dynamics import SingleIntegrator
+from pdstl.predicates import InsideRectangle, OutsideRectangle
+from planning.environment import Environment
+from planning.planner import Planner
+from visualization.planning import plot_event_probabilities, plot_reach_avoid, visualize_reach_avoid
 
 CONFIG = "configs/scenarios/reach_avoid.yaml"
-ROOT = Path(__file__).resolve().parents[1]
-FAST = {"max_iterations": 40, "convergence_patience": 15}
 
 
 @pytest.fixture(scope="module")
-def config():
-    return load_config(CONFIG)
+def problem():
+    """The same objects run_reach_avoid builds, for replay and gradient checks."""
+    cfg, planner_cfg = load_scenario_config(CONFIG)
+    dyn = build_dynamics(cfg, "cpu")
+    env = build_environment(cfg, "cpu")
+    x0_mean, x0_cov = build_initial_belief(cfg, "cpu")
+    rollout = runners.gaussian_rollout(dyn, x0_mean, x0_cov)
+    spec = env.get_specification(cfg["H"], t_goal_start=1)
+    planner = Planner(dyn, env, cfg["H"], config=planner_cfg)
+    return cfg, planner_cfg, dyn, env, rollout, spec, planner
 
 
 @pytest.fixture(scope="module")
-def problem(config):
-    environment = build_scenario(config, "cpu")
-    planner = build_planner(config, environment)
-    mean0, covariance0 = build_initial_belief(config["initial_belief"], "cpu")
-    return config, environment, planner, mean0, covariance0
+def result():
+    return run_reach_avoid(show=False, save=False)
 
 
-def _solve(config, *, overrides=None, optimizer=None):
-    """Solve the scenario with a small iteration budget, optionally after editing the config."""
-    cfg = copy.deepcopy(config)
-    cfg["optimizer"] = {**cfg["optimizer"], **FAST, **(optimizer or {})}
-    if overrides:
-        cfg["environment"] = {**cfg["environment"], **overrides}
-    environment = build_scenario(cfg, "cpu")
-    planner = build_planner(cfg, environment)
-    mean0, covariance0 = build_initial_belief(cfg["initial_belief"], "cpu")
-    controls = initialize_toward_goal(
-        mean0=mean0, goal=environment.goal, dynamics=planner.dynamics, horizon=cfg["horizon"]
+def _inside(points, x_range, y_range, strict):
+    x, y = points[:, 0], points[:, 1]
+    if strict:
+        return (x > x_range[0]) & (x < x_range[1]) & (y > y_range[0]) & (y < y_range[1])
+    return (x >= x_range[0]) & (x <= x_range[1]) & (y >= y_range[0]) & (y <= y_range[1])
+
+
+# --- Wiring ------------------------------------------------------------------
+
+
+def test_runner_uses_the_scenario_model_environment_and_rollout(monkeypatch):
+    calls = {"rollout": [], "spec": 0}
+    real_rollout = runners.gaussian_rollout
+    real_spec = Environment.get_specification
+
+    def rollout_spy(dynamics, mean0, cov0):
+        calls["rollout"].append(dynamics)
+        return real_rollout(dynamics, mean0, cov0)
+
+    def spec_spy(self, *args, **kwargs):
+        calls["spec"] += 1
+        return real_spec(self, *args, **kwargs)
+
+    monkeypatch.setattr(runners, "gaussian_rollout", rollout_spy)
+    monkeypatch.setattr(Environment, "get_specification", spec_spy)
+    run_reach_avoid(show=False, save=False)
+
+    assert len(calls["rollout"]) == 1
+    assert isinstance(calls["rollout"][0], SingleIntegrator)
+    assert calls["spec"] == 1
+
+
+def test_spec_is_built_from_spatial_events(problem):
+    cfg, *_, spec, _ = problem
+    events = [m for m in spec.modules() if isinstance(m, (InsideRectangle, OutsideRectangle))]
+    outside = [e for e in events if isinstance(e, OutsideRectangle)]
+    inside = [e for e in events if isinstance(e, InsideRectangle)]
+
+    assert len(outside) == len(cfg["obstacles"])   # one avoid event per barrier block
+    assert len(inside) == 2                        # goal and workspace
+    assert len(events) == len(outside) + len(inside)
+
+
+def test_runner_contains_no_optimisation_or_probability_code():
+    tree = ast.parse(inspect.getsource(run_reach_avoid))
+    assert not any(isinstance(n, (ast.For, ast.While)) for n in ast.walk(tree))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    for forbidden in ("backward", "optim", "Adam", "normal_cdf", "cdf", "erf", "step"):
+        assert forbidden not in names
+
+    module = ast.parse(inspect.getsource(runners))
+    imported = {n.module for n in ast.walk(module) if isinstance(n, ast.ImportFrom)}
+    imported |= {a.name for n in ast.walk(module) if isinstance(n, ast.Import) for a in n.names}
+    assert not any("optim" in m for m in imported)
+
+
+def test_shaping_weights_are_zero(problem):
+    _, planner_cfg, *_ = problem
+    assert planner_cfg["w_dist"] == planner_cfg["w_obs"] == planner_cfg["w_visit"] == 0
+    assert planner_cfg["w_phi"] > 0
+    assert planner_cfg["smoothing"]["enabled"]
+
+
+# --- Planning outcome ----------------------------------------------------------
+
+
+def test_outputs_are_finite_and_controls_bounded(result, problem):
+    _, _, dyn, *_ = problem
+    for key in ("mean_trace", "cov_trace", "goal_trace", "safe_trace", "controls"):
+        assert torch.isfinite(result[key]).all(), key
+    assert torch.isfinite(torch.tensor(result["history"])).all()
+    assert (result["controls"].abs() <= dyn.u_max).all()
+
+
+def test_pdstl_lower_score_improves_from_a_poor_start(result):
+    lower_initial, lower_final = result["interval_initial"][0], result["interval_final"][0]
+    assert lower_initial < 0.1
+    assert lower_final > lower_initial + 0.5
+    # The Frechet conjunction bound caps this near 0.945; do not pin it tighter.
+    assert lower_final > 0.85
+    assert lower_final <= result["interval_final"][1] + 1e-6
+
+
+def test_plan_has_useful_goal_and_safety_probabilities(result):
+    assert result["goal_interval"][0] > 0.9
+    assert result["min_safe_interval"][0] > 0.9
+    assert result["safe_trace"][1:, 0].min() == pytest.approx(result["min_safe_interval"][0])
+    assert result["goal_trace"][1:, 0].max() == pytest.approx(result["goal_interval"][0])
+
+
+def test_safety_trace_is_the_conjunction_over_every_block(result, problem):
+    cfg, *_ = problem
+    per_obstacle = result["obstacle_traces"]
+    assert len(per_obstacle) == len(cfg["obstacles"])
+
+    # Frechet: the joint lower bound never exceeds any single block's, and the joint
+    # upper bound never exceeds the tightest single upper bound.
+    for trace in per_obstacle:
+        assert (result["safe_trace"][:, 0] <= trace[:, 0] + 1e-6).all()
+        assert (result["safe_trace"][:, 1] <= trace[:, 1] + 1e-6).all()
+
+
+def test_returned_controls_replay_to_the_stored_pdstl_interval(result, problem):
+    *_, rollout, spec, planner = problem
+    replay = planner.evaluate_controls(rollout, result["controls"], spec=spec)
+
+    assert all(isinstance(b, GaussianBelief) for b in replay.rollout.belief_trajectory)
+    assert list(replay.hard_interval) == pytest.approx(result["interval_final"], abs=1e-4)
+    assert result["interval_final"] == pytest.approx(result["stored_interval"], abs=1e-4)
+
+
+def test_gradients_flow_from_controls_through_beliefs_and_events_to_the_objective(problem):
+    cfg, _, dyn, _, rollout, spec, planner = problem
+    u_init = torch.tensor(cfg["init_control"]).repeat(cfg["H"], 1)
+    v = planner._control_parameters(u_init).clone().requires_grad_(True)
+
+    predicted = rollout(v)
+    smooth, _ = planner._scores(spec, predicted.belief_trajectory, planner._beta(0))
+    objective = planner._objective(predicted.nominal_trace, dyn.bound_control(v), smooth)
+    objective.backward()
+
+    assert torch.isfinite(objective)
+    assert torch.isfinite(v.grad).all()
+    assert v.grad.abs().sum() > 0
+
+
+def test_post_hoc_mean_avoids_every_block_and_reaches_the_goal(result, problem):
+    cfg, *_ = problem
+    path = result["mean_trace"][0, 1:]
+
+    for obstacle in cfg["obstacles"]:
+        assert not _inside(path, obstacle["x_range"], obstacle["y_range"], strict=True).any()
+    assert result["min_mean_clearance"] > 0
+    assert _inside(path, cfg["bounds"]["x_range"], cfg["bounds"]["y_range"], strict=False).all()
+    assert _inside(path, cfg["goal"]["x_range"], cfg["goal"]["y_range"], strict=False).any()
+
+    # and the initial guess did not: it runs straight into the middle block
+    initial = result["mean_initial"][0, 1:]
+    hits = [_inside(initial, o["x_range"], o["y_range"], strict=True).any() for o in cfg["obstacles"]]
+    assert any(hits)
+
+
+def test_optimized_mean_crosses_the_barrier_only_through_a_slit(result, problem):
+    """The blocks tile the barrier's y-extent apart from the slits, so clearing every
+    block inside the barrier x-span is exactly 'the plan went through a gap'."""
+    cfg, *_ = problem
+    path = result["mean_trace"][0, 1:]
+    span = cfg["obstacles"][0]["x_range"]
+    crossing = path[_inside(path, span, cfg["bounds"]["y_range"], strict=False)]
+
+    assert len(crossing) > 0, "the plan never reaches the barrier"
+    for obstacle in cfg["obstacles"]:
+        blocked = (crossing[:, 1] > obstacle["y_range"][0]) & (crossing[:, 1] < obstacle["y_range"][1])
+        assert not blocked.any()
+
+
+# --- Visualization -------------------------------------------------------------
+
+
+def test_plots_draw_the_belief_sequence_and_event_probabilities(result, problem):
+    cfg, _, _, env, *_ = problem
+    fig, ax = plot_reach_avoid(
+        result["mean_initial"], result["cov_initial"],
+        result["mean_trace"], result["cov_trace"],
+        env, cfg["ellipse_every"], show=False,
     )
-    return environment, planner, planner.solve(mean0, covariance0, initial_controls=controls)
+    ellipses = [p for p in ax.patches if isinstance(p, patches.Ellipse)]
+    rectangles = [p for p in ax.patches if isinstance(p, patches.Rectangle)]
+    assert len(rectangles) == len(cfg["obstacles"]) + 2   # blocks, goal, workspace
+    assert len(ellipses) == len(range(0, cfg["H"] + 1, cfg["ellipse_every"]))
+    labels = ax.get_legend_handles_labels()[1]
+    assert "Predicted belief mean" in labels
+    assert not any("Initial" in label for label in labels)
+    fig.canvas.draw()
+    plt.close(fig)
 
-
-# --- Environment: configuration drives the geometry ------------------------------
-
-
-def test_specification_is_always_safe_and_eventually_goal(problem):
-    _, environment, _, _, _ = problem
-    spec = environment.specification(12)
-
-    assert isinstance(spec, And)
-    safe, reach = spec.subformula1, spec.subformula2
-    assert isinstance(safe, Always) and safe.interval == [1, 12]
-    assert isinstance(reach, Eventually) and reach.interval == [1, 12]
-    assert isinstance(reach.subformula, InsideRectangle)
-
-    # Always covers every obstacle-outside event conjoined with the workspace.
-    leaves, stack = [], [safe.subformula]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, And):
-            stack.extend([node.subformula1, node.subformula2])
-        else:
-            leaves.append(node)
-    assert sum(isinstance(leaf, OutsideRectangle) for leaf in leaves) == 2
-    assert sum(isinstance(leaf, InsideRectangle) for leaf in leaves) == 1  # the workspace
-
-
-@pytest.mark.parametrize("count", [0, 1, 3, 5])
-def test_any_number_of_obstacles_is_accepted(config, count):
-    blocks = [
-        {"name": f"block_{i}", "x_range": [float(i), i + 0.5], "y_range": [0.0, 1.0]}
-        for i in range(count)
-    ]
-    environment = Environment.from_config({**config["environment"], "obstacles": blocks})
-    assert len(environment.obstacles) == count
-    assert len(environment.predicates()["obstacles"]) == count
-    environment.specification(10)  # still a well-formed formula
-
-
-def test_moving_an_obstacle_in_yaml_moves_its_predicate(config):
-    moved = [{"name": "block", "x_range": [1.25, 2.75], "y_range": [3.5, 4.5]}]
-    environment = Environment.from_config({**config["environment"], "obstacles": moved})
-    (event,) = environment.predicates()["obstacles"]
-    assert event.x_range == (1.25, 2.75)
-    assert event.y_range == (3.5, 4.5)
-    assert "block" in event.name
-
-
-def test_no_scenario_coordinates_are_embedded_in_python():
-    """Gate-corridor numbers must appear only in YAML."""
-    scenario_numbers = {8.5, 9.5, 4.0, 6.0, 10.0}
-    for path in ("src/planning/environment.py", "src/planning/planner.py",
-                 "src/planning/runners.py"):
-        tree = ast.parse((ROOT / path).read_text())
-        literals = {
-            node.value for node in ast.walk(tree)
-            if isinstance(node, ast.Constant) and isinstance(node.value, float)
-        }
-        assert not (literals & scenario_numbers), f"{path} hard-codes scenario geometry"
-
-
-# --- Planner ---------------------------------------------------------------------
-
-
-def test_solve_returns_the_minimal_plan_result(config):
-    _, _, result = _solve(config)
-    assert isinstance(result, PlanResult)
-    assert set(result.__dataclass_fields__) == {
-        "controls", "rollout", "hard_interval", "history", "best_iteration"
+    traces = {
+        "P(goal)": result["goal_trace"],
+        "P(safe)": result["safe_trace"],
+        "P(workspace)": result["bounds_trace"],
     }
-    assert all(isinstance(record, OptimizationRecord) for record in result.history)
-    assert result.hard_interval.shape == (2,)
+    fig, ax = plot_event_probabilities(cfg["dt"], traces, show=False)
+    assert len(ax.lines) == 2 * len(traces)   # a lower and an upper curve per event
+    assert ax.get_legend_handles_labels()[1] == list(traces)
+    assert len(ax.collections) == len(traces)
+    plt.close(fig)
 
 
-def test_returned_controls_respect_the_configured_limit(config):
-    _, planner, result = _solve(config)
-    assert result.controls.shape == (config["horizon"], 2)
-    assert float(result.controls.abs().max()) <= planner.dynamics.u_max + 1e-6
-
-
-def test_optimization_improves_the_exact_hard_lower_score(config):
-    _, _, result = _solve(config)
-    first, best = result.history[0].hard_lower, max(r.hard_lower for r in result.history)
-    assert best > first, f"hard lower did not improve: {first} -> {best}"
-    assert 0.0 <= result.hard_lower <= result.hard_upper <= 1.0
-
-
-def test_replaying_the_returned_controls_reproduces_the_hard_interval(config):
-    environment, planner, result = _solve(config)
-    mean0, covariance0 = build_initial_belief(config["initial_belief"], "cpu")
-    from models.rollouts import gaussian_rollout
-
-    replay = gaussian_rollout(planner.dynamics, mean0, covariance0)(
-        planner.control_parameters(result.controls)
-    )
-    spec = environment.specification(config["horizon"])
-    with torch.no_grad():
-        interval = spec(replay.belief_trajectory, scale=-1)[0, 0]
-    torch.testing.assert_close(interval, result.hard_interval, atol=1e-5, rtol=0)
-
-
-def test_hard_evaluation_never_supplies_gradients(config):
-    """The returned interval is a detached diagnostic, not part of the objective graph."""
-    _, _, result = _solve(config)
-    assert not result.hard_interval.requires_grad
-    assert not result.controls.requires_grad
-
-
-def test_mean_path_crosses_the_gate_and_enters_neither_block(config):
-    environment, _, result = _solve(config, optimizer={"max_iterations": 250})
-    path = result.rollout.aux["mean_trace"][0]
-
-    for obstacle in environment.obstacles:
-        (x_lo, x_hi), (y_lo, y_hi) = obstacle["x"], obstacle["y"]
-        inside = (
-            (path[:, 0] >= x_lo) & (path[:, 0] <= x_hi)
-            & (path[:, 1] >= y_lo) & (path[:, 1] <= y_hi)
+def test_optimization_trace_records_the_actual_semantics_and_checkpoint(result, problem):
+    *_, rollout, spec, planner = problem
+    records = result["optimization_trace"]
+    assert [r["iteration"] for r in records] == list(range(result["iterations"]))
+    assert [r["objective"] for r in records] == result["history"]
+    for record in records:
+        assert record["beta"] == pytest.approx(planner._beta(record["iteration"]))
+        assert record["objective"] == pytest.approx(
+            -planner.cfg["w_phi"] * record["smooth_lower"] + record["control_cost"], abs=1e-5
         )
-        assert not bool(inside.any()), f"mean path entered {obstacle['name']}"
-
-    # and it went through the gap rather than around the wall
-    crossing = path[(path[:, 0] >= 4.0) & (path[:, 0] <= 6.0)]
-    assert len(crossing) > 0, "the path never crossed the barrier"
-    assert bool(((crossing[:, 1] > 4.0) & (crossing[:, 1] < 6.0)).all())
-
-
-def test_final_belief_reaches_the_goal_with_a_meaningful_lower_score(config):
-    environment, _, result = _solve(config, optimizer={"max_iterations": 250})
-    final_mean = result.rollout.aux["mean_trace"][0, -1]
-    (x_lo, x_hi), (y_lo, y_hi) = environment.goal["x"], environment.goal["y"]
-    assert x_lo <= float(final_mean[0]) <= x_hi
-    assert y_lo <= float(final_mean[1]) <= y_hi
-    assert result.hard_lower > 0.2
+    selected = records[result["returned_iteration"]]
+    assert selected["hard_interval"] == pytest.approx(result["hard_interval"], abs=1e-4)
+    predicted = rollout(planner._control_parameters(result["controls"]))
+    smooth = spec(predicted.belief_trajectory, scale=selected["beta"])[0, 0, 0].item()
+    assert selected["smooth_lower"] == pytest.approx(smooth, abs=1e-4)
 
 
-def test_planner_needs_no_repulsion_or_goal_distance_shaping(config):
-    """The canonical loss is pdSTL plus control regularisation; shaping stays off."""
-    cfg = copy.deepcopy(config)
-    assert cfg["optimizer"]["loss"]["terminal_goal_weight"] == 0.0
-    _, planner, result = _solve(cfg)
-    assert planner.config.terminal_goal_weight == 0.0
-    assert max(r.hard_lower for r in result.history) > result.history[0].hard_lower
-
-
-def test_changing_goal_and_obstacles_in_yaml_needs_no_python_change(config):
-    """Same code, different YAML: a wider gate must score at least as well."""
-    wide = [
-        {"name": "lower", "x_range": [4.0, 6.0], "y_range": [0.0, 3.0]},
-        {"name": "upper", "x_range": [4.0, 6.0], "y_range": [7.0, 10.0]},
-    ]
-    environment, _, result = _solve(config, overrides={"obstacles": wide})
-    assert [o["name"] for o in environment.obstacles] == ["lower", "upper"]
-    assert 0.0 <= result.hard_lower <= 1.0
-
-
-# --- Temporal obligations --------------------------------------------------------
-
-
-def test_goal_window_is_relative_without_a_configured_deadline(problem):
-    _, environment, _, _, _ = problem
-    assert environment.goal_deadline is None
-    assert environment.goal_window(40, step=0) == [1, 40]
-    assert environment.goal_window(40, step=9) == [1, 40], "no deadline means no countdown"
-
-
-def test_configured_deadline_counts_down_and_expires():
-    environment = Environment.from_config({
-        "goal_deadline": 12,
-        "bounds": {"x_range": [0.0, 1.0], "y_range": [0.0, 1.0]},
-        "goal": {"name": "g", "x_range": [0.0, 1.0], "y_range": [0.0, 1.0]},
-    })
-    assert environment.goal_window(20, step=0) == [1, 12]
-    assert environment.goal_window(20, step=5) == [0, 7]
-    assert environment.goal_window(20, step=12) == [0, 0]
-    with pytest.raises(DeadlineExpired):
-        environment.goal_window(20, step=13)
-
-
-# --- Runner ----------------------------------------------------------------------
-
-
-def test_runner_returns_the_plan_result_unchanged(config, monkeypatch, tmp_path):
-    captured = {}
-    cfg = copy.deepcopy(config)
-    cfg["optimizer"] = {**cfg["optimizer"], **FAST}
-    monkeypatch.setattr(runners, "load_config", lambda path: cfg)
-
-    from planning.planner import Planner
-
-    original = Planner.solve
-
-    def spy(self, *args, **kwargs):
-        captured["result"] = original(self, *args, **kwargs)
-        return captured["result"]
-
-    monkeypatch.setattr(Planner, "solve", spy)
-    returned = runners.run_reach_avoid(show=False, save=False)
-
-    assert returned is captured["result"], "the runner must not rebuild the result"
-    assert isinstance(returned, PlanResult)
-
-
-def test_runner_plotting_and_saving_can_both_be_disabled(config, monkeypatch):
-    cfg = copy.deepcopy(config)
-    cfg["optimizer"] = {**cfg["optimizer"], **FAST}
-    monkeypatch.setattr(runners, "load_config", lambda path: cfg)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("visualization ran with show=False, save=False")
-
-    import visualization.planning as planning_viz
-
-    monkeypatch.setattr(planning_viz, "visualize_plan", forbidden)
-    runners.run_reach_avoid(show=False, save=False)
-
-
-def test_default_scenario_is_deterministic_under_a_fixed_seed(config):
-    torch.manual_seed(0)
-    _, _, first = _solve(config)
-    torch.manual_seed(0)
-    _, _, second = _solve(config)
-    torch.testing.assert_close(first.controls, second.controls)
-    torch.testing.assert_close(first.hard_interval, second.hard_interval)
-
-
-def test_initialization_points_from_the_start_toward_the_goal(problem):
-    config, environment, planner, mean0, _ = problem
-    controls = initialize_toward_goal(
-        mean0=mean0, goal=environment.goal, dynamics=planner.dynamics,
-        horizon=config["horizon"],
-    )
-    assert controls.shape == (config["horizon"], 2)
-    assert float(controls.abs().max()) <= planner.dynamics.u_max + 1e-6
-    centre = torch.tensor([
-        sum(environment.goal["x"]) / 2.0, sum(environment.goal["y"]) / 2.0
-    ])
-    direction = (centre - mean0) / torch.linalg.norm(centre - mean0)
-    step = controls[0] / torch.linalg.norm(controls[0])
-    torch.testing.assert_close(step, direction, atol=1e-5, rtol=0)
+def test_default_presentation_saves_three_views_and_debug_is_opt_in(result, problem, tmp_path):
+    cfg, _, _, env, *_ = problem
+    views = visualize_reach_avoid(result, env, dt=cfg["dt"], show=False,
+                                  save_path=str(tmp_path / "reach.png"))
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "reach.png", "reach_probabilities.png", "reach_optimization.png"
+    }
+    assert len(views[1][1].collections) == 2
+    curve = views[2][1].lines[0]
+    assert list(curve.get_ydata()) == [r["smooth_lower"] for r in result["optimization_trace"]]
+    debug_views = visualize_reach_avoid(result, env, dt=cfg["dt"], show=False,
+                                        show_initial=True, show_workspace=True)
+    assert "Initial predicted belief mean" in debug_views[0][1].get_legend_handles_labels()[1]
+    assert len(debug_views[1][1].collections) == 3
+    for fig, _ in (*views, *debug_views):
+        fig.canvas.draw()
+        plt.close(fig)

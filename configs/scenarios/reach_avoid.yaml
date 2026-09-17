@@ -1,79 +1,79 @@
-# Gate-corridor reach-avoid: a stochastic single integrator must cross a wall of blocks
-# through the gap between them and settle inside the goal rectangle.
+# Reach-avoid through a double-slit barrier.
 #
-# Every coordinate below is read by the code; nothing is hard-coded in Python. Adding,
-# moving, resizing or removing a block is an edit to `environment.obstacles` alone.
+#   phi = Always[1,H](outside A and outside B and outside C)
+#         and Eventually[1,H](inside goal)
+#         and Always[1,H](inside workspace)
+#
+# The barrier spans x in [3, 6] and is sealed against both workspace walls, so the
+# two slits are the only way through. The start sits at y = 5, dead centre in block
+# B, so the planner has to choose a passage rather than drift around one rectangle.
 #
 #   y=10 +--------------------------+
-#        |      ### upper ###       |
-#    6.0 |      ------------        |   gate: y in [4, 6]
-#    4.0 |      ------------        |
-#        |      ### lower ###  +-G-+|
-#   y=0  +--------------------------+
-#        x=0      4    6      8.5 9.5
+#        |      ### C ###           |
+#    7.5 |      ---------  slit 2   |   1.0 m gap
+#    6.5 |      ### B ###           |
+#      S |----> #######    +--G--+  |
+#    4.0 |      ---------  slit 1   |   1.2 m gap
+#    2.8 |      ### A ###  +-----+  |
+#    y=0 +--------------------------+
+#        x=0      3    6    9.5  12
 
-scenario:
-  type: reach_avoid
-  name: gate_corridor
+# --- Dynamics ---
+dynamics: single_integrator
+H: 80            # Planning horizon (time steps); 16 m budget for a ~10.9 m path
+dt: 0.2          # Time step [s]
+u_max: 1.0       # Maximum control magnitude per axis [m/s]
+q_std: 0.05      # Process noise standard deviation; sigma_k^2 = x0_cov_scale + k q_std^2
 
-controller:
-  type: single_shot
+# --- Initial belief ---
+x0_mean: [0.5, 5.0]   # Held off the x = 0 wall so P(workspace) starts at 1, not 0.5
+x0_cov_scale: 0.01   # Diagonal covariance initialised as I * x0_cov_scale
 
-horizon: 40
+# --- Environment ---
+# Workspace membership is another geometric predicate, not a clipping operation:
+# it is what stops the plan from going around the barrier instead of through it.
+bounds:
+  x_range: [0.0, 12.0]
+  y_range: [0.0, 10.0]
 
-dynamics:
-  type: single_integrator
-  dt: 0.25
-  u_max: 1.5
-  q_std: 0.08
+# Held clear of the x = 12 wall so reaching the goal does not fight the workspace.
+goal:
+  x_range: [9.5, 11.5]
+  y_range: [2.0, 4.0]
 
-initial_belief:
-  mean: [1.0, 1.0]
-  covariance:
-    - [0.04, 0.0]
-    - [0.0, 0.04]
+# Slit 1 (y in [2.8, 4.0]) is wider and lines up with the goal; slit 2 (y in
+# [6.5, 7.5]) is the narrower alternative. Both stay wide enough that the safety
+# bounds carry gradient instead of saturating at 0 or 1.
+obstacles:
+  - type: rectangle
+    x_range: [3.0, 6.0]
+    y_range: [0.0, 2.8]
+  - type: rectangle
+    x_range: [3.0, 6.0]
+    y_range: [4.0, 6.5]
+  - type: rectangle
+    x_range: [3.0, 6.0]
+    y_range: [7.5, 10.0]
 
-environment:
-  bounds:
-    x_range: [0.0, 10.0]
-    y_range: [0.0, 10.0]
+# Initial guess only, not part of the objective: a rightward bias that runs
+# straight into block B, so the optimiser has to discover a slit for itself.
+init_control: [0.7, -0.05]
 
-  goal:
-    name: goal
-    x_range: [8.5, 9.5]
-    y_range: [8.5, 9.5]
+# --- Planner overrides (on top of configs/planning.yaml); shaping off ---
+planner:
+  w_phi: 10.0
+  w_u: 0.01
+  w_du: 0.01
+  w_dist: 0.0
+  w_obs: 0.0
+  w_visit: 0.0
+  lr: 0.05
+  max_iters: 300
+  alpha: 0.90    # Early-stop target, reached around iteration 130. The Frechet
+                 # conjunction bound caps the attainable lower score near 0.945,
+                 # so the 0.95 default would never stop early.
 
-  obstacles:
-    - name: lower_block
-      x_range: [4.0, 6.0]
-      y_range: [0.0, 4.0]
-
-    - name: upper_block
-      x_range: [4.0, 6.0]
-      y_range: [6.0, 10.0]
-
-optimizer:
-  learning_rate: 0.03
-  max_iterations: 500
-  probability_target: 0.80
-  convergence_patience: 15
-
-  smoothing:
-    enabled: true
-    beta_start: 1.0
-    beta_end: 20.0
-
-  loss:
-    pdstl_weight: 1.0
-    control_effort_weight: 0.001
-    control_smoothness_weight: 0.01
-    terminal_goal_weight: 0.0
-
-visualization:
-  ellipse_every: 3
-  confidence_level: 0.95
-  show_initial_plan: true
-  show_optimization_history: true
-
-output:
-  figure: reach_avoid.png
+# --- Output ---
+ellipse_every: 10    # Covariance ellipse every N predicted steps
+save_file: reach_avoid.pt
+figure: reach_avoid.png

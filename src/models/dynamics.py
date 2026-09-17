@@ -25,23 +25,6 @@ class Dynamics(nn.Module):
         noise = torch.distributions.MultivariateNormal(torch.zeros_like(x_next), self.Q).sample()
         return x_next + noise, P_next
 
-    def execute_step(self, state, belief, control):
-        """Advance the simulated plant one step; returns (next_state, next_belief).
-
-        ASSUMPTION, preserved unchanged from the previous MPC loop rather than derived: the
-        controller observes the realised state exactly, so the next belief mean *is* the
-        sampled true state, while the covariance keeps growing as A P A^T + Q as though
-        nothing had been observed. That is neither an open-loop prediction nor a filtered
-        posterior, and the two would coincide only under a perfect, noiseless measurement.
-
-        It is kept deliberately: introducing an estimator is out of scope here. Whoever adds
-        a Kalman update later replaces exactly this method, and should replace the covariance
-        line as well as the mean.
-        """
-        _, covariance = belief
-        next_mean, next_covariance = self.sample_step(state, covariance, control)
-        return next_mean, (next_mean, next_covariance)
-
     def forward(self, v_sequence, x0_mean, x0_cov):
         """Roll out v [T, m] from (x0_mean, x0_cov); returns mean [1,T+1,D], cov [1,T+1,D,D]."""
         means, covs = [x0_mean], [x0_cov]

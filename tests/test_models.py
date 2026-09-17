@@ -10,8 +10,8 @@ from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
 from pdstl.base import BeliefTrajectory
 from pdstl.operators import GreaterThan, LessThan
 from scipy.stats import norm
-from planning.environment import Environment
-from planning.scenarios.lane_merge import extract_trajectory_stats
+from planning.environment import Environment, extract_trajectory_stats
+from models.rollouts import gaussian_rollout
 from planning.planner import Planner
 
 
@@ -119,17 +119,18 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     environment = Environment()
     environment.set_goal([0.5, 1.5], [-0.5, 0.5])
     planner = Planner(
-        SingleIntegrator(), environment, 3, config={"max_iterations": 1}
+        SingleIntegrator(), environment, 3, config={"max_iters": 1}
     )
-    result = planner.solve(
-        torch.tensor([0.0, 0.0]), torch.eye(2) * 0.1, initial_controls=torch.zeros(3, 2)
+    best, history = planner.optimize_window(
+        gaussian_rollout(planner.dyn, torch.tensor([0.0, 0.0]), torch.eye(2) * 0.1),
+        init_guess=torch.zeros(3, 2),
     )
-    assert result.rollout.aux["mean_trace"].shape == (1, 4, 2)
-    assert result.rollout.aux["cov_trace"].shape == (1, 4, 2, 2)
-    assert result.controls.shape == (3, 2)
-    assert 0 <= result.hard_lower <= 1
-    assert len(result.history) == 1
-    assert torch.isfinite(torch.tensor([r.loss for r in result.history])).all()
+    assert best.rollout.aux["mean_trace"].shape == (1, 4, 2)
+    assert best.rollout.aux["cov_trace"].shape == (1, 4, 2, 2)
+    assert best.controls.shape == (3, 2)
+    assert 0 <= best.hard_lower <= 1
+    assert len(history) == 1
+    assert torch.isfinite(torch.tensor(history)).all()
 
 
 def test_gaussian_trajectory_factory_preserves_supported_shapes_and_types():

@@ -1,5 +1,4 @@
-from planning.examples import run_altitude_safety
-from planning.runners import run_reach_avoid
+from planning.runners import run_altitude_safety, run_reach_avoid
 from utils import load_config, skip_run
 
 show_plots = load_config("configs/examples.yaml")["show_plots"]
