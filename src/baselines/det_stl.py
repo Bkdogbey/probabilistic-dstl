@@ -300,7 +300,7 @@ class DetMovingRectangularObstaclePredicate(DetSTL_Formula):
 
 def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
     """Deterministic mirror of Environment.get_specification on the mean trajectory."""
-    from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
+    from planning.environment import CircleRegion, MovingRectangleRegion
 
     def box(region):
         return {"x": region.x, "y": region.y}
@@ -308,9 +308,9 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
     specs = []
 
     # 1. Goal
-    if "goal" in env.regions:
+    if env.by_role("goal"):
         specs.append(DetEventually(
-            DetRectangularGoalPredicate(box(env.region("goal"))), interval=[t_goal_start, T]
+            DetRectangularGoalPredicate(box(env.single_region("goal"))), interval=[t_goal_start, T]
         ))
 
     # 2. Visit regions (liveness)
@@ -340,9 +340,9 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
         specs.append(DetAlways(safe_formula, interval=[t_constraints_start, T]))
 
     # 4. Workspace bounds
-    if "workspace" in env.regions:
+    if env.by_role("workspace"):
         specs.append(DetAlways(
-            DetRectangularGoalPredicate(box(env.region("workspace"))),
+            DetRectangularGoalPredicate(box(env.single_region("workspace"))),
             interval=[t_constraints_start, T],
         ))
 

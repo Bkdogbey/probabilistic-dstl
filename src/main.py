@@ -10,7 +10,7 @@ with skip_run("run", "AltitudeSafety") as check, check():
     run_altitude_safety(show=show_plots, save=True)
 
 
-# 2. ReachAvoid: 2-D position, Always[1,H](outside obstacle) and Eventually[1,H](inside goal)
+# 2. ReachAvoid: G[1,H](workspace and outside obstacles) and F[0,H](goal)
 with skip_run("run", "ReachAvoid") as check, check():
     print("\nReachAvoid")
     run_reach_avoid(show=show_plots, save=True)

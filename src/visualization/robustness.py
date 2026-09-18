@@ -320,15 +320,15 @@ def plot_mpc_reach(
     show=False,
 ):
     """Receding-horizon run: executed state, per-window plans, scores and applied controls."""
-    executed = _to_array(result["mean_trace"])[0, :, dim]
-    controls = _to_array(result["u_trace"])[0]
-    scores = np.asarray(result["exact_lowers"])
+    executed = np.asarray([state[0][dim].item() for state in result.states])
+    controls = _to_array(result.applied_controls)
+    scores = np.asarray([plan.hard_interval[0] for plan in result.window_plans])
     time = dt * np.arange(len(executed))
 
     fig, (ax_state, ax_score, ax_u) = plt.subplots(3, 1, figsize=figsize, sharex=True)
 
-    for k, plan in enumerate(result["plan_mean_traces"]):
-        plan_x = _to_array(plan)[0, :, dim]
+    for k, plan in enumerate(result.window_plans):
+        plan_x = _to_array(plan.rollout.aux["mean_trace"])[0, :, dim]
         ax_state.plot(
             dt * (k + np.arange(len(plan_x))), plan_x, color=_BLUE, lw=0.8, alpha=0.25,
             label="predicted H-step plans" if k == 0 else None,
@@ -337,7 +337,7 @@ def plot_mpc_reach(
     ax_state.axhline(float(threshold), color=_RED, ls="--", lw=1.3, label=f"x = {threshold}")
     ax_state.set_ylabel("state $x$")
     ax_state.set_title(
-        f"(a) Executed trajectory ({result['stopped_reason']})", loc="left", fontweight="bold"
+        f"(a) Executed trajectory ({result.stopped_reason})", loc="left", fontweight="bold"
     )
     ax_state.legend(fontsize=8, loc="best", framealpha=0.95)
     ax_state.grid(True, alpha=0.3)
@@ -369,3 +369,18 @@ def _to_array(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def plot_end_to_end_plans(result, initial, atom, cfg, *, show=False, save_path=None):
+    def presentation(plan):
+        return {
+            "mean": plan.rollout.aux["mean_trace"][0, :, cfg["dim"]],
+            "var": plan.rollout.aux["cov_trace"][0, :, cfg["dim"], cfg["dim"]],
+            "atomic": atom(plan.rollout.belief_trajectory),
+            "score": plan.hard_interval[0],
+        }
+    return plot_end_to_end(
+        [k * cfg["dt"] for k in range(cfg["H"] + 1)],
+        presentation(initial), presentation(result), cfg["threshold"],
+        show=show, save_path=save_path,
+    )

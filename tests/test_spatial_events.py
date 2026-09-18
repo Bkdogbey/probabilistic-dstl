@@ -17,13 +17,13 @@ from models.beliefs import GaussianBelief, create_gaussian_belief_trajectory
 from pdstl.base import BeliefTrajectory
 from pdstl.operators import Always, And, Eventually, Predicate, _conjunction, _negation
 from pdstl.predicates import GreaterThan, HalfSpace, InsideRectangle, LessThan, OutsideRectangle
-from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
-from planning.scenarios import moment_predicates
-from planning.scenarios.moment_predicates import (
+from planning.environment import CircleRegion, MovingRectangleRegion
+from pdstl import predicates as moment_predicates
+from pdstl.predicates import (
     CircularObstaclePredicate,
     MovingRectangularObstaclePredicate,
 )
-from planning.scenarios.reach_avoid import build_reach_avoid_environment
+from planning.environment import build_reach_avoid_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 GOAL = ([10.0, 12.0], [2.0, 4.0])
@@ -86,10 +86,15 @@ def test_predicates_module_imports_no_gaussian_or_model_code():
     tree = ast.parse((ROOT / "src/pdstl/predicates.py").read_text(encoding="utf-8"))
     modules = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
     modules += [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
-    assert modules and all(m.startswith("pdstl") for m in modules)
+    assert modules and all(m.startswith("pdstl") or m in {"math", "torch"} for m in modules)
 
-    identifiers = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    identifiers |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    # Only the explicit legacy moment predicates may inspect moments. Geometric
+    # events continue to delegate probability evaluation to the belief contract.
+    geometry = [n for n in tree.body if isinstance(n, ast.ClassDef)
+                and n.name not in {"CircularObstaclePredicate", "MovingRectangularObstaclePredicate"}]
+    nodes = [node for cls in geometry for node in ast.walk(cls)]
+    identifiers = {n.id for n in nodes if isinstance(n, ast.Name)}
+    identifiers |= {n.attr for n in nodes if isinstance(n, ast.Attribute)}
     for forbidden in ("torch", "mean", "covariance", "GaussianBelief", "norm", "erf"):
         assert forbidden not in identifiers
 

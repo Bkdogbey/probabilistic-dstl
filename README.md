@@ -1,135 +1,115 @@
 # Probabilistic differentiable STL
 
-pdSTL evaluates Signal Temporal Logic specifications over uncertain state
-trajectories. A model supplies a belief at each prediction step, the belief
-evaluates atomic predicates as lower and upper probability bounds, and pdSTL
-combines those bounds with Boolean and temporal operators.
+pdSTL evaluates Signal Temporal Logic formulas over uncertain trajectories.
+A belief supplies atomic probability bounds; Boolean and temporal operators
+combine them. The generic contract is probability_bounds(predicate) -> [B, 2].
+The included Gaussian model evaluates threshold, half-space, and rectangle events.
+Rectangular enclosures do not assume independent coordinates.
 
-```text
-belief trajectory → predicate probability intervals → temporal formula trace
-```
+## Planning
 
-The implemented stochastic baseline is a precise Gaussian belief. Linear
-dynamics propagate its mean and covariance. Threshold and affine half-space
-events return exact bounds `[p_k, p_k]`; rectangles return a valid probability
-enclosure from exact marginal interval probabilities. The generic `Belief` contract remains
-`probability_bounds(predicate) -> [B, 2]`.
+The execution path is:
 
-Planning follows this boundary:
+    config -> environment and specification -> stochastic rollout
+           -> smooth lower pdSTL score -> optimize controls
+           -> final hard interval -> PlanResult
 
-```text
-controls/current belief -> upstream rollout -> BeliefRollout
-  -> BeliefTrajectory -> pdSTL -> planner objective
-```
+Planner(dynamics, horizon, config=None) accepts rollout(v) -> BeliefRollout
+and an explicit spec in optimize_window. Only the belief trajectory is required;
+nominal and auxiliary traces are optional diagnostics.
 
-`BeliefRollout` requires only `belief_trajectory`. Its optional `nominal_trace`
-and `aux` tensors supply costs and plots; they do not define belief semantics.
-Set `w_dist`, `w_obs`, and `w_visit` to zero for objectives using only pdSTL and
-control regularization. Enabled heuristic shaping requires a nominal trace.
-`detach_diagnostics()` detaches these optional tensors and preserves the
-original belief trajectory, including any gradient graph it retains.
+The only objective is:
 
-Hard and differentiable evaluations are two versions of the same pdSTL / StoRI
-semantics. With `scale=-1`, the formula returns the unsmoothed stochastic
-robustness interval. With `scale=beta>0`, softplus replaces the conjunction's
-lower clamp and smooth min/max replace temporal extrema. The planner uses the
-differentiable lower semantics directly:
+    -w_phi * smooth_lower + w_u * control_effort + w_du * control_smoothness
 
-$$J(\mathbf u)=-w_\varphi\widetilde R^\downarrow_{\varphi,\beta}
-  +w_uJ_u+w_{\Delta u}J_{\Delta u}.$$
+Effort is the sum of squared controls. Smoothness is the sum of squared successive
+differences plus the squared first control. The initial guess is in physical
+control units; omission means zero controls. Dynamics bounds controls with tanh.
 
-Beta follows the existing geometric annealing schedule. Hard evaluations supply
-monitoring, checkpoint selection, early stopping, and final verification; they
-do not supply gradients in smooth mode. Neither the formula interval nor its
-smooth approximation is claimed to be a whole-trajectory satisfaction
-probability. Smooth values need not be valid probability bounds.
+The planner differentiates spec.smooth_lower(trajectory, beta), using a geometric
+beta schedule. It returns the final optimizer update, reports its smooth score
+at beta_end, and evaluates spec.probability_interval(trajectory) for validation.
+Hard scores never select checkpoints. Optional hard-threshold stopping is
+disabled by default (alpha: null).
 
-## Reach–Avoid example
+Smooth values need not be probability bounds. The hard interval is a pdSTL/StoRI
+evaluation, not an exact whole-trajectory satisfaction probability.
 
-The canonical double-slit scenario in `configs/scenarios/reach_avoid.yaml` keeps
-all shaping weights (`w_dist`, `w_obs`, `w_visit`) at zero. Its pipeline is
+PlanResult contains controls, rollout, smooth_lower, hard_interval, loss_history.
+History records the loss before each optimizer update at that iteration's beta.
+Optional iteration observers receive post-update plans. Returned predictions
+retain no optimization graph.
 
-```text
-controls -> Gaussian mean/covariance rollout -> predicate probability intervals
-         -> differentiable pdSTL lower semantics -> objective -> Adam update
-returned controls -> hard pdSTL interval at planning origin 0
-```
+## Receding horizon
 
-`HalfSpace(a, b)` in `pdstl.predicates` defines the event $a^T X\le b$ in any
-state dimension. `GaussianBelief` evaluates it as
-$\Phi((b-a^T\mu)/\sqrt{a^T\Sigma a})$, using the full covariance orientation.
-A zero projected variance is evaluated as a deterministic closed inequality.
+Planner.run_receding_horizon is the only MPC loop:
 
-`InsideRectangle` and `OutsideRectangle` remain the specialized events for this
-example. Exact Gaussian CDF differences give $p_x$ and $p_y$; the inside bounds
-are $[\max(0,p_x+p_y-1),\min(p_x,p_y)]$. Outside bounds are the complement
-$[1-U,1-L]$. These enclosures do not assume independent coordinates.
+    current state/belief -> rollout and local specification -> optimize horizon
+                        -> execute first control -> update -> shift -> repeat
 
-Running `run_reach_avoid(show=False, save=True)` from `planning.runners` produces
-three figures in `outputs/`:
+Supply make_rollout(state, step), make_spec(state, step),
+execute(state, control, step), a pure is_done(state, step), and max_steps.
+Execution returns a new state. Warm starts drop the executed control and
+repeat the last control at the horizon tail.
 
-- `reach_avoid.png`: predicted belief mean, 95% joint covariance ellipses,
-  workspace, three barrier blocks, goal, and start.
-- `reach_avoid_probabilities.png`: two interval bands, for goal membership and
-  combined safety at each prediction time.
-- `reach_avoid_optimization.png`: differentiable lower robustness versus
-  iteration, with the returned checkpoint marked and its hard interval reported.
+MPCResult contains states, applied_controls shaped [steps, control_dim],
+window_plans, and stopped_reason (goal_reached or max_steps).
+States include the initial state, including when the loop executes zero controls.
 
-The curve records each iteration's actual beta; annealing changes the evaluated
-function, so the curve need not increase monotonically. The returned checkpoint
-can precede the last iteration.
+## Scenarios and outputs
 
-`PlanCandidate` exposes `smooth_lower`, `hard_interval`, `hard_lower`,
-`hard_upper`, and `beta`. The saved `reach_avoid.pt` retains controls, covariances,
-initial beliefs, `obstacle_traces`, `bounds_trace`, and `optimization_trace`
-(iteration, beta, smooth lower, hard interval, control cost, and objective).
-`history` remains the total objective history. Final `smooth_lower` is replayed
-at `smooth_beta=beta_end`; the per-iteration values retain their original beta.
-`interval_final` and `hard_interval` both report the final unsmoothed evaluation.
+Reach-avoid and MPC share the workspace/goal/obstacles rectangular schema,
+with configurable name, x, y, and optional style fields. The default has two
+blocks forming one gap. Its specification is:
 
-For comparisons, pass `show_initial=True` to `visualize_reach_avoid` or
-`plot_reach_avoid`; `show_workspace=True` adds the workspace probability band to
-`visualize_reach_avoid`. Controls and individual obstacle bounds remain available
-as diagnostics without adding more default figures.
+    G[1,H](inside workspace AND outside every obstacle)
+    AND F[0,H](inside goal)
+
+Lane merge preserves its moving vehicle, local goal/workspace rules, moment
+predicate, and consecutive-step success criterion. It uses the canonical loss,
+so numerical trajectories can differ from the former heuristic optimizer.
+Lane settings live in the lane scenario YAML.
+
+Public runners: run_reach_avoid, run_mpc, run_lane_change, run_altitude_safety.
+All accept show, save, and verbose. With show=False and save=False, no plotting
+diagnostics or output files are made.
+
+Reach-avoid saves a structured result and three figures: predicted trajectory,
+event probability intervals, and optimization loss. Altitude can animate
+optimizer updates. MPC and lane runs can save trajectory figures and animations.
+Visualization derives its data on demand rather than extending result schemas.
+
+Save with torch.save; load trusted result files with
+torch.load(path, weights_only=False). Old dictionaries and solve() dispatch
+are intentionally unsupported.
 
 ## Install and run
 
-```bash
-pip install -r requirements.txt
-python src/main.py
-```
+    pip install -r requirements.txt
+    python src/main.py
 
-Examples are selected with the numbered `skip_run` blocks in `src/main.py`.
-Their model, predicate, confidence, and temporal-window settings live in
-`configs/examples.yaml`. Set `show_plots: false` there for noninteractive runs.
+Select altitude and reach-avoid using the skip_run blocks in src/main.py.
+Set show_plots: false in configs/examples.yaml for noninteractive runs.
+Additional scalar demonstrations are in planning.examples.
 
-## Package organization
+## Remaining planning files
 
-```text
-src/
-  pdstl/
-    base.py       Generic belief contracts and probability-bound validation
-    operators.py  Boolean and temporal semantics
-    predicates.py Spatial event geometry (half-spaces and rectangles)
-  models/
-    dynamics.py   Linear dynamics and bounded controls
-    beliefs.py    Precise Gaussian beliefs, helpers, and trajectory factory
-    rollouts.py   BeliefRollout and Gaussian rollout adapter
-  planning/
-    planner.py      Planner: how controls are optimized
-    environment.py  Planning world and its pdSTL specification
-    runners.py      Which experiment runs (altitude safety, reach-avoid, ...)
-  baselines/      Deterministic STL comparison
-  visualization/  Reusable plots
-  main.py         AltitudeSafety and ReachAvoid demonstrations
-configs/          Example and planning configuration
-```
+| File | Purpose |
+| --- | --- |
+| environment.py | Geometry, config parsing, reach-avoid/lane specification builders |
+| planner.py | One optimizer, structured results, one generic MPC loop |
+| runners.py | Setup, execution rules, saving and visualization orchestration |
+| examples.py | Five scalar formula cases and scalar one-shot/MPC reach demonstrations |
+| __init__.py | Minimal public exports |
 
-Import `GaussianBelief` and `create_gaussian_belief_trajectory` from
-`models.beliefs`.
-These names are no longer exported by `models.dynamics`. The enclosure demo
-and its implementation have been removed; no replacement uncertainty model
-is introduced.
+The scenario subpackage, logging wrappers, alternative benchmark, and obsolete
+single-shot runner/configuration have been removed.
+
+Other packages: pdstl owns semantics and predicates; models owns beliefs,
+dynamics, and rollouts; visualization owns plots and animations; baselines owns
+the deterministic STL comparison. Existing Gaussian-moment predicates now live
+in pdstl/predicates.py; generic geometric events retain their belief-independent
+probability contract.
 
 ## License
 

@@ -5,9 +5,8 @@ import pytest
 from pdstl.operators import Always, And, Eventually
 from pdstl.predicates import InsideRectangle, OutsideRectangle
 from planning.environment import Environment, RectangleRegion
-from planning.scenarios.reach_avoid import (
+from planning.environment import (
     build_reach_avoid_environment,
-    reach_avoid_specification,
 )
 
 CONFIG = {
@@ -63,7 +62,7 @@ def test_an_unknown_role_is_rejected():
 
 
 def _environment():
-    return Environment(specification_builder=reach_avoid_specification)
+    return Environment()
 
 
 def test_duplicate_region_names_are_rejected():
@@ -234,7 +233,7 @@ def test_the_environment_computes_no_probabilities_and_draws_nothing():
 
     for attribute in ("draw_on_ax", "metadata", "sample", "robustness", "probability"):
         assert not hasattr(environment, attribute), f"Environment grew {attribute!r}"
-    assert set(vars(environment)) == {"regions", "_specification_builder"}
+    assert set(vars(environment)) == {"regions"}
 
 
 def test_planner_facing_usage_is_two_calls():

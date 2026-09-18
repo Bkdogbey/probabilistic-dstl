@@ -98,7 +98,7 @@ def setup_lane_change_live_plot(env, label="", xlim=None):
     ax.add_patch(ego_cov_patch)
 
     obs0 = env.moving_obstacles[0]
-    obs_pos0 = np.asarray([obs0["x_traj"][0], obs0["y_traj"][0]])
+    obs_pos0 = np.asarray([float(obs0["x_traj"][0]), float(obs0["y_traj"][0])])
     obs_rect = patches.Rectangle(
         (obs_pos0[0] - obs0["width"] / 2, obs_pos0[1] - obs0["height"] / 2),
         obs0["width"], obs0["height"],
@@ -160,7 +160,10 @@ def make_mpc_live_callback(env):
     fig, ax_map, ax_p, line_exec, line_plan, line_p = setup_mpc_live_plot(env)
     real_trace, p_sat_so_far = [], []
 
-    def callback(step, curr_mean, curr_cov, best_mean, best_p):
+    def callback(step, state, plan):
+        curr_mean, curr_cov = state[:2]
+        best_mean = plan.rollout.aux["mean_trace"]
+        best_p = plan.hard_interval[0]
         real_trace.append(curr_mean.detach())
         p_sat_so_far.append(best_p)
         update_mpc_live_plot(fig, line_exec, line_plan, line_p, ax_p,
@@ -170,20 +173,22 @@ def make_mpc_live_callback(env):
 
 
 def make_lane_change_live_callback(env):
+    from planning.environment import obstacle_position
+
+    view = geometry(env)
     fig_live, _ax, ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect = (
-        setup_lane_change_live_plot(env, label=geometry(env).label, xlim=geometry(env).plot_xlim)
+        setup_lane_change_live_plot(env, label=view.label, xlim=view.plot_xlim)
     )
     real_trace = []
-    obs0 = env.moving_obstacles[0]
+    obs0 = view.moving_obstacles[0]
 
-    def callback(step, curr_mean, curr_cov, best_mean, best_p):
+    def callback(step, state, plan):
+        curr_mean, curr_cov = state[:2]
         real_trace.append(curr_mean.detach())
-        obs_pos = env.moving_obstacle_position(step)
-        if obs_pos is None:
-            obs_pos = [0.0, 0.0]
         update_lane_change_plot(
             ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect,
-            real_trace, curr_cov, best_mean, obs_pos, obs0,
+            real_trace, curr_cov, plan.rollout.aux["mean_trace"],
+            obstacle_position(env, step + 1), obs0,
         )
 
     return callback

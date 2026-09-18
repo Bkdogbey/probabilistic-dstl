@@ -1,4 +1,4 @@
-"""Planner contract: silent when asked, independent of the belief type."""
+"""Behavioral contracts for the canonical optimizer and receding-horizon loop."""
 
 import ast
 import logging
@@ -10,307 +10,217 @@ import torch
 from models.dynamics import SingleIntegrator
 from models.rollouts import BeliefRollout, gaussian_rollout
 from pdstl.base import create_probability_belief_trajectory
-from pdstl.operators import Eventually, Predicate
+from pdstl.operators import Always, Eventually, Predicate
 from pdstl.predicates import GreaterThan
-from planning.scenarios.reach_avoid import build_reach_avoid_environment
-from planning.planner import Planner
-
-ROOT = Path(__file__).resolve().parents[1]
+from planning.planner import MPCResult, PlanResult, Planner
 
 
-def _planner(**config):
-    base = {
-        "max_iters": 60, "converge_patience": 1, "alpha": 0.0, "smoothing": {"enabled": False},
-        "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
-    }
-    return Planner(SingleIntegrator(), None, 3, config={**base, **config})
-
-
-def test_quiet_optimisation_emits_no_log_records(caplog):
-    planner = _planner()
-    spec = Eventually(GreaterThan(0.1), interval=[0, 3])
-
-    with caplog.at_level(logging.INFO, logger="planning"):
-        planner.optimize_window(
-            gaussian_rollout(planner.dyn, torch.zeros(2), torch.eye(2) * 0.01),
-            spec=spec, init_guess=torch.zeros(3, 2),
-        )
-
-    assert caplog.records == []
-
-
-def _probability_rollout(dynamics, event, *, diagnostics=True):
-    """A non-Gaussian upstream model: p_k = sigmoid(4 (progress_k - 1)), bounds [0.9 p, p]."""
-
-    def rollout(v):
-        progress = torch.cat([torch.zeros(1), torch.cumsum(dynamics.bound_control(v)[:, 0], 0) * 0.5])
-        p = torch.sigmoid(4.0 * (progress - 1.0))
-        bounds = torch.stack([0.9 * p, p], dim=-1)
-        trajectory = create_probability_belief_trajectory(event, bounds)
-        if not diagnostics:
-            return BeliefRollout(trajectory)
-        nominal = progress.reshape(1, -1, 1)
-        return BeliefRollout(trajectory, nominal, {})
-
-    return rollout
-
-
-def test_planner_optimises_a_belief_rollout_it_knows_nothing_about():
-    planner = Planner(SingleIntegrator(), None, 5, config={
-        "max_iters": 150, "smoothing": {"enabled": False}, "w_u": 0.0, "w_du": 0.0,
-        "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
+def problem(**config):
+    dyn = SingleIntegrator(state_dim=1)
+    planner = Planner(dyn, 5, {
+        "max_iters": 80, "w_u": 0.01, "w_du": 0.01,
+        "smoothing": {"beta_start": 10., "beta_end": 10.},
+        **config,
     })
+    rollout = gaussian_rollout(dyn, torch.zeros(1), torch.eye(1) * 0.1)
+    spec = Eventually(GreaterThan(0.4), interval=[0, 5])
+    return planner, rollout, spec
+
+
+def test_quiet_optimization(caplog):
+    planner, rollout, spec = problem(max_iters=2)
+    with caplog.at_level(logging.INFO):
+        result = planner.optimize_window(rollout, spec=spec)
+    assert caplog.records == []
+    assert isinstance(result, PlanResult)
+
+
+def test_neutral_initialization_and_bounded_controls():
+    planner, rollout, spec = problem()
+    assert torch.count_nonzero(planner._init_controls(None)) == 0
+    initial = planner.evaluate_controls(rollout, torch.zeros(5, 1), spec=spec)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.controls.shape == (5, 1)
+    assert (result.controls.abs() <= planner.dyn.u_max).all()
+    assert result.smooth_lower > initial.smooth_lower
+    assert result.hard_interval[0] > initial.hard_interval[0] + 0.3
+
+
+def test_loss_is_only_smooth_score_effort_and_smoothness():
+    planner, _, _ = problem(w_phi=3., w_u=2., w_du=4.)
+    controls = torch.tensor([[0.1], [0.3], [0.2], [-0.2], [0.0]])
+    expected = -3 * 0.7 + 2 * controls.square().sum()
+    expected += 4 * ((controls[1:] - controls[:-1]).square().sum() + controls[0].square().sum())
+    torch.testing.assert_close(planner._objective(controls, torch.tensor(0.7)), expected)
+
+
+def test_one_iteration_returns_the_updated_controls_and_replays():
+    planner, rollout, spec = problem(max_iters=1)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.controls.abs().sum() > 0
+    assert len(result.loss_history) == 1
+    replay = planner.evaluate_controls(rollout, result.controls, spec=spec)
+    assert replay.hard_interval == pytest.approx(result.hard_interval, abs=1e-6)
+    assert replay.smooth_lower == pytest.approx(result.smooth_lower, abs=1e-6)
+    torch.testing.assert_close(replay.rollout.aux["mean_trace"], result.rollout.aux["mean_trace"])
+    assert not result.rollout.aux["mean_trace"].requires_grad
+    assert not result.rollout.belief_trajectory[1].value().requires_grad
+
+
+def test_returns_final_smooth_iterate_even_when_hard_score_worsens():
+    planner, rollout, spec = problem(max_iters=3)
+    observed = []
+    original = spec.probability_interval
+    # Reporting values cannot influence optimization when stopping is disabled.
+    spec.probability_interval = lambda trajectory: -original(trajectory)
+    result = planner.optimize_window(rollout, spec=spec,
+                                    on_iteration=lambda k, p: observed.append(p))
+    torch.testing.assert_close(result.controls, observed[-1].controls)
+    assert observed[-1].hard_interval[0] < observed[0].hard_interval[0]
+
+
+def test_observer_is_optional_and_does_not_change_optimization():
+    planner, rollout, spec = problem(max_iters=4)
+    seen = []
+    expected = planner.optimize_window(rollout, spec=spec)
+    actual = planner.optimize_window(rollout, spec=spec, on_iteration=lambda k, p: seen.append((k, p)))
+    assert [k for k, _ in seen] == list(range(4))
+    torch.testing.assert_close(actual.controls, expected.controls)
+    assert actual.loss_history == expected.loss_history
+
+
+def test_optional_hard_stopping_and_annealing():
+    planner, rollout, spec = problem(max_iters=20, alpha=0., converge_patience=2)
+    assert len(planner.optimize_window(rollout, spec=spec).loss_history) == 2
+    planner, rollout, spec = problem(
+        max_iters=4, loss_tol=100., min_iters=0,
+        smoothing={"beta_start": 2., "beta_end": 20.},
+    )
+    assert planner._beta(0) == 2.
+    assert planner._beta(3) == 20.
+    assert len(planner.optimize_window(rollout, spec=spec).loss_history) == 4
+
+
+def test_probability_only_rollout_and_gradients():
+    dyn = SingleIntegrator(state_dim=1)
     event = Predicate("reach")
     spec = Eventually(event, interval=[0, 5])
-    rollout = _probability_rollout(planner.dyn, event)
-    initial = spec(rollout(torch.zeros(5, 2)).belief_trajectory)[0, 0, 0].item()
+    planner = Planner(dyn, 5, {"max_iters": 100, "w_u": 0., "w_du": 0.})
 
-    best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(5, 2))
+    def rollout(v):
+        progress = torch.cat((torch.zeros(1), dyn.bound_control(v)[:, 0].cumsum(0)))
+        p = torch.sigmoid(4 * (progress - 1))
+        return BeliefRollout(create_probability_belief_trajectory(
+            event, torch.stack((0.9 * p, p), dim=-1)))
 
-    assert best.hard_lower > initial + 0.5
-
-
-def test_planner_source_builds_no_concrete_beliefs():
-    source = (ROOT / "src/planning/planner.py").read_text(encoding="utf-8")
-    for name in ("create_gaussian_belief_trajectory", "GaussianBelief("):
-        assert name not in source
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module or ""]
-            assert all(
-                "Belief" not in alias.name or alias.name == "BeliefRollout"
-                for alias in node.names
-            )
-        else:
-            continue
-        assert all(
-            not module.startswith("models") or module == "models.rollouts"
-            for module in modules
-        )
+    parameters = torch.zeros(5, 1, requires_grad=True)
+    lower = spec.smooth_lower(rollout(parameters).belief_trajectory, 10.)
+    planner._objective(dyn.bound_control(parameters), lower).backward()
+    assert torch.isfinite(parameters.grad).all() and parameters.grad.abs().sum() > 0
+    initial = planner.evaluate_controls(rollout, torch.zeros(5, 1), spec=spec)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.rollout.nominal_trace is None and result.rollout.aux is None
+    assert result.hard_interval[0] > initial.hard_interval[0] + 0.5
 
 
-def test_pdstl_imports_no_model_implementation():
-    for path in (ROOT / "src/pdstl").rglob("*.py"):
+def test_fixed_step_zero_bottleneck():
+    planner, rollout, _ = problem()
+    spec = Always(GreaterThan(0.4), interval=[0, 5])
+    initial = planner.evaluate_controls(rollout, torch.zeros(5, 1), spec=spec)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.hard_interval[0] <= initial.hard_interval[0] + 1e-6
+
+
+@pytest.mark.parametrize("steps", [0, 1, 3])
+def test_mpc_first_control_execution_local_spec_and_warm_start(steps):
+    planner, _, spec = problem(max_iters=2)
+    state = (torch.zeros(1), torch.eye(1) * 0.1)
+    specifications, guesses = [], []
+    optimize = planner.optimize_window
+
+    def wrapped(rollout, **kwargs):
+        guesses.append(kwargs["init_guess"])
+        return optimize(rollout, **kwargs)
+
+    planner.optimize_window = wrapped
+
+    def local_spec(state, step):
+        specifications.append((state[0].clone(), step))
+        return spec
+
+    result = planner.run_receding_horizon(
+        state, make_rollout=lambda s, k: gaussian_rollout(planner.dyn, *s),
+        make_spec=local_spec, execute=lambda s, u, k: planner.dyn.step(*s, u),
+        is_done=lambda s, k: False, max_steps=steps,
+    )
+    assert isinstance(result, MPCResult)
+    assert result.applied_controls.shape == (steps, 1)
+    assert len(result.states) == steps + 1
+    assert len(result.window_plans) == steps
+    assert result.stopped_reason == "max_steps"
+    assert [k for _, k in specifications] == list(range(steps))
+    for k, plan in enumerate(result.window_plans):
+        torch.testing.assert_close(result.applied_controls[k], plan.controls[0])
+        expected = planner.dyn.step(*result.states[k], plan.controls[0])
+        torch.testing.assert_close(result.states[k + 1], expected)
+        torch.testing.assert_close(specifications[k][0], result.states[k][0])
+        if k:
+            previous = result.window_plans[k - 1].controls
+            torch.testing.assert_close(guesses[k], torch.cat((previous[1:], previous[-1:])))
+
+
+@pytest.mark.parametrize("done_at", [0, 1])
+def test_mpc_checks_completion_before_planning_and_after_execution(done_at):
+    planner, _, spec = problem(max_iters=1)
+    state = (torch.zeros(1), torch.eye(1) * 0.1)
+    result = planner.run_receding_horizon(
+        state, make_rollout=lambda s, k: gaussian_rollout(planner.dyn, *s),
+        make_spec=lambda s, k: spec, execute=lambda s, u, k: planner.dyn.step(*s, u),
+        is_done=lambda s, k: k >= done_at, max_steps=3,
+    )
+    assert len(result.window_plans) == done_at
+    assert result.stopped_reason == "goal_reached"
+
+
+def test_invalid_initial_guess_and_obsolete_settings_fail_clearly():
+    planner, rollout, spec = problem()
+    for guess in (torch.zeros(4, 1), torch.full((5, 1), float("nan")), torch.full((5, 1), 2.)):
+        with pytest.raises(ValueError):
+            planner.optimize_window(rollout, spec=spec, init_guess=guess)
+    with pytest.raises(ValueError, match="unknown planner settings"):
+        Planner(SingleIntegrator(), 3, {"w_dist": 1.})
+
+
+def test_bounded_warm_start_at_exact_saturation():
+    planner, rollout, spec = problem(max_iters=1)
+    result = planner.optimize_window(rollout, spec=spec, init_guess=torch.ones(5, 1))
+    assert torch.isfinite(result.controls).all()
+    assert (result.controls.abs() <= 1).all()
+
+
+def test_result_round_trip(tmp_path):
+    planner, rollout, spec = problem(max_iters=1)
+    result = planner.optimize_window(rollout, spec=spec)
+    path = tmp_path / "plan.pt"
+    torch.save(result, path)
+    loaded = torch.load(path, weights_only=False)
+    assert isinstance(loaded, PlanResult)
+    torch.testing.assert_close(loaded.controls, result.controls)
+    assert loaded.hard_interval == result.hard_interval
+
+
+def test_planner_and_pdstl_have_no_scenario_or_concrete_model_dependencies():
+    root = Path(__file__).resolve().parents[1]
+    planner = (root / "src/planning/planner.py").read_text()
+    assert "gaussian_rollout" not in planner and "lane" not in planner.lower()
+    for path in (root / "src/pdstl").glob("*.py"):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                names = [node.module or "", *(alias.name for alias in node.names)]
-            else:
-                continue
-            assert not any(
-                name.split(".")[0] in {"models", "planning", "baselines"}
-                or "Gaussian" in name
-                for name in names
-            ), path
+            if isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[0] not in {"models", "planning", "baselines"}
 
 
-def test_planner_optimises_without_diagnostics_with_control_regularisation():
-    planner = _planner(max_iters=100, alpha=2.0)
-    event = Predicate("reach")
-    spec = Eventually(event, interval=[0, 3])
-    rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
-    initial = spec(rollout(torch.zeros(3, 2)).belief_trajectory)[0, 0, 0].item()
-
-    best, history = planner.optimize_window(
-        rollout, spec=spec, init_guess=torch.zeros(3, 2)
-    )
-
-    assert planner.cfg["w_u"] > 0 and planner.cfg["w_du"] > 0
-    assert best.rollout.nominal_trace is None
-    assert best.rollout.aux is None
-    assert best.hard_lower > initial + 0.2
-    replay = rollout(torch.atanh(best.controls / planner.dyn.u_max))
-    score, exact = planner._scores(spec, replay.belief_trajectory)
-    objective = planner._objective(None, best.controls, score)
-    assert objective.item() == pytest.approx(best.objective, abs=1e-5)
-    torch.testing.assert_close(exact, torch.tensor(best.hard_interval))
-
-
-@pytest.mark.parametrize("beta", [None, 5.0])
-def test_belief_only_rollout_keeps_gradients_to_controls(beta):
-    planner = _planner()
-    event = Predicate("reach")
-    rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
-    v = torch.zeros(3, 2, requires_grad=True)
-    predicted = rollout(v)
-    smooth, _ = planner._scores(
-        Eventually(event, interval=[0, 3]), predicted.belief_trajectory, beta
-    )
-    objective = planner._objective(None, planner.dyn.bound_control(v), smooth)
-    objective.backward()
-
-    assert v.grad is not None
-    assert torch.isfinite(v.grad).all()
-    assert v.grad.abs().sum() > 0
-
-
-@pytest.mark.parametrize("heuristic", ["w_dist", "w_obs", "w_visit"])
-def test_enabled_shaping_requires_nominal_trace(heuristic):
-    planner = _planner(**{heuristic: 1.0})
-    event = Predicate("reach")
-    rollout = _probability_rollout(planner.dyn, event, diagnostics=False)
-
-    with pytest.raises(ValueError, match=rf"{heuristic}.*nominal_trace"):
-        planner.optimize_window(
-            rollout, spec=Eventually(event, interval=[0, 3]),
-            init_guess=torch.zeros(3, 2),
-        )
-
-
-@pytest.mark.parametrize("with_nominal", [False, True])
-@pytest.mark.parametrize("aux_kind", ["absent", "empty", "populated"])
-def test_detach_diagnostics_preserves_beliefs_and_handles_optional_fields(
-    with_nominal, aux_kind
-):
-    event = Predicate("reach")
-    v = torch.zeros(3, 2, requires_grad=True)
-    original = _probability_rollout(SingleIntegrator(), event)(v)
-    nominal = original.nominal_trace if with_nominal else None
-    aux = None if aux_kind == "absent" else {}
-    if aux_kind == "populated":
-        aux["progress"] = original.nominal_trace
-    predicted = BeliefRollout(original.belief_trajectory, nominal, aux)
-
-    detached = predicted.detach_diagnostics()
-
-    assert detached.belief_trajectory is predicted.belief_trajectory
-    if nominal is None:
-        assert detached.nominal_trace is None
-    else:
-        torch.testing.assert_close(detached.nominal_trace, nominal)
-        assert not detached.nominal_trace.requires_grad
-        assert nominal.requires_grad
-    if aux is None:
-        assert detached.aux is None
-    else:
-        assert detached.aux is not aux
-        assert detached.aux.keys() == aux.keys()
-        for name, trace in aux.items():
-            torch.testing.assert_close(detached.aux[name], trace)
-            assert not detached.aux[name].requires_grad
-            assert trace.requires_grad
-    event(detached.belief_trajectory).sum().backward()
-    assert torch.isfinite(v.grad).all()
-    assert v.grad.abs().sum() > 0
-
-
-def test_legacy_environment_solve_modes_still_run():
-    environment = build_reach_avoid_environment({
-        "workspace": {"x": [-5.0, 5.0], "y": [-5.0, 5.0]},
-        "goal": {"x": [0.5, 1.5], "y": [-0.5, 0.5]},
-    })
-    x0_mean, x0_cov = torch.zeros(2), torch.eye(2) * 0.1
-
-    for extra, mode in (({}, "single_shot"), ({"T_SIM": 2}, "mpc_fixed"), ({"MAX_STEPS": 2}, "mpc_goal")):
-        planner = Planner(SingleIntegrator(), environment, 3, config={"max_iters": 2, **extra})
-        result = planner.solve(x0_mean, x0_cov, verbose=False)
-        assert result["mode"] == mode
-        assert torch.isfinite(result["mean_trace"]).all()
-
-
-def _smooth_problem(**config):
-    smoothing = {"enabled": True, "beta_start": 2.0, "beta_end": 20.0}
-    planner = _planner(smoothing=smoothing, lr=0.05, alpha=2.0, **config)
-    spec = Eventually(GreaterThan(0.5), interval=[0, 3])
-    rollout = gaussian_rollout(planner.dyn, torch.zeros(2), torch.eye(2) * 0.01)
-    return planner, spec, rollout
-
-
-def test_planner_handles_one_dimensional_controls():
-    dyn = SingleIntegrator(state_dim=1)
-    planner = Planner(dyn, None, 3, config={
-        "max_iters": 5, "alpha": 2.0, "w_dist": 0.0, "w_obs": 0.0, "w_visit": 0.0,
-    })
-    rollout = gaussian_rollout(dyn, torch.zeros(1), torch.eye(1) * 0.01)
-    spec = Eventually(GreaterThan(0.1), interval=[0, 3])
-
-    best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 1))
-
-    assert best.controls.shape == (3, 1)
-    assert planner._init_controls(None).shape == (3, 1)
-    assert planner._empty_u_trace().shape == (1, 0, 1)
-
-
-def test_on_iteration_observes_every_iterate_without_changing_the_result():
-    planner, spec, rollout = _smooth_problem()
-    seen = []
-
-    best, history = planner.optimize_window(
-        rollout, spec=spec, init_guess=torch.zeros(3, 2),
-        on_iteration=lambda k, candidate: seen.append((k, candidate.objective)),
-    )
-    plain, plain_history = planner.optimize_window(
-        rollout, spec=spec, init_guess=torch.zeros(3, 2)
-    )
-
-    assert [k for k, _ in seen] == list(range(len(history)))
-    assert [objective for _, objective in seen] == history
-    assert history == plain_history
-    assert best.hard_interval == plain.hard_interval
-
-
-def test_evaluate_controls_scores_returned_controls_like_the_optimiser():
-    planner, spec, rollout = _smooth_problem()
-    best, _ = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 2))
-
-    replay = planner.evaluate_controls(rollout, best.controls, spec=spec)
-
-    torch.testing.assert_close(
-        torch.tensor(replay.hard_interval), torch.tensor(best.hard_interval), atol=1e-5, rtol=0
-    )
-    torch.testing.assert_close(replay.controls, best.controls, atol=1e-5, rtol=0)
-
-
-def test_checkpoint_selection_uses_hard_lower_and_control_cost():
-    planner, spec, rollout = _smooth_problem()
-    seen = []
-
-    best, _ = planner.optimize_window(
-        rollout, spec=spec, init_guess=torch.zeros(3, 2),
-        on_iteration=lambda k, candidate: seen.append(candidate),
-    )
-
-    top = max(c.hard_lower for c in seen)
-    assert best.hard_lower == top
-    assert best.control_cost == min(c.control_cost for c in seen if c.hard_lower == top)
-    assert seen[best.iteration] == best
-
-
-def test_smooth_lower_carries_gradients_and_hard_interval_is_detached():
-    planner, spec, rollout = _smooth_problem()
-    v = torch.zeros(3, 2, requires_grad=True)
-    predicted = rollout(v)
-
-    score, exact = planner._scores(spec, predicted.belief_trajectory, beta=5.0)
-    score.backward()
-
-    assert not exact.requires_grad
-    torch.testing.assert_close(exact, spec(predicted.belief_trajectory, beta=None)[0, 0].detach())
-    assert score.item() != pytest.approx(exact[0].item())
-    assert torch.isfinite(v.grad).all() and v.grad.abs().sum() > 0
-
-
-def test_beta_anneals_geometrically_and_is_none_when_smoothing_is_off():
-    planner, _, _ = _smooth_problem(max_iters=11)
-    betas = [planner._beta(k) for k in range(11)]
-
-    assert betas[0] == pytest.approx(2.0) and betas[-1] == pytest.approx(20.0)
-    assert all(b2 / b1 == pytest.approx(10 ** 0.1) for b1, b2 in zip(betas, betas[1:]))
-    assert _planner()._beta(0) is None
-
-
-def test_alpha_stopping_uses_hard_lower():
-    planner, spec, rollout = _smooth_problem()
-    smooth, exact = planner._scores(spec, rollout(torch.zeros(3, 2)).belief_trajectory, planner._beta(0))
-    assert smooth < exact[0]  # the normalized smooth max underestimates the max
-
-    planner.cfg.update(
-        lr=0.0, alpha=(exact[0].item() + smooth.item()) / 2,
-        converge_patience=1, min_iters=20, max_iters=20,
-    )
-    _, history = planner.optimize_window(rollout, spec=spec, init_guess=torch.zeros(3, 2))
-
-    assert len(history) == 1
+def test_final_smooth_score_uses_beta_end_even_after_one_update():
+    planner, rollout, spec = problem(max_iters=1, smoothing={"beta_start": 2., "beta_end": 20.})
+    result = planner.optimize_window(rollout, spec=spec)
+    expected = spec.smooth_lower(result.rollout.belief_trajectory, 20.).item()
+    assert result.smooth_lower == pytest.approx(expected)

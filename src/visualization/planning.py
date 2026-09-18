@@ -27,7 +27,7 @@ def geometry(environment):
     geometry, so it is plotting's job to read regions in the form it wants.
     """
     from planning.environment import RectangleRegion
-    from planning.scenarios.lane_merge import CircleRegion, MovingRectangleRegion
+    from planning.environment import CircleRegion, MovingRectangleRegion
 
     if not hasattr(environment, "regions"):
         return environment  # already a flat view
@@ -40,11 +40,11 @@ def geometry(environment):
         ]
 
     metadata = getattr(environment, "metadata", {})
-    workspace = environment.regions.get("workspace")
-    goal = environment.regions.get("goal")
+    workspace = next(iter(environment.by_role("workspace")), None)
+    goal = next(iter(environment.by_role("goal")), None)
     return SimpleNamespace(
-        bounds={"x": workspace.x, "y": workspace.y} if workspace is not None else None,
-        goal={"x": goal.x, "y": goal.y} if goal is not None else None,
+        bounds={"x": workspace.x, "y": workspace.y, "style": workspace.style} if workspace is not None else None,
+        goal={"x": goal.x, "y": goal.y, "style": goal.style} if goal is not None else None,
         obstacles=rectangles("obstacle"),
         visit_regions=rectangles("visit"),
         circle_obstacles=[
@@ -136,6 +136,14 @@ def draw_road_backdrop(ax, env):
     return road_lo, road_hi
 
 
+def _region_style(region, **defaults):
+    style = dict(region.get("style") or {})
+    color = style.pop("color", None)
+    if color is not None:
+        defaults.update(facecolor=color, edgecolor=color)
+    return {**defaults, **style}
+
+
 def draw_env_on_ax(
     ax,
     env,
@@ -156,12 +164,9 @@ def draw_env_on_ax(
                 (bx[0], by[0]),
                 bx[1] - bx[0],
                 by[1] - by[0],
-                facecolor="none",
-                edgecolor=PALETTE["lane"]["stroke"],
-                linestyle="--",
-                linewidth=1.5,
-                zorder=2,
-                label="Workspace",
+                **_region_style(env.bounds, facecolor="none",
+                                edgecolor=PALETTE["lane"]["stroke"], linestyle="--",
+                                linewidth=1.5, zorder=2, label="Workspace"),
             )
         )
 
@@ -175,11 +180,9 @@ def draw_env_on_ax(
                     (gx[0], gy[0]),
                     gx[1] - gx[0],
                     gy[1] - gy[0],
-                    facecolor=PALETTE["goal"]["fill"],
-                    edgecolor=PALETTE["goal"]["stroke"],
-                    alpha=0.4,
-                    zorder=3,
-                    label="Goal",
+                    **_region_style(env.goal, facecolor=PALETTE["goal"]["fill"],
+                                    edgecolor=PALETTE["goal"]["stroke"],
+                                    alpha=0.4, zorder=3, label="Goal"),
                 )
             )
 
@@ -205,12 +208,9 @@ def draw_env_on_ax(
                 (ox[0], oy[0]),
                 ox[1] - ox[0],
                 oy[1] - oy[0],
-                facecolor=PALETTE["obs_static"]["fill"],
-                edgecolor=PALETTE["obs_static"]["stroke"],
-                alpha=0.6,
-                hatch="//",
-                zorder=4,
-                label=obs_static_label,
+                **_region_style(obs, facecolor=PALETTE["obs_static"]["fill"],
+                                edgecolor=PALETTE["obs_static"]["stroke"], alpha=0.6,
+                                hatch="//", zorder=4, label=obs_static_label),
             )
         )
 
@@ -334,7 +334,7 @@ def heading_deg(mean_np, t, T):
     return np.degrees(np.arctan2(dy, dx))
 
 
-def plot_trajectory(mean_np, cov_np, env):
+def plot_trajectory(mean_np, cov_np, env, *, show=True, save_path=None):
     env = geometry(env)
     T = mean_np.shape[0] - 1
     x_min, x_max, y_min, y_max = _compute_env_bounds(mean_np, env)
@@ -426,8 +426,8 @@ def plot_trajectory(mean_np, cov_np, env):
             edgecolor="#cccccc",
         )
 
-    plt.show()
-    plt.close(fig)
+    _finish(fig, save_path, show)
+    return fig, ax
 
 
 def _to_np(trace):
@@ -580,22 +580,29 @@ def _draw_altitude_plan(axes, plan, *, dt, name, color, style, alpha=1.0):
               linewidth=2.2, alpha=alpha, label=f"{name} controls")
 
 
-def _plan(result, tag):
-    keys = ("mean", "cov", "atomic", "interval", "controls")
-    return {key: result[f"{key}_{tag}"] for key in keys}
+def altitude_plan(plan, threshold):
+    """Derive altitude plotting data only when a plot/animation requests it."""
+    from pdstl.predicates import GreaterThan
+
+    return {
+        "mean": plan.rollout.aux["mean_trace"],
+        "cov": plan.rollout.aux["cov_trace"],
+        "controls": plan.controls,
+        "interval": plan.hard_interval,
+        "atomic": GreaterThan(threshold, dim=0)(plan.rollout.belief_trajectory)[0],
+    }
 
 
-def plot_altitude_safety(result, *, dt, threshold, u_max, save_path=None, show=True):
-    """Initial vs optimized plan for Always_[1,H](Z >= threshold)."""
-    H = len(_to_np(result["controls_final"]))
-    fig, axes = _altitude_axes(dt, H, threshold, u_max)
-    _draw_altitude_plan(axes, _plan(result, "initial"), dt=dt, name="Initial",
-                        color=PALETTE["lane"]["stroke"], style="--")
-    _draw_altitude_plan(axes, _plan(result, "final"), dt=dt, name="Optimized",
-                        color=PALETTE["ego"]["stroke"], style="-")
+def plot_altitude_safety(result, *, initial, dt, threshold, u_max, save_path=None, show=True):
+    fig, axes = _altitude_axes(dt, len(result.controls), threshold, u_max)
+    for plan, name, color, style in (
+        (initial, "Initial", PALETTE["lane"]["stroke"], "--"),
+        (result, "Optimized", PALETTE["ego"]["stroke"], "-"),
+    ):
+        _draw_altitude_plan(axes, altitude_plan(plan, threshold), dt=dt,
+                            name=name, color=color, style=style)
     for ax in axes:
         ax.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.01, 1.0))
-
     _finish(fig, save_path, show)
     return fig, axes
 
@@ -624,57 +631,82 @@ def plot_event_probabilities(dt, traces, *, title=None, save_path=None, show=Tru
 
 
 def plot_pdstl_optimization(result, *, save_path=None, show=True):
-    """Differentiable lower semantics at each iteration's annealed beta."""
-    records = result["optimization_trace"]
-    iterations = [record["iteration"] for record in records]
-    smooth_lower = [record["smooth_lower"] for record in records]
+    """Loss used for optimization; the final hard interval is reporting only."""
     fig, ax = plt.subplots(figsize=(9, 3.6))
-    ax.plot(iterations, smooth_lower, color=PALETTE["ego"]["stroke"], linewidth=2)
-    selected = result["returned_iteration"]
-    record = next(record for record in records if record["iteration"] == selected)
-    ax.plot(selected, record["smooth_lower"], "o", color=PALETTE["ego"]["stroke"],
-            label="Returned checkpoint")
-    lo, hi = result["hard_interval"]
-    ax.text(0.98, 0.05, f"Returned plan: hard pdSTL interval [{lo:.4f}, {hi:.4f}]",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=10,
-            bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "none"})
-    ax.set_xlabel("Optimization iteration")
-    ax.set_ylabel("Differentiable pdSTL lower robustness")
-    ax.set_title("Differentiable pdSTL optimization (annealed beta)")
+    ax.plot(result.loss_history, color=PALETTE["ego"]["stroke"], linewidth=2)
+    lo, hi = result.hard_interval
+    ax.text(0.98, 0.05, f"Final hard pdSTL interval [{lo:.4f}, {hi:.4f}]",
+            transform=ax.transAxes, ha="right", va="bottom")
+    ax.set(xlabel="Optimization iteration", ylabel="Loss",
+           title="Smooth pdSTL objective and control regularization")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", fontsize=9)
     _finish(fig, save_path, show)
     return fig, ax
 
 
 def visualize_reach_avoid(result, env, *, dt, ellipse_every=10, save_path=None,
-                          show=True, show_initial=False, show_workspace=False):
-    """Three scientific views; initial beliefs/workspace bounds are opt-in diagnostics."""
-    env = geometry(env)
+                          show=True, initial=None, show_workspace=False):
+    """Spatial, event-probability and optimization views of a PlanResult."""
+    from functools import reduce
+    from pdstl.operators import And
+    from planning.environment import reach_avoid_events
+
+    prediction = result.rollout
+    mean, cov = prediction.aux["mean_trace"], prediction.aux["cov_trace"]
     spatial = plot_reach_avoid(
-        result["mean_initial"], result["cov_initial"],
-        result["mean_trace"], result["cov_trace"],
-        env, ellipse_every,
-        title="Reach-avoid: predicted stochastic trajectory", show_initial=show_initial,
+        initial.rollout.aux["mean_trace"] if initial else None,
+        initial.rollout.aux["cov_trace"] if initial else None,
+        mean, cov, env, ellipse_every, show_initial=initial is not None,
         save_path=save_path, show=show,
     )
+    events = reach_avoid_events(env)
+    trace = prediction.belief_trajectory
+    obstacles = events["obstacles"]
+    safe = (reduce(And, obstacles)(trace)[0] if obstacles
+            else torch.ones(len(trace), 2, device=mean.device))
+    traces = {"Goal": events["goal"](trace)[0], "Outside all obstacles": safe}
+    if show_workspace:
+        traces["Workspace"] = events["workspace"](trace)[0]
     probability_path = optimization_path = None
     if save_path:
         root, ext = os.path.splitext(save_path)
         probability_path = f"{root}_probabilities{ext}"
         optimization_path = f"{root}_optimization{ext}"
-    traces = {
-        r"$P(X_k \in G)$": result["goal_trace"],
-        r"$P(\mathrm{safe\ at\ }k)$": result["safe_trace"],
-    }
-    if show_workspace:
-        traces[r"$P(X_k \in \mathcal{X})$"] = result["bounds_trace"]
-    probabilities = plot_event_probabilities(
-        dt, traces,
-        save_path=probability_path, show=show,
-    )
+    probabilities = plot_event_probabilities(dt, traces, save_path=probability_path, show=show)
     optimization = plot_pdstl_optimization(result, save_path=optimization_path, show=show)
     return spatial, probabilities, optimization
+
+
+def visualize_mpc(result, env, cfg, *, show, save, output_dir, lane=False):
+    """Build presentation traces from executed states and window plans on demand."""
+    from pathlib import Path
+    from visualization.animation import animate_results
+
+    means = torch.stack([state[0] for state in result.states]).unsqueeze(0)
+    covs = torch.stack([state[1] for state in result.states]).unsqueeze(0)
+    plans = [plan.rollout.aux["mean_trace"] for plan in result.window_plans]
+    scores = [plan.hard_interval[0] for plan in result.window_plans]
+    output_dir = Path(output_dir)
+    if save:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if lane and len(result.applied_controls):
+        visualize_lane_change(
+            means, covs, result.applied_controls.unsqueeze(0), env,
+            p_sat_trace=scores, dt=cfg["dt"], robot_dims=env.metadata.get("robot_dims"),
+            xlim=env.metadata.get("plot_xlim"), show=show,
+            save_path=str(output_dir / "lane_change.png") if save else None,
+        )
+    else:
+        plot_trajectory(_to_np(means), _to_np(covs), env, show=show,
+                        save_path=str(output_dir / cfg.get("figure", "mpc.png")) if save else None)
+    if save and cfg.get("animation") and result.window_plans:
+        animation = cfg["animation"]
+        animate_results(
+            means, covs, env, filename=str(output_dir / animation["filename"]),
+            step=animation["step"], title=animation["title"], dt=cfg["dt"],
+            bounds=animation.get("bounds"), plan_traces=plans,
+            robot_dims=cfg.get("robot_dims"),
+        )
 
 
 def plot_controls(u_np):
@@ -1079,10 +1111,12 @@ def visualize_lane_change(
     dt=0.2,
     robot_dims=None,
     xlim=None,
+    show=True,
+    save_path=None,
 ):
     env = geometry(env)
     mean_np = mean_trace.cpu().squeeze().numpy()  # [T+1, ≥2]
-    u_np = u_trace.cpu().squeeze().numpy()  # [T,  2]
+    u_np = u_trace.detach().cpu().reshape(-1, u_trace.shape[-1]).numpy()  # [T,  2]
     T = mean_np.shape[0] - 1
     time_u = np.arange(T) * dt
 
@@ -1117,8 +1151,7 @@ def visualize_lane_change(
     fig.subplots_adjust(bottom=0.15)
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.15)
-    plt.show()
-    plt.close(fig)
+    _finish(fig, save_path, show)
 
     n_rows = 3 if p_sat_trace is not None else 2
     fig3, axes = plt.subplots(n_rows, 1, figsize=(10, 2.6 * n_rows), sharex=True)
@@ -1165,5 +1198,5 @@ def visualize_lane_change(
 
     axes[-1].set_xlabel("Time [s]", fontsize=16)
     plt.tight_layout()
-    plt.show()
-    plt.close(fig3)
+    metrics_path = None if save_path is None else os.path.splitext(save_path)[0] + "_metrics.png"
+    _finish(fig3, metrics_path, show)

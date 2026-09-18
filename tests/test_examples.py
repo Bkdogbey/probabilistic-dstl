@@ -254,12 +254,12 @@ def test_examples_configuration_holds_no_hand_authored_signals():
         "threshold", "dim", "H", "dt", "u_max", "q_std", "x0_mean", "x0_cov_scale", "planner",
     }
     for heuristic in ("w_dist", "w_obs", "w_visit"):
-        assert end_to_end["planner"][heuristic] == 0
+        assert heuristic not in end_to_end["planner"]
 
     mpc = config["end_to_end_mpc_reach"]
     assert set(mpc) == set(end_to_end) | {"max_steps", "init_control", "seed"}
     for heuristic in ("w_dist", "w_obs", "w_visit"):
-        assert mpc["planner"][heuristic] == 0
+        assert heuristic not in mpc["planner"]
 
 
 def test_offline_module_and_signal_dispatcher_remain_absent():
@@ -324,6 +324,21 @@ def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
     config["show_plots"] = False
     config_path = tmp_path / "examples.yaml"
     config_path.write_text(yaml.safe_dump(config))
+    # This test checks main's selection/orchestration. Numerical convergence is
+    # covered by the scenario tests; keep its subprocess animations short.
+    for name in ("altitude_safety", "reach_avoid"):
+        scenario = yaml.safe_load((ROOT / f"configs/scenarios/{name}.yaml").read_text())
+        scenario["planner"]["max_iters"] = 2
+        scenario_path = tmp_path / f"{name}.yaml"
+        scenario_path.write_text(yaml.safe_dump(scenario))
+        source = source.replace(
+            f"run_{name}(show=", f"run_{name}(config_path={str(scenario_path)!r}, show="
+        )
+    source = (
+        "from pathlib import Path\nimport planning.runners\n"
+        f"planning.runners.RESULTS_DIR = Path({str(tmp_path / 'outputs')!r})\n"
+        + source
+    )
     script = tmp_path / "main.py"
     script.write_text(
         source.replace('"configs/examples.yaml"', repr(str(config_path)))
@@ -335,7 +350,7 @@ def test_main_runs_whichever_blocks_the_user_selected(tmp_path, flags):
         env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "MPLBACKEND": "Agg"},
         capture_output=True,
         text=True,
-        timeout=300,  # Two full CPU optimizations, figures, and the altitude GIF.
+        timeout=120,
     )
 
     assert result.returncode == 0, result.stderr

@@ -10,7 +10,7 @@ from visualization.planning import (
     PALETTE,
     _altitude_axes,
     _draw_altitude_plan,
-    _plan,
+    altitude_plan,
     _to_np,
     cov_ellipse_params,
     draw_env_on_ax,
@@ -185,25 +185,19 @@ def animate_results(
     ani = FuncAnimation(fig, update, frames=frames, init_func=init, blit=False, interval=100)
 
     if filename:
-        print(f"Saving animation to {filename}...")
         try:
-            if filename.endswith(".gif"):
-                ani.save(filename, writer="pillow", fps=20)
-            else:
-                ani.save(filename, writer="ffmpeg", fps=20)
-            print("Animation saved successfully.")
-        except Exception as e:
-            print(f"Warning: Could not save animation (ffmpeg/pillow issue?): {e}")
-            print("Displaying plot instead.")
-            plt.show()
+            ani.save(filename, writer="pillow" if filename.endswith(".gif") else "ffmpeg", fps=20)
+        finally:
+            plt.close(fig)
     else:
         plt.show()
+    return ani
 
 
-def animate_altitude_optimization(result, *, dt, threshold, u_max, filename=None, fps=6):
+def animate_altitude_optimization(plans, *, initial, dt, threshold, u_max, filename=None, fps=6):
     """One frame per optimizer iterate up to the returned plan, held for one second at the end."""
-    returned = result["returned_iteration"]
-    frames = result["frames"][: returned + 1]
+    frames = [altitude_plan(plan, threshold) for plan in plans]
+    returned = len(frames) - 1
     H = len(_to_np(frames[0]["controls"]))
     bands = [
         (_to_np(f["mean"])[:, 0], 2 * np.sqrt(_to_np(f["cov"])[:, 0, 0])) for f in frames
@@ -214,7 +208,7 @@ def animate_altitude_optimization(result, *, dt, threshold, u_max, filename=None
 
     fig, axes = _altitude_axes(dt, H, threshold, u_max, state_ylim)
     static_lines = [len(ax.lines) for ax in axes]  # threshold and control bounds
-    initial = _plan(result, "initial")
+    initial = altitude_plan(initial, threshold)
 
     def update(k):
         for ax, n_static in zip(axes, static_lines):

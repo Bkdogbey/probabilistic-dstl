@@ -1,89 +1,39 @@
-# Reach-avoid through a double-slit barrier.
-#
-#   phi = Always[1,H](outside A and outside B and outside C)
-#         and Eventually[1,H](inside goal)
-#         and Always[1,H](inside workspace)
-#
-# The barrier spans x in [3, 6] and is sealed against both workspace walls, so the
-# two slits are the only way through. The start sits at y = 5, dead centre in block
-# B, so the planner has to choose a passage rather than drift around one rectangle.
-#
-#   y=10 +--------------------------+
-#        |      ### C ###           |
-#    7.5 |      ---------  slit 2   |   1.0 m gap
-#    6.5 |      ### B ###           |
-#      S |----> #######    +--G--+  |
-#    4.0 |      ---------  slit 1   |   1.2 m gap
-#    2.8 |      ### A ###  +-----+  |
-#    y=0 +--------------------------+
-#        x=0      3    6    9.5  12
-
-# --- Dynamics ---
-# --- Scenario ---
 scenario:
   type: reach_avoid
-
 dynamics: single_integrator
-H: 80            # Planning horizon (time steps); 16 m budget for a ~10.9 m path
-dt: 0.2          # Time step [s]
-u_max: 1.0       # Maximum control magnitude per axis [m/s]
-q_std: 0.05      # Process noise standard deviation; sigma_k^2 = x0_cov_scale + k q_std^2
-
-# --- Initial belief ---
-x0_mean: [0.5, 5.0]   # Held off the x = 0 wall so P(workspace) starts at 1, not 0.5
-x0_cov_scale: 0.01   # Diagonal covariance initialised as I * x0_cov_scale
-
-# --- Environment ---
-# Workspace membership is another geometric predicate, not a clipping operation:
-# it is what stops the plan from going around the barrier instead of through it.
-# --- Environment: names, bounds and styles are all configuration ---
-# Workspace membership is a geometric predicate, not a clipping operation: it is what stops
-# the plan going around the barrier instead of through it.
+H: 80
+dt: 0.2
+u_max: 1.0
+q_std: 0.05
+x0_mean: [0.5, 5.0]
+x0_cov_scale: 0.01
 workspace:
   name: workspace
   x: [0.0, 12.0]
   y: [0.0, 10.0]
-
-# Held clear of the x = 12 wall so reaching the goal does not fight the workspace.
 goal:
   name: goal
   x: [9.5, 11.5]
   y: [4.0, 6.0]
-
-# A barrier with two slits: y in [2.8, 4.0] and y in [6.5, 7.5]. Both stay wide enough that
-# the safety bounds carry gradient instead of saturating at 0 or 1.
 obstacles:
-  - name: lower_block
-    x: [3.0, 5.0]
-    y: [0.0, 2.8]
-
-  - name: middle_block
-    x: [3.0, 5.0]
-    y: [4.0, 6.5]
-
-  - name: upper_block
-    x: [3.0, 5.0]
-    y: [7.5, 10.0]
-
-# Initial guess only, not part of the objective: a rightward bias that runs straight into the
-# middle block, so the optimiser has to discover a slit for itself.
-init_control: [0.7, -0.05]
-
-# --- Planner overrides (on top of configs/planning.yaml); shaping off ---
+- name: lower_block
+  x: [3.0, 5.0]
+  y: [0.0, 4.0]
+  style:
+    color: '#d62728'
+- name: upper_block
+  x: [3.0, 5.0]
+  y: [6.0, 10.0]
+  style:
+    color: '#d62728'
+init_control: [0.7, 0.0]
 planner:
   w_phi: 20.0
-  w_u: 0.1 # 
-  w_du: 0.01   
-  w_dist: 5.0
-  w_obs: 10.0
-  w_visit: 0.0
+  w_u: 0.01
+  w_du: 0.01
   lr: 0.05
   max_iters: 800
-  alpha: 0.90    # Early-stop target, reached around iteration 130. The Frechet
-                 # conjunction bound caps the attainable lower score near 0.945,
-                 # so the 0.95 default would never stop early.
-
-# --- Output ---
-ellipse_every: 10    # Covariance ellipse every N predicted steps
+  alpha: null
+ellipse_every: 10
 save_file: reach_avoid.pt
 figure: reach_avoid.png
