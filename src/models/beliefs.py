@@ -3,7 +3,7 @@
 import torch
 
 from pdstl.base import Belief, BeliefTrajectory
-from pdstl.predicates import AxisInterval, HalfSpace
+from pdstl.predicates import AxisInterval, HalfSpace, RelativeAxisInterval
 
 INF = float("inf")
 
@@ -21,7 +21,9 @@ def interval_probability(low, high, mean, variance):
     variance compares deterministically instead of dividing by zero.
     """
     certain = variance <= 0
-    sigma = torch.sqrt(torch.where(certain, torch.ones_like(variance), variance))
+    sigma = torch.sqrt(
+        torch.where(certain, torch.ones_like(variance), variance)
+    )
 
     if low == -INF and high == INF:
         probability = torch.ones_like(mean)
@@ -31,7 +33,9 @@ def interval_probability(low, high, mean, variance):
         probability = _cdf((mean - low) / sigma)
     else:
         a, b = (low - mean) / sigma, (high - mean) / sigma
-        probability = torch.where(a > 0, _cdf(-a) - _cdf(-b), _cdf(b) - _cdf(a))
+        probability = torch.where(
+            a > 0, _cdf(-a) - _cdf(-b), _cdf(b) - _cdf(a)
+        )
 
     deterministic = ((mean >= low) & (mean <= high)).to(mean.dtype)
     return torch.where(certain, deterministic, probability.clamp(0.0, 1.0))
@@ -41,7 +45,11 @@ def _as_full_covariance(mean, covariance):
     """Expand a [..., D] diagonal covariance to [..., D, D]; pass a full one through."""
     if not torch.is_tensor(covariance):
         raise ValueError("GaussianBelief covariance must be a tensor")
-    return torch.diag_embed(covariance) if covariance.shape == mean.shape else covariance
+    return (
+        torch.diag_embed(covariance)
+        if covariance.shape == mean.shape
+        else covariance
+    )
 
 
 def _validate(mean, covariance):
@@ -50,7 +58,9 @@ def _validate(mean, covariance):
         raise ValueError("GaussianBelief mean must have shape [..., D]")
     expected = mean.shape + mean.shape[-1:]
     if covariance.shape != expected:
-        raise ValueError(f"covariance must be {tuple(expected)}, got {tuple(covariance.shape)}")
+        raise ValueError(
+            f"covariance must be {tuple(expected)}, got {tuple(covariance.shape)}"
+        )
     if not torch.isfinite(mean).all():
         raise ValueError("GaussianBelief mean must be finite")
     if not torch.isfinite(covariance).all():
@@ -85,20 +95,30 @@ class GaussianBelief(Belief):
 
     def probability(self, event):
         """[...] exact probability of an atomic event."""
+        if isinstance(event, RelativeAxisInterval):
+            raise ValueError(
+                "relative events require a lane belief trajectory"
+            )
         if isinstance(event, AxisInterval):
-            variance = self._variance(event.dim)  # checks the index before indexing the mean
+            variance = self._variance(
+                event.dim
+            )  # checks the index before indexing the mean
             return interval_probability(
                 event.lower, event.upper, self.mean[..., event.dim], variance
             )
         if isinstance(event, HalfSpace):
             normal = self.mean.new_tensor(event.a)
             if normal.shape != self.mean.shape[-1:]:
-                raise ValueError("half-space normal must match the state dimension")
+                raise ValueError(
+                    "half-space normal must match the state dimension"
+                )
             # A PSD covariance can still project to a tiny negative value by round-off.
             variance = torch.einsum(
                 "i,...ij,j->...", normal, self.covariance, normal
             ).clamp_min(0)
-            return interval_probability(-INF, event.b, self.mean @ normal, variance)
+            return interval_probability(
+                -INF, event.b, self.mean @ normal, variance
+            )
         raise ValueError(f"GaussianBelief cannot evaluate {event}")
 
     def _variance(self, dim):
@@ -127,16 +147,27 @@ class GaussianBeliefTrajectory(BeliefTrajectory):
         return self.trace.probability_bounds(event)
 
 
-def create_gaussian_belief_trajectory(mean, covariance, dtype=None, device=None):
-    """Trajectory from a mean trace [T], [T, D] or [B, T, D] with matching covariance."""
-    mean = torch.as_tensor(mean, dtype=dtype, device=device)
-    covariance = torch.as_tensor(covariance, dtype=mean.dtype, device=mean.device)
-    if mean.ndim == 1:                                      # scalar trace
-        mean, covariance = mean.unsqueeze(-1), covariance.reshape(-1, 1)
-    if mean.ndim == 2:                                      # [T, D] -> a batch of one
-        mean, covariance = mean.unsqueeze(0), covariance.unsqueeze(0)
-    if mean.ndim != 3:
-        raise ValueError("mean trace must have shape [T], [T,D] or [B,T,D]")
-    if covariance.shape[:2] != mean.shape[:2]:
-        raise ValueError("covariance must have the same batch and number of steps as mean")
-    return GaussianBeliefTrajectory(mean, covariance)
+class ProbabilityBelief(Belief):
+    """Supplied probability bounds for named events, with gradients retained."""
+
+    def __init__(self, bounds, value=None):
+        self.bounds = {}
+        for name, bound in bounds.items():
+            bound = torch.as_tensor(bound)
+            if bound.ndim != 2 or bound.shape[-1] != 2:
+                raise ValueError(
+                    f"bounds[{name!r}] must be [batch, 2], got {tuple(bound.shape)}"
+                )
+            self.bounds[name] = bound
+        self._value = value
+
+    def probability_bounds(self, predicate):
+        name = getattr(predicate, "name", None)
+        if name not in self.bounds:
+            raise ValueError(
+                f"no supplied bounds for event {name!r}; have {sorted(self.bounds)}"
+            )
+        return self.bounds[name]
+
+    def value(self):
+        return super().value() if self._value is None else self._value

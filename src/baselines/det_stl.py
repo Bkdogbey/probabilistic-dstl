@@ -30,19 +30,6 @@ class DetSTL_Formula(nn.Module):
         mu = self._extract_mean(belief_trajectory)
         return self.robustness_trace(mu, beta=beta, **kwargs)
 
-    def robustness(self, belief_trajectory, beta=None, **kwargs):
-        """Robustness at t=0 (the planning-relevant quantity)."""
-        return self.forward(belief_trajectory, beta=beta, **kwargs)[:, :1, :]
-
-    def __and__(self, other):
-        return DetAnd(self, other)
-
-    def __or__(self, other):
-        return DetOr(self, other)
-
-    def __invert__(self):
-        return DetNegation(self)
-
 
 # --- TEMPORAL OPERATORS (stlcg RNN logic, forward-time interface) ---
 
@@ -62,14 +49,19 @@ class DetTemporalOperator(DetSTL_Formula):
         self.operation = None
         # Shift matrices for the sliding window (identical to stlcg)
         M = np.diag(np.ones(self.rnn_dim - 1), k=1)
-        self.register_buffer("M", torch.tensor(M, dtype=torch.float32), persistent=False)
+        self.register_buffer(
+            "M", torch.tensor(M, dtype=torch.float32), persistent=False
+        )
         b = torch.zeros(self.rnn_dim, 1, dtype=torch.float32)
         b[-1] = 1.0
         self.register_buffer("b", b, persistent=False)
 
     def _initialize_rnn_cell(self, x):
         """x: [B, T+1, 1] time-reversed. Init hidden state from first (= time T) element."""
-        h0 = torch.ones(x.shape[0], self.rnn_dim, x.shape[2], device=x.device) * x[:, :1, :]
+        h0 = (
+            torch.ones(x.shape[0], self.rnn_dim, x.shape[2], device=x.device)
+            * x[:, :1, :]
+        )
         if (self._interval[1] == np.inf) and (self._interval[0] > 0):
             d0 = x[:, :1, :]
             return ((d0, h0), 0.0)
@@ -139,37 +131,12 @@ class DetAnd(DetSTL_Formula):
         self.operation = Minish()
 
     def robustness_trace(self, mu, beta=None, **kwargs):
-        r1 = self.subformula1.robustness_trace(mu, beta=beta, **kwargs)  # [B, T+1, 1]
+        r1 = self.subformula1.robustness_trace(
+            mu, beta=beta, **kwargs
+        )  # [B, T+1, 1]
         r2 = self.subformula2.robustness_trace(mu, beta=beta, **kwargs)
         xx = torch.cat([r1, r2], dim=-1)  # [B, T+1, 2]
         return self.operation(xx, beta, dim=-1, keepdim=True)  # [B, T+1, 1]
-
-
-class DetOr(DetSTL_Formula):
-    """φ ∨ ψ  —  max(ρ_φ, ρ_ψ) element-wise."""
-
-    def __init__(self, subformula1, subformula2):
-        super().__init__()
-        self.subformula1 = subformula1
-        self.subformula2 = subformula2
-        self.operation = Maxish()
-
-    def robustness_trace(self, mu, beta=None, **kwargs):
-        r1 = self.subformula1.robustness_trace(mu, beta=beta, **kwargs)
-        r2 = self.subformula2.robustness_trace(mu, beta=beta, **kwargs)
-        xx = torch.cat([r1, r2], dim=-1)
-        return self.operation(xx, beta, dim=-1, keepdim=True)
-
-
-class DetNegation(DetSTL_Formula):
-    """¬φ  —  negate robustness."""
-
-    def __init__(self, subformula):
-        super().__init__()
-        self.subformula = subformula
-
-    def robustness_trace(self, mu, beta=None, **kwargs):
-        return -self.subformula.robustness_trace(mu, beta=beta, **kwargs)
 
 
 # --- DETERMINISTIC PREDICATES (signed distance on mean trajectory) ---
@@ -235,29 +202,6 @@ class DetRectangularObstaclePredicate(DetSTL_Formula):
         return stacked.max(dim=-1, keepdim=True)[0]
 
 
-class DetCircularObstaclePredicate(DetSTL_Formula):
-    """
-    Signed distance to being outside a circular obstacle.
-
-        ρ(t) = ||μ(t) − center|| − radius
-
-    Positive iff mean is outside the circle (safe).
-    Mirrors CircularObstaclePredicate from environment.py.
-    """
-
-    def __init__(self, circle_def, device="cpu"):
-        super().__init__()
-        self.center = torch.tensor(
-            circle_def["center"], dtype=torch.float32, device=device
-        )
-        self.radius = circle_def["radius"]
-
-    def robustness_trace(self, mu, **kwargs):
-        diff = mu[..., :2] - self.center  # [B, T+1, 2]
-        dist = torch.norm(diff, dim=-1, keepdim=True)  # [B, T+1, 1]
-        return dist - self.radius
-
-
 class DetMovingRectangularObstaclePredicate(DetSTL_Formula):
     """
     Signed distance to being outside a moving rectangular obstacle.
@@ -298,9 +242,24 @@ class DetMovingRectangularObstaclePredicate(DetSTL_Formula):
 # --- SPECIFICATION BUILDER ---
 
 
+def _det_obstacle(region):
+    from planning.environment import MovingRectangleRegion
+
+    if isinstance(region, MovingRectangleRegion):
+        centers = region.centers
+        return DetMovingRectangularObstaclePredicate(
+            {
+                "x_traj": centers[..., 0],
+                "y_traj": centers[..., 1],
+                "width": region.width,
+                "height": region.height,
+            }
+        )
+    return DetRectangularObstaclePredicate({"x": region.x, "y": region.y})
+
+
 def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
     """Deterministic mirror of Environment.get_specification on the mean trajectory."""
-    from planning.environment import CircleRegion, MovingRectangleRegion
 
     def box(region):
         return {"x": region.x, "y": region.y}
@@ -309,42 +268,34 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
 
     # 1. Goal
     if env.by_role("goal"):
-        specs.append(DetEventually(
-            DetRectangularGoalPredicate(box(env.single_region("goal"))), interval=[t_goal_start, T]
-        ))
+        specs.append(
+            DetEventually(
+                DetRectangularGoalPredicate(box(env.single_region("goal"))),
+                interval=[t_goal_start, T],
+            )
+        )
 
-    # 2. Visit regions (liveness)
-    for region in env.by_role("visit"):
-        specs.append(DetEventually(DetRectangularGoalPredicate(box(region)), interval=[0, T]))
-
-    # 3. Obstacle safety
-    obs_preds = []
-    for region in env.by_role("obstacle"):
-        if isinstance(region, CircleRegion):
-            obs_preds.append(DetCircularObstaclePredicate(
-                {"center": region.center, "radius": region.radius}
-            ))
-        elif isinstance(region, MovingRectangleRegion):
-            centers = region.centers
-            obs_preds.append(DetMovingRectangularObstaclePredicate({
-                "x_traj": centers[..., 0], "y_traj": centers[..., 1],
-                "width": region.width, "height": region.height,
-            }))
-        else:
-            obs_preds.append(DetRectangularObstaclePredicate(box(region)))
+    # 2. Obstacle safety
+    obs_preds = [_det_obstacle(region) for region in env.by_role("obstacle")]
 
     if obs_preds:
         safe_formula = obs_preds[0]
         for p in obs_preds[1:]:
             safe_formula = DetAnd(safe_formula, p)
-        specs.append(DetAlways(safe_formula, interval=[t_constraints_start, T]))
+        specs.append(
+            DetAlways(safe_formula, interval=[t_constraints_start, T])
+        )
 
-    # 4. Workspace bounds
+    # 3. Workspace bounds
     if env.by_role("workspace"):
-        specs.append(DetAlways(
-            DetRectangularGoalPredicate(box(env.single_region("workspace"))),
-            interval=[t_constraints_start, T],
-        ))
+        specs.append(
+            DetAlways(
+                DetRectangularGoalPredicate(
+                    box(env.single_region("workspace"))
+                ),
+                interval=[t_constraints_start, T],
+            )
+        )
 
     if not specs:
         raise ValueError("No constraints defined in environment.")
@@ -354,3 +305,47 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
         combined = DetAnd(combined, s)
 
     return combined
+
+
+def compare_lane_window(plan, environment, horizon):
+    """Evaluate one stored lane plan against nominal road, traffic, and dwell."""
+    metadata = environment.metadata
+    ego = plan.rollout.aux["mean_trace"][0]
+    traffic = plan.rollout.aux["traffic_mean_trace"][0]
+    road = metadata["road"]
+    collision = metadata["collision"]
+    task = metadata["task"]
+    step = metadata.get("step", 0)
+    road_margin = torch.minimum(
+        ego[:, 1] - road["y_min"], road["y_max"] - ego[:, 1]
+    )
+    separation = traffic[:, :, :2] - ego[:, None, :2]
+    vehicle_margin = (
+        torch.maximum(
+            separation[..., 0].abs() - collision["longitudinal"],
+            separation[..., 1].abs() - collision["lateral"],
+        )
+        .min(dim=-1)
+        .values
+    )
+    safety = torch.minimum(road_margin.min(), vehicle_margin.min())
+    target_margin = (
+        task["target_tolerance"] - (ego[:, 1] - task["target_center"]).abs()
+    )
+    dwell = task["dwell_steps"]
+    start = max(0, task["start_end_steps"][0] - step)
+    end = min(task["start_end_steps"][1] - step, horizon - dwell)
+    if end >= start:
+        completion = torch.stack(
+            [
+                target_margin[t : t + dwell + 1].min()
+                for t in range(start, end + 1)
+            ]
+        ).max()
+    else:
+        completion = target_margin.new_tensor(float("-inf"))
+    value = torch.minimum(safety, completion)
+    return {
+        "pdstl_probability_interval": plan.hard_interval,
+        "deterministic_signed_distance": float(value.detach()),
+    }

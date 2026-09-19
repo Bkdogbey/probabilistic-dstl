@@ -1,14 +1,13 @@
-"""Geometric events and the existing Gaussian-moment lane/baseline predicates.
+"""Geometric events evaluated through belief probability bounds.
 
 `AxisInterval` and `HalfSpace` are atoms a belief evaluates exactly. A rectangle is the
 Boolean composition of its two axis intervals, so pdSTL's `beta` relaxes the conjunction
 instead of the belief clamping it.
 """
 
-import math
-
 import torch
 
+from pdstl.base import BeliefTrajectory
 from pdstl.operators import And, Negation, Predicate, STL_Formula
 
 INF = float("inf")
@@ -17,13 +16,17 @@ INF = float("inf")
 def _ordered(label, low, high):
     low, high = float(low), float(high)
     if not low < high:
-        raise ValueError(f"{label} must satisfy min < max, got [{low}, {high}]")
+        raise ValueError(
+            f"{label} must satisfy min < max, got [{low}, {high}]"
+        )
     return low, high
 
 
 def _state_index(dim):
     if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
-        raise ValueError(f"dim must be a non-negative state index, got {dim!r}")
+        raise ValueError(
+            f"dim must be a non-negative state index, got {dim!r}"
+        )
     return dim
 
 
@@ -43,8 +46,23 @@ class GreaterThan(AxisInterval):
     sense = ">="
 
     def __init__(self, threshold, dim=0, name=None):
-        super().__init__(threshold, INF, dim, name=name or f"x[{dim}] >= {threshold}")
+        super().__init__(
+            threshold, INF, dim, name=name or f"x[{dim}] >= {threshold}"
+        )
         self.threshold = float(threshold)
+
+
+class RelativeAxisInterval(AxisInterval):
+    """Interval on traffic position minus ego position for one vehicle."""
+
+    def __init__(self, vehicle, lower, upper, dim, name=None):
+        super().__init__(
+            lower,
+            upper,
+            dim=dim,
+            name=name or f"{vehicle} relative axis {dim}",
+        )
+        self.vehicle = vehicle
 
 
 class LessThan(AxisInterval):
@@ -53,7 +71,9 @@ class LessThan(AxisInterval):
     sense = "<="
 
     def __init__(self, threshold, dim=0, name=None):
-        super().__init__(-INF, threshold, dim, name=name or f"x[{dim}] <= {threshold}")
+        super().__init__(
+            -INF, threshold, dim, name=name or f"x[{dim}] <= {threshold}"
+        )
         self.threshold = float(threshold)
 
 
@@ -84,7 +104,9 @@ class _Rectangle(STL_Formula):
         self.x_range = _ordered("x_range", *x_range)
         self.y_range = _ordered("y_range", *y_range)
         if len(dims) != 2 or dims[0] == dims[1]:
-            raise ValueError(f"dims must be two distinct state indices, got {tuple(dims)}")
+            raise ValueError(
+                f"dims must be two distinct state indices, got {tuple(dims)}"
+            )
         self.dims = tuple(_state_index(d) for d in dims)
 
         self.name = name or (
@@ -119,68 +141,39 @@ class OutsideRectangle(_Rectangle):
     negated = True
 
 
-# Legacy lane/baseline predicates below assume Gaussian moments. They do not
-# change the probability_bounds contract of the geometric events above.
-
-def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
-    """Stack means [B,T,D] and variances [B,T,D] (or full covariances) over the trajectory."""
-    means, vars_ = [], []
-    for belief in belief_trajectory:
-        means.append(belief.value())
-        if diagonal_only and belief.covariance.ndim > 2:
-            vars_.append(torch.diagonal(belief.covariance, dim1=-2, dim2=-1))
-        else:
-            vars_.append(belief.covariance)
-    return torch.stack(means, dim=1), torch.stack(vars_, dim=1)
-
-
-def normal_cdf(value, mean, var):
-    """P(X <= value) for X ~ N(mean, var)."""
-    z = (value - mean) / torch.sqrt(var + 1e-6)
-    return 0.5 * (1 + torch.erf(z / math.sqrt(2)))
-
-
-class CircularObstaclePredicate(STL_Formula):
-    """P(||x - center|| > radius), using the variance projected on the radial direction."""
-
-    def __init__(self, region):
-        super().__init__()
-        self.name = region.name
-        self.center = torch.as_tensor(region.center, dtype=torch.float32)
-        self.radius = float(region.radius)
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        mu, cov = extract_trajectory_stats(belief_trajectory, diagonal_only=False)
-        diff = mu - self.center.to(mu.device)
-        dist = torch.norm(diff, dim=-1)
-        direction = diff / (dist.unsqueeze(-1) + 1e-6)
-        if cov.ndim == 3:
-            radial_var = torch.sum(direction**2 * cov, dim=-1)
-        else:
-            radial_var = torch.einsum("bti,btij,btj->bt", direction, cov, direction)
-        p_safe = 1.0 - normal_cdf(self.radius, dist, radial_var)
-        return torch.stack([p_safe, p_safe], dim=-1)
-
-
 class MovingRectangularObstaclePredicate(STL_Formula):
-    """Max of the four one-sided probabilities of being outside a moving rectangle."""
+    """Outside a rectangle whose geometry changes at each prediction step."""
 
     def __init__(self, region):
         super().__init__()
         self.name = region.name
-        centers = torch.as_tensor(region.centers, dtype=torch.float32)
-        self.x_traj, self.y_traj = centers[..., 0], centers[..., 1]
+        self.centers = torch.as_tensor(region.centers, dtype=torch.float32)
+        if self.centers.ndim != 2 or self.centers.shape[1] != 2:
+            raise ValueError(
+                "moving rectangle centers must have shape [time, 2]"
+            )
         self.width, self.height = float(region.width), float(region.height)
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("moving rectangle dimensions must be positive")
+        self.events = torch.nn.ModuleList()
+        for t, center in enumerate(self.centers):
+            x, y = (float(v) for v in center)
+            self.events.append(
+                OutsideRectangle(
+                    (x - self.width / 2, x + self.width / 2),
+                    (y - self.height / 2, y + self.height / 2),
+                    name=f"{self.name} at step {t}",
+                )
+            )
+
+    @property
+    def is_pointwise(self):
+        return True
 
     def robustness_trace(self, belief_trajectory, **kwargs):
-        mu, var = extract_trajectory_stats(belief_trajectory)
-        mu_x, mu_y, var_x, var_y = mu[..., 0], mu[..., 1], var[..., 0], var[..., 1]
-        half_w, half_h = self.width / 2.0, self.height / 2.0
-        x_traj, y_traj = self.x_traj.to(mu.device), self.y_traj.to(mu.device)
-        p_safe = torch.stack([
-            normal_cdf(x_traj - half_w, mu_x, var_x),
-            1.0 - normal_cdf(x_traj + half_w, mu_x, var_x),
-            normal_cdf(y_traj - half_h, mu_y, var_y),
-            1.0 - normal_cdf(y_traj + half_h, mu_y, var_y),
-        ], dim=0).max(dim=0).values
-        return torch.stack([p_safe, p_safe], dim=-1)
+        if len(belief_trajectory) > len(self.events):
+            raise ValueError("moving rectangle has fewer centers than beliefs")
+        bounds = []
+        for t, belief in enumerate(belief_trajectory):
+            bounds.append(self.events[t](BeliefTrajectory([belief]), **kwargs))
+        return torch.cat(bounds, dim=1)

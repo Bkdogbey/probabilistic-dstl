@@ -32,8 +32,14 @@ planner:
   w_u: 0.01
   w_du: 0.01
   lr: 0.05
-  max_iters: 800
-  alpha: null
-ellipse_every: 10
-save_file: reach_avoid.pt
-figure: reach_avoid.png
+  max_iters: 150
+  alpha: 0.95
+  converge_patience: 3
+mpc:
+  horizon: 60
+  max_steps: 70
+  seed: 0
+  planner:
+    max_iters: 40
+    alpha: 0.95
+    converge_patience: 3

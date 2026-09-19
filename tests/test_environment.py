@@ -28,11 +28,21 @@ def _config(**overrides):
 
 def test_a_valid_region_keeps_its_geometry_role_and_style():
     region = RectangleRegion(
-        name="goal", role="goal", xmin=1.0, xmax=2.0, ymin=3.0, ymax=4.5,
+        name="goal",
+        role="goal",
+        xmin=1.0,
+        xmax=2.0,
+        ymin=3.0,
+        ymax=4.5,
         style={"color": "green"},
     )
 
-    assert (region.xmin, region.xmax, region.ymin, region.ymax) == (1.0, 2.0, 3.0, 4.5)
+    assert (region.xmin, region.xmax, region.ymin, region.ymax) == (
+        1.0,
+        2.0,
+        3.0,
+        4.5,
+    )
     assert region.x == (1.0, 2.0) and region.y == (3.0, 4.5)
     assert region.role == "goal"
     assert region.style == {"color": "green"}
@@ -41,10 +51,19 @@ def test_a_valid_region_keeps_its_geometry_role_and_style():
 @pytest.mark.parametrize(
     "bounds, axis",
     [
-        ({"xmin": 2.0, "xmax": 1.0, "ymin": 0.0, "ymax": 1.0}, "xmin < xmax"),  # reversed
-        ({"xmin": 1.0, "xmax": 1.0, "ymin": 0.0, "ymax": 1.0}, "xmin < xmax"),  # zero width
+        (
+            {"xmin": 2.0, "xmax": 1.0, "ymin": 0.0, "ymax": 1.0},
+            "xmin < xmax",
+        ),  # reversed
+        (
+            {"xmin": 1.0, "xmax": 1.0, "ymin": 0.0, "ymax": 1.0},
+            "xmin < xmax",
+        ),  # zero width
         ({"xmin": 0.0, "xmax": 1.0, "ymin": 2.0, "ymax": 1.0}, "ymin < ymax"),
-        ({"xmin": 0.0, "xmax": 1.0, "ymin": 1.0, "ymax": 1.0}, "ymin < ymax"),  # zero height
+        (
+            {"xmin": 0.0, "xmax": 1.0, "ymin": 1.0, "ymax": 1.0},
+            "ymin < ymax",
+        ),  # zero height
     ],
 )
 def test_reversed_or_zero_width_bounds_are_rejected_by_name(bounds, axis):
@@ -55,7 +74,9 @@ def test_reversed_or_zero_width_bounds_are_rejected_by_name(bounds, axis):
 
 def test_an_unknown_role_is_rejected():
     with pytest.raises(ValueError, match="role must be one of"):
-        RectangleRegion(name="thing", role="teleporter", xmin=0, xmax=1, ymin=0, ymax=1)
+        RectangleRegion(
+            name="thing", role="teleporter", xmin=0, xmax=1, ymin=0, ymax=1
+        )
 
 
 # --- Environment container ----------------------------------------------------------
@@ -84,11 +105,16 @@ def test_regions_are_looked_up_by_name():
 
 def test_regions_are_looked_up_by_role_in_insertion_order():
     environment = _environment()
-    environment.add_region(RectangleRegion("workspace", "workspace", 0, 9, 0, 9))
+    environment.add_region(
+        RectangleRegion("workspace", "workspace", 0, 9, 0, 9)
+    )
     environment.add_region(RectangleRegion("first", "obstacle", 1, 2, 1, 2))
     environment.add_region(RectangleRegion("second", "obstacle", 3, 4, 3, 4))
 
-    assert [r.name for r in environment.by_role("obstacle")] == ["first", "second"]
+    assert [r.name for r in environment.by_role("obstacle")] == [
+        "first",
+        "second",
+    ]
     assert [r.name for r in environment.by_role("workspace")] == ["workspace"]
     assert environment.by_role("goal") == []
 
@@ -107,8 +133,16 @@ def test_an_invalid_horizon_is_rejected(horizon):
 def test_the_builder_reads_names_bounds_and_roles_from_configuration():
     environment = build_reach_avoid_environment(CONFIG)
 
-    assert list(environment.regions) == ["workspace", "goal", "upper_block", "lower_block"]
-    assert [r.name for r in environment.by_role("obstacle")] == ["upper_block", "lower_block"]
+    assert list(environment.regions) == [
+        "workspace",
+        "goal",
+        "upper_block",
+        "lower_block",
+    ]
+    assert [r.name for r in environment.by_role("obstacle")] == [
+        "upper_block",
+        "lower_block",
+    ]
 
     goal = environment.region("goal")
     assert (goal.xmin, goal.xmax, goal.ymin, goal.ymax) == (8.5, 9.5, 2.5, 3.5)
@@ -133,29 +167,43 @@ def test_zero_obstacles_is_allowed(obstacles):
 
 def test_many_obstacles_all_reach_the_formula():
     obstacles = [
-        {"name": f"block_{i}", "x": [float(i), i + 0.5], "y": [0.0, 1.0]} for i in range(5)
+        {"name": f"block_{i}", "x": [float(i), i + 0.5], "y": [0.0, 1.0]}
+        for i in range(5)
     ]
     environment = build_reach_avoid_environment(_config(obstacles=obstacles))
 
     assert len(environment.by_role("obstacle")) == 5
     assert _leaf_names(environment.get_specification(5)) == {
-        "workspace", "goal", *(f"block_{i}" for i in range(5))
+        "workspace",
+        "goal",
+        *(f"block_{i}" for i in range(5)),
     }
 
 
 def test_a_malformed_coordinate_pair_names_the_field():
     config = _config(goal={"name": "goal", "x": [1.0], "y": [0.0, 1.0]})
 
-    with pytest.raises(ValueError, match="region 'goal': x must be a \\[min, max\\] pair"):
+    with pytest.raises(
+        ValueError, match="region 'goal': x must be a \\[min, max\\] pair"
+    ):
         build_reach_avoid_environment(config)
 
 
 def test_style_is_carried_through_untouched():
-    config = _config(goal={"name": "goal", "x": [1.0, 2.0], "y": [0.0, 1.0],
-                           "style": {"color": "green", "hatch": "//"}})
+    config = _config(
+        goal={
+            "name": "goal",
+            "x": [1.0, 2.0],
+            "y": [0.0, 1.0],
+            "style": {"color": "green", "hatch": "//"},
+        }
+    )
     environment = build_reach_avoid_environment(config)
 
-    assert environment.region("goal").style == {"color": "green", "hatch": "//"}
+    assert environment.region("goal").style == {
+        "color": "green",
+        "hatch": "//",
+    }
 
 
 # --- The specification ----------------------------------------------------------------
@@ -213,12 +261,16 @@ def test_the_goal_event_is_the_configured_rectangle():
 
 
 def test_moving_a_rectangle_in_configuration_moves_its_event():
-    moved = _config(obstacles=[{"name": "block", "x": [1.25, 2.75], "y": [3.5, 4.5]}])
+    moved = _config(
+        obstacles=[{"name": "block", "x": [1.25, 2.75], "y": [3.5, 4.5]}]
+    )
 
     (event,) = [
         leaf
         for leaf in _leaves(
-            build_reach_avoid_environment(moved).get_specification(5).subformula1.subformula
+            build_reach_avoid_environment(moved)
+            .get_specification(5)
+            .subformula1.subformula
         )
         if isinstance(leaf, OutsideRectangle)
     ]
@@ -231,8 +283,16 @@ def test_the_environment_computes_no_probabilities_and_draws_nothing():
     """Sampling, robustness and plotting belong to other layers."""
     environment = build_reach_avoid_environment(CONFIG)
 
-    for attribute in ("draw_on_ax", "metadata", "sample", "robustness", "probability"):
-        assert not hasattr(environment, attribute), f"Environment grew {attribute!r}"
+    for attribute in (
+        "draw_on_ax",
+        "metadata",
+        "sample",
+        "robustness",
+        "probability",
+    ):
+        assert not hasattr(environment, attribute), (
+            f"Environment grew {attribute!r}"
+        )
     assert set(vars(environment)) == {"regions"}
 
 

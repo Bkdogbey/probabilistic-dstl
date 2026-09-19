@@ -1,194 +1,381 @@
-import matplotlib.patches as patches
+"""Optional live execution and optimizer progress views."""
+
+import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import numpy as np
-from matplotlib.transforms import blended_transform_factory
 
 from visualization.planning import (
-    PALETTE,
-    cov_ellipse_params,
-    draw_env_on_ax,
-    draw_road_backdrop,
-    geometry,
+    COLORS,
+    _draw_ego_vehicle,
+    _draw_environment,
+    _ellipse_parameters,
+    _move_obstacle,
+    _move_ego_vehicle,
+    _np,
+    _style,
+    _unique_legend,
 )
 
 
-def setup_mpc_live_plot(env):
-    env = geometry(env)
-    """Create the two-panel live figure for MPC execution."""
-    plt.ion()
-    fig = plt.figure(figsize=(14, 6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.5, 1])
-    ax_map = fig.add_subplot(gs[0])
-    ax_p = fig.add_subplot(gs[1])
-
-    if env.bounds:
-        ax_map.set_xlim(*env.bounds["x"])
-        ax_map.set_ylim(*env.bounds["y"])
-    ax_map.set_aspect("equal")
-    ax_map.grid(True, alpha=0.3)
-    ax_map.set_title("MPC Live Execution")
-
-    draw_env_on_ax(ax_map, env)
-
-    (line_exec,) = ax_map.plot([], [], color=PALETTE["ego"]["stroke"], marker="o", label="Executed Path")
-    (line_plan,) = ax_map.plot([], [], color=PALETTE["plan"]["stroke"], linestyle="--", alpha=0.8, label="Planned Window")
-    ax_map.legend(loc="upper left")
-
-    ax_p.set_xlim(0, 100)
-    ax_p.set_ylim(0, 1.1)
-    ax_p.set_title("Window Satisfaction Prob")
-    ax_p.set_xlabel("Step")
-    ax_p.set_ylabel("P(Sat)")
-    ax_p.grid(True)
-    (line_p,) = ax_p.plot([], [], color=PALETTE["goal"]["stroke"], marker="o", markersize=3)
-
-    return fig, ax_map, ax_p, line_exec, line_plan, line_p
+def _update_control_lines(ax, lines, controls):
+    if not lines:
+        palette = (COLORS["mean"], COLORS["planned"], COLORS["goal"])
+        for dimension in range(controls.shape[1]):
+            (line,) = ax.plot(
+                [],
+                [],
+                color=palette[dimension % len(palette)],
+                label=f"Control {dimension + 1}",
+            )
+            lines.append(line)
+        _unique_legend(ax, loc="best")
+    for dimension, line in enumerate(lines):
+        line.set_data(np.arange(len(controls)), controls[:, dimension])
+    ax.set_xlim(0, max(1, len(controls) - 1))
+    ax.relim()
+    ax.autoscale_view(scalex=False)
 
 
-def setup_lane_change_live_plot(env, label="", xlim=None):
-    env = geometry(env)
-    """Create the live-execution figure for lane-change MPC."""
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.grid(True, alpha=0.3, zorder=3)
-    ax.set_title(f"Lane Change MPC ({label}) — Live Execution")
-    ax.set_ylabel("$y$ [m]")
-    ax.set_xlabel("$x$ [m]")
+def _refresh(fig, interactive):
+    if interactive:
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+        plt.pause(0.001)
 
-    road_lo, road_hi = draw_road_backdrop(ax, env)
 
-    if env.success:
-        ax.axhspan(
-            env.success["y_min"], env.success["y_max"],
-            color=PALETTE["goal"]["fill"], alpha=0.15, zorder=1,
+def _state_beliefs(env, state, lane):
+    values = [(state[0], state[1], COLORS["mean"])]
+    if lane:
+        values.extend(
+            (
+                state[3][index],
+                state[4][index],
+                COLORS.get(vehicle["name"], COLORS["obstacle"]),
+            )
+            for index, vehicle in enumerate(env.metadata["traffic"])
         )
+    return values
 
-    divider_y = next(
-        (lm["y"] for lm in env.lane_markings if lm["style"] == "dashed"), None
-    )
-    if divider_y is not None:
-        _blend = blended_transform_factory(ax.transAxes, ax.transData)
-        ax.text(
-            0.02, (road_lo + divider_y) / 2, "Lane 1",
-            transform=_blend, color=PALETTE["lane"]["stroke"],
-            fontsize=8, va="center", ha="left",
+
+def _draw_belief_outlines(ax, env, state, lane):
+    if state[1] is None:
+        return []
+    outlines = []
+    for mean, covariance, color in _state_beliefs(env, state, lane):
+        width, height, angle = _ellipse_parameters(_np(covariance))
+        outline = patches.Ellipse(
+            _np(mean)[:2],
+            width,
+            height,
+            angle=angle,
+            fill=False,
+            edgecolor=color,
+            alpha=0.7,
+            linewidth=1.2,
         )
-        ax.text(
-            0.02, (divider_y + road_hi) / 2, "Lane 2",
-            transform=_blend, color=PALETTE["lane"]["stroke"],
-            fontsize=8, va="center", ha="left",
+        ax.add_patch(outline)
+        outlines.append(outline)
+    return outlines
+
+
+def _update_belief_outlines(outlines, env, state, lane):
+    for outline, (mean, covariance, _) in zip(
+        outlines, _state_beliefs(env, state, lane)
+    ):
+        width, height, angle = _ellipse_parameters(_np(covariance))
+        outline.center = _np(mean)[:2]
+        outline.width = width
+        outline.height = height
+        outline.angle = angle
+
+
+def _candidate_trace(dynamics, state, controls):
+    point = _np(state[0]).copy()
+    candidate = [point[:2].copy()]
+    for control in _np(controls):
+        point = _np(dynamics.A) @ point + _np(dynamics.B) @ control
+        candidate.append(point[:2].copy())
+    return np.asarray(candidate)
+
+
+def _follow_lane(ax, x, lane):
+    if lane:
+        ax.set_xlim(x - 15, x + 45)
+
+
+def _mark_lane_window(ax, env, lane, dt):
+    if not lane:
+        return dt
+    task = env.metadata["task"]
+    start, end = task["start_end_steps"]
+    ax.axvspan(
+        start * dt,
+        end * dt,
+        color=COLORS["goal"],
+        alpha=0.12,
+        label="Lane entry window",
+    )
+    ax.axvline(
+        end * dt,
+        color=COLORS["goal"],
+        linestyle="--",
+        linewidth=1,
+        label="Entry deadline",
+    )
+    return (end + task["dwell_steps"]) * dt
+
+
+def create_optimization_view(label, *, max_iters, control_unit="m/s"):
+    """Show sampled gradient-descent iterates from the planner callback."""
+    fig, (ax_loss, ax_score, ax_controls) = plt.subplots(
+        3, 1, figsize=(7, 7), layout="constrained"
+    )
+    (loss_line,) = ax_loss.plot(
+        [], [], color=COLORS["planned"], label="Optimization loss"
+    )
+    (smooth_line,) = ax_score.plot(
+        [], [], color=COLORS["score"], label="Smooth lower score"
+    )
+    (hard_line,) = ax_score.plot(
+        [],
+        [],
+        color=COLORS["goal"],
+        label="Hard lower satisfaction bound",
+    )
+    ax_loss.set(
+        xlabel="gradient descent iteration", ylabel="optimization loss"
+    )
+    ax_score.set(xlabel="gradient descent iteration", ylabel="score")
+    ax_controls.set(
+        xlabel="prediction step", ylabel=f"current control [{control_unit}]"
+    )
+    for ax in (ax_loss, ax_score):
+        ax.set_xlim(0, max_iters)
+        _style(ax)
+        _unique_legend(ax, loc="best")
+    _style(ax_controls)
+    beta_text = ax_score.text(
+        0.02,
+        0.05,
+        "",
+        transform=ax_score.transAxes,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
+    )
+    interactive = matplotlib.get_backend().lower() != "agg"
+    if interactive:
+        fig.show()
+    window_number = None
+    iterations, losses, smooth_scores, hard_scores = [], [], [], []
+    control_lines = []
+
+    def redraw():
+        loss_line.set_data(iterations, losses)
+        smooth_line.set_data(iterations, smooth_scores)
+        hard_line.set_data(iterations, hard_scores)
+        for ax in (ax_loss, ax_score):
+            ax.relim()
+            ax.autoscale_view(scalex=False)
+        _refresh(fig, interactive)
+
+    def on_iteration(window, iteration, record):
+        nonlocal window_number
+        if window_number != window:
+            window_number = window
+            iterations.clear()
+            losses.clear()
+            smooth_scores.clear()
+            hard_scores.clear()
+            ax_loss.set_title(f"{label}: planning window {window + 1}")
+        iterations.append(iteration + 1)
+        losses.append(record.loss)
+        smooth_scores.append(record.smooth_lower)
+        hard_scores.append(record.hard_interval[0])
+        _update_control_lines(ax_controls, control_lines, _np(record.controls))
+        beta_text.set_text(f"smoothing beta: {record.beta:.2f}")
+        print(
+            f"{label} window {window + 1}, iteration {iteration + 1}/"
+            f"{max_iters}: loss {record.loss:.4f}, "
+            f"smooth lower {record.smooth_lower:.4f}, "
+            f"hard lower {record.hard_interval[0]:.4f}",
+            flush=True,
         )
+        redraw()
 
-    (ego_dot,) = ax.plot(
-        [], [], color=PALETTE["ego"]["stroke"], marker="o", markersize=8,
-        label="Ego", zorder=10,
-    )
-    (ego_trail,) = ax.plot(
-        [], [], color=PALETTE["ego"]["stroke"], alpha=0.4, linewidth=1.5, zorder=9,
-    )
-    (plan_line,) = ax.plot(
-        [], [], color=PALETTE["plan"]["stroke"], linestyle="--",
-        alpha=0.8, linewidth=1.5, label="Plan", zorder=8,
-    )
-    ego_cov_patch = patches.Ellipse(
-        (0, 0), width=0, height=0, angle=0,
-        facecolor=PALETTE["ego"]["fill"], edgecolor=PALETTE["ego"]["stroke"],
-        alpha=0.2, label="Uncertainty", zorder=7,
-    )
-    ax.add_patch(ego_cov_patch)
+    def finish_window(window, plan):
+        loss_line.set_data(
+            np.arange(1, len(plan.loss_history) + 1), plan.loss_history
+        )
+        ax_loss.relim()
+        ax_loss.autoscale_view(scalex=False)
+        beta_text.set_text(f"final smoothing beta: {plan.smoothing_beta:.2f}")
+        print(
+            f"{label} window {window + 1} complete after "
+            f"{len(plan.loss_history)} iterations: "
+            f"hard interval [{plan.hard_interval[0]:.4f}, "
+            f"{plan.hard_interval[1]:.4f}]",
+            flush=True,
+        )
+        _refresh(fig, interactive)
 
-    obs0 = env.moving_obstacles[0]
-    obs_pos0 = np.asarray([float(obs0["x_traj"][0]), float(obs0["y_traj"][0])])
-    obs_rect = patches.Rectangle(
-        (obs_pos0[0] - obs0["width"] / 2, obs_pos0[1] - obs0["height"] / 2),
-        obs0["width"], obs0["height"],
-        facecolor=PALETTE["obs_moving"]["fill"], edgecolor=PALETTE["obs_moving"]["stroke"],
-        alpha=0.8, label="Other Car", zorder=9,
-    )
-    ax.add_patch(obs_rect)
-    ax.legend(loc="upper right", fontsize=8)
-    if xlim:
-        ax.set_xlim(xlim)
-    ax.set_ylim(road_lo - 1, road_hi + 1)
-
-    return fig, ax, ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect
+    return fig, (ax_loss, ax_score, ax_controls), on_iteration, finish_window
 
 
-def update_mpc_live_plot(fig, line_exec, line_plan, line_p, ax_p,
-                         real_mean_trace, best_mean, p_sat_trace):
-    xs = [m[0].item() for m in real_mean_trace]
-    ys = [m[1].item() for m in real_mean_trace]
-    line_exec.set_data(xs, ys)
-
-    plan_np = best_mean.detach().cpu().squeeze().numpy()
-    line_plan.set_data(plan_np[:, 0], plan_np[:, 1])
-
-    steps = list(range(len(p_sat_trace)))
-    line_p.set_data(steps, p_sat_trace)
-    if p_sat_trace:
-        ax_p.set_xlim(0, max(len(p_sat_trace) + 5, 20))
-
-    plt.pause(0.001)
-
-
-def update_lane_change_plot(
-    ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect,
-    real_mean_trace, curr_cov, p_mean, obs_pos, obs_cfg,
+def create_live_view(
+    env,
+    initial_state,
+    *,
+    dt,
+    lane=False,
+    dynamics=None,
+    max_iters=40,
+    label="MPC",
 ):
-    ego_pos = real_mean_trace[-1].cpu().numpy()
-    ego_x, ego_y = ego_pos[0], ego_pos[1]
-
-    ego_dot.set_data([ego_x], [ego_y])
-    ego_trail.set_data(
-        [m[0].item() for m in real_mean_trace],
-        [m[1].item() for m in real_mean_trace],
+    """One road-centered figure for candidate plans and executed steps."""
+    fig = plt.figure(figsize=(14, 6), layout="constrained")
+    grid = fig.add_gridspec(3, 2, width_ratios=(2.8, 1.0))
+    ax_map = fig.add_subplot(grid[:, 0])
+    ax_loss = fig.add_subplot(grid[0, 1])
+    ax_score = fig.add_subplot(grid[1, 1])
+    ax_windows = fig.add_subplot(grid[2, 1])
+    moving = _draw_environment(ax_map, env, lane=lane)
+    initial = _np(initial_state[0])[:2]
+    ego_patch = _draw_ego_vehicle(ax_map, env, initial) if lane else None
+    executed = [initial]
+    window_scores = []
+    (line_exec,) = ax_map.plot(
+        [initial[0]],
+        [initial[1]],
+        color=COLORS["executed"],
+        linewidth=2,
+        marker="o",
+        markersize=3,
+        label="Executed trajectory",
     )
-
-    theta, w_e, h_e = cov_ellipse_params(curr_cov[:2, :2].cpu().numpy())
-    ego_cov_patch.set_center((ego_x, ego_y))
-    ego_cov_patch.set_width(w_e)
-    ego_cov_patch.set_height(h_e)
-    ego_cov_patch.set_angle(theta)
-
-    plan_np = p_mean.detach().cpu().squeeze().numpy()
-    plan_line.set_data(plan_np[:, 0], plan_np[:, 1])
-    obs_rect.set_xy((obs_pos[0] - obs_cfg["width"] / 2, obs_pos[1] - obs_cfg["height"] / 2))
-    plt.pause(0.001)
-
-
-def make_mpc_live_callback(env):
-    fig, ax_map, ax_p, line_exec, line_plan, line_p = setup_mpc_live_plot(env)
-    real_trace, p_sat_so_far = [], []
-
-    def callback(step, state, plan):
-        curr_mean, curr_cov = state[:2]
-        best_mean = plan.rollout.aux["mean_trace"]
-        best_p = plan.hard_interval[0]
-        real_trace.append(curr_mean.detach())
-        p_sat_so_far.append(best_p)
-        update_mpc_live_plot(fig, line_exec, line_plan, line_p, ax_p,
-                             real_trace, best_mean, p_sat_so_far)
-
-    return callback
-
-
-def make_lane_change_live_callback(env):
-    from planning.environment import obstacle_position
-
-    view = geometry(env)
-    fig_live, _ax, ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect = (
-        setup_lane_change_live_plot(env, label=view.label, xlim=view.plot_xlim)
+    (line_plan,) = ax_map.plot(
+        [],
+        [],
+        color=COLORS["planned"],
+        linewidth=1.5,
+        label="Predicted planning window",
     )
-    real_trace = []
-    obs0 = view.moving_obstacles[0]
+    (line_loss,) = ax_loss.plot(
+        [],
+        [],
+        color=COLORS["planned"],
+        marker="o",
+        markersize=3,
+        label="Optimization loss",
+    )
+    (line_smooth,) = ax_score.plot(
+        [],
+        [],
+        color=COLORS["score"],
+        marker="o",
+        markersize=3,
+        label="Smooth lower score",
+    )
+    (line_hard,) = ax_score.plot(
+        [],
+        [],
+        color=COLORS["goal"],
+        marker="o",
+        markersize=3,
+        label="Hard lower bound",
+    )
+    (line_windows,) = ax_windows.plot(
+        [],
+        [],
+        color=COLORS["score"],
+        linewidth=1.5,
+        marker="o",
+        markersize=3,
+        label="Window hard lower bound",
+    )
+    ax_loss.set(xlabel="iteration", ylabel="loss", xlim=(0, max_iters))
+    ax_score.set(xlabel="iteration", ylabel="lower score", xlim=(0, max_iters))
+    ax_windows.set(xlabel="executed time [s]", ylabel="hard lower bound")
+    final_time = _mark_lane_window(ax_windows, env, lane, dt)
+    ax_windows.set_xlim(0, final_time)
+    for ax in (ax_loss, ax_score, ax_windows):
+        _style(ax, probability=ax is ax_windows)
+        _unique_legend(ax, loc="best")
+    _unique_legend(ax_map, loc="best")
+    _follow_lane(ax_map, initial[0], lane)
+    belief_outlines = _draw_belief_outlines(ax_map, env, initial_state, lane)
+    interactive = matplotlib.get_backend().lower() != "agg"
+    if interactive:
+        fig.show()
+    current_state = initial_state
+    iterations, losses, smooth, hard = [], [], [], []
+    current_window = None
 
-    def callback(step, state, plan):
-        curr_mean, curr_cov = state[:2]
-        real_trace.append(curr_mean.detach())
-        update_lane_change_plot(
-            ego_dot, ego_trail, plan_line, ego_cov_patch, obs_rect,
-            real_trace, curr_cov, plan.rollout.aux["mean_trace"],
-            obstacle_position(env, step + 1), obs0,
+    def on_iteration(window, iteration, record):
+        nonlocal current_window
+        if current_window != window:
+            current_window = window
+            iterations.clear()
+            losses.clear()
+            smooth.clear()
+            hard.clear()
+            ax_map.set_title(
+                f"Planning window {window + 1} at t={window * dt:.1f} s"
+            )
+        iterations.append(iteration + 1)
+        losses.append(record.loss)
+        smooth.append(record.smooth_lower)
+        hard.append(record.hard_interval[0])
+        line_loss.set_data(iterations, losses)
+        line_smooth.set_data(iterations, smooth)
+        line_hard.set_data(iterations, hard)
+        for ax in (ax_loss, ax_score):
+            ax.relim()
+            ax.autoscale_view(scalex=False)
+        if dynamics is not None:
+            candidate = _candidate_trace(
+                dynamics, current_state, record.controls
+            )
+            line_plan.set_data(candidate[:, 0], candidate[:, 1])
+        print(
+            f"{label} window {window + 1}, iteration {iteration + 1}/{max_iters}: "
+            f"loss {record.loss:.4f}, smooth lower {record.smooth_lower:.4f}, "
+            f"hard lower {record.hard_interval[0]:.4f}",
+            flush=True,
+        )
+        _refresh(fig, interactive)
+
+    def finish_window(window, plan):
+        print(
+            f"{label} window {window + 1} complete after "
+            f"{len(plan.loss_history)} iterations: "
+            f"hard interval [{plan.hard_interval[0]:.4f}, "
+            f"{plan.hard_interval[1]:.4f}]",
+            flush=True,
         )
 
-    return callback
+    def on_step(step, state, plan):
+        nonlocal current_state
+        current_state = state
+        executed.append(_np(state[0])[:2])
+        points = np.asarray(executed)
+        line_exec.set_data(points[:, 0], points[:, 1])
+        trace = _np(plan.rollout.aux["mean_trace"])[0]
+        line_plan.set_data(trace[:, 0], trace[:, 1])
+        window_scores.append(plan.hard_interval[0])
+        line_windows.set_data(
+            dt * np.arange(1, len(window_scores) + 1), window_scores
+        )
+        ax_windows.set_xlim(0, max(final_time, dt * (len(window_scores) + 1)))
+        _move_obstacle(moving, env, step + 1, state)
+        if ego_patch is not None:
+            _move_ego_vehicle(ego_patch, points[-1])
+        _follow_lane(ax_map, points[-1, 0], lane)
+        _update_belief_outlines(belief_outlines, env, state, lane)
+        ax_map.set_title(
+            f"Executed step {step + 1} at t={(step + 1) * dt:.1f} s"
+        )
+        _refresh(fig, interactive)
+
+    on_step.on_iteration = on_iteration
+    on_step.finish_window = finish_window
+    return fig, (ax_map, ax_loss, ax_score, ax_windows), on_step

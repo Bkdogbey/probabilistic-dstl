@@ -1,116 +1,92 @@
 # Probabilistic differentiable STL
 
-pdSTL evaluates Signal Temporal Logic formulas over uncertain trajectories.
-A belief supplies atomic probability bounds; Boolean and temporal operators
-combine them. The generic contract is probability_bounds(predicate) -> [B, 2].
-The included Gaussian model evaluates threshold, half-space, and rectangle events.
-Rectangular enclosures do not assume independent coordinates.
+pdSTL combines probability bounds for atomic events into Boolean and temporal
+satisfaction intervals. A belief supplies `probability_bounds(event) -> [B, 2]`;
+the pdSTL layer does not assume a particular uncertainty distribution. Gaussian
+beliefs provide exact axis and half-space probabilities. Rectangle intervals use
+Fréchet bounds. The lane example evaluates collision events on relative Gaussian
+beliefs for three surrounding vehicles.
 
-## Planning
+## Planning pipeline
 
-The execution path is:
+```text
+YAML scenario → dynamics and initial belief → rollout → atomic probability bounds
+→ pdSTL formula → smooth lower score → bounded control optimization
+→ final hard interval → PlanResult → publication figure
+```
 
-    config -> environment and specification -> stochastic rollout
-           -> smooth lower pdSTL score -> optimize controls
-           -> final hard interval -> PlanResult
+`Planner.optimize_window` optimizes only the smooth lower score, control effort,
+and control smoothness. The hard interval is evaluated for reporting and optional
+stopping. It is a pdSTL satisfaction interval, not an exact joint trajectory
+probability. `PlanResult` holds controls, the predicted rollout, smooth score,
+hard interval, one post-update loss per iteration, the final loss, and the beta
+used for that result. Optional iteration observers receive a lightweight record
+for the same post-update iterate. Saturated initial controls are moved inside
+the tanh bound to preserve useful gradients.
 
-Planner(dynamics, horizon, config=None) accepts rollout(v) -> BeliefRollout
-and an explicit spec in optimize_window. Only the belief trajectory is required;
-nominal and auxiliary traces are optional diagnostics.
+`Planner.run_receding_horizon` is the only MPC loop. It optimizes a local window,
+executes its first control, updates the state, shifts the remaining controls,
+and repeats until the goal or step limit. `MPCResult` stores executed states,
+applied controls, window plans, and the stopping reason.
 
-The only objective is:
+## Scenarios and figures
 
-    -w_phi * smooth_lower + w_u * control_effort + w_du * control_smoothness
+- `configs/scenarios/altitude_safety.yaml`: altitude belief, atomic probability,
+  controls, and final pdSTL interval.
+- `configs/scenarios/reach_avoid.yaml`: one shared workspace, goal, and obstacle
+  geometry for one-shot and MPC execution. Its `mpc` section holds step limit
+  and seed. The default geometry has two blocks and one gap.
+- `configs/scenarios/lane_change.yaml`: four-vehicle lane change with road
+  safety, relative collision checks, and a timed target-lane dwell. This is the
+  default live MPC run.
+- `configs/scenarios/lane_merge.yaml`: selectable on-ramp merge where the ramp
+  tapers into the main lane. It uses the same stochastic traffic and pdSTL
+  safety machinery.
 
-Effort is the sum of squared controls. Smoothness is the sum of squared successive
-differences plus the squared first control. The initial guess is in physical
-control units; omission means zero controls. Dynamics bounds controls with tanh.
+The canonical runners save a structured `.pt` result and a 300-dpi `.png` plus
+vector `.pdf` figure in `outputs/`. Altitude and reach–avoid GIFs reveal the
+predicted trajectory step by step. MPC and lane GIFs show every executed step,
+its current plan, the lower satisfaction bound, and surrounding traffic when
+present. Load trusted result files with
+`torch.load(path, weights_only=False)`.
 
-The planner differentiates spec.smooth_lower(trajectory, beta), using a geometric
-beta schedule. It returns the final optimizer update, reports its smooth score
-at beta_end, and evaluates spec.probability_interval(trajectory) for validation.
-Hard scores never select checkpoints. Optional hard-threshold stopping is
-disabled by default (alpha: null).
+The publication plots show predicted belief means, selected 95% belief ellipses,
+executed trajectories, predicate intervals, controls or optimization loss, and
+per-window lower satisfaction bounds as appropriate. The ellipse uses the joint
+95% radius for a two-dimensional Gaussian. The MPC and lane live view places the
+environment at the center and shows sampled optimizer updates in graphs beside
+it, then advances the scene after each executed step.
 
-Smooth values need not be probability bounds. The hard interval is a pdSTL/StoRI
-evaluation, not an exact whole-trajectory satisfaction probability.
+## Run
 
-PlanResult contains controls, rollout, smooth_lower, hard_interval, loss_history.
-History records the loss before each optimizer update at that iteration's beta.
-Optional iteration observers receive post-update plans. Returned predictions
-retain no optimization graph.
+```bash
+pip install -r requirements.txt
+python src/main.py
+```
 
-## Receding horizon
+Edit the `"run"` and `"skip"` flags beside each project block in `src/main.py`.
+The current flags in that file select the projects to run. `show_plots=True`
+displays each completed plot before saving it. `show_optimization=True`
+reports sampled gradient descent iterations in the terminal. For MPC and lane
+runs, the same live figure shows the candidate path and side graphs with an
+interactive Matplotlib backend. Set `optimization_every=1` in `src/main.py` to
+display every update; the default samples every 5 iterations. `live_plots=True`
+shows the environment as planning and execution progress. The public
+runners also accept `show`, `save`, `live_optimization`, and, for MPC and lane
+runs, `live`. Their `max_steps` override is useful for bounded runs.
 
-Planner.run_receding_horizon is the only MPC loop:
+The deterministic baseline remains available for comparison of a stored lane
+plan; it does not add another optimizer. Lane collision checks use configured
+relative longitudinal and lateral bounds around the vehicle centers.
 
-    current state/belief -> rollout and local specification -> optimize horizon
-                        -> execute first control -> update -> shift -> repeat
+## Development checks
 
-Supply make_rollout(state, step), make_spec(state, step),
-execute(state, control, step), a pure is_done(state, step), and max_steps.
-Execution returns a new state. Warm starts drop the executed control and
-repeat the last control at the horizon tail.
-
-MPCResult contains states, applied_controls shaped [steps, control_dim],
-window_plans, and stopped_reason (goal_reached or max_steps).
-States include the initial state, including when the loop executes zero controls.
-
-## Scenarios and outputs
-
-Reach-avoid and MPC share the workspace/goal/obstacles rectangular schema,
-with configurable name, x, y, and optional style fields. The default has two
-blocks forming one gap. Its specification is:
-
-    G[1,H](inside workspace AND outside every obstacle)
-    AND F[0,H](inside goal)
-
-Lane merge preserves its moving vehicle, local goal/workspace rules, moment
-predicate, and consecutive-step success criterion. It uses the canonical loss,
-so numerical trajectories can differ from the former heuristic optimizer.
-Lane settings live in the lane scenario YAML.
-
-Public runners: run_reach_avoid, run_mpc, run_lane_change, run_altitude_safety.
-All accept show, save, and verbose. With show=False and save=False, no plotting
-diagnostics or output files are made.
-
-Reach-avoid saves a structured result and three figures: predicted trajectory,
-event probability intervals, and optimization loss. Altitude can animate
-optimizer updates. MPC and lane runs can save trajectory figures and animations.
-Visualization derives its data on demand rather than extending result schemas.
-
-Save with torch.save; load trusted result files with
-torch.load(path, weights_only=False). Old dictionaries and solve() dispatch
-are intentionally unsupported.
-
-## Install and run
-
-    pip install -r requirements.txt
-    python src/main.py
-
-Select altitude and reach-avoid using the skip_run blocks in src/main.py.
-Set show_plots: false in configs/examples.yaml for noninteractive runs.
-Additional scalar demonstrations are in planning.examples.
-
-## Remaining planning files
-
-| File | Purpose |
-| --- | --- |
-| environment.py | Geometry, config parsing, reach-avoid/lane specification builders |
-| planner.py | One optimizer, structured results, one generic MPC loop |
-| runners.py | Setup, execution rules, saving and visualization orchestration |
-| examples.py | Five scalar formula cases and scalar one-shot/MPC reach demonstrations |
-| __init__.py | Minimal public exports |
-
-The scenario subpackage, logging wrappers, alternative benchmark, and obsolete
-single-shot runner/configuration have been removed.
-
-Other packages: pdstl owns semantics and predicates; models owns beliefs,
-dynamics, and rollouts; visualization owns plots and animations; baselines owns
-the deterministic STL comparison. Existing Gaussian-moment predicates now live
-in pdstl/predicates.py; generic geometric events retain their belief-independent
-probability contract.
+```bash
+ruff format --check src tests
+flake8 src
+PYTHONPATH=src MPLBACKEND=Agg pytest -q
+```
 
 ## License
 
-MIT. See LICENSE.
+MIT. See [LICENSE](LICENSE).

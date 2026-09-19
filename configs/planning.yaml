@@ -4,11 +4,9 @@ w_u: 0.1
 w_du: 0.1
 lr: 0.05
 max_iters: 500
-loss_tol: 1.0e-4
-min_iters: 10
 smoothing:
   beta_start: 2.0
   beta_end: 20.0
-# Optional stopping check, never a checkpoint selection objective.
+# Optional hard-bound stopping check, never an optimization objective.
 alpha: null
 converge_patience: 50

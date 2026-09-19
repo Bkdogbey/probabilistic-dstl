@@ -22,7 +22,9 @@ class Dynamics(nn.Module):
     def sample_step(self, x, P, u):
         """Simulated step: sampled next state and predicted covariance."""
         x_next, P_next = self.step(x, P, u)
-        noise = torch.distributions.MultivariateNormal(torch.zeros_like(x_next), self.Q).sample()
+        noise = torch.distributions.MultivariateNormal(
+            torch.zeros_like(x_next), self.Q
+        ).sample()
         return x_next + noise, P_next
 
     def forward(self, v_sequence, x0_mean, x0_cov):
@@ -38,7 +40,9 @@ class Dynamics(nn.Module):
 class SingleIntegrator(Dynamics):
     """Velocity control in R^D: A = I, B = dt I, Q = q_std^2 I."""
 
-    def __init__(self, dt=0.2, u_max=1.0, q_std=0.05, device="cpu", state_dim=2):
+    def __init__(
+        self, dt=0.2, u_max=1.0, q_std=0.05, device="cpu", state_dim=2
+    ):
         super().__init__(dt, u_max, device)
         eye = torch.eye(state_dim, device=device)
         self.register_buffer("A", eye.clone())
