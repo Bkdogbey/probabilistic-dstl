@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 
@@ -20,6 +21,7 @@ class PlanResult:
     loss_history: list[float]
     final_loss: float
     smoothing_beta: float
+    planning_time: float = 0.0
 
 
 @dataclass
@@ -39,6 +41,7 @@ class MPCResult:
     applied_controls: torch.Tensor  # [steps, control_dim]
     window_plans: list[PlanResult]
     stopped_reason: str
+    failure_detail: str | None = None
 
 
 class Planner:
@@ -197,6 +200,7 @@ class Planner:
         ):
             raise ValueError("callback_every must be a positive integer")
         parameters = self._init_controls(init_guess)
+        started = perf_counter()
         optimizer = torch.optim.Adam([parameters], lr=self.cfg["lr"])
         history, patience = [], 0
         for iteration in range(self.cfg["max_iters"]):
@@ -269,7 +273,9 @@ class Planner:
                     post_loss,
                     post_lower,
                 )
-        return self._evaluate(rollout, parameters, spec, beta, history)
+        result = self._evaluate(rollout, parameters, spec, beta, history)
+        result.planning_time = perf_counter() - started
+        return result
 
     @staticmethod
     def shift_controls(controls):
@@ -290,6 +296,7 @@ class Planner:
         on_step=None,
         on_iteration=None,
         callback_every=1,
+        capture_planning_failures=False,
     ):
         """Callbacks use (state, step); execute additionally receives physical u_0.
 
@@ -303,27 +310,35 @@ class Planner:
         ):
             raise ValueError("max_steps must be a nonnegative integer")
         states, applied, plans = [state], [], []
+        failure_detail = None
         guess = init_guess
         reason = is_done(state, 0)
         for step in range(max_steps):
             if reason:
                 break
-            plan = self.optimize_window(
-                make_rollout(state, step),
-                spec=make_spec(state, step),
-                init_guess=guess,
-                verbose=verbose,
-                on_iteration=(
-                    (
-                        lambda iteration, record: on_iteration(
-                            step, iteration, record
+            try:
+                plan = self.optimize_window(
+                    make_rollout(state, step),
+                    spec=make_spec(state, step),
+                    init_guess=guess,
+                    verbose=verbose,
+                    on_iteration=(
+                        (
+                            lambda iteration, record: on_iteration(
+                                step, iteration, record
+                            )
                         )
-                    )
-                    if on_iteration is not None
-                    else None
-                ),
-                callback_every=callback_every,
-            )
+                        if on_iteration is not None
+                        else None
+                    ),
+                    callback_every=callback_every,
+                )
+            except (RuntimeError, ValueError) as error:
+                if not capture_planning_failures:
+                    raise
+                reason = "planning_failure"
+                failure_detail = f"{type(error).__name__}: {error}"
+                break
             control = plan.controls[0].clone()
             state = execute(state, control, step)
             states.append(state)
@@ -347,4 +362,5 @@ class Planner:
             (reason if isinstance(reason, str) else "goal_reached")
             if reason
             else "max_steps",
+            failure_detail,
         )

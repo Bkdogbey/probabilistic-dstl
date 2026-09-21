@@ -26,7 +26,7 @@ def _update_control_lines(ax, lines, controls):
                 [],
                 [],
                 color=palette[dimension % len(palette)],
-                label=f"Control {dimension + 1}",
+                label=("Longitudinal" if dimension == 0 else "Lateral"),
             )
             lines.append(line)
         _unique_legend(ax, loc="best")
@@ -51,7 +51,7 @@ def _state_beliefs(env, state, lane):
             (
                 state[3][index],
                 state[4][index],
-                COLORS.get(vehicle["name"], COLORS["obstacle"]),
+                COLORS["traffic"],
             )
             for index, vehicle in enumerate(env.metadata["traffic"])
         )
@@ -109,21 +109,22 @@ def _mark_lane_window(ax, env, lane, dt):
         return dt
     task = env.metadata["task"]
     start, end = task["start_end_steps"]
+    latest_start = end - task["dwell_steps"]
     ax.axvspan(
         start * dt,
-        end * dt,
+        latest_start * dt,
         color=COLORS["goal"],
         alpha=0.12,
-        label="Lane entry window",
+        label="Dwell-start window",
     )
     ax.axvline(
         end * dt,
         color=COLORS["goal"],
         linestyle="--",
         linewidth=1,
-        label="Entry deadline",
+        label="Completion deadline",
     )
-    return (end + task["dwell_steps"]) * dt
+    return end * dt
 
 
 def create_optimization_view(label, *, max_iters, control_unit="m/s"):
@@ -135,13 +136,13 @@ def create_optimization_view(label, *, max_iters, control_unit="m/s"):
         [], [], color=COLORS["planned"], label="Optimization loss"
     )
     (smooth_line,) = ax_score.plot(
-        [], [], color=COLORS["score"], label="Smooth lower score"
+        [], [], color=COLORS["score"], label="Smooth score"
     )
     (hard_line,) = ax_score.plot(
         [],
         [],
         color=COLORS["goal"],
-        label="Hard lower satisfaction bound",
+        label="Hard lower",
     )
     ax_loss.set(
         xlabel="gradient descent iteration", ylabel="optimization loss"
@@ -250,14 +251,14 @@ def create_live_view(
         linewidth=2,
         marker="o",
         markersize=3,
-        label="Executed trajectory",
+        label="Executed",
     )
     (line_plan,) = ax_map.plot(
         [],
         [],
         color=COLORS["planned"],
         linewidth=1.5,
-        label="Predicted planning window",
+        label="Plan",
     )
     (line_loss,) = ax_loss.plot(
         [],
@@ -273,7 +274,7 @@ def create_live_view(
         color=COLORS["score"],
         marker="o",
         markersize=3,
-        label="Smooth lower score",
+        label="Smooth score",
     )
     (line_hard,) = ax_score.plot(
         [],
@@ -281,7 +282,7 @@ def create_live_view(
         color=COLORS["goal"],
         marker="o",
         markersize=3,
-        label="Hard lower bound",
+        label="Hard lower",
     )
     (line_windows,) = ax_windows.plot(
         [],
@@ -290,7 +291,7 @@ def create_live_view(
         linewidth=1.5,
         marker="o",
         markersize=3,
-        label="Window hard lower bound",
+        label="Hard lower",
     )
     ax_loss.set(xlabel="iteration", ylabel="loss", xlim=(0, max_iters))
     ax_score.set(xlabel="iteration", ylabel="lower score", xlim=(0, max_iters))
@@ -300,7 +301,9 @@ def create_live_view(
     for ax in (ax_loss, ax_score, ax_windows):
         _style(ax, probability=ax is ax_windows)
         _unique_legend(ax, loc="best")
-    _unique_legend(ax_map, loc="best")
+    _unique_legend(
+        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.16), ncol=5
+    )
     _follow_lane(ax_map, initial[0], lane)
     belief_outlines = _draw_belief_outlines(ax_map, env, initial_state, lane)
     interactive = matplotlib.get_backend().lower() != "agg"

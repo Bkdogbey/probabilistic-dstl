@@ -23,9 +23,7 @@ COLORS = {
     "workspace": "tab:gray",
     "score": "tab:purple",
     "ellipse": "tab:cyan",
-    "lead": "tab:red",
-    "target_front": "tab:purple",
-    "target_rear": "tab:brown",
+    "traffic": "#c62828",
 }
 CHI95_RADIUS = sqrt(-2 * log(0.05))
 
@@ -174,7 +172,14 @@ def _draw_environment(ax, env, *, lane=False):
                     road["lane_divider"],
                 ]
             )
-            ax.fill_between(x, lower, road["y_max"], color="#f2f2f7")
+            ax.fill_between(
+                [start, end],
+                [road["y_min"], road["lane_divider"]],
+                road["y_min"],
+                color="#7f0000",
+                alpha=0.38,
+                label="Non-drivable",
+            )
             ax.plot(x, lower, color=COLORS["workspace"], linewidth=1.3)
             ax.axhline(road["y_max"], color=COLORS["workspace"], linewidth=1.3)
             ax.plot(
@@ -205,17 +210,17 @@ def _draw_environment(ax, env, *, lane=False):
             )
         )
         moving = {}
-        for vehicle in env.metadata["traffic"]:
+        for index, vehicle in enumerate(env.metadata["traffic"]):
             name = vehicle["name"]
             patch = VehiclePatch(
                 vehicle["x0"] - vehicle["width"] / 2,
                 vehicle["y"] - vehicle["height"] / 2,
                 vehicle["width"],
                 vehicle["height"],
-                facecolor=COLORS.get(name, COLORS["obstacle"]),
-                edgecolor=COLORS.get(name, COLORS["obstacle"]),
+                facecolor=COLORS["traffic"],
+                edgecolor=COLORS["traffic"],
                 alpha=0.65,
-                label=name.replace("_", " ").title(),
+                label="Traffic" if index == 0 else "_nolegend_",
             )
             ax.add_patch(patch)
             moving[name] = patch
@@ -523,6 +528,26 @@ def plot_reach_avoid(
     return fig, (ax_map, ax_prob, ax_loss)
 
 
+def _mark_lane_task_window(ax, env, dt):
+    task = env.metadata["task"]
+    start, end = task["start_end_steps"]
+    latest_start = end - task["dwell_steps"]
+    ax.axvspan(
+        start * dt,
+        latest_start * dt,
+        color=COLORS["goal"],
+        alpha=0.10,
+        label="Dwell-start window",
+    )
+    ax.axvline(
+        end * dt,
+        color=COLORS["obstacle"],
+        linestyle="--",
+        linewidth=1,
+        label="Completion deadline",
+    )
+
+
 def _plot_execution(result, env, *, dt, lane, save_path, show):
     fig = plt.figure(
         figsize=(14, 6) if lane else (11, 7), layout="constrained"
@@ -544,7 +569,7 @@ def _plot_execution(result, env, *, dt, lane, save_path, show):
         means[:, 1],
         color=COLORS["executed"],
         linewidth=2,
-        label="Executed trajectory",
+        label="Executed",
         zorder=5,
     )
     ax_map.scatter(
@@ -563,35 +588,29 @@ def _plot_execution(result, env, *, dt, lane, save_path, show):
             color=COLORS["planned"],
             linewidth=1.1,
             alpha=0.6,
-            label="Predicted planning window",
+            label="Plan",
         )
     if lane:
         _draw_ego_vehicle(ax_map, env, means[-1])
-        traffic_positions = []
-        for index, vehicle in enumerate(env.metadata["traffic"]):
+        for index, _vehicle in enumerate(env.metadata["traffic"]):
             positions = np.asarray(
                 [_np(state[3][index])[:2] for state in result.states]
             )
-            traffic_positions.append(positions)
             ax_map.plot(
                 positions[:, 0],
                 positions[:, 1],
-                color=COLORS.get(vehicle["name"], COLORS["obstacle"]),
+                color=COLORS["traffic"],
                 linestyle=":",
                 linewidth=1.2,
-                label=f"{vehicle['name'].replace('_', ' ').title()} path",
+                label="Traffic path" if index == 0 else "_nolegend_",
             )
         _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
-        all_x = np.concatenate(
-            [
-                means[:, 0],
-                *(positions[:, 0] for positions in traffic_positions),
-            ]
-        )
-        ax_map.set_xlim(all_x.min() - 8, all_x.max() + 8)
+        ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
     reason = {
         "goal_reached": "goal reached",
+        "success": "success",
         "max_steps": "step limit reached",
+        "step_limit": "step limit reached",
         "deadline_missed": "lane-change deadline missed",
         "collision": "collision",
         "road_violation": "road boundary violated",
@@ -609,23 +628,49 @@ def _plot_execution(result, env, *, dt, lane, save_path, show):
         _unique_legend(
             ax_map,
             loc="lower center",
-            bbox_to_anchor=(0.5, 1.02),
+            bbox_to_anchor=(0.5, 1.12),
             ncol=6,
         )
     else:
         _unique_legend(ax_map, loc="best")
-    scores = [plan.hard_interval[0] for plan in result.window_plans]
-    time = dt * np.arange(len(scores))
-    ax_score.plot(
-        time,
-        scores,
-        color=COLORS["score"],
-        marker="o",
-        markersize=3,
-        linewidth=1.5,
-        label="Lower satisfaction bound",
+    intervals = np.asarray(
+        [plan.hard_interval for plan in result.window_plans]
     )
-    ax_score.set(xlabel="time [s]", ylabel="lower satisfaction bound")
+    time = dt * np.arange(len(intervals))
+    if len(intervals):
+        ax_score.fill_between(
+            time,
+            intervals[:, 0],
+            intervals[:, 1],
+            color=COLORS["goal"],
+            alpha=0.24,
+            label="Hard interval",
+        )
+        ax_score.plot(time, intervals[:, 0], color=COLORS["goal"])
+        ax_score.plot(
+            time, intervals[:, 1], color=COLORS["goal"], linestyle="--"
+        )
+        ax_score.plot(
+            time,
+            [plan.smooth_lower for plan in result.window_plans],
+            color=COLORS["score"],
+            marker="o",
+            markersize=3,
+            linewidth=1.2,
+            label="Smooth score",
+        )
+        ax_score.text(
+            0.98,
+            0.05,
+            f"Final pdSTL: [{intervals[-1, 0]:.3f}, {intervals[-1, 1]:.3f}]",
+            transform=ax_score.transAxes,
+            ha="right",
+            fontsize=9,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+        )
+    if lane:
+        _mark_lane_task_window(ax_score, env, dt)
+    ax_score.set(xlabel="executed time [s]", ylabel="score")
     _style(ax_score, probability=True)
     _unique_legend(ax_score, loc="best")
     controls = _np(result.applied_controls)
@@ -635,7 +680,7 @@ def _plot_execution(result, env, *, dt, lane, save_path, show):
             controls[:, dimension],
             where="post",
             linewidth=1.4,
-            label=f"Applied control {dimension + 1}",
+            label=("Longitudinal" if dimension == 0 else "Lateral"),
         )
     ax_control.set(
         xlabel="time [s]",
@@ -655,7 +700,111 @@ def plot_mpc_execution(result, env, *, dt, save_path=None, show=False):
 
 
 def plot_lane_merge(result, env, *, dt, save_path=None, show=False):
-    """Lane geometry, moving vehicle, executed path, plans, and bounds."""
-    return _plot_execution(
-        result, env, dt=dt, lane=True, save_path=save_path, show=show
+    """Save one combined result and one local-scale lane trajectory view."""
+
+    combined = _plot_execution(
+        result,
+        env,
+        dt=dt,
+        lane=True,
+        save_path=save_path,
+        show=show,
     )
+
+    def output(kind):
+        if save_path is None:
+            return None
+        stem = Path(save_path).with_suffix("")
+        return stem.with_name(f"{stem.name}_{kind}.png")
+
+    means = np.asarray([_np(state[0])[:2] for state in result.states])
+
+    trajectory_fig, ax_map = plt.subplots(
+        figsize=(12, 4.2), layout="constrained"
+    )
+    moving = _draw_environment(ax_map, env, lane=True)
+    ax_map.plot(
+        means[:, 0],
+        means[:, 1],
+        color=COLORS["executed"],
+        linewidth=2,
+        label="Executed",
+        zorder=5,
+    )
+    ax_map.scatter(
+        means[0, 0],
+        means[0, 1],
+        color=COLORS["executed"],
+        s=25,
+        label="Start",
+        zorder=6,
+    )
+    for index in _selected_windows(len(result.window_plans)):
+        plan = _np(result.window_plans[index].rollout.aux["mean_trace"])[0]
+        ax_map.plot(
+            plan[:, 0],
+            plan[:, 1],
+            color=COLORS["planned"],
+            linewidth=1.1,
+            alpha=0.55,
+            label="Plan",
+        )
+    for index, _vehicle in enumerate(env.metadata["traffic"]):
+        positions = np.asarray(
+            [_np(state[3][index])[:2] for state in result.states]
+        )
+        ax_map.plot(
+            positions[:, 0],
+            positions[:, 1],
+            color=COLORS["traffic"],
+            linestyle=":",
+            linewidth=1.2,
+            label="Traffic path" if index == 0 else "_nolegend_",
+        )
+    _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
+    _draw_ego_vehicle(ax_map, env, means[-1])
+    ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
+
+    elapsed = dt * np.arange(len(means))
+    used = set()
+    for second in range(int(np.floor(elapsed[-1])) + 1):
+        index = int(np.argmin(np.abs(elapsed - second)))
+        if index in used:
+            continue
+        used.add(index)
+        ax_map.annotate(
+            f"t={second} s",
+            means[index],
+            xytext=(4, 8 if second % 2 == 0 else -15),
+            textcoords="offset points",
+            fontsize=8,
+            color=COLORS["executed"],
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.72,
+                "pad": 1,
+            },
+        )
+    ax_map.text(
+        0.99,
+        0.04,
+        (
+            f"Outcome: {result.stopped_reason.replace('_', ' ')}\n"
+            f"Final pdSTL: [{result.window_plans[-1].hard_interval[0]:.3f}, "
+            f"{result.window_plans[-1].hard_interval[1]:.3f}]"
+            if result.window_plans
+            else f"Outcome: {result.stopped_reason.replace('_', ' ')}"
+        ),
+        transform=ax_map.transAxes,
+        ha="right",
+        fontsize=9,
+    )
+    _unique_legend(
+        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.12), ncol=7
+    )
+    _finish(trajectory_fig, output("trajectory"), show)
+    return {
+        "combined": combined,
+        "trajectory": (trajectory_fig, ax_map),
+    }

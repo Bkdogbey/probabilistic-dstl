@@ -58,9 +58,7 @@ def test_mpc_uses_shared_configuration_and_saves_publication_outputs(
     initial = result.states[0]
     live_fig, live_axes, observe = create_live_view(env, initial, dt=cfg["dt"])
     executed = next(
-        line
-        for line in live_axes[0].lines
-        if line.get_label() == "Executed trajectory"
+        line for line in live_axes[0].lines if line.get_label() == "Executed"
     )
     assert len(executed.get_xdata()) == 1
     assert executed.get_xdata()[0] == float(initial[0][0])

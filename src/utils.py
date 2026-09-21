@@ -1,7 +1,9 @@
 """Configuration and device helpers shared by the scenario runners."""
 
 import os
+import sys
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 import yaml
@@ -21,12 +23,21 @@ def get_device():
 
 
 def load_config(path):
-    """Load YAML, resolving relative paths from the project root."""
-    if not os.path.isabs(path):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(root, path)
-    with open(path) as stream:
-        return yaml.safe_load(stream)
+    """Load YAML from the requested path, repository configs, or wheel data."""
+    candidate = Path(path)
+    if candidate.is_file():
+        return yaml.safe_load(candidate.read_text())
+    if candidate.is_absolute():
+        raise FileNotFoundError(candidate)
+    repository_file = Path(__file__).resolve().parents[1] / candidate
+    if repository_file.is_file():
+        return yaml.safe_load(repository_file.read_text())
+    installed_file = (
+        Path(sys.prefix) / "share" / "probabilistic-dstl" / candidate
+    )
+    if installed_file.is_file():
+        return yaml.safe_load(installed_file.read_text())
+    raise FileNotFoundError(path)
 
 
 class _SkippedRun(Exception):

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probabilistic-dstl"
+version = "0.1.0"
+description = "Probability-bound differentiable Signal Temporal Logic planning"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "matplotlib",
+  "numpy",
+  "Pillow",
+  "PyYAML",
+  "scipy",
+  "torch",
+]
+
+[project.optional-dependencies]
+dev = ["build", "flake8", "pytest", "ruff"]
+notebook = ["jupyterlab"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["utils"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["baselines*", "models*", "pdstl*", "planning*", "visualization*"]
+
+[tool.setuptools.data-files]
+"share/probabilistic-dstl/configs" = ["configs/*.yaml"]
+"share/probabilistic-dstl/configs/scenarios" = ["configs/scenarios/*.yaml"]
+"share/probabilistic-dstl/configs/experiments" = ["configs/experiments/*.yaml"]

@@ -25,3 +25,29 @@ jobs:
 
       - name: Run pre-commit
         run: pre-commit run --all-files
+
+  pytest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install project
+        run: python -m pip install ".[dev]"
+
+      - name: Run tests
+        env:
+          MPLBACKEND: Agg
+        run: pytest -q
+
+      - name: Build and smoke-test wheel
+        run: |
+          python -m build --wheel
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          cd /tmp
+          python -c "import pdstl, planning; from utils import load_config; assert load_config('configs/planning.yaml')['max_iters'] > 0"

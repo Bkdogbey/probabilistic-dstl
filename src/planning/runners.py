@@ -13,8 +13,12 @@ from pdstl.predicates import GreaterThan
 from planning.environment import (
     build_lane_merge_environment,
     build_reach_avoid_environment,
-    lane_contains_point,
+    lane_contains_footprint,
+    lane_deadline_missed,
+    lane_goal_reached,
+    lane_has_collision,
     lane_local_window,
+    lane_target_contains,
 )
 from planning.planner import Planner
 from utils import get_device, load_config
@@ -204,12 +208,7 @@ def run_reach_avoid(
 
 def lane_success_counter(environment, mean, counter):
     """Update the lane success streak once per executed step."""
-    task = environment.metadata["task"]
-    inside = (
-        task["target_center"] - task["target_tolerance"]
-        <= float(mean[1])
-        <= task["target_center"] + task["target_tolerance"]
-    )
+    inside = lane_target_contains(environment.metadata, mean)
     return counter + 1 if inside else 0
 
 
@@ -298,6 +297,12 @@ def _present_execution(result, s, *, stem, lane, show, save):
         from visualization.planning import plot_lane_merge, plot_mpc_execution
 
         plot = plot_lane_merge if lane else plot_mpc_execution
+        if lane and save:
+            for obsolete in ("controls", "scores"):
+                for suffix in (".png", ".pdf"):
+                    _output_path(f"{stem}_{obsolete}", suffix).unlink(
+                        missing_ok=True
+                    )
         plot(
             result,
             s.env,
@@ -380,6 +385,126 @@ def run_mpc(
     return result
 
 
+def _lane_executor(
+    s, traffic_q, ego_disturbances, traffic_disturbances, verbose
+):
+    def execute(state, control, step):
+        mean, covariance = s.dyn.step(state[0], state[1], control)
+        if ego_disturbances is None:
+            noise = torch.distributions.MultivariateNormal(
+                torch.zeros_like(mean), s.dyn.Q
+            ).sample()
+        else:
+            noise = ego_disturbances[step].to(mean)
+        mean = mean + noise
+        mean = mean.clone()
+        mean[2] = mean[2].clamp(*s.cfg["speed_bounds"])
+        counter = lane_success_counter(s.env, mean, state[2])
+        entry = step + 1 if counter == 1 else state[5] if counter else None
+        if traffic_disturbances is None:
+            traffic_noise = torch.randn_like(state[3]) * s.cfg["traffic_q_std"]
+        else:
+            traffic_noise = traffic_disturbances[step].to(state[3])
+        traffic_mean = state[3] @ s.dyn.A.T + traffic_noise
+        traffic_cov = s.dyn.A @ state[4] @ s.dyn.A.T + traffic_q
+        if verbose and step % 5 == 0:
+            logger.info("Lane step %d: position %s", step, mean[:2].tolist())
+        return mean, covariance, counter, traffic_mean, traffic_cov, entry
+
+    return execute
+
+
+def _lane_outcome(s):
+    def is_done(state, step):
+        if lane_has_collision(s.env, state[0][:2], state[3][:, :2]):
+            return "collision"
+        if not lane_contains_footprint(
+            s.env, float(state[0][0]), float(state[0][1])
+        ):
+            return "road_violation"
+        if lane_goal_reached(s.env, state[0], step, state[2]):
+            return "success"
+        if lane_deadline_missed(s.env, state[0], step, state[2]):
+            return "deadline_missed"
+        return None
+
+    return is_done
+
+
+def _lane_specification(s, factory, state, step):
+    environment = lane_local_window(
+        s.env, step, state[0], s.cfg, streak=state[2]
+    )
+    return (
+        factory(environment, state, step)
+        if factory is not None
+        else environment.get_specification(s.cfg["H"])
+    )
+
+
+def run_lane_trial(
+    s,
+    *,
+    initial_state=None,
+    ego_disturbances=None,
+    traffic_disturbances=None,
+    make_spec=None,
+    max_steps=None,
+    verbose=False,
+    on_step=None,
+    on_iteration=None,
+    callback_every=1,
+):
+    """Run one lane trial, optionally with predetermined paired disturbances."""
+    initial_state = (
+        _lane_initial_state(s) if initial_state is None else initial_state
+    )
+    traffic_q = s.cfg["traffic_q_std"] ** 2 * torch.eye(
+        4, dtype=s.dyn.B.dtype, device=s.dyn.device
+    )
+    acceleration = s.cfg["accel_bounds"]
+    accel_bounds = (
+        acceleration["longitudinal"],
+        acceleration["lateral"],
+    )
+    names = [car["name"] for car in s.cfg["traffic"]]
+    result = s.planner.run_receding_horizon(
+        initial_state,
+        make_rollout=lambda state, step: lane_rollout(
+            s.dyn,
+            state[0],
+            state[1],
+            state[3],
+            state[4],
+            traffic_q,
+            names,
+            s.cfg["speed_bounds"],
+            accel_bounds,
+        ),
+        make_spec=lambda state, step: _lane_specification(
+            s, make_spec, state, step
+        ),
+        execute=_lane_executor(
+            s,
+            traffic_q,
+            ego_disturbances,
+            traffic_disturbances,
+            verbose,
+        ),
+        is_done=_lane_outcome(s),
+        max_steps=s.cfg["T_SIM"] if max_steps is None else max_steps,
+        init_guess=_lane_initial_controls(s),
+        verbose=verbose,
+        on_step=on_step,
+        on_iteration=on_iteration,
+        callback_every=callback_every,
+        capture_planning_failures=True,
+    )
+    if result.stopped_reason == "max_steps":
+        result.stopped_reason = "step_limit"
+    return result
+
+
 def run_lane_change(
     config_path="configs/scenarios/lane_change.yaml",
     *,
@@ -395,15 +520,6 @@ def run_lane_change(
     if "seed" in s.cfg:
         torch.manual_seed(s.cfg["seed"])
     initial_state = _lane_initial_state(s)
-    traffic_q = s.cfg["traffic_q_std"] ** 2 * torch.eye(
-        4, dtype=s.dyn.B.dtype, device=s.dyn.device
-    )
-    acceleration = s.cfg["accel_bounds"]
-    accel_bounds = (
-        acceleration["longitudinal"],
-        acceleration["lateral"],
-    )
-    names = [car["name"] for car in s.cfg["traffic"]]
     scenario_label = (
         "Lane merge" if s.env.metadata.get("ramp") else "Lane change"
     )
@@ -416,85 +532,26 @@ def run_lane_change(
         optimization_every=optimization_every,
         initial_state=initial_state,
     )
-
-    def execute(state, control, step):
-        mean, covariance = s.dyn.sample_step(state[0], state[1], control)
-        mean = mean.clone()
-        mean[2] = mean[2].clamp(*s.cfg["speed_bounds"])
-        counter = lane_success_counter(s.env, mean, state[2])
-        entry = step + 1 if counter == 1 else state[5] if counter else None
-        traffic_mean = state[3] @ s.dyn.A.T + (
-            torch.randn_like(state[3]) * s.cfg["traffic_q_std"]
-        )
-        traffic_cov = s.dyn.A @ state[4] @ s.dyn.A.T + traffic_q
-        if verbose and step % 5 == 0:
-            logger.info("Lane step %d: position %s", step, mean[:2].tolist())
-        return mean, covariance, counter, traffic_mean, traffic_cov, entry
-
-    def is_done(state, step):
-        task = s.env.metadata["task"]
-        if not lane_contains_point(
-            s.env, float(state[0][0]), float(state[0][1])
-        ):
-            return "road_violation"
-        delta = state[3][:, :2] - state[0][:2]
-        collision = s.env.metadata["collision"]
-        if bool(
-            (
-                (delta[:, 0].abs() <= collision["longitudinal"])
-                & (delta[:, 1].abs() <= collision["lateral"])
-            ).any()
-        ):
-            return "collision"
-        start, end = task["start_end_steps"]
-        witness = max(state[5], start) if state[5] is not None else None
-        if (
-            witness is not None
-            and witness <= end
-            and step >= witness + task["dwell_steps"]
-        ):
-            return "goal_reached"
-        if step > end and (state[2] == 0 or state[5] > end):
-            return "deadline_missed"
-        if step > end + task["dwell_steps"]:
-            return "deadline_missed"
-        return None
-
-    result = s.planner.run_receding_horizon(
-        initial_state,
-        make_rollout=lambda state, step: lane_rollout(
-            s.dyn,
-            state[0],
-            state[1],
-            state[3],
-            state[4],
-            traffic_q,
-            names,
-            s.cfg["speed_bounds"],
-            accel_bounds,
-        ),
-        make_spec=lambda state, step: lane_local_window(
-            s.env, step, state[0], s.cfg, streak=state[2]
-        ).get_specification(s.cfg["H"]),
-        execute=execute,
-        is_done=is_done,
-        max_steps=s.cfg["T_SIM"] if max_steps is None else max_steps,
-        init_guess=_lane_initial_controls(s),
+    result = run_lane_trial(
+        s,
+        initial_state=initial_state,
+        max_steps=max_steps,
         verbose=verbose,
         on_step=on_step,
         on_iteration=on_iteration,
         callback_every=callback_every,
     )
     stem = Path(config_path).stem
-    final_bound = (
-        result.window_plans[-1].hard_interval[0]
+    final_interval = (
+        result.window_plans[-1].hard_interval
         if result.window_plans
-        else float("nan")
+        else (float("nan"), float("nan"))
     )
     print(
         f"{scenario_label}: {result.stopped_reason} after "
         f"{len(result.window_plans)} steps; "
-        f"last hard lower bound {final_bound:.4f}",
+        f"final certified hard interval "
+        f"[{final_interval[0]:.4f}, {final_interval[1]:.4f}]",
         flush=True,
     )
     _present_execution(result, s, stem=stem, lane=True, show=show, save=save)

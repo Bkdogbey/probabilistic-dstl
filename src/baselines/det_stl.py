@@ -309,32 +309,38 @@ def det_get_specification(env, T, t_goal_start=0, t_constraints_start=1):
 
 def compare_lane_window(plan, environment, horizon):
     """Evaluate one stored lane plan against nominal road, traffic, and dwell."""
+    from planning.environment import lane_collision_extents
+
     metadata = environment.metadata
     ego = plan.rollout.aux["mean_trace"][0]
     traffic = plan.rollout.aux["traffic_mean_trace"][0]
     road = metadata["road"]
-    collision = metadata["collision"]
     task = metadata["task"]
     step = metadata.get("step", 0)
     road_margin = torch.minimum(
         ego[:, 1] - road["y_min"], road["y_max"] - ego[:, 1]
     )
     separation = traffic[:, :, :2] - ego[:, None, :2]
-    vehicle_margin = (
-        torch.maximum(
-            separation[..., 0].abs() - collision["longitudinal"],
-            separation[..., 1].abs() - collision["lateral"],
+    vehicle_margins = []
+    for index, vehicle in enumerate(metadata["traffic"]):
+        longitudinal, lateral = lane_collision_extents(metadata, vehicle)
+        vehicle_margins.append(
+            torch.maximum(
+                separation[:, index, 0].abs() - longitudinal,
+                separation[:, index, 1].abs() - lateral,
+            )
         )
-        .min(dim=-1)
-        .values
-    )
+    vehicle_margin = torch.stack(vehicle_margins, dim=-1).min(dim=-1).values
     safety = torch.minimum(road_margin.min(), vehicle_margin.min())
     target_margin = (
         task["target_tolerance"] - (ego[:, 1] - task["target_center"]).abs()
     )
     dwell = task["dwell_steps"]
     start = max(0, task["start_end_steps"][0] - step)
-    end = min(task["start_end_steps"][1] - step, horizon - dwell)
+    end = min(
+        task["start_end_steps"][1] - dwell - step,
+        horizon - dwell,
+    )
     if end >= start:
         completion = torch.stack(
             [

@@ -62,7 +62,7 @@ with skip_run("run", "LaneChange") as check, check():
 
 
 # 5. On-ramp merge into the main lane
-with skip_run("skip", "LaneMerge") as check, check():
+with skip_run("run", "LaneMerge") as check, check():
     run_lane_change(
         "configs/scenarios/lane_merge.yaml",
         show=show_plots,

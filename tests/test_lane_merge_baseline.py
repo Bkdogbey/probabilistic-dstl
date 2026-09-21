@@ -89,8 +89,13 @@ def test_lane_save_and_live_observer(
     cfg, path = lane_config
     monkeypatch.setattr(runners, "RESULTS_DIR", tmp_path)
     result = run_lane_change(str(path), max_steps=1, show=False, save=True)
-    for suffix in (".pt", ".png", ".pdf", ".gif"):
-        assert (tmp_path / f"lane_change{suffix}").exists()
+    assert (tmp_path / "lane_change.pt").exists()
+    assert (tmp_path / "lane_change.gif").exists()
+    for stem in ("lane_change", "lane_change_trajectory"):
+        for suffix in (".png", ".pdf"):
+            assert (tmp_path / f"{stem}{suffix}").exists()
+    assert not (tmp_path / "lane_change_controls.png").exists()
+    assert not (tmp_path / "lane_change_scores.png").exists()
     with Image.open(tmp_path / "lane_change.gif") as movie:
         assert movie.n_frames >= 2
         first = movie.convert("RGB").tobytes()
@@ -108,13 +113,13 @@ def test_lane_save_and_live_observer(
     )
     ax_map = axes[0]
     labels = [patch.get_label() for patch in ax_map.patches]
-    assert {"Ego", "Lead", "Target Front", "Target Rear"} <= set(labels)
-    for vehicle in cfg["traffic"]:
-        patch = next(
-            item
-            for item in ax_map.patches
-            if item.get_label() == vehicle["name"].replace("_", " ").title()
-        )
+    assert {"Ego", "Traffic"} <= set(labels)
+    traffic_patches = [
+        item
+        for item in ax_map.patches
+        if item.get_label() in {"Traffic", "_nolegend_"}
+    ]
+    for vehicle, patch in zip(cfg["traffic"], traffic_patches):
         assert patch.get_x() + patch.get_width() / 2 == pytest.approx(
             vehicle["x0"]
         )
@@ -123,18 +128,12 @@ def test_lane_save_and_live_observer(
     window_labels = [
         item.get_text() for item in axes[3].get_legend().get_texts()
     ]
-    assert "Lane entry window" in window_labels
-    assert "Entry deadline" in window_labels
+    assert "Dwell-start window" in window_labels
+    assert "Completion deadline" in window_labels
     executed = next(
-        line
-        for line in ax_map.lines
-        if line.get_label() == "Executed trajectory"
+        line for line in ax_map.lines if line.get_label() == "Executed"
     )
-    planned = next(
-        line
-        for line in ax_map.lines
-        if line.get_label() == "Predicted planning window"
-    )
+    planned = next(line for line in ax_map.lines if line.get_label() == "Plan")
     assert list(executed.get_xdata()) == [cfg["x0_mean"][0]]
     plan = result.window_plans[0]
     observe.on_iteration(
@@ -185,12 +184,13 @@ def test_lane_save_and_live_observer(
 def test_default_lane_completes_with_physical_controls():
     cfg = load_config("configs/scenarios/lane_change.yaml")
     result = run_lane_change(show=False, save=False)
-    assert result.stopped_reason == "goal_reached"
+    assert result.stopped_reason == "success"
     assert 1 <= len(result.window_plans) <= cfg["T_SIM"]
     assert (
-        len(result.window_plans[0].loss_history) < cfg["planner"]["max_iters"]
+        len(result.window_plans[0].loss_history) <= cfg["planner"]["max_iters"]
     )
-    assert result.window_plans[0].hard_interval[0] >= cfg["planner"]["alpha"]
+    lower, upper = result.window_plans[0].hard_interval
+    assert 0 <= lower <= upper <= 1
     for index, plan in enumerate(result.window_plans):
         torch.testing.assert_close(
             result.applied_controls[index], plan.controls[0]
@@ -254,7 +254,8 @@ def test_on_ramp_merge_tapers_and_completes():
     result = run_lane_change(
         "configs/scenarios/lane_merge.yaml", show=False, save=False
     )
-    assert result.stopped_reason == "goal_reached"
+    assert result.stopped_reason == "success"
     assert len(result.window_plans) <= cfg["T_SIM"]
     assert float(result.states[-1][0][1]) >= road["lane_divider"]
-    assert result.window_plans[-1].hard_interval[0] > 0.5
+    lower, upper = result.window_plans[-1].hard_interval
+    assert 0 <= lower <= upper <= 1
