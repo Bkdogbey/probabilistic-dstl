@@ -22,15 +22,17 @@ dependencies = [
 dev = ["build", "flake8", "pytest", "ruff"]
 notebook = ["jupyterlab"]
 
+[tool.ruff]
+line-length = 79
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = ["utils"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["baselines*", "models*", "pdstl*", "planning*", "visualization*"]
+include = ["models*", "pdstl*", "planning*", "visualization*"]
 
 [tool.setuptools.data-files]
 "share/probabilistic-dstl/configs" = ["configs/*.yaml"]
 "share/probabilistic-dstl/configs/scenarios" = ["configs/scenarios/*.yaml"]
-"share/probabilistic-dstl/configs/experiments" = ["configs/experiments/*.yaml"]

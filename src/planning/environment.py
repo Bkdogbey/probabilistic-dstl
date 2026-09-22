@@ -111,10 +111,10 @@ class Environment:
 
 
 def reach_avoid_specification(environment, horizon):
-    """G[1,H](inside workspace and outside every obstacle) and F[0,H](inside goal).
+    """Stay inside the workspace, avoid obstacles, and reach the goal.
 
-    Stay inside the workspace and clear of every obstacle from step 1 to the horizon, and
-    reach the goal at least once between step 0 and the horizon.
+    Safety holds from step 1 through the horizon. The goal must be reached at
+    least once from step 0 through the horizon.
     """
     events = reach_avoid_events(environment)
     safe = [events["workspace"], *events["obstacles"]]
@@ -167,8 +167,9 @@ def _rectangle(entry, role, fallback_name):
 def build_reach_avoid_environment(config):
     """Build the environment from a scenario file's geometry.
 
-    Expects a `workspace` block, a `goal` block, and zero or more `obstacles`. Names, bounds
-    and styles all come from configuration, so the example is changed without editing code.
+    Expects a `workspace` block, a `goal` block, and zero or more `obstacles`.
+    Names, bounds and styles all come from configuration, so the example is
+    changed without editing code.
     """
     for required in ("workspace", "goal"):
         if config.get(required) is None:

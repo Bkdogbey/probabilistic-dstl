@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from pdstl.predicates import GreaterThan
-from planning.environment import reach_avoid_events
 from visualization.planning import (
     COLORS,
     _draw_ego_vehicle,
@@ -116,56 +115,63 @@ def animate_altitude(
     return fig, (ax_state, ax_prob), movie
 
 
-def animate_reach_avoid(result, env, *, dt, filename=None, fps=6, show=False):
-    """Reveal a planned path, its joint 95% ellipse, and goal probability."""
+def animate_reach_avoid(
+    result,
+    env,
+    *,
+    dt,
+    title="Reach–Avoid",
+    filename=None,
+    fps=6,
+    show=False,
+):
+    """Reveal one optimized belief trajectory inside its environment."""
     mean = _np(result.rollout.aux["mean_trace"])[0]
     covariance = _np(result.rollout.aux["cov_trace"])[0]
-    time = dt * np.arange(len(mean))
-    goal = _np(
-        reach_avoid_events(env)["goal"](result.rollout.belief_trajectory)
-    )[0]
-    fig, (ax_map, ax_prob) = plt.subplots(
-        1,
-        2,
-        figsize=(11, 5),
-        layout="constrained",
-        gridspec_kw={"width_ratios": (1.4, 1)},
-    )
-    _draw_environment(ax_map, env)
-    ax_map.plot(
+    fig, ax = plt.subplots(figsize=(10, 7), layout="constrained")
+    _draw_environment(ax, env)
+    ax.plot(
         mean[:, 0],
         mean[:, 1],
         color=COLORS["mean"],
-        alpha=0.2,
+        alpha=0.15,
     )
-    (path,) = ax_map.plot(
+    ax.scatter(
+        [mean[0, 0]],
+        [mean[0, 1]],
+        marker="o",
+        s=55,
+        color="black",
+        zorder=10,
+    )
+    (path,) = ax.plot(
         [],
         [],
         color=COLORS["mean"],
-        linewidth=2,
-        label="Predicted belief mean",
+        linewidth=2.2,
+        zorder=8,
     )
-    (point,) = ax_map.plot(
-        [], [], marker="o", color=COLORS["mean"], markersize=5
+    (point,) = ax.plot(
+        [],
+        [],
+        marker="s",
+        color=COLORS["mean"],
+        markersize=6,
+        zorder=10,
     )
-    ellipse = _ellipse(
-        ax_map, mean[0], covariance[0], label="95% belief ellipse"
-    )
-    ax_prob.plot(time, goal[:, 0], color=COLORS["goal"], alpha=0.2)
-    (goal_line,) = ax_prob.plot(
-        [], [], color=COLORS["goal"], linewidth=2, label="Goal probability"
-    )
-    ax_prob.set(xlabel="time [s]", ylabel="goal probability")
-    _style(ax_prob, probability=True)
-    status = ax_prob.text(
+    ellipse = _ellipse(ax, mean[0], covariance[0])
+    status = ax.text(
         0.02,
-        0.05,
+        0.96,
         "",
-        transform=ax_prob.transAxes,
+        transform=ax.transAxes,
+        va="top",
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
     )
-    _unique_legend(ax_map, loc="best")
-    _unique_legend(ax_prob, loc="best")
+    ax.set_title(
+        f"{title} | P↓(φ)={result.hard_interval[0]:.3f}",
+        fontweight="bold",
+    )
 
     def update(step):
         path.set_data(mean[: step + 1, 0], mean[: step + 1, 1])
@@ -175,13 +181,10 @@ def animate_reach_avoid(result, env, *, dt, filename=None, fps=6, show=False):
         ellipse.set_width(width)
         ellipse.set_height(height)
         ellipse.set_angle(angle)
-        goal_line.set_data(time[: step + 1], goal[: step + 1, 0])
         status.set_text(
-            f"Predicted step {step}/{len(mean) - 1}  ·  "
-            f"goal P = {goal[step, 0]:.3f}\n"
-            f"{_interval_text(result.hard_interval)}"
+            f"t = {step * dt:.1f} s  ·  predicted step {step}/{len(mean) - 1}"
         )
-        return path, point, ellipse, goal_line, status
+        return path, point, ellipse, status
 
     movie = animation.FuncAnimation(
         fig,
@@ -191,7 +194,7 @@ def animate_reach_avoid(result, env, *, dt, filename=None, fps=6, show=False):
         blit=False,
     )
     _finish_animation(fig, movie, filename, fps, show)
-    return fig, (ax_map, ax_prob), movie
+    return fig, ax, movie
 
 
 def animate_mpc(
@@ -329,8 +332,7 @@ def animate_mpc(
         hard = (
             "—"
             if step == 0
-            else f"[{intervals[step - 1, 0]:.3f}, "
-            f"{intervals[step - 1, 1]:.3f}]"
+            else f"[{intervals[step - 1, 0]:.3f}, {intervals[step - 1, 1]:.3f}]"
         )
         if step == 0:
             control = "No control applied yet"

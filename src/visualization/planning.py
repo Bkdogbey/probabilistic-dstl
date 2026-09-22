@@ -23,7 +23,7 @@ COLORS = {
     "workspace": "tab:gray",
     "score": "tab:purple",
     "ellipse": "tab:cyan",
-    "traffic": "#c62828",
+    "traffic": "tab:red",
 }
 CHI95_RADIUS = sqrt(-2 * log(0.05))
 
@@ -104,7 +104,7 @@ def _finish(fig, save_path, show):
 
 
 def _style(ax, *, probability=False):
-    ax.grid(color="#888888", alpha=0.16, linewidth=0.6)
+    ax.grid(color=COLORS["workspace"], alpha=0.16, linewidth=0.6)
     ax.tick_params(labelsize=9)
     if probability:
         ax.set_ylim(-0.03, 1.03)
@@ -113,6 +113,26 @@ def _style(ax, *, probability=False):
 def _interval_text(interval):
     lower, upper = interval
     return f"pdSTL probability interval: [{lower:.3f}, {upper:.3f}]"
+
+
+def reach_avoid_certificate_trace(belief_trajectory, env):
+    """Overall hard pdSTL interval for every accumulated prediction prefix.
+
+    Entry ``t`` certifies ``G_[1,t](safe) & F_[0,t](goal)``. Safety is
+    vacuously certain at ``t=0``. The final entry is therefore the same
+    complete-horizon interval reported by the planner.
+    """
+    events = reach_avoid_events(env)
+    safe_formula = reduce(And, [events["workspace"], *events["obstacles"]])
+    safe = _np(safe_formula(belief_trajectory))[0]
+    goal = _np(events["goal"](belief_trajectory))[0]
+    always_safe = np.ones_like(safe)
+    if len(safe) > 1:
+        always_safe[1:] = np.minimum.accumulate(safe[1:], axis=0)
+    eventually_goal = np.maximum.accumulate(goal, axis=0)
+    lower = np.maximum(0.0, always_safe[:, 0] + eventually_goal[:, 0] - 1.0)
+    upper = np.minimum(always_safe[:, 1], eventually_goal[:, 1])
+    return np.stack((lower, upper), axis=-1)
 
 
 def _ellipse_parameters(covariance):
@@ -143,6 +163,50 @@ def _ellipse(ax, mean, covariance, *, label=None):
     return ellipse
 
 
+def _ellipse_indices(mean, every, minimum_distance=0.35):
+    """Temporal ellipse cadence with spatial thinning near stationary states."""
+    candidates = sorted(
+        set(range(0, len(mean), max(1, every))) | {len(mean) - 1}
+    )
+    selected = []
+    for index in candidates:
+        if (
+            not selected
+            or np.linalg.norm(mean[index, :2] - mean[selected[-1], :2])
+            >= minimum_distance
+        ):
+            selected.append(index)
+        elif index == len(mean) - 1:
+            selected[-1] = index
+    return selected
+
+
+def _draw_goal_region(ax, region):
+    color = region.style.get("color", COLORS["goal"])
+    ax.add_patch(
+        patches.Rectangle(
+            (region.xmin, region.ymin),
+            region.xmax - region.xmin,
+            region.ymax - region.ymin,
+            facecolor=color,
+            edgecolor=region.style.get("edgecolor", COLORS["goal"]),
+            alpha=region.style.get("alpha", 0.35),
+            label="Goal",
+        )
+    )
+    ax.text(
+        (region.xmin + region.xmax) / 2,
+        region.ymin + 0.75 * (region.ymax - region.ymin),
+        "G",
+        color=COLORS["goal"],
+        fontsize=16,
+        fontweight="bold",
+        ha="center",
+        va="center",
+        zorder=9,
+    )
+
+
 def _draw_environment(ax, env, *, lane=False):
     """Draw configured geometry; return patches for moving traffic, if any."""
     moving = None
@@ -150,7 +214,12 @@ def _draw_environment(ax, env, *, lane=False):
         road = env.metadata["road"]
         ramp = env.metadata.get("ramp")
         if ramp is None:
-            ax.axhspan(road["y_min"], road["y_max"], color="#f2f2f7")
+            ax.axhspan(
+                road["y_min"],
+                road["y_max"],
+                color=COLORS["workspace"],
+                alpha=0.08,
+            )
             for y in (road["y_min"], road["y_max"]):
                 ax.axhline(y, color=COLORS["workspace"], linewidth=1.3)
             ax.axhline(
@@ -176,7 +245,7 @@ def _draw_environment(ax, env, *, lane=False):
                 [start, end],
                 [road["y_min"], road["lane_divider"]],
                 road["y_min"],
-                color="#7f0000",
+                color=COLORS["obstacle"],
                 alpha=0.38,
                 label="Non-drivable",
             )
@@ -244,25 +313,15 @@ def _draw_environment(ax, env, *, lane=False):
                     region.xmax - region.xmin,
                     region.ymax - region.ymin,
                     fill=False,
-                    edgecolor=COLORS["workspace"],
-                    linewidth=1.2,
+                    edgecolor=region.style.get("color", COLORS["workspace"]),
+                    linewidth=1.3,
                     label="Workspace",
                 )
             )
-            ax.set_xlim(region.xmin - 0.5, region.xmax + 0.5)
-            ax.set_ylim(region.ymin - 0.5, region.ymax + 0.5)
+            ax.set_xlim(region.xmin, region.xmax)
+            ax.set_ylim(region.ymin, region.ymax)
         elif region.role == "goal" and not lane:
-            ax.add_patch(
-                patches.Rectangle(
-                    (region.xmin, region.ymin),
-                    region.xmax - region.xmin,
-                    region.ymax - region.ymin,
-                    facecolor=COLORS["goal"],
-                    edgecolor=COLORS["goal"],
-                    alpha=0.30,
-                    label="Goal",
-                )
-            )
+            _draw_goal_region(ax, region)
         elif region.role == "obstacle":
             ax.add_patch(
                 patches.Rectangle(
@@ -270,13 +329,16 @@ def _draw_environment(ax, env, *, lane=False):
                     region.xmax - region.xmin,
                     region.ymax - region.ymin,
                     facecolor=region.style.get("color", COLORS["obstacle"]),
-                    edgecolor=COLORS["obstacle"],
-                    alpha=0.35,
+                    edgecolor=region.style.get(
+                        "edgecolor", COLORS["obstacle"]
+                    ),
+                    alpha=region.style.get("alpha", 0.45),
+                    hatch=region.style.get("hatch", "//"),
                     label="Obstacles",
                 )
             )
-    ax.set_xlabel("x position [m]")
-    ax.set_ylabel("y position [m]")
+    ax.set_xlabel("x [m]" if not lane else "x position [m]")
+    ax.set_ylabel("y [m]" if not lane else "y position [m]")
     ax.set_aspect(1.4 if lane else "equal", adjustable="box")
     _style(ax)
     return moving
@@ -441,91 +503,115 @@ def plot_altitude_safety(
 
 
 def plot_reach_avoid(
-    result, env, *, dt, ellipse_every=10, save_path=None, show=False
+    result,
+    env,
+    *,
+    title="Reach–Avoid",
+    ellipse_every=4,
+    save_path=None,
+    show=False,
 ):
-    """Workspace plan, predicate intervals, and optimization history."""
-    fig = plt.figure(figsize=(11, 7), layout="constrained")
-    grid = fig.add_gridspec(2, 2, width_ratios=(1.25, 1))
-    ax_map = fig.add_subplot(grid[:, 0])
-    ax_prob = fig.add_subplot(grid[0, 1])
-    ax_loss = fig.add_subplot(grid[1, 1])
-    _draw_environment(ax_map, env)
+    """Plot the optimized belief trajectory in its configured environment."""
+    fig, ax = plt.subplots(figsize=(10, 7), layout="constrained")
+    _draw_environment(ax, env)
     mean = _np(result.rollout.aux["mean_trace"])[0]
     covariance = _np(result.rollout.aux["cov_trace"])[0]
-    ax_map.plot(
+    ax.plot(
         mean[:, 0],
         mean[:, 1],
         color=COLORS["mean"],
-        linewidth=2,
+        linewidth=2.2,
         label="Predicted belief mean",
+        zorder=8,
     )
-    ax_map.scatter(
+    ax.scatter(
         [mean[0, 0]],
         [mean[0, 1]],
         marker="o",
-        s=32,
-        color=COLORS["executed"],
+        s=55,
+        color="black",
         label="Start",
-        zorder=4,
+        zorder=10,
     )
-    indices = sorted(
-        set(range(0, len(mean), max(1, ellipse_every))) | {len(mean) - 1}
+    ax.scatter(
+        [mean[-1, 0]],
+        [mean[-1, 1]],
+        marker="s",
+        s=55,
+        color=COLORS["mean"],
+        label="Terminal belief mean",
+        zorder=10,
     )
+    indices = _ellipse_indices(mean, ellipse_every)
     for index in indices:
         _ellipse(
-            ax_map,
+            ax,
             mean[index],
             covariance[index],
             label="95% belief ellipse" if index == indices[0] else None,
         )
-    _unique_legend(ax_map, loc="best")
-    events = reach_avoid_events(env)
-    belief = result.rollout.belief_trajectory
-    time = np.arange(len(belief)) * dt
-    obstacles = events["obstacles"]
-    traces = [
-        (events["goal"](belief), COLORS["goal"], "Goal probability interval")
-    ]
-    if obstacles:
-        traces.append(
-            (
-                reduce(And, obstacles)(belief),
-                COLORS["obstacle"],
-                "Obstacle avoidance probability interval",
-            )
-        )
-    traces.append(
-        (
-            events["workspace"](belief),
-            COLORS["workspace"],
-            "Workspace probability interval",
-        )
+    ax.set_title(
+        f"{title} | P↓(φ)={result.hard_interval[0]:.3f}",
+        fontweight="bold",
     )
-    for bounds, color, label in traces:
-        _plot_bounds(ax_prob, time, bounds, color, label)
-    ax_prob.set(xlabel="time [s]", ylabel="predicate probability interval")
-    _style(ax_prob, probability=True)
-    _unique_legend(ax_prob, loc="best")
-    ax_loss.plot(
-        np.arange(1, len(result.loss_history) + 1),
-        result.loss_history,
-        color=COLORS["score"],
-        linewidth=1.6,
-        label="Optimization loss",
-    )
-    ax_loss.text(
-        0.02,
-        0.05,
-        f"{_interval_text(result.hard_interval)}\n"
-        f"Smooth lower score: {result.smooth_lower:.3f}",
-        transform=ax_loss.transAxes,
-        fontsize=9,
-    )
-    ax_loss.set(xlabel="optimization iteration", ylabel="optimization loss")
-    _style(ax_loss)
-    _unique_legend(ax_loss, loc="best")
     _finish(fig, save_path, show)
-    return fig, (ax_map, ax_prob, ax_loss)
+    return fig, ax
+
+
+def plot_reach_avoid_pdstl(
+    result,
+    env,
+    *,
+    dt,
+    title="Overall pdSTL certificate over time",
+    save_path=None,
+    show=False,
+):
+    """Plot the overall prefix certificate, never separate predicate scores."""
+    bounds = reach_avoid_certificate_trace(
+        result.rollout.belief_trajectory, env
+    )
+    time = dt * np.arange(len(bounds))
+    fig, ax = plt.subplots(figsize=(8, 4), layout="constrained")
+    ax.fill_between(
+        time,
+        bounds[:, 0],
+        bounds[:, 1],
+        color=COLORS["score"],
+        alpha=0.18,
+        label="Certified interval",
+    )
+    ax.plot(
+        time,
+        bounds[:, 0],
+        color=COLORS["score"],
+        linewidth=2,
+        label="Certified lower bound",
+    )
+    ax.plot(
+        time,
+        bounds[:, 1],
+        color=COLORS["score"],
+        linewidth=1.2,
+        linestyle="--",
+        label="Certified upper bound",
+    )
+    ax.scatter(
+        [time[-1]],
+        [bounds[-1, 0]],
+        color=COLORS["score"],
+        marker="s",
+        zorder=5,
+    )
+    ax.set(
+        xlabel="prediction time [s]",
+        ylabel="overall pdSTL probability bound",
+        title=f"{title} | final P↓(φ)={bounds[-1, 0]:.3f}",
+    )
+    _style(ax, probability=True)
+    _unique_legend(ax, loc="best")
+    _finish(fig, save_path, show)
+    return fig, ax
 
 
 def _mark_lane_task_window(ax, env, dt):
@@ -690,13 +776,6 @@ def _plot_execution(result, env, *, dt, lane, save_path, show):
     _unique_legend(ax_control, loc="best")
     _finish(fig, save_path, show)
     return fig, (ax_map, ax_score, ax_control)
-
-
-def plot_mpc_execution(result, env, *, dt, save_path=None, show=False):
-    """Executed reach-avoid path, selected plans, bounds, and controls."""
-    return _plot_execution(
-        result, env, dt=dt, lane=False, save_path=save_path, show=show
-    )
 
 
 def plot_lane_merge(result, env, *, dt, save_path=None, show=False):

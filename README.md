@@ -24,7 +24,8 @@ used for that result. Optional iteration observers receive a lightweight record
 for the same post-update iterate. Saturated initial controls are moved inside
 the tanh bound to preserve useful gradients.
 
-`Planner.run_receding_horizon` is the only MPC loop. It optimizes a local window,
+`Planner.run_receding_horizon` is the generic MPC loop used by the lane
+planners. It optimizes a local window,
 executes its first control, updates the state, shifts the remaining controls,
 and repeats until a terminal outcome. Lane outcomes are mutually exclusive:
 success, collision, road violation, deadline missed, planning failure, or step
@@ -35,22 +36,22 @@ the outcome.
 
 - `configs/scenarios/altitude_safety.yaml`: altitude belief, atomic probability,
   controls, and final pdSTL interval.
-- `configs/scenarios/reach_avoid.yaml`: one shared workspace, goal, and obstacle
-  geometry for one-shot and MPC execution. Its `mpc` section holds step limit
-  and seed. The default geometry has two blocks and one gap.
+- `configs/scenarios/reach_avoid.yaml`: a configurable, single-shot double-slit
+  task. The belief stays inside the workspace, avoids every rectangular
+  obstacle, and eventually reaches the goal. Bounds, names, styles, and the
+  number of obstacles all come directly from YAML.
 - `configs/scenarios/lane_change.yaml`: four-vehicle lane change with road
-  safety, relative collision checks, and a timed target-lane dwell. This is the
-  default live MPC run.
+  safety, relative collision checks, and a timed target-lane dwell.
 - `configs/scenarios/lane_merge.yaml`: selectable on-ramp merge where the ramp
   tapers into the main lane. It uses the same stochastic traffic and pdSTL
   safety machinery.
 
 The canonical runners save a structured `.pt` result and publication figures
-in `outputs/`. Lane runs produce one combined result and one local-scale
-trajectory view as both 300-dpi PNG and vector PDF. Altitude and reach–avoid
-GIFs reveal the predicted trajectory step by step. MPC and lane GIFs show every
-executed step, its current plan, the lower satisfaction bound, and surrounding
-traffic when present. Load trusted result files with
+in `outputs/`. The reach–avoid runner saves one environment view as PNG and
+PDF, plus a GIF that reveals the optimized trajectory and its current belief
+ellipse. Lane runs produce one combined result and one local-scale trajectory
+view. Their GIFs show every executed step, its current plan, the lower
+satisfaction bound, and surrounding traffic. Load trusted result files with
 `torch.load(path, weights_only=False)`.
 
 Edit traffic directly in `configs/scenarios/lane_change.yaml` or
@@ -58,12 +59,13 @@ Edit traffic directly in `configs/scenarios/lane_change.yaml` or
 in metres and `speed` is the longitudinal speed in m/s. The ego initial state is
 `x0_mean: [x, y, vx, vy]` in the same file.
 
-The publication plots show predicted belief means, selected 95% belief ellipses,
-executed trajectories, predicate intervals, controls or optimization loss, and
-per-window lower satisfaction bounds as appropriate. The ellipse uses the joint
-95% radius for a two-dimensional Gaussian. The MPC and lane live view places the
-environment at the center and shows sampled optimizer updates in graphs beside
-it, then advances the scene after each executed step.
+The double-slit publication plot contains only the configured environment, the
+optimized belief mean, selected joint 95% Gaussian belief ellipses, start and
+terminal markers, and the certified overall lower bound `P↓(φ)`. Lane plots
+retain their execution diagnostics and live views. A second reach–avoid figure
+shows the overall pdSTL interval as the prediction prefix grows over time; it
+does not split the task into separate predicate probabilities. All planning
+figures use the shared Matplotlib Tableau palette.
 
 ## Run
 
@@ -73,15 +75,13 @@ python src/main.py
 ```
 
 Edit the `"run"` and `"skip"` flags beside each project block in `src/main.py`.
-The current flags in that file select the projects to run. `show_plots=True`
-displays each completed plot before saving it. `show_optimization=True`
-reports sampled gradient descent iterations in the terminal. For MPC and lane
-runs, the same live figure shows the candidate path and side graphs with an
-interactive Matplotlib backend. Set `optimization_every=1` in `src/main.py` to
-display every update; the default samples every 5 iterations. `live_plots=True`
-shows the environment as planning and execution progress. The public
-runners also accept `show`, `save`, `live_optimization`, and, for MPC and lane
-runs, `live`. Their `max_steps` override is useful for bounded runs.
+The current flags select only the one-shot reach–avoid example.
+`show_plots=True` displays each completed plot before saving it. The
+reach–avoid runner accepts `live=True` to update its candidate belief path and
+overall pdSTL-over-time certificate during optimization. This remains a
+single-shot optimization, not replanning. `optimization_every` controls the
+live refresh cadence. Lane runners also accept `live`, `live_optimization`,
+and `max_steps`.
 
 Lane collision and road checks use the full axis-aligned vehicle footprint plus
 configured safety margins. A merge succeeds only when the complete target-lane
@@ -94,38 +94,26 @@ optimization surrogate. Physical success describes the sampled execution, so
 it is not itself a probability score. The final reported interval is the last
 window solved before that execution terminated.
 
-## Optional paired baseline study
+## Experiment notebooks
 
-The standalone study is not imported by `main.py` or the normal runners. Run it
-only when needed:
+[`experiments/reach_avoid_demo.ipynb`](experiments/reach_avoid_demo.ipynb)
+loads the editable double-slit configuration, displays the reach–avoid formula,
+optimizes once through the production runner, and shows the final one-axis
+environment figure, overall pdSTL-time figure, and animation. The notebook
+contains no stored outputs.
 
-```bash
-python -m baselines.lane_study
-```
-
-It compares deterministic mean-trajectory STL with pdSTL for lane change and
-lane merge using paired initial states and disturbances at three uncertainty
-levels. Results, Wilson intervals, per-window certified hard intervals, and rate
-figures are written under `outputs/lane_baseline/`. Override the trial count or
-output location with `--trials` and `--output-dir`. Its only configuration is
-`configs/experiments/lane_baseline.yaml`; `device: auto` selects CUDA when
-PyTorch reports it available. The default is 600 planner runs, so first use
-`--trials 1` to measure the printed live ETA on the target machine.
-
-## Lane pipeline notebook
-
-[`notebooks/lane_pipeline_demo.ipynb`](notebooks/lane_pipeline_demo.ipynb)
-provides a lab-meeting walkthrough of both lane scenarios, from Gaussian beliefs
-and the generated pdSTL task through receding-horizon execution, direct
-certificate recomputation, final figures, and animations. It calls the normal
-project runner and plotting code and reads the same editable scenario YAMLs.
+[`experiments/lane_change_merge_demo.ipynb`](experiments/lane_change_merge_demo.ipynb)
+is a from-dynamics-to-optimization walkthrough of both lane scenarios. It
+visualizes the environments, derives the double-integrator belief rollout,
+constructs the relative-traffic pdSTL task, optimizes one window step by step,
+and then runs and visualizes both receding-horizon executions.
 
 ```bash
 pip install -e ".[notebook]"
-jupyter lab notebooks/lane_pipeline_demo.ipynb
+jupyter lab experiments/
 ```
 
-Its figures and optional GIFs are isolated under `outputs/lane_notebook/`.
+Its figures and GIF are isolated under `outputs/experiments/reach_avoid/`.
 
 ## Development checks
 

@@ -3,7 +3,6 @@
 from planning.runners import (
     run_altitude_safety,
     run_lane_change,
-    run_mpc,
     run_reach_avoid,
 )
 from utils import skip_run
@@ -34,23 +33,12 @@ with skip_run("skip", "ReachAvoid") as check, check():
     run_reach_avoid(
         show=show_plots,
         save=save_plots,
-        live_optimization=show_optimization,
-        optimization_every=optimization_every,
-    )
-
-
-# 3. Receding-horizon reach-avoid execution
-with skip_run("skip", "MPC") as check, check():
-    run_mpc(
-        show=show_plots,
-        save=save_plots,
         live=live_plots,
-        live_optimization=show_optimization,
         optimization_every=optimization_every,
     )
 
 
-# 4. Two-lane change
+# 3. Two-lane change
 with skip_run("run", "LaneChange") as check, check():
     run_lane_change(
         show=show_plots,
@@ -61,8 +49,8 @@ with skip_run("run", "LaneChange") as check, check():
     )
 
 
-# 5. On-ramp merge into the main lane
-with skip_run("run", "LaneMerge") as check, check():
+# 4. On-ramp merge into the main lane
+with skip_run("skip", "LaneMerge") as check, check():
     run_lane_change(
         "configs/scenarios/lane_merge.yaml",
         show=show_plots,

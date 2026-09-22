@@ -9,12 +9,15 @@ from visualization.planning import (
     COLORS,
     _draw_ego_vehicle,
     _draw_environment,
+    _ellipse,
+    _ellipse_indices,
     _ellipse_parameters,
     _move_obstacle,
     _move_ego_vehicle,
     _np,
     _style,
     _unique_legend,
+    reach_avoid_certificate_trace,
 )
 
 
@@ -220,6 +223,125 @@ def create_optimization_view(label, *, max_iters, control_unit="m/s"):
         _refresh(fig, interactive)
 
     return fig, (ax_loss, ax_score, ax_controls), on_iteration, finish_window
+
+
+def create_reach_avoid_live_view(
+    env,
+    evaluate_controls,
+    *,
+    dt,
+    title="Reach–Avoid",
+    max_iters,
+    ellipse_every=8,
+):
+    """Live candidate trajectory and overall pdSTL prefix certificate."""
+    fig, (ax_map, ax_pdstl) = plt.subplots(
+        1,
+        2,
+        figsize=(13, 5.5),
+        layout="constrained",
+        gridspec_kw={"width_ratios": (1.45, 1)},
+    )
+    _draw_environment(ax_map, env)
+    (path,) = ax_map.plot(
+        [],
+        [],
+        color=COLORS["mean"],
+        linewidth=2.2,
+        label="Candidate belief mean",
+        zorder=8,
+    )
+    start = ax_map.scatter(
+        [], [], color="black", s=55, marker="o", label="Start", zorder=10
+    )
+    terminal = ax_map.scatter(
+        [],
+        [],
+        color=COLORS["mean"],
+        s=55,
+        marker="s",
+        label="Terminal belief mean",
+        zorder=10,
+    )
+    (lower_line,) = ax_pdstl.plot(
+        [],
+        [],
+        color=COLORS["score"],
+        linewidth=2,
+        label="Certified lower bound",
+    )
+    (upper_line,) = ax_pdstl.plot(
+        [],
+        [],
+        color=COLORS["score"],
+        linewidth=1.2,
+        linestyle="--",
+        label="Certified upper bound",
+    )
+    ax_pdstl.set(
+        xlabel="prediction time [s]",
+        ylabel="overall pdSTL probability bound",
+        ylim=(-0.03, 1.03),
+        title="Overall pdSTL certificate over time",
+    )
+    _style(ax_pdstl, probability=True)
+    _unique_legend(ax_pdstl, loc="best")
+    interactive = matplotlib.get_backend().lower() != "agg"
+    if interactive:
+        fig.show()
+    ellipses = []
+    interval_fill = None
+
+    def render(iteration, controls, hard_interval):
+        nonlocal interval_fill
+        plan = evaluate_controls(controls)
+        mean = _np(plan.rollout.aux["mean_trace"])[0]
+        covariance = _np(plan.rollout.aux["cov_trace"])[0]
+        path.set_data(mean[:, 0], mean[:, 1])
+        start.set_offsets(mean[:1, :2])
+        terminal.set_offsets(mean[-1:, :2])
+        while ellipses:
+            ellipses.pop().remove()
+        for index in _ellipse_indices(mean, ellipse_every):
+            ellipses.append(_ellipse(ax_map, mean[index], covariance[index]))
+        bounds = reach_avoid_certificate_trace(
+            plan.rollout.belief_trajectory, env
+        )
+        time = dt * np.arange(len(bounds))
+        lower_line.set_data(time, bounds[:, 0])
+        upper_line.set_data(time, bounds[:, 1])
+        if interval_fill is not None:
+            interval_fill.remove()
+        interval_fill = ax_pdstl.fill_between(
+            time,
+            bounds[:, 0],
+            bounds[:, 1],
+            color=COLORS["score"],
+            alpha=0.18,
+        )
+        ax_pdstl.set_xlim(0, max(dt, time[-1]))
+        ax_map.set_title(
+            f"{title} | iteration {iteration + 1}/{max_iters} | "
+            f"P↓(φ)={hard_interval[0]:.3f}",
+            fontweight="bold",
+        )
+        _refresh(fig, interactive)
+
+    def on_iteration(iteration, record):
+        render(iteration, record.controls, record.hard_interval)
+        print(
+            f"{title} iteration {iteration + 1}/{max_iters}: "
+            f"loss {record.loss:.4f}, "
+            f"hard lower {record.hard_interval[0]:.4f}",
+            flush=True,
+        )
+
+    def finish(result):
+        render(
+            len(result.loss_history) - 1, result.controls, result.hard_interval
+        )
+
+    return fig, (ax_map, ax_pdstl), on_iteration, finish
 
 
 def create_live_view(

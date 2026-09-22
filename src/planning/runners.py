@@ -50,17 +50,23 @@ def build_environment(cfg, device="cpu"):
     raise ValueError(f"unknown scenario type {kind!r}")
 
 
+def _initial_controls(cfg, dyn):
+    """Build the configured constant or full-horizon control guess."""
+    guess = cfg.get("init_control")
+    if guess is None:
+        return None
+    controls = torch.as_tensor(guess, device=dyn.device, dtype=dyn.B.dtype)
+    return controls.repeat(cfg["H"], 1) if controls.ndim == 1 else controls
+
+
 def setup_problem(cfg, *, device=None, with_environment=False):
     """Construct a dynamics, initial belief, planner, rollout, and optional world."""
     device = get_device() if device is None else device
     dyn = build_dynamics(cfg, device)
     state = build_initial_belief(cfg, device)
     planner = Planner(dyn, cfg["H"], cfg.get("planner", {}))
-    guess = cfg.get("init_control")
-    if guess is not None:
-        guess = torch.as_tensor(guess, device=device, dtype=dyn.B.dtype)
-        if guess.ndim == 1:
-            guess = guess.repeat(cfg["H"], 1)
+    environment = build_environment(cfg, device) if with_environment else None
+    guess = _initial_controls(cfg, dyn)
     return SimpleNamespace(
         cfg=cfg,
         dyn=dyn,
@@ -68,7 +74,7 @@ def setup_problem(cfg, *, device=None, with_environment=False):
         planner=planner,
         init_guess=guess,
         rollout=gaussian_rollout(dyn, *state),
-        env=build_environment(cfg, device) if with_environment else None,
+        env=environment,
     )
 
 
@@ -162,43 +168,69 @@ def run_reach_avoid(
     show=False,
     save=True,
     verbose=False,
-    live_optimization=False,
-    optimization_every=20,
+    live=False,
+    optimization_every=5,
 ):
-    s = setup_problem(load_config(config_path), with_environment=True)
+    config = load_config(config_path)
+    s = setup_problem(config, with_environment=True)
     spec = s.env.get_specification(s.cfg["H"])
-    on_iteration, finish_window = _optimization_view(
-        s, "Reach-avoid", live_optimization
-    )
+    on_iteration, finish_live = None, None
+    if live:
+        from visualization.live_plots import create_reach_avoid_live_view
+
+        visual = config.get("visualization", {})
+        _, _, on_iteration, finish_live = create_reach_avoid_live_view(
+            s.env,
+            lambda controls: s.planner.evaluate_controls(
+                s.rollout, controls, spec=spec
+            ),
+            dt=s.cfg["dt"],
+            title=config.get("scenario", {}).get("name", "Reach–Avoid"),
+            max_iters=s.planner.cfg["max_iters"],
+            ellipse_every=visual.get("ellipse_every", 4),
+        )
     result = s.planner.optimize_window(
         s.rollout,
         spec=spec,
         init_guess=s.init_guess,
         verbose=verbose,
-        on_iteration=(
-            (lambda iteration, record: on_iteration(0, iteration, record))
-            if on_iteration is not None
-            else None
-        ),
+        on_iteration=on_iteration,
         callback_every=optimization_every if on_iteration is not None else 1,
     )
-    if finish_window is not None:
-        finish_window(0, result)
+    if finish_live is not None:
+        finish_live(result)
     if show or save:
         from visualization.animation import animate_reach_avoid
-        from visualization.planning import plot_reach_avoid
+        from visualization.planning import (
+            plot_reach_avoid,
+            plot_reach_avoid_pdstl,
+        )
 
+        visual = config.get("visualization", {})
+        title = config.get("scenario", {}).get("name", "Reach–Avoid")
         plot_reach_avoid(
             result,
             s.env,
-            dt=s.cfg["dt"],
+            title=title,
+            ellipse_every=visual.get("ellipse_every", 4),
             save_path=_output_path("reach_avoid", ".png") if save else None,
+            show=show,
+        )
+        plot_reach_avoid_pdstl(
+            result,
+            s.env,
+            dt=s.cfg["dt"],
+            save_path=_output_path("reach_avoid_pdstl", ".png")
+            if save
+            else None,
             show=show,
         )
         animate_reach_avoid(
             result,
             s.env,
             dt=s.cfg["dt"],
+            title=title,
+            fps=visual.get("animation_fps", 6),
             filename=_output_path("reach_avoid", ".gif") if save else None,
             show=show,
         )
@@ -292,18 +324,17 @@ def _execution_observers(
     )
 
 
-def _present_execution(result, s, *, stem, lane, show, save):
+def _present_lane_execution(result, s, *, stem, show, save):
     if show or save:
-        from visualization.planning import plot_lane_merge, plot_mpc_execution
+        from visualization.planning import plot_lane_merge
 
-        plot = plot_lane_merge if lane else plot_mpc_execution
-        if lane and save:
+        if save:
             for obsolete in ("controls", "scores"):
                 for suffix in (".png", ".pdf"):
                     _output_path(f"{stem}_{obsolete}", suffix).unlink(
                         missing_ok=True
                     )
-        plot(
+        plot_lane_merge(
             result,
             s.env,
             dt=s.cfg["dt"],
@@ -318,71 +349,9 @@ def _present_execution(result, s, *, stem, lane, show, save):
             s.env,
             dt=s.cfg["dt"],
             filename=_output_path(stem, ".gif") if save else None,
-            lane=lane,
+            lane=True,
             show=show,
         )
-
-
-def run_mpc(
-    config_path="configs/scenarios/reach_avoid.yaml",
-    *,
-    show=False,
-    save=True,
-    live=False,
-    live_optimization=False,
-    optimization_every=20,
-    verbose=False,
-    max_steps=None,
-):
-    s = setup_problem(load_config(config_path), with_environment=True)
-    options = s.cfg["mpc"]
-    s.planner = Planner(
-        s.dyn,
-        options.get("horizon", s.cfg["H"]),
-        {**s.cfg.get("planner", {}), **options.get("planner", {})},
-    )
-    init_guess = (
-        s.init_guess[: s.planner.horizon] if s.init_guess is not None else None
-    )
-    torch.manual_seed(options["seed"])
-    goal = s.env.single_region("goal")
-    on_step, on_iteration, callback_every = _execution_observers(
-        s,
-        label="MPC",
-        lane=False,
-        live=live,
-        live_optimization=live_optimization,
-        optimization_every=optimization_every,
-        initial_state=s.state,
-    )
-
-    def is_done(state, step):
-        mean = state[0]
-        return bool(
-            goal.xmin <= mean[0] <= goal.xmax
-            and goal.ymin <= mean[1] <= goal.ymax
-        )
-
-    result = s.planner.run_receding_horizon(
-        s.state,
-        make_rollout=lambda state, step: gaussian_rollout(s.dyn, *state),
-        make_spec=lambda state, step: s.env.get_specification(
-            s.planner.horizon
-        ),
-        execute=lambda state, control, step: s.dyn.sample_step(
-            *state, control
-        ),
-        is_done=is_done,
-        max_steps=options["max_steps"] if max_steps is None else max_steps,
-        init_guess=init_guess,
-        verbose=verbose,
-        on_step=on_step,
-        on_iteration=on_iteration,
-        callback_every=callback_every,
-    )
-    _present_execution(result, s, stem="mpc", lane=False, show=show, save=save)
-    _save_result(result, "mpc", save)
-    return result
 
 
 def _lane_executor(
@@ -554,6 +523,6 @@ def run_lane_change(
         f"[{final_interval[0]:.4f}, {final_interval[1]:.4f}]",
         flush=True,
     )
-    _present_execution(result, s, stem=stem, lane=True, show=show, save=save)
+    _present_lane_execution(result, s, stem=stem, show=show, save=save)
     _save_result(result, stem, save)
     return result

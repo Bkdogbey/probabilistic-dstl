@@ -6,7 +6,6 @@ import torch
 import yaml
 from PIL import Image
 
-from baselines.det_stl import compare_lane_window
 from models.beliefs import GaussianBeliefTrajectory
 from models.rollouts import lane_rollout
 from pdstl.predicates import AxisInterval, RelativeAxisInterval
@@ -226,9 +225,6 @@ def test_default_lane_completes_with_physical_controls():
         replay.rollout.aux["mean_trace"], first.rollout.aux["mean_trace"]
     )
     assert replay.hard_interval == pytest.approx(first.hard_interval, abs=1e-6)
-    comparison = compare_lane_window(first, setup.env, cfg["H"])
-    assert comparison["pdstl_probability_interval"] == first.hard_interval
-    assert comparison["deterministic_signed_distance"] > 0
     task = build_environment(cfg).metadata["task"]
     witness = max(result.states[-1][5], task["start_end_steps"][0])
     assert witness <= task["start_end_steps"][1]

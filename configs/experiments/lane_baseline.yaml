@@ -1,9 +1,0 @@
-scenarios:
-  - configs/scenarios/lane_change.yaml
-  - configs/scenarios/lane_merge.yaml
-trials: 50
-uncertainty_factors: [0.5, 1.0, 2.0]
-seed: 2026
-# auto selects CUDA when available and otherwise uses CPU.
-device: auto
-output_dir: outputs/lane_baseline
