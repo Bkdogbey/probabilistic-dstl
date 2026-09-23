@@ -239,6 +239,17 @@ def test_the_specification_is_always_safe_and_eventually_goal():
     assert isinstance(reach, Eventually) and reach.interval == [0, 12]
 
 
+def test_the_goal_window_is_configurable_and_validated():
+    environment = build_reach_avoid_environment(CONFIG)
+
+    specification = environment.get_specification(12, [7, 12])
+    assert specification.subformula2.interval == [7, 12]
+
+    for interval in ([7], [8, 7], [-1, 7], [7, 13], [7.0, 12]):
+        with pytest.raises(ValueError, match="goal_interval"):
+            environment.get_specification(12, interval)
+
+
 def test_safety_conjoins_the_workspace_with_every_obstacle():
     environment = build_reach_avoid_environment(CONFIG)
 

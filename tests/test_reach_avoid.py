@@ -1,4 +1,4 @@
-"""The configurable double-slit reach-avoid pipeline and presentation."""
+"""The configurable asymmetric reach-avoid proof of concept."""
 
 import matplotlib
 
@@ -16,8 +16,6 @@ from visualization.live_plots import create_reach_avoid_live_view
 from visualization.planning import (
     COLORS,
     plot_reach_avoid,
-    plot_reach_avoid_pdstl,
-    reach_avoid_certificate_trace,
 )
 
 
@@ -36,8 +34,9 @@ def result():
 
 
 def test_default_geometry_and_custom_names(problem):
-    assert len(problem.env.by_role("obstacle")) == 3
+    assert len(problem.env.by_role("obstacle")) == 1
     assert problem.cfg["x0_mean"] == [-3.0, 0.0]
+    assert problem.cfg["goal_interval"] == [30, 40]
     workspace = problem.env.single_region("workspace")
     goal = problem.env.single_region("goal")
     assert workspace.x == tuple(problem.cfg["workspace"]["x"])
@@ -55,12 +54,36 @@ def test_default_geometry_and_custom_names(problem):
     cfg["workspace"] = {**cfg["workspace"], "name": "room"}
     cfg["goal"] = {**cfg["goal"], "name": "destination"}
     renamed = setup_problem(cfg, device="cpu", with_environment=True)
-    spec = renamed.env.get_specification(cfg["H"])
+    spec = renamed.env.get_specification(cfg["H"], cfg["goal_interval"])
     assert spec.subformula2.subformula.name == "destination"
+    assert spec.subformula2.interval == [30, 40]
+
+
+def test_initial_controls_are_goal_directed_and_cross_obstacle(problem):
+    expected = torch.tensor([0.8125, 0.0]).repeat(problem.cfg["H"], 1)
+    torch.testing.assert_close(problem.init_guess, expected)
+    initial = problem.planner.evaluate_controls(
+        problem.rollout,
+        problem.init_guess,
+        spec=problem.env.get_specification(
+            problem.cfg["H"], problem.cfg["goal_interval"]
+        ),
+    )
+    points = initial.rollout.aux["mean_trace"][0]
+    obstacle = problem.env.single_region("obstacle")
+    intersects = (
+        (points[:, 0] >= obstacle.xmin)
+        & (points[:, 0] <= obstacle.xmax)
+        & (points[:, 1] >= obstacle.ymin)
+        & (points[:, 1] <= obstacle.ymax)
+    )
+    assert intersects.any()
 
 
 def test_reach_avoid_returns_safe_bounded_replayable_plan(problem, result):
-    spec = problem.env.get_specification(problem.cfg["H"])
+    spec = problem.env.get_specification(
+        problem.cfg["H"], problem.cfg["goal_interval"]
+    )
     initial = problem.planner.evaluate_controls(
         problem.rollout, problem.init_guess, spec=spec
     )
@@ -71,7 +94,14 @@ def test_reach_avoid_returns_safe_bounded_replayable_plan(problem, result):
         initial.rollout.belief_trajectory, result.smoothing_beta
     )
     assert result.smooth_lower > initial_at_final_beta
-    assert result.hard_interval[0] > 0.9
+    assert result.hard_interval[0] >= problem.cfg["planner"]["alpha"]
+    assert result.threshold_met
+    assert result.alpha == problem.cfg["planner"]["alpha"]
+    assert result.control_cost == pytest.approx(
+        problem.planner._control_cost(result.controls).item()
+    )
+    assert len(result.smooth_history) == len(result.loss_history) + 1
+    assert len(result.hard_lower_history) == len(result.loss_history) + 1
     assert replay.hard_interval == pytest.approx(
         result.hard_interval, abs=1e-6
     )
@@ -94,21 +124,23 @@ def test_reach_avoid_returns_safe_bounded_replayable_plan(problem, result):
         )
 
     assert inside(workspace).all()
-    assert inside(goal).any()
+    goal_steps = torch.nonzero(inside(goal)).flatten()
+    assert any(
+        problem.cfg["goal_interval"][0]
+        <= int(step)
+        <= problem.cfg["goal_interval"][1]
+        for step in goal_steps
+    )
     assert all(
         not inside(obstacle).any()
         for obstacle in problem.env.by_role("obstacle")
     )
-    crossing = points[(points[:, 0] >= 0) & (points[:, 0] <= 1.5)]
-    middle = problem.env.region("middle_wall")
-    top = problem.env.region("top_wall")
-    assert (
-        len(crossing) > 0
-        and (
-            (crossing[:, 1] > middle.ymax) & (crossing[:, 1] < top.ymin)
-        ).all()
-    )
-    assert float(points[:, 1].max()) > 2.0
+    obstacle = problem.env.single_region("obstacle")
+    crossing = points[
+        (points[:, 0] >= obstacle.xmin) & (points[:, 0] <= obstacle.xmax)
+    ]
+    assert len(crossing) > 0
+    assert (crossing[:, 1] < obstacle.ymin).all()
 
 
 def test_gradient_reaches_controls(problem):
@@ -116,7 +148,9 @@ def test_gradient_reaches_controls(problem):
         problem.init_guess
     ).requires_grad_()
     beliefs = problem.rollout(parameters).belief_trajectory
-    spec = problem.env.get_specification(problem.cfg["H"])
+    spec = problem.env.get_specification(
+        problem.cfg["H"], problem.cfg["goal_interval"]
+    )
     spec.smooth_lower(beliefs, 2.0).backward()
     assert (
         parameters.grad.abs().sum() > 0
@@ -128,19 +162,29 @@ def test_publication_figure_is_saved_and_zero_obstacles_plot(
     problem, result, tmp_path
 ):
     path = tmp_path / "reach.png"
-    fig, axis = plot_reach_avoid(
+    spec = problem.env.get_specification(
+        problem.cfg["H"], problem.cfg["goal_interval"]
+    )
+    initial = problem.planner.evaluate_controls(
+        problem.rollout, problem.init_guess, spec=spec
+    )
+    fig, axes = plot_reach_avoid(
         result,
         problem.env,
-        title="Double Slit",
+        initial=initial,
+        dt=problem.cfg["dt"],
+        u_max=problem.dyn.u_max,
+        title="Asymmetric Reach–Avoid",
         save_path=str(path),
         show=False,
     )
-    assert len(fig.axes) == 1 and fig.axes[0] is axis
+    axis, controls_axis, scores_axis = axes
+    assert len(fig.axes) == 3
     assert path.exists() and path.with_suffix(".pdf").exists()
-    assert axis.get_legend() is None
-    assert axis.get_title() == (
-        f"Double Slit | P↓(φ)={result.hard_interval[0]:.3f}"
-    )
+    assert axis.get_title() == "Asymmetric Reach–Avoid"
+    assert "Hard pdSTL" in scores_axis.get_title()
+    assert "threshold achieved" in scores_axis.get_title()
+    assert len(controls_axis.lines) == 2
     assert axis.get_xlim() == pytest.approx(
         tuple(problem.cfg["workspace"]["x"])
     )
@@ -148,7 +192,7 @@ def test_publication_figure_is_saved_and_zero_obstacles_plot(
         tuple(problem.cfg["workspace"]["y"])
     )
     assert {text.get_text() for text in axis.texts} >= {"G"}
-    assert sum(p.get_label() == "Obstacles" for p in axis.patches) == 3
+    assert sum(p.get_label() == "Obstacles" for p in axis.patches) == 1
     assert {collection.get_label() for collection in axis.collections} >= {
         "Start",
         "Terminal belief mean",
@@ -168,7 +212,8 @@ def test_publication_figure_is_saved_and_zero_obstacles_plot(
     )
     cfg = {**problem.cfg, "obstacles": []}
     empty = setup_problem(cfg, device="cpu", with_environment=True)
-    empty_fig, empty_axis = plot_reach_avoid(result, empty.env, show=False)
+    empty_fig, empty_axes = plot_reach_avoid(result, empty.env, show=False)
+    empty_axis = empty_axes[0]
     assert not any(
         patch.get_label() == "Obstacles" for patch in empty_axis.patches
     )
@@ -190,7 +235,8 @@ def test_plot_honors_configured_region_styles(problem, result):
         }
     ]
     styled = setup_problem(cfg, device="cpu", with_environment=True)
-    fig, axis = plot_reach_avoid(result, styled.env, show=False)
+    fig, axes = plot_reach_avoid(result, styled.env, show=False)
+    axis = axes[0]
     obstacle = next(p for p in axis.patches if p.get_label() == "Obstacles")
     assert styled.env.region("shifted_wall").x == (-1.0, -0.25)
     assert (obstacle.get_x(), obstacle.get_y()) == (-1.0, 2.0)
@@ -200,40 +246,19 @@ def test_plot_honors_configured_region_styles(problem, result):
     plt.close(fig)
 
 
-def test_overall_pdstl_certificate_is_plotted_over_prediction_time(
-    problem, result, tmp_path
-):
-    bounds = reach_avoid_certificate_trace(
-        result.rollout.belief_trajectory, problem.env
+def test_live_view_updates_path_and_optimization_trace(problem, result):
+    spec = problem.env.get_specification(
+        problem.cfg["H"], problem.cfg["goal_interval"]
     )
-    assert bounds.shape == (problem.cfg["H"] + 1, 2)
-    assert bounds[-1] == pytest.approx(result.hard_interval, abs=1e-6)
-    path = tmp_path / "reach_avoid_pdstl.png"
-    fig, axis = plot_reach_avoid_pdstl(
-        result,
-        problem.env,
-        dt=problem.cfg["dt"],
-        save_path=path,
-        show=False,
-    )
-    assert path.exists() and path.with_suffix(".pdf").exists()
-    assert len(fig.axes) == 1 and fig.axes[0] is axis
-    assert axis.lines[0].get_color() == COLORS["score"]
-    assert len(axis.lines[0].get_xdata()) == problem.cfg["H"] + 1
-    assert "final P↓(φ)=" in axis.get_title()
-    plt.close(fig)
-
-
-def test_live_view_updates_path_and_overall_pdstl_trace(problem, result):
-    spec = problem.env.get_specification(problem.cfg["H"])
     fig, axes, observe, finish = create_reach_avoid_live_view(
         problem.env,
         lambda controls: problem.planner.evaluate_controls(
             problem.rollout, controls, spec=spec
         ),
         dt=problem.cfg["dt"],
-        title="Double Slit",
+        title="Asymmetric Reach–Avoid",
         max_iters=problem.planner.cfg["max_iters"],
+        alpha=problem.planner.cfg["alpha"],
     )
     record = IterationRecord(
         result.controls,
@@ -244,7 +269,7 @@ def test_live_view_updates_path_and_overall_pdstl_trace(problem, result):
     )
     observe(0, record)
     assert len(axes[0].lines[0].get_xdata()) == problem.cfg["H"] + 1
-    assert len(axes[1].lines[0].get_xdata()) == problem.cfg["H"] + 1
+    assert len(axes[1].lines[0].get_xdata()) == 1
     assert axes[0].lines[0].get_color() == COLORS["mean"]
     assert axes[1].lines[0].get_color() == COLORS["score"]
     finish(result)
@@ -256,12 +281,12 @@ def test_animation_is_the_same_single_environment_view(problem, result):
         result,
         problem.env,
         dt=problem.cfg["dt"],
-        title="Double Slit",
+        title="Asymmetric Reach–Avoid",
         show=False,
     )
     assert len(fig.axes) == 1 and fig.axes[0] is axis
     assert axis.get_title() == (
-        f"Double Slit | P↓(φ)={result.hard_interval[0]:.3f}"
+        f"Asymmetric Reach–Avoid | P↓(φ)={result.hard_interval[0]:.3f}"
     )
     movie._draw_next_frame(1, blit=False)
     path = axis.lines[1]

@@ -16,13 +16,14 @@ YAML scenario → dynamics and initial belief → rollout → atomic probability
 ```
 
 `Planner.optimize_window` optimizes only the smooth lower score, control effort,
-and control smoothness. The hard interval is evaluated for reporting and optional
-stopping. It is a pdSTL satisfaction interval, not an exact joint trajectory
-probability. `PlanResult` holds controls, the predicted rollout, smooth score,
-hard interval, one post-update loss per iteration, the final loss, and the beta
-used for that result. Optional iteration observers receive a lightweight record
-for the same post-update iterate. Saturated initial controls are moved inside
-the tanh bound to preserve useful gradients.
+and control smoothness. When `alpha` is configured, the hard interval defines
+feasibility, stopping, and candidate selection: the planner returns the
+lowest-cost feasible candidate, or the highest-hard-lower candidate if none is
+feasible. It does not automatically return the last smooth iterate. The hard
+interval is a pdSTL satisfaction interval, not an exact joint trajectory
+probability. `PlanResult` records the selected candidate, its control cost and
+threshold status, and aligned smooth/hard optimization histories. Saturated
+initial controls are moved inside the tanh bound to preserve useful gradients.
 
 `Planner.run_receding_horizon` is the generic MPC loop used by the lane
 planners. It optimizes a local window,
@@ -36,10 +37,10 @@ the outcome.
 
 - `configs/scenarios/altitude_safety.yaml`: altitude belief, atomic probability,
   controls, and final pdSTL interval.
-- `configs/scenarios/reach_avoid.yaml`: a configurable, single-shot double-slit
-  task. The belief stays inside the workspace, avoids every rectangular
-  obstacle, and eventually reaches the goal. Bounds, names, styles, and the
-  number of obstacles all come directly from YAML.
+- `configs/scenarios/reach_avoid.yaml`: a configurable, single-shot stochastic
+  reach–avoid proof of concept. A generic straight-line initialization crosses
+  one asymmetric obstacle; smooth pdSTL optimization must find a safe route and
+  reach the goal during the configured time window.
 - `configs/scenarios/lane_change.yaml`: four-vehicle lane change with road
   safety, relative collision checks, and a timed target-lane dwell.
 - `configs/scenarios/lane_merge.yaml`: selectable on-ramp merge where the ramp
@@ -59,13 +60,12 @@ Edit traffic directly in `configs/scenarios/lane_change.yaml` or
 in metres and `speed` is the longitudinal speed in m/s. The ego initial state is
 `x0_mean: [x, y, vx, vy]` in the same file.
 
-The double-slit publication plot contains only the configured environment, the
-optimized belief mean, selected joint 95% Gaussian belief ellipses, start and
-terminal markers, and the certified overall lower bound `P↓(φ)`. Lane plots
-retain their execution diagnostics and live views. A second reach–avoid figure
-shows the overall pdSTL interval as the prediction prefix grows over time; it
-does not split the task into separate predicate probabilities. All planning
-figures use the shared Matplotlib Tableau palette.
+The reach–avoid publication plot compares the initial and selected belief means,
+shows selected joint 95% Gaussian belief ellipses and controls, and separates
+the smooth optimization surrogate from the hard lower score. Its headline
+reports the selected hard pdSTL interval, requested threshold, control cost, and
+planning time. Lane plots retain their execution diagnostics and live views.
+All planning figures use the shared Matplotlib Tableau palette.
 
 ## Run
 
@@ -78,10 +78,10 @@ Edit the `"run"` and `"skip"` flags beside each project block in `src/main.py`.
 The current flags select only the one-shot reach–avoid example.
 `show_plots=True` displays each completed plot before saving it. The
 reach–avoid runner accepts `live=True` to update its candidate belief path and
-overall pdSTL-over-time certificate during optimization. This remains a
-single-shot optimization, not replanning. `optimization_every` controls the
-live refresh cadence. Lane runners also accept `live`, `live_optimization`,
-and `max_steps`.
+separate smooth-surrogate and hard-lower traces during optimization. This
+remains a single-shot optimization, not replanning. `optimization_every`
+controls the live refresh cadence. Lane runners also accept `live`,
+`live_optimization`, and `max_steps`.
 
 Lane collision and road checks use the full axis-aligned vehicle footprint plus
 configured safety margins. A merge succeeds only when the complete target-lane
@@ -97,10 +97,10 @@ window solved before that execution terminated.
 ## Experiment notebooks
 
 [`experiments/reach_avoid_demo.ipynb`](experiments/reach_avoid_demo.ipynb)
-loads the editable double-slit configuration, displays the reach–avoid formula,
-optimizes once through the production runner, and shows the final one-axis
-environment figure, overall pdSTL-time figure, and animation. The notebook
-contains no stored outputs.
+loads the editable asymmetric configuration, displays the timed reach–avoid
+formula, optimizes once through the production runner, and shows the initial
+and selected plans, optimizer diagnostics, and animation. The notebook contains
+no stored outputs.
 
 [`experiments/lane_change_merge_demo.ipynb`](experiments/lane_change_merge_demo.ipynb)
 is a from-dynamics-to-optimization walkthrough of both lane scenarios. It

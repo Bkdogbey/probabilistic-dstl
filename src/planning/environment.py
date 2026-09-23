@@ -95,7 +95,7 @@ class Environment:
             raise ValueError(f"environment needs exactly one {role!r} region")
         return regions[0]
 
-    def get_specification(self, horizon):
+    def get_specification(self, horizon, goal_interval=None):
         if (
             isinstance(horizon, bool)
             or not isinstance(horizon, int)
@@ -104,22 +104,36 @@ class Environment:
             raise ValueError(
                 f"horizon must be a positive integer, got {horizon!r}"
             )
-        return reach_avoid_specification(self, horizon)
+        return reach_avoid_specification(self, horizon, goal_interval)
 
 
 # Reach-avoid construction and specification
 
 
-def reach_avoid_specification(environment, horizon):
+def reach_avoid_specification(environment, horizon, goal_interval=None):
     """Stay inside the workspace, avoid obstacles, and reach the goal.
 
-    Safety holds from step 1 through the horizon. The goal must be reached at
-    least once from step 0 through the horizon.
+    Safety holds from step 1 through the horizon. The goal must be reached in
+    ``goal_interval``, which defaults to the complete prediction horizon.
     """
+    goal_interval = [0, horizon] if goal_interval is None else goal_interval
+    if not (
+        isinstance(goal_interval, (list, tuple))
+        and len(goal_interval) == 2
+        and all(
+            isinstance(step, int) and not isinstance(step, bool)
+            for step in goal_interval
+        )
+        and 0 <= goal_interval[0] <= goal_interval[1] <= horizon
+    ):
+        raise ValueError(
+            "goal_interval must be [start, end] with "
+            f"0 <= start <= end <= {horizon}"
+        )
     events = reach_avoid_events(environment)
     safe = [events["workspace"], *events["obstacles"]]
     return Always(reduce(And, safe), interval=[1, horizon]) & Eventually(
-        events["goal"], interval=[0, horizon]
+        events["goal"], interval=list(goal_interval)
     )
 
 

@@ -79,6 +79,8 @@ def test_one_shot_animations_reveal_more_than_one_step(
     ):
         cfg = load_config(f"configs/scenarios/{scenario}.yaml")
         cfg["H"] = 4
+        if scenario == "reach_avoid":
+            cfg["goal_interval"] = [0, 4]
         cfg["planner"]["max_iters"] = 2
         path = tmp_path / f"{scenario}.yaml"
         path.write_text(yaml.safe_dump(cfg))
@@ -90,9 +92,6 @@ def test_one_shot_animations_reveal_more_than_one_step(
         runner(str(path), show=False, save=True, **kwargs)
         for suffix in (".pt", ".png", ".pdf", ".gif"):
             assert (tmp_path / f"{stem}{suffix}").exists()
-        if scenario == "reach_avoid":
-            assert (tmp_path / "reach_avoid_pdstl.png").exists()
-            assert (tmp_path / "reach_avoid_pdstl.pdf").exists()
         with Image.open(tmp_path / f"{stem}.gif") as movie:
             assert movie.n_frames >= 2
             first = movie.convert("RGB").tobytes()
@@ -100,6 +99,6 @@ def test_one_shot_animations_reveal_more_than_one_step(
             assert movie.convert("RGB").tobytes() != first
     progress = capsys.readouterr().out
     assert "Altitude safety window 1, iteration 1/2" in progress
-    assert "Double Slit iteration 1/2" in progress
+    assert "Asymmetric Reach–Avoid iteration 1/2" in progress
     assert "Reach-avoid window" not in progress
     plt.close("all")

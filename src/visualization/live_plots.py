@@ -17,7 +17,6 @@ from visualization.planning import (
     _np,
     _style,
     _unique_legend,
-    reach_avoid_certificate_trace,
 )
 
 
@@ -233,9 +232,10 @@ def create_reach_avoid_live_view(
     title="Reach–Avoid",
     max_iters,
     ellipse_every=8,
+    alpha=None,
 ):
-    """Live candidate trajectory and overall pdSTL prefix certificate."""
-    fig, (ax_map, ax_pdstl) = plt.subplots(
+    """Live candidate trajectory with separate smooth and hard scores."""
+    fig, (ax_map, ax_scores) = plt.subplots(
         1,
         2,
         figsize=(13, 5.5),
@@ -263,37 +263,44 @@ def create_reach_avoid_live_view(
         label="Terminal belief mean",
         zorder=10,
     )
-    (lower_line,) = ax_pdstl.plot(
+    (smooth_line,) = ax_scores.plot(
         [],
         [],
         color=COLORS["score"],
-        linewidth=2,
-        label="Certified lower bound",
+        linewidth=1.7,
+        label="Smooth surrogate",
     )
-    (upper_line,) = ax_pdstl.plot(
+    (hard_line,) = ax_scores.plot(
         [],
         [],
-        color=COLORS["score"],
-        linewidth=1.2,
-        linestyle="--",
-        label="Certified upper bound",
+        color=COLORS["mean"],
+        linewidth=1.7,
+        label="Hard lower score",
     )
-    ax_pdstl.set(
-        xlabel="prediction time [s]",
-        ylabel="overall pdSTL probability bound",
+    if alpha is not None:
+        ax_scores.axhline(
+            alpha,
+            color=COLORS["obstacle"],
+            linestyle="--",
+            linewidth=1.1,
+            label=f"Required alpha={alpha:.2f}",
+        )
+    ax_scores.set(
+        xlabel="optimizer iteration",
+        ylabel="score",
         ylim=(-0.03, 1.03),
-        title="Overall pdSTL certificate over time",
+        xlim=(1, max(1, max_iters)),
+        title="Optimization diagnostics",
     )
-    _style(ax_pdstl, probability=True)
-    _unique_legend(ax_pdstl, loc="best")
+    _style(ax_scores, probability=True)
+    _unique_legend(ax_scores, loc="best")
     interactive = matplotlib.get_backend().lower() != "agg"
     if interactive:
         fig.show()
     ellipses = []
-    interval_fill = None
+    iterations, smooth_scores, hard_scores = [], [], []
 
     def render(iteration, controls, hard_interval):
-        nonlocal interval_fill
         plan = evaluate_controls(controls)
         mean = _np(plan.rollout.aux["mean_trace"])[0]
         covariance = _np(plan.rollout.aux["cov_trace"])[0]
@@ -304,22 +311,6 @@ def create_reach_avoid_live_view(
             ellipses.pop().remove()
         for index in _ellipse_indices(mean, ellipse_every):
             ellipses.append(_ellipse(ax_map, mean[index], covariance[index]))
-        bounds = reach_avoid_certificate_trace(
-            plan.rollout.belief_trajectory, env
-        )
-        time = dt * np.arange(len(bounds))
-        lower_line.set_data(time, bounds[:, 0])
-        upper_line.set_data(time, bounds[:, 1])
-        if interval_fill is not None:
-            interval_fill.remove()
-        interval_fill = ax_pdstl.fill_between(
-            time,
-            bounds[:, 0],
-            bounds[:, 1],
-            color=COLORS["score"],
-            alpha=0.18,
-        )
-        ax_pdstl.set_xlim(0, max(dt, time[-1]))
         ax_map.set_title(
             f"{title} | iteration {iteration + 1}/{max_iters} | "
             f"P↓(φ)={hard_interval[0]:.3f}",
@@ -328,6 +319,11 @@ def create_reach_avoid_live_view(
         _refresh(fig, interactive)
 
     def on_iteration(iteration, record):
+        iterations.append(iteration + 1)
+        smooth_scores.append(record.smooth_lower)
+        hard_scores.append(record.hard_interval[0])
+        smooth_line.set_data(iterations, smooth_scores)
+        hard_line.set_data(iterations, hard_scores)
         render(iteration, record.controls, record.hard_interval)
         print(
             f"{title} iteration {iteration + 1}/{max_iters}: "
@@ -337,11 +333,15 @@ def create_reach_avoid_live_view(
         )
 
     def finish(result):
+        candidates = np.arange(len(result.smooth_history))
+        smooth_line.set_data(candidates, result.smooth_history)
+        hard_line.set_data(candidates, result.hard_lower_history)
+        ax_scores.set_xlim(0, max(1, len(candidates) - 1))
         render(
-            len(result.loss_history) - 1, result.controls, result.hard_interval
+            result.selected_iteration, result.controls, result.hard_interval
         )
 
-    return fig, (ax_map, ax_pdstl), on_iteration, finish
+    return fig, (ax_map, ax_scores), on_iteration, finish
 
 
 def create_live_view(

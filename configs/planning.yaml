@@ -9,3 +9,4 @@ smoothing:
   beta_end: 20.0
 alpha: null
 converge_patience: 50
+candidate_tolerance: 1.0e-8

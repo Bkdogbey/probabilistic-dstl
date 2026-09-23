@@ -1,47 +1,36 @@
-# Configurable single-shot reach-avoid problem. The three blocks form two
-# passages; edit any x/y pair to move the workspace, goal, or obstacles.
+# Configurable single-shot stochastic reach-avoid proof of concept.
 scenario:
   type: reach_avoid
-  name: Double Slit
+  name: Asymmetric Reach–Avoid
 
 dynamics: single_integrator
-H: 100
+H: 40
 dt: 0.2
 u_max: 1.0
-q_std: 0.03
+q_std: 0.02
 
 x0_mean: [-3.0, 0.0]
 x0_cov_scale: 0.01
 
 workspace:
   name: workspace
-  x: [-4.0, 7.0]
-  y: [-4.5, 4.5]
+  x: [-4.5, 5.0]
+  y: [-2.5, 2.5]
   style: {color: 'tab:gray'}
 
 goal:
   name: goal
-  x: [4.5, 5.5]
-  y: [0.5, 1.5]
+  x: [3.0, 4.0]
+  y: [-0.5, 0.5]
   style: {color: 'tab:green'}
 
 obstacles:
-  - name: top_wall
-    x: [0.0, 1.5]
-    y: [2.5, 4.5]
-    style: {color: 'tab:red', hatch: '//'}
-  - name: middle_wall
-    x: [-1.5, 0]
-    y: [-1.0, 1.5]
-    style: {color: 'tab:red', hatch: '//'}
-  - name: bottom_wall
-    x: [1.0, 2.0]
-    y: [-4.5, -2.0]
+  - name: obstacle
+    x: [-1.0, 1.0]
+    y: [-1.0, 1.0]
     style: {color: 'tab:red', hatch: '//'}
 
-# A feasible curved bias for optimization only; it is not a temporal-logic
-# predicate or a waypoint requirement.
-init_control: [0.2, 0.2]
+goal_interval: [30, 40]
 
 planner:
   w_phi: 100.0
@@ -49,9 +38,9 @@ planner:
   w_du: 0.01
   lr: 0.05
   max_iters: 1000
-  alpha: 0.95
+  alpha: 0.90
   converge_patience: 3
 
 visualization:
-  ellipse_every: 4
+  ellipse_every: 6
   animation_fps: 6

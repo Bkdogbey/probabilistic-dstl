@@ -1,6 +1,7 @@
 """Behavioral contracts for the canonical optimizer and receding-horizon loop."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -57,10 +58,7 @@ def test_loss_is_only_smooth_score_effort_and_smoothness():
     planner, _, _ = problem(w_phi=3.0, w_u=2.0, w_du=4.0)
     controls = torch.tensor([[0.1], [0.3], [0.2], [-0.2], [0.0]])
     expected = -3 * 0.7 + 2 * controls.square().sum()
-    expected += 4 * (
-        (controls[1:] - controls[:-1]).square().sum()
-        + controls[0].square().sum()
-    )
+    expected += 4 * (controls[1:] - controls[:-1]).square().sum()
     torch.testing.assert_close(
         planner._objective(controls, torch.tensor(0.7)), expected
     )
@@ -71,6 +69,9 @@ def test_one_iteration_returns_the_updated_controls_and_replays():
     result = planner.optimize_window(rollout, spec=spec)
     assert result.controls.abs().sum() > 0
     assert len(result.loss_history) == 1
+    assert len(result.smooth_history) == 2
+    assert len(result.hard_lower_history) == 2
+    assert result.selected_iteration == 0
     replay = planner.evaluate_controls(rollout, result.controls, spec=spec)
     assert replay.hard_interval == pytest.approx(
         result.hard_interval, abs=1e-6
@@ -96,6 +97,23 @@ def test_returns_final_smooth_iterate_even_when_hard_score_worsens():
     assert observed[-1].hard_interval[0] < observed[0].hard_interval[0]
 
 
+def test_later_smooth_updates_cannot_discard_a_feasible_candidate():
+    planner, rollout, spec = problem(
+        max_iters=3, alpha=0.7, converge_patience=3
+    )
+    hard_scores = iter((0.4, 0.8, 0.6, 0.5))
+    spec.probability_interval = lambda trajectory: torch.tensor(
+        [next(hard_scores), 1.0]
+    )
+    observed = []
+    result = planner.optimize_window(
+        rollout, spec=spec, on_iteration=lambda k, p: observed.append(p)
+    )
+    torch.testing.assert_close(result.controls, observed[0].controls)
+    assert result.hard_interval[0] == pytest.approx(0.8)
+    assert result.threshold_met
+
+
 def test_observer_is_optional_and_does_not_change_optimization():
     planner, rollout, spec = problem(max_iters=4)
     seen = []
@@ -114,7 +132,9 @@ def test_optional_hard_stopping_and_annealing():
     )
     result = planner.optimize_window(rollout, spec=spec)
     assert len(result.loss_history) == 2
-    assert result.smoothing_beta == pytest.approx(planner._beta(1))
+    assert result.selected_iteration == -1
+    assert result.smoothing_beta == pytest.approx(planner._beta(0))
+    assert result.threshold_met
     planner, rollout, spec = problem(
         max_iters=4,
         smoothing={"beta_start": 2.0, "beta_end": 20.0},
@@ -277,6 +297,9 @@ def test_callback_loss_and_scores_describe_its_controls():
         expected_loss = planner._objective(record.controls, smooth).item()
         assert record.smooth_lower == pytest.approx(smooth)
         assert record.loss == pytest.approx(expected_loss)
+        assert record.control_cost == pytest.approx(
+            planner._control_cost(record.controls).item()
+        )
     assert result.loss_history == pytest.approx([r.loss for r in records])
     assert result.final_loss == pytest.approx(result.loss_history[-1])
 
@@ -340,6 +363,40 @@ def test_result_round_trip(tmp_path):
     assert isinstance(loaded, PlanResult)
     torch.testing.assert_close(loaded.controls, result.controls)
     assert loaded.hard_interval == result.hard_interval
+    assert loaded.smooth_history == result.smooth_history
+
+
+def test_hard_candidate_selection_prefers_feasibility_then_cost():
+    planner, _, _ = problem(alpha=0.8)
+
+    def candidate(lower, cost):
+        return SimpleNamespace(hard_interval=(lower, 1.0), control_cost=cost)
+
+    candidates = [
+        (-1, candidate(0.79, 0.1)),
+        (0, candidate(0.85, 2.0)),
+        (1, candidate(0.82, 1.0)),
+    ]
+    iteration, selected = planner._select_candidate(candidates)
+    assert iteration == 1
+    assert selected.control_cost == 1.0
+
+
+def test_hard_candidate_fallback_uses_tolerance_and_cost():
+    planner, _, _ = problem(alpha=0.9, candidate_tolerance=1e-3)
+
+    def candidate(lower, cost):
+        return SimpleNamespace(hard_interval=(lower, 1.0), control_cost=cost)
+
+    candidates = [
+        (-1, candidate(0.70, 2.0)),
+        (0, candidate(0.7005, 1.0)),
+        (1, candidate(0.72, 3.0)),
+        (2, candidate(0.7195, 0.5)),
+    ]
+    iteration, selected = planner._select_candidate(candidates)
+    assert iteration == 2
+    assert selected.control_cost == 0.5
 
 
 def test_final_smooth_score_uses_beta_end_even_after_one_update():

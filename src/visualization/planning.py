@@ -1,6 +1,5 @@
 """Publication figures from completed pdSTL planning results."""
 
-from functools import reduce
 from math import log, sqrt
 from pathlib import Path
 
@@ -10,9 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from pdstl.operators import And
 from pdstl.predicates import GreaterThan
-from planning.environment import MovingRectangleRegion, reach_avoid_events
+from planning.environment import MovingRectangleRegion
 
 COLORS = {
     "mean": "tab:blue",
@@ -113,26 +111,6 @@ def _style(ax, *, probability=False):
 def _interval_text(interval):
     lower, upper = interval
     return f"pdSTL probability interval: [{lower:.3f}, {upper:.3f}]"
-
-
-def reach_avoid_certificate_trace(belief_trajectory, env):
-    """Overall hard pdSTL interval for every accumulated prediction prefix.
-
-    Entry ``t`` certifies ``G_[1,t](safe) & F_[0,t](goal)``. Safety is
-    vacuously certain at ``t=0``. The final entry is therefore the same
-    complete-horizon interval reported by the planner.
-    """
-    events = reach_avoid_events(env)
-    safe_formula = reduce(And, [events["workspace"], *events["obstacles"]])
-    safe = _np(safe_formula(belief_trajectory))[0]
-    goal = _np(events["goal"](belief_trajectory))[0]
-    always_safe = np.ones_like(safe)
-    if len(safe) > 1:
-        always_safe[1:] = np.minimum.accumulate(safe[1:], axis=0)
-    eventually_goal = np.maximum.accumulate(goal, axis=0)
-    lower = np.maximum(0.0, always_safe[:, 0] + eventually_goal[:, 0] - 1.0)
-    upper = np.minimum(always_safe[:, 1], eventually_goal[:, 1])
-    return np.stack((lower, upper), axis=-1)
 
 
 def _ellipse_parameters(covariance):
@@ -506,14 +484,32 @@ def plot_reach_avoid(
     result,
     env,
     *,
+    initial=None,
+    dt=1.0,
+    u_max=1.0,
     title="Reach–Avoid",
     ellipse_every=4,
     save_path=None,
     show=False,
 ):
-    """Plot the optimized belief trajectory in its configured environment."""
-    fig, ax = plt.subplots(figsize=(10, 7), layout="constrained")
+    """Show the initial and selected plans, controls, and score histories."""
+    fig = plt.figure(figsize=(13, 7), layout="constrained")
+    grid = fig.add_gridspec(2, 2, width_ratios=(1.55, 1.0))
+    ax = fig.add_subplot(grid[:, 0])
+    ax_controls = fig.add_subplot(grid[0, 1])
+    ax_scores = fig.add_subplot(grid[1, 1])
     _draw_environment(ax, env)
+    if initial is not None:
+        initial_mean = _np(initial.rollout.aux["mean_trace"])[0]
+        ax.plot(
+            initial_mean[:, 0],
+            initial_mean[:, 1],
+            color=COLORS["workspace"],
+            linestyle="--",
+            linewidth=1.6,
+            label="Initial belief mean",
+            zorder=7,
+        )
     mean = _np(result.rollout.aux["mean_trace"])[0]
     covariance = _np(result.rollout.aux["cov_trace"])[0]
     ax.plot(
@@ -521,7 +517,7 @@ def plot_reach_avoid(
         mean[:, 1],
         color=COLORS["mean"],
         linewidth=2.2,
-        label="Predicted belief mean",
+        label="Selected belief mean",
         zorder=8,
     )
     ax.scatter(
@@ -550,68 +546,82 @@ def plot_reach_avoid(
             covariance[index],
             label="95% belief ellipse" if index == indices[0] else None,
         )
-    ax.set_title(
-        f"{title} | P↓(φ)={result.hard_interval[0]:.3f}",
-        fontweight="bold",
-    )
-    _finish(fig, save_path, show)
-    return fig, ax
+    if result.threshold_met is None:
+        status = "no threshold requested"
+    else:
+        status = (
+            "threshold achieved"
+            if result.threshold_met
+            else "threshold not achieved"
+        )
+    ax.set_title(title, fontweight="bold")
+    _unique_legend(ax, loc="best")
 
+    control_time = dt * np.arange(len(result.controls))
+    controls = _np(result.controls)
+    for dimension, label in enumerate(("u_x", "u_y")):
+        ax_controls.step(
+            control_time,
+            controls[:, dimension],
+            where="post",
+            linewidth=1.6,
+            label=label,
+        )
+    ax_controls.set(
+        ylabel="control [m/s]",
+        ylim=(-1.1 * u_max, 1.1 * u_max),
+        title="Selected controls",
+    )
+    _style(ax_controls)
+    _unique_legend(ax_controls, loc="best")
 
-def plot_reach_avoid_pdstl(
-    result,
-    env,
-    *,
-    dt,
-    title="Overall pdSTL certificate over time",
-    save_path=None,
-    show=False,
-):
-    """Plot the overall prefix certificate, never separate predicate scores."""
-    bounds = reach_avoid_certificate_trace(
-        result.rollout.belief_trajectory, env
-    )
-    time = dt * np.arange(len(bounds))
-    fig, ax = plt.subplots(figsize=(8, 4), layout="constrained")
-    ax.fill_between(
-        time,
-        bounds[:, 0],
-        bounds[:, 1],
+    candidates = np.arange(len(result.smooth_history))
+    ax_scores.plot(
+        candidates,
+        result.smooth_history,
         color=COLORS["score"],
-        alpha=0.18,
-        label="Certified interval",
+        linewidth=1.7,
+        label="Smooth surrogate",
     )
-    ax.plot(
-        time,
-        bounds[:, 0],
-        color=COLORS["score"],
-        linewidth=2,
-        label="Certified lower bound",
+    ax_scores.plot(
+        candidates,
+        result.hard_lower_history,
+        color=COLORS["mean"],
+        linewidth=1.7,
+        label="Hard lower score",
     )
-    ax.plot(
-        time,
-        bounds[:, 1],
-        color=COLORS["score"],
-        linewidth=1.2,
-        linestyle="--",
-        label="Certified upper bound",
-    )
-    ax.scatter(
-        [time[-1]],
-        [bounds[-1, 0]],
-        color=COLORS["score"],
+    if result.alpha is not None:
+        ax_scores.axhline(
+            result.alpha,
+            color=COLORS["obstacle"],
+            linestyle="--",
+            linewidth=1.1,
+            label=f"Required alpha={result.alpha:.2f}",
+        )
+    selected = result.selected_iteration + 1
+    ax_scores.scatter(
+        [selected],
+        [result.hard_interval[0]],
+        color=COLORS["mean"],
         marker="s",
         zorder=5,
+        label="Selected candidate",
     )
-    ax.set(
-        xlabel="prediction time [s]",
-        ylabel="overall pdSTL probability bound",
-        title=f"{title} | final P↓(φ)={bounds[-1, 0]:.3f}",
+    ax_scores.set(
+        xlabel="candidate (0 = initial)",
+        ylabel="score",
+        ylim=(-0.03, 1.03),
+        title=(
+            f"Hard pdSTL [{result.hard_interval[0]:.3f}, "
+            f"{result.hard_interval[1]:.3f}] · {status}\n"
+            f"cost={result.control_cost:.3f}, "
+            f"planning={result.planning_time:.2f} s"
+        ),
     )
-    _style(ax, probability=True)
-    _unique_legend(ax, loc="best")
+    _style(ax_scores, probability=True)
+    _unique_legend(ax_scores, loc="best")
     _finish(fig, save_path, show)
-    return fig, ax
+    return fig, (ax, ax_controls, ax_scores)
 
 
 def _mark_lane_task_window(ax, env, dt):

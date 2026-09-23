@@ -51,7 +51,19 @@ def build_environment(cfg, device="cpu"):
 
 
 def _initial_controls(cfg, dyn):
-    """Build the configured constant or full-horizon control guess."""
+    """Build a generic goal-directed reach guess or configured fallback."""
+    if cfg.get("scenario", {}).get("type") == "reach_avoid":
+        start = torch.as_tensor(
+            cfg["x0_mean"][: dyn.B.shape[1]],
+            device=dyn.device,
+            dtype=dyn.B.dtype,
+        )
+        goal = cfg["goal"]
+        center = start.new_tensor([sum(goal[axis]) / 2 for axis in ("x", "y")])
+        velocity = ((center - start) / (cfg["H"] * cfg["dt"])).clamp(
+            -dyn.u_max, dyn.u_max
+        )
+        return velocity.repeat(cfg["H"], 1)
     guess = cfg.get("init_control")
     if guess is None:
         return None
@@ -173,7 +185,8 @@ def run_reach_avoid(
 ):
     config = load_config(config_path)
     s = setup_problem(config, with_environment=True)
-    spec = s.env.get_specification(s.cfg["H"])
+    spec = s.env.get_specification(s.cfg["H"], s.cfg.get("goal_interval"))
+    initial = s.planner.evaluate_controls(s.rollout, s.init_guess, spec=spec)
     on_iteration, finish_live = None, None
     if live:
         from visualization.live_plots import create_reach_avoid_live_view
@@ -188,6 +201,7 @@ def run_reach_avoid(
             title=config.get("scenario", {}).get("name", "Reach–Avoid"),
             max_iters=s.planner.cfg["max_iters"],
             ellipse_every=visual.get("ellipse_every", 4),
+            alpha=s.planner.cfg["alpha"],
         )
     result = s.planner.optimize_window(
         s.rollout,
@@ -201,28 +215,19 @@ def run_reach_avoid(
         finish_live(result)
     if show or save:
         from visualization.animation import animate_reach_avoid
-        from visualization.planning import (
-            plot_reach_avoid,
-            plot_reach_avoid_pdstl,
-        )
+        from visualization.planning import plot_reach_avoid
 
         visual = config.get("visualization", {})
         title = config.get("scenario", {}).get("name", "Reach–Avoid")
         plot_reach_avoid(
             result,
             s.env,
+            initial=initial,
+            dt=s.cfg["dt"],
+            u_max=s.dyn.u_max,
             title=title,
             ellipse_every=visual.get("ellipse_every", 4),
             save_path=_output_path("reach_avoid", ".png") if save else None,
-            show=show,
-        )
-        plot_reach_avoid_pdstl(
-            result,
-            s.env,
-            dt=s.cfg["dt"],
-            save_path=_output_path("reach_avoid_pdstl", ".png")
-            if save
-            else None,
             show=show,
         )
         animate_reach_avoid(

@@ -29,7 +29,7 @@ with skip_run("skip", "AltitudeSafety") as check, check():
 
 
 # 2. One-shot reach-avoid planning
-with skip_run("skip", "ReachAvoid") as check, check():
+with skip_run("run", "ReachAvoid") as check, check():
     run_reach_avoid(
         show=show_plots,
         save=save_plots,
@@ -39,7 +39,7 @@ with skip_run("skip", "ReachAvoid") as check, check():
 
 
 # 3. Two-lane change
-with skip_run("run", "LaneChange") as check, check():
+with skip_run("skip", "LaneChange") as check, check():
     run_lane_change(
         show=show_plots,
         save=save_plots,

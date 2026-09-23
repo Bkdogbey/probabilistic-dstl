@@ -26,7 +26,6 @@ def test_reach_avoid_notebook_exposes_one_shot_certificate_workflow():
     )
     assert "run_reach_avoid(" in source
     assert "plot_reach_avoid(" in source
-    assert "plot_reach_avoid_pdstl(" in source
     assert "animate_reach_avoid(" in source
     assert "hard_interval[0]" in source
     assert "visit" not in source.lower()
