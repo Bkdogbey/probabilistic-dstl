@@ -114,8 +114,10 @@ ENV/
 # Data folder
 data/*
 
-# Generated run outputs (plots from src/main.py)
-outputs/
+# Generated run outputs (plots from src/main.py), except the tracked baselines
+outputs/*
+!outputs/lane_baseline/
+!outputs/lane_notebook/
 
 # Cached optimizer results; regenerable by re-running the scenario.
 # Untracked so a stale cache cannot arrive with a fresh checkout and be

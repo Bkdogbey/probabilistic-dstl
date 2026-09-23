@@ -1,0 +1,239 @@
+{
+  "config": "configs/experiments/lane_baseline.yaml",
+  "device": "cpu",
+  "fixed_optimizer_iterations": true,
+  "methods": [
+    "deterministic_stl",
+    "pdstl"
+  ],
+  "paired_initial_states_and_disturbances": true,
+  "scenario_settings": {
+    "lane_change": {
+      "H": 35,
+      "T_SIM": 40,
+      "accel_bounds": {
+        "lateral": [
+          -2.0,
+          2.0
+        ],
+        "longitudinal": [
+          -2.5,
+          2.5
+        ]
+      },
+      "dt": 0.2,
+      "dynamics": "double_integrator",
+      "ego_vehicle": {
+        "height": 1.8,
+        "width": 4.5
+      },
+      "goal": {
+        "x_range": [
+          -10.0,
+          150.0
+        ],
+        "y_range": [
+          1.8,
+          5.4
+        ]
+      },
+      "planner": {
+        "alpha": 0.95,
+        "converge_patience": 3,
+        "max_iters": 40,
+        "w_du": 0.005,
+        "w_phi": 100.0,
+        "w_u": 0.002
+      },
+      "q_std": 0.01,
+      "road": {
+        "lane_divider": 1.8,
+        "y_max": 5.4,
+        "y_min": -1.8
+      },
+      "safety_margin": {
+        "lateral": 0.2,
+        "longitudinal": 0.5
+      },
+      "scenario": {
+        "type": "lane_merge"
+      },
+      "seed": 0,
+      "speed_bounds": [
+        0.0,
+        25.0
+      ],
+      "task": {
+        "dwell_seconds": 1.0,
+        "start_window_seconds": [
+          2.5,
+          5.0
+        ],
+        "target_center": 3.6,
+        "target_tolerance": 0.9
+      },
+      "traffic": [
+        {
+          "height": 1.8,
+          "name": "lead",
+          "speed": 14.0,
+          "width": 4.5,
+          "x0": 30.0,
+          "y": 0.0
+        },
+        {
+          "height": 1.8,
+          "name": "target_front",
+          "speed": 19.0,
+          "width": 4.5,
+          "x0": 38.0,
+          "y": 3.6
+        },
+        {
+          "height": 1.8,
+          "name": "target_rear",
+          "speed": 20.0,
+          "width": 4.5,
+          "x0": -12.0,
+          "y": 3.6
+        }
+      ],
+      "traffic_cov_scale": 0.01,
+      "traffic_q_std": 0.01,
+      "u_max": 2.5,
+      "warm_start": {
+        "lateral": 0.9,
+        "longitudinal": 0.8,
+        "switch_step": 10
+      },
+      "x0_cov_scale": 0.01,
+      "x0_mean": [
+        0.0,
+        0.0,
+        18.0,
+        0.0
+      ]
+    },
+    "lane_merge": {
+      "H": 30,
+      "T_SIM": 40,
+      "accel_bounds": {
+        "lateral": [
+          -2.0,
+          2.0
+        ],
+        "longitudinal": [
+          -2.5,
+          2.5
+        ]
+      },
+      "dt": 0.2,
+      "dynamics": "double_integrator",
+      "ego_vehicle": {
+        "height": 1.8,
+        "width": 4.5
+      },
+      "goal": {
+        "x_range": [
+          -10.0,
+          150.0
+        ],
+        "y_range": [
+          1.8,
+          5.4
+        ]
+      },
+      "planner": {
+        "alpha": 0.95,
+        "converge_patience": 3,
+        "max_iters": 40,
+        "w_du": 0.005,
+        "w_phi": 100.0,
+        "w_u": 0.002
+      },
+      "q_std": 0.005,
+      "ramp": {
+        "end_x": 72.0,
+        "start_x": 28.0
+      },
+      "road": {
+        "lane_divider": 1.8,
+        "y_max": 5.4,
+        "y_min": -1.8
+      },
+      "safety_margin": {
+        "lateral": 0.2,
+        "longitudinal": 0.5
+      },
+      "scenario": {
+        "type": "lane_merge"
+      },
+      "seed": 2,
+      "speed_bounds": [
+        0.0,
+        25.0
+      ],
+      "task": {
+        "dwell_seconds": 1.0,
+        "start_window_seconds": [
+          2.5,
+          5.0
+        ],
+        "target_center": 3.6,
+        "target_tolerance": 1.2
+      },
+      "traffic": [
+        {
+          "height": 1.8,
+          "name": "lead",
+          "speed": 20.0,
+          "width": 4.5,
+          "x0": 42.0,
+          "y": 3.6
+        },
+        {
+          "height": 1.8,
+          "name": "target_front",
+          "speed": 21.0,
+          "width": 4.5,
+          "x0": 70.0,
+          "y": 3.6
+        },
+        {
+          "height": 1.8,
+          "name": "target_rear",
+          "speed": 17.0,
+          "width": 4.5,
+          "x0": -18.0,
+          "y": 3.6
+        }
+      ],
+      "traffic_cov_scale": 0.01,
+      "traffic_q_std": 0.005,
+      "u_max": 2.5,
+      "warm_start": {
+        "lateral": 0.9,
+        "longitudinal": 0.5,
+        "switch_step": 10
+      },
+      "x0_cov_scale": 0.01,
+      "x0_mean": [
+        0.0,
+        0.0,
+        18.0,
+        0.0
+      ]
+    }
+  },
+  "scenarios": [
+    "configs/scenarios/lane_change.yaml",
+    "configs/scenarios/lane_merge.yaml"
+  ],
+  "seed": 2026,
+  "trials": 1,
+  "uncertainty_factors": [
+    0.5,
+    1.0,
+    2.0
+  ]
+}
