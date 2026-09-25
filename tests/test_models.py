@@ -7,7 +7,11 @@ from scipy.stats import norm
 
 from models.beliefs import GaussianBelief
 from models.dynamics import DoubleIntegrator, SingleIntegrator
-from models.rollouts import create_gaussian_belief_trajectory, gaussian_rollout
+from models.rollouts import (
+    create_gaussian_belief_trajectory,
+    gaussian_rollout,
+    sample_trajectories,
+)
 from pdstl.base import Belief, BeliefTrajectory
 from pdstl.predicates import GreaterThan, LessThan
 from planning.environment import build_reach_avoid_environment
@@ -110,8 +114,8 @@ def test_sample_step_is_the_predicted_step_plus_process_noise():
 def test_planner_accepts_the_shared_belief_in_a_small_window():
     environment = build_reach_avoid_environment(
         {
-            "workspace": {"x": [-5.0, 5.0], "y": [-5.0, 5.0]},
-            "goals": {"goal": {"x": [0.5, 1.5], "y": [-0.5, 0.5]}},
+            "bounds": {"x_range": [-5.0, 5.0], "y_range": [-5.0, 5.0]},
+            "goal": {"x_range": [0.5, 1.5], "y_range": [-0.5, 0.5]},
         }
     )
     planner = Planner(SingleIntegrator(), 3, config={"max_iters": 1})
@@ -274,3 +278,19 @@ def test_float32_gaussian_tail_keeps_a_usable_probability_and_gradient(z):
     assert p.item() > 0
     assert p.item() == pytest.approx(norm.cdf(z), rel=1e-3, abs=0)
     assert torch.isfinite(mean.grad).all() and mean.grad.item() > 0
+
+
+def test_sampled_trajectories_match_the_predicted_belief():
+    model = SingleIntegrator(dt=0.2, u_max=1.0, q_std=0.1)
+    mean0, cov0 = torch.tensor([1.0, -1.0]), torch.eye(2) * 0.04
+    controls = torch.full((5, 2), 0.5)
+    generator = torch.Generator().manual_seed(0)
+    paths = sample_trajectories(
+        model, mean0, cov0, controls, 20_000, generator
+    )
+    mean, covariance = model(torch.atanh(controls), mean0, cov0)
+    assert paths.shape == (20_000, 6, 2)
+    torch.testing.assert_close(paths.mean(0), mean[0], atol=5e-3, rtol=0)
+    torch.testing.assert_close(
+        torch.cov(paths[:, -1].T), covariance[0, -1], atol=5e-3, rtol=0
+    )

@@ -38,20 +38,6 @@ class BeliefTrajectory:
         return type(self)(self.beliefs[t:])
 
 
-class OnlineBeliefTrajectory(BeliefTrajectory):
-    """Appendable trajectory; formulas re-evaluate the whole trace (not incremental)."""
-
-    def __init__(self, beliefs=None):
-        super().__init__([] if beliefs is None else beliefs)
-
-    def append(self, belief):
-        self.beliefs.append(belief)
-
-    @classmethod
-    def from_list(cls, lst):
-        return cls(lst)
-
-
 def check_probability_bounds(trace, predicate=None):
     """Raise (never clamp) on non-finite, unordered, or out-of-[0, 1] bounds."""
     who = "predicate"

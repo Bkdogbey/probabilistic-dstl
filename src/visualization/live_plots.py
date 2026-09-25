@@ -1,42 +1,25 @@
-"""Optional live execution and optimizer progress views."""
+"""Live views while planning: reach-avoid iterates and lane execution."""
 
 import matplotlib
-import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 import numpy as np
 
-from visualization.planning import (
+from visualization.figures import (
     COLORS,
+    RHO_INTERVAL,
+    RHO_LOWER,
     _draw_ego_vehicle,
     _draw_environment,
     _ellipse,
     _ellipse_indices,
     _ellipse_parameters,
-    _move_obstacle,
     _move_ego_vehicle,
+    _move_obstacle,
     _np,
     _style,
     _unique_legend,
 )
-
-
-def _update_control_lines(ax, lines, controls):
-    if not lines:
-        palette = (COLORS["mean"], COLORS["planned"], COLORS["goal"])
-        for dimension in range(controls.shape[1]):
-            (line,) = ax.plot(
-                [],
-                [],
-                color=palette[dimension % len(palette)],
-                label=("Longitudinal" if dimension == 0 else "Lateral"),
-            )
-            lines.append(line)
-        _unique_legend(ax, loc="best")
-    for dimension, line in enumerate(lines):
-        line.set_data(np.arange(len(controls)), controls[:, dimension])
-    ax.set_xlim(0, max(1, len(controls) - 1))
-    ax.relim()
-    ax.autoscale_view(scalex=False)
 
 
 def _refresh(fig, interactive):
@@ -44,184 +27,6 @@ def _refresh(fig, interactive):
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
         plt.pause(0.001)
-
-
-def _state_beliefs(env, state, lane):
-    values = [(state[0], state[1], COLORS["mean"])]
-    if lane:
-        values.extend(
-            (
-                state[3][index],
-                state[4][index],
-                COLORS["traffic"],
-            )
-            for index, vehicle in enumerate(env.metadata["traffic"])
-        )
-    return values
-
-
-def _draw_belief_outlines(ax, env, state, lane):
-    if state[1] is None:
-        return []
-    outlines = []
-    for mean, covariance, color in _state_beliefs(env, state, lane):
-        width, height, angle = _ellipse_parameters(_np(covariance))
-        outline = patches.Ellipse(
-            _np(mean)[:2],
-            width,
-            height,
-            angle=angle,
-            fill=False,
-            edgecolor=color,
-            alpha=0.7,
-            linewidth=1.2,
-        )
-        ax.add_patch(outline)
-        outlines.append(outline)
-    return outlines
-
-
-def _update_belief_outlines(outlines, env, state, lane):
-    for outline, (mean, covariance, _) in zip(
-        outlines, _state_beliefs(env, state, lane)
-    ):
-        width, height, angle = _ellipse_parameters(_np(covariance))
-        outline.center = _np(mean)[:2]
-        outline.width = width
-        outline.height = height
-        outline.angle = angle
-
-
-def _candidate_trace(dynamics, state, controls):
-    point = _np(state[0]).copy()
-    candidate = [point[:2].copy()]
-    for control in _np(controls):
-        point = _np(dynamics.A) @ point + _np(dynamics.B) @ control
-        candidate.append(point[:2].copy())
-    return np.asarray(candidate)
-
-
-def _follow_lane(ax, x, lane):
-    if lane:
-        ax.set_xlim(x - 15, x + 45)
-
-
-def _mark_lane_window(ax, env, lane, dt):
-    if not lane:
-        return dt
-    task = env.metadata["task"]
-    start, end = task["start_end_steps"]
-    latest_start = end - task["dwell_steps"]
-    ax.axvspan(
-        start * dt,
-        latest_start * dt,
-        color=COLORS["goal"],
-        alpha=0.12,
-        label="Dwell-start window",
-    )
-    ax.axvline(
-        end * dt,
-        color=COLORS["goal"],
-        linestyle="--",
-        linewidth=1,
-        label="Completion deadline",
-    )
-    return end * dt
-
-
-def create_optimization_view(label, *, max_iters, control_unit="m/s"):
-    """Show sampled gradient-descent iterates from the planner callback."""
-    fig, (ax_loss, ax_score, ax_controls) = plt.subplots(
-        3, 1, figsize=(7, 7), layout="constrained"
-    )
-    (loss_line,) = ax_loss.plot(
-        [], [], color=COLORS["planned"], label="Optimization loss"
-    )
-    (smooth_line,) = ax_score.plot(
-        [], [], color=COLORS["score"], label="Smooth score"
-    )
-    (hard_line,) = ax_score.plot(
-        [],
-        [],
-        color=COLORS["goal"],
-        label="Hard lower",
-    )
-    ax_loss.set(
-        xlabel="gradient descent iteration", ylabel="optimization loss"
-    )
-    ax_score.set(xlabel="gradient descent iteration", ylabel="score")
-    ax_controls.set(
-        xlabel="prediction step", ylabel=f"current control [{control_unit}]"
-    )
-    for ax in (ax_loss, ax_score):
-        ax.set_xlim(0, max_iters)
-        _style(ax)
-        _unique_legend(ax, loc="best")
-    _style(ax_controls)
-    beta_text = ax_score.text(
-        0.02,
-        0.05,
-        "",
-        transform=ax_score.transAxes,
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
-    )
-    interactive = matplotlib.get_backend().lower() != "agg"
-    if interactive:
-        fig.show()
-    window_number = None
-    iterations, losses, smooth_scores, hard_scores = [], [], [], []
-    control_lines = []
-
-    def redraw():
-        loss_line.set_data(iterations, losses)
-        smooth_line.set_data(iterations, smooth_scores)
-        hard_line.set_data(iterations, hard_scores)
-        for ax in (ax_loss, ax_score):
-            ax.relim()
-            ax.autoscale_view(scalex=False)
-        _refresh(fig, interactive)
-
-    def on_iteration(window, iteration, record):
-        nonlocal window_number
-        if window_number != window:
-            window_number = window
-            iterations.clear()
-            losses.clear()
-            smooth_scores.clear()
-            hard_scores.clear()
-            ax_loss.set_title(f"{label}: planning window {window + 1}")
-        iterations.append(iteration + 1)
-        losses.append(record.loss)
-        smooth_scores.append(record.smooth_lower)
-        hard_scores.append(record.hard_interval[0])
-        _update_control_lines(ax_controls, control_lines, _np(record.controls))
-        beta_text.set_text(f"smoothing beta: {record.beta:.2f}")
-        print(
-            f"{label} window {window + 1}, iteration {iteration + 1}/"
-            f"{max_iters}: loss {record.loss:.4f}, "
-            f"smooth lower {record.smooth_lower:.4f}, "
-            f"hard lower {record.hard_interval[0]:.4f}",
-            flush=True,
-        )
-        redraw()
-
-    def finish_window(window, plan):
-        loss_line.set_data(
-            np.arange(1, len(plan.loss_history) + 1), plan.loss_history
-        )
-        ax_loss.relim()
-        ax_loss.autoscale_view(scalex=False)
-        beta_text.set_text(f"final smoothing beta: {plan.smoothing_beta:.2f}")
-        print(
-            f"{label} window {window + 1} complete after "
-            f"{len(plan.loss_history)} iterations: "
-            f"hard interval [{plan.hard_interval[0]:.4f}, "
-            f"{plan.hard_interval[1]:.4f}]",
-            flush=True,
-        )
-        _refresh(fig, interactive)
-
-    return fig, (ax_loss, ax_score, ax_controls), on_iteration, finish_window
 
 
 def create_reach_avoid_live_view(
@@ -234,7 +39,7 @@ def create_reach_avoid_live_view(
     ellipse_every=8,
     alpha=None,
 ):
-    """Live candidate trajectory with separate smooth and hard scores."""
+    """Live candidate trajectory and its lower robustness per iteration."""
     fig, (ax_map, ax_scores) = plt.subplots(
         1,
         2,
@@ -263,19 +68,12 @@ def create_reach_avoid_live_view(
         label="Terminal belief mean",
         zorder=10,
     )
-    (smooth_line,) = ax_scores.plot(
-        [],
-        [],
-        color=COLORS["score"],
-        linewidth=1.7,
-        label="Smooth surrogate",
-    )
-    (hard_line,) = ax_scores.plot(
+    (score_line,) = ax_scores.plot(
         [],
         [],
         color=COLORS["mean"],
         linewidth=1.7,
-        label="Hard lower score",
+        label=f"{RHO_LOWER} (lower bound)",
     )
     if alpha is not None:
         ax_scores.axhline(
@@ -283,14 +81,13 @@ def create_reach_avoid_live_view(
             color=COLORS["obstacle"],
             linestyle="--",
             linewidth=1.1,
-            label=f"Required alpha={alpha:.2f}",
+            label=f"threshold α = {alpha:.2f}",
         )
     ax_scores.set(
         xlabel="optimizer iteration",
-        ylabel="score",
+        ylabel=f"lower robustness {RHO_LOWER}",
         ylim=(-0.03, 1.03),
-        xlim=(1, max(1, max_iters)),
-        title="Optimization diagnostics",
+        xlim=(0, max(1, max_iters)),
     )
     _style(ax_scores, probability=True)
     _unique_legend(ax_scores, loc="best")
@@ -298,7 +95,7 @@ def create_reach_avoid_live_view(
     if interactive:
         fig.show()
     ellipses = []
-    iterations, smooth_scores, hard_scores = [], [], []
+    iterations, scores = [], []
 
     def render(iteration, controls, hard_interval):
         plan = evaluate_controls(controls)
@@ -313,30 +110,26 @@ def create_reach_avoid_live_view(
             ellipses.append(_ellipse(ax_map, mean[index], covariance[index]))
         ax_map.set_title(
             f"{title} | iteration {iteration + 1}/{max_iters} | "
-            f"P↓(φ)={hard_interval[0]:.3f}",
+            f"{RHO_LOWER} = {hard_interval[0]:.3f}",
             fontweight="bold",
         )
         _refresh(fig, interactive)
 
     def on_iteration(iteration, record):
         iterations.append(iteration + 1)
-        smooth_scores.append(record.smooth_lower)
-        hard_scores.append(record.hard_interval[0])
-        smooth_line.set_data(iterations, smooth_scores)
-        hard_line.set_data(iterations, hard_scores)
+        scores.append(record.hard_interval[0])
+        score_line.set_data(iterations, scores)
         render(iteration, record.controls, record.hard_interval)
         print(
             f"{title} iteration {iteration + 1}/{max_iters}: "
             f"loss {record.loss:.4f}, "
-            f"hard lower {record.hard_interval[0]:.4f}",
+            f"rho_lower {record.hard_interval[0]:.4f}",
             flush=True,
         )
 
     def finish(result):
-        candidates = np.arange(len(result.smooth_history))
-        smooth_line.set_data(candidates, result.smooth_history)
-        hard_line.set_data(candidates, result.hard_lower_history)
-        ax_scores.set_xlim(0, max(1, len(candidates) - 1))
+        history = result.hard_lower_history
+        score_line.set_data(np.arange(len(history)), history)
         render(
             result.selected_iteration, result.controls, result.hard_interval
         )
@@ -344,26 +137,86 @@ def create_reach_avoid_live_view(
     return fig, (ax_map, ax_scores), on_iteration, finish
 
 
+def _beliefs(state):
+    """(mean, covariance, colour) of the ego and every traffic vehicle."""
+    ego = [(state[0], state[1], COLORS["mean"])]
+    traffic = [
+        (mean, covariance, COLORS["traffic"])
+        for mean, covariance in zip(state[3], state[4])
+    ]
+    return ego + traffic
+
+
+def _draw_belief_outlines(ax, state):
+    outlines = []
+    for mean, covariance, color in _beliefs(state):
+        width, height, angle = _ellipse_parameters(_np(covariance))
+        outline = patches.Ellipse(
+            _np(mean)[:2],
+            width,
+            height,
+            angle=angle,
+            fill=False,
+            edgecolor=color,
+            alpha=0.7,
+            linewidth=1.2,
+        )
+        ax.add_patch(outline)
+        outlines.append(outline)
+    return outlines
+
+
+def _update_belief_outlines(outlines, state):
+    for outline, (mean, covariance, _) in zip(outlines, _beliefs(state)):
+        width, height, angle = _ellipse_parameters(_np(covariance))
+        outline.center = _np(mean)[:2]
+        outline.width = width
+        outline.height = height
+        outline.angle = angle
+
+
+def _candidate_trace(dynamics, state, controls):
+    point = _np(state[0]).copy()
+    candidate = [point[:2].copy()]
+    for control in _np(controls):
+        point = _np(dynamics.A) @ point + _np(dynamics.B) @ control
+        candidate.append(point[:2].copy())
+    return np.asarray(candidate)
+
+
+def _mark_lane_window(ax, env, dt):
+    task = env.metadata["task"]
+    start, end = task["start_end_steps"]
+    ax.axvspan(
+        start * dt,
+        (end - task["dwell_steps"]) * dt,
+        color=COLORS["goal"],
+        alpha=0.12,
+        label="Dwell-start window",
+    )
+    ax.axvline(
+        end * dt,
+        color=COLORS["goal"],
+        linestyle="--",
+        linewidth=1,
+        label="Completion deadline",
+    )
+    return end * dt
+
+
 def create_live_view(
-    env,
-    initial_state,
-    *,
-    dt,
-    lane=False,
-    dynamics=None,
-    max_iters=40,
-    label="MPC",
+    env, initial_state, *, dt, dynamics=None, max_iters=40, label="MPC"
 ):
-    """One road-centered figure for candidate plans and executed steps."""
+    """One road-centred figure for candidate plans and executed steps."""
     fig = plt.figure(figsize=(14, 6), layout="constrained")
     grid = fig.add_gridspec(3, 2, width_ratios=(2.8, 1.0))
     ax_map = fig.add_subplot(grid[:, 0])
     ax_loss = fig.add_subplot(grid[0, 1])
     ax_score = fig.add_subplot(grid[1, 1])
     ax_windows = fig.add_subplot(grid[2, 1])
-    moving = _draw_environment(ax_map, env, lane=lane)
+    moving = _draw_environment(ax_map, env, lane=True)
     initial = _np(initial_state[0])[:2]
-    ego_patch = _draw_ego_vehicle(ax_map, env, initial) if lane else None
+    ego_patch = _draw_ego_vehicle(ax_map, env, initial)
     executed = [initial]
     window_scores = []
     (line_exec,) = ax_map.plot(
@@ -376,11 +229,7 @@ def create_live_view(
         label="Executed",
     )
     (line_plan,) = ax_map.plot(
-        [],
-        [],
-        color=COLORS["planned"],
-        linewidth=1.5,
-        label="Plan",
+        [], [], color=COLORS["planned"], linewidth=1.5, label="Plan"
     )
     (line_loss,) = ax_loss.plot(
         [],
@@ -396,7 +245,7 @@ def create_live_view(
         color=COLORS["score"],
         marker="o",
         markersize=3,
-        label="Smooth score",
+        label=f"smooth {RHO_LOWER}",
     )
     (line_hard,) = ax_score.plot(
         [],
@@ -404,7 +253,7 @@ def create_live_view(
         color=COLORS["goal"],
         marker="o",
         markersize=3,
-        label="Hard lower",
+        label=RHO_LOWER,
     )
     (line_windows,) = ax_windows.plot(
         [],
@@ -413,12 +262,12 @@ def create_live_view(
         linewidth=1.5,
         marker="o",
         markersize=3,
-        label="Hard lower",
+        label=f"{RHO_LOWER} per window",
     )
     ax_loss.set(xlabel="iteration", ylabel="loss", xlim=(0, max_iters))
-    ax_score.set(xlabel="iteration", ylabel="lower score", xlim=(0, max_iters))
-    ax_windows.set(xlabel="executed time [s]", ylabel="hard lower bound")
-    final_time = _mark_lane_window(ax_windows, env, lane, dt)
+    ax_score.set(xlabel="iteration", ylabel=RHO_LOWER, xlim=(0, max_iters))
+    ax_windows.set(xlabel="executed time [s]", ylabel=RHO_LOWER)
+    final_time = _mark_lane_window(ax_windows, env, dt)
     ax_windows.set_xlim(0, final_time)
     for ax in (ax_loss, ax_score, ax_windows):
         _style(ax, probability=ax is ax_windows)
@@ -426,8 +275,8 @@ def create_live_view(
     _unique_legend(
         ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.16), ncol=5
     )
-    _follow_lane(ax_map, initial[0], lane)
-    belief_outlines = _draw_belief_outlines(ax_map, env, initial_state, lane)
+    ax_map.set_xlim(initial[0] - 15, initial[0] + 45)
+    belief_outlines = _draw_belief_outlines(ax_map, initial_state)
     interactive = matplotlib.get_backend().lower() != "agg"
     if interactive:
         fig.show()
@@ -462,9 +311,9 @@ def create_live_view(
             )
             line_plan.set_data(candidate[:, 0], candidate[:, 1])
         print(
-            f"{label} window {window + 1}, iteration {iteration + 1}/{max_iters}: "
-            f"loss {record.loss:.4f}, smooth lower {record.smooth_lower:.4f}, "
-            f"hard lower {record.hard_interval[0]:.4f}",
+            f"{label} window {window + 1}, iteration {iteration + 1}/"
+            f"{max_iters}: loss {record.loss:.4f}, "
+            f"rho_lower {record.hard_interval[0]:.4f}",
             flush=True,
         )
         _refresh(fig, interactive)
@@ -472,9 +321,8 @@ def create_live_view(
     def finish_window(window, plan):
         print(
             f"{label} window {window + 1} complete after "
-            f"{len(plan.loss_history)} iterations: "
-            f"hard interval [{plan.hard_interval[0]:.4f}, "
-            f"{plan.hard_interval[1]:.4f}]",
+            f"{len(plan.loss_history)} iterations: {RHO_INTERVAL} = "
+            f"[{plan.hard_interval[0]:.4f}, {plan.hard_interval[1]:.4f}]",
             flush=True,
         )
 
@@ -492,10 +340,9 @@ def create_live_view(
         )
         ax_windows.set_xlim(0, max(final_time, dt * (len(window_scores) + 1)))
         _move_obstacle(moving, env, step + 1, state)
-        if ego_patch is not None:
-            _move_ego_vehicle(ego_patch, points[-1])
-        _follow_lane(ax_map, points[-1, 0], lane)
-        _update_belief_outlines(belief_outlines, env, state, lane)
+        _move_ego_vehicle(ego_patch, points[-1])
+        ax_map.set_xlim(points[-1, 0] - 15, points[-1, 0] + 45)
+        _update_belief_outlines(belief_outlines, state)
         ax_map.set_title(
             f"Executed step {step + 1} at t={(step + 1) * dt:.1f} s"
         )

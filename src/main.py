@@ -1,73 +1,35 @@
-"""Run the current projects by changing each block's ``run`` or ``skip`` flag."""
+"""Run each experiment by setting its block to "run" or "skip".
 
-from planning.runners import (
-    run_altitude_safety,
-    run_lane_change,
-    run_reach_avoid,
-)
+Figures are shown, then saved to outputs/ when closed.
+"""
+
+from experiments import lane, reach_avoid
 from utils import skip_run
 
-
-# A displayed figure or animation is shown first; closing it starts saving.
-show_plots = True
-save_plots = True
-live_plots = True
-
-# Stream sampled gradient-descent steps and open their live convergence plot.
-show_optimization = True
-optimization_every = 5  # set to 1 to display every gradient update
+REACH_AVOID = "configs/scenarios/reach_avoid"
+LANE = "configs/scenarios/lane"
 
 
-# 1. Altitude safety: Always[1,H](altitude >= threshold)
-with skip_run("skip", "AltitudeSafety") as check, check():
-    run_altitude_safety(
-        show=show_plots,
-        save=save_plots,
-        live_optimization=show_optimization,
-        optimization_every=optimization_every,
-    )
+# 1. Reach-avoid: one obstacle
+with skip_run("run", "ReachAvoid") as check, check():
+    reach_avoid.run(f"{REACH_AVOID}/obstacle.yaml")
 
 
-# 2. Reach-avoid, stlpy NarrowPassage: reach either goal past four obstacles
-with skip_run("run", "NarrowPassage") as check, check():
-    run_reach_avoid(
-        "configs/scenarios/narrow_passage.yaml",
-        show=show_plots,
-        save=save_plots,
-        live=live_plots,
-        optimization_every=optimization_every,
-    )
+# 2. Reach-avoid (stlpy NarrowPassage): goal A or B past four obstacles
+with skip_run("skip", "NarrowPassage") as check, check():
+    reach_avoid.run(f"{REACH_AVOID}/narrow_passage.yaml")
 
 
-# 3. Reach-avoid, stlpy EitherOr: dwell in t1 or t2, then reach the goal
+# 3. Reach-avoid (stlpy EitherOr): dwell in t1 or t2, then reach the goal
 with skip_run("run", "EitherOr") as check, check():
-    run_reach_avoid(
-        "configs/scenarios/either_or.yaml",
-        show=show_plots,
-        save=save_plots,
-        live=live_plots,
-        optimization_every=optimization_every,
-    )
+    reach_avoid.run(f"{REACH_AVOID}/either_or.yaml")
 
 
-# 4. Two-lane change
+# 4. Lane change into the faster lane
 with skip_run("skip", "LaneChange") as check, check():
-    run_lane_change(
-        show=show_plots,
-        save=save_plots,
-        live=live_plots,
-        live_optimization=show_optimization,
-        optimization_every=optimization_every,
-    )
+    lane.run(f"{LANE}/lane_change.yaml")
 
 
 # 5. On-ramp merge into the main lane
 with skip_run("skip", "LaneMerge") as check, check():
-    run_lane_change(
-        "configs/scenarios/lane_merge.yaml",
-        show=show_plots,
-        save=save_plots,
-        live=live_plots,
-        live_optimization=show_optimization,
-        optimization_every=optimization_every,
-    )
+    lane.run(f"{LANE}/lane_merge.yaml")

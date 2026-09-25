@@ -12,10 +12,9 @@ from pdstl.predicates import RelativeAxisInterval
 
 
 class BeliefRollout(NamedTuple):
-    """Predicted beliefs (what pdSTL reads) plus optional traces for costs and plots."""
+    """Predicted beliefs (what pdSTL reads) plus traces for costs and plots."""
 
     belief_trajectory: BeliefTrajectory
-    nominal_trace: torch.Tensor | None = None  # [1, T+1, D]
     aux: dict[str, torch.Tensor] | None = None
 
 
@@ -86,11 +85,47 @@ def gaussian_rollout(dynamics, mean0, cov0):
         mean_trace, cov_trace = dynamics(v, mean0, cov0)
         return BeliefRollout(
             create_gaussian_belief_trajectory(mean_trace[0], cov_trace[0]),
-            mean_trace,
             {"mean_trace": mean_trace, "cov_trace": cov_trace},
         )
 
     return rollout
+
+
+def sample_trajectories(dynamics, mean0, cov0, controls, samples, generator):
+    """Noisy trajectories x' = A x + B u + w, w ~ N(0, Q), under fixed controls.
+
+    Args:
+        dynamics: Linear dynamics with A, B, Q.
+        mean0, cov0: Gaussian initial state.
+        controls: [H, m] physical controls.
+        samples: Number of trajectories N.
+        generator: torch.Generator for reproducible draws.
+
+    Returns:
+        [N, H+1, D] sampled states.
+    """
+
+    def draw(covariance):
+        # Cholesky of a PSD matrix that may be singular (zero variances).
+        jitter = 1e-9 * torch.eye(len(covariance), device=covariance.device)
+        factor = torch.linalg.cholesky(covariance + jitter)
+        noise = torch.randn(
+            samples,
+            len(covariance),
+            generator=generator,
+            device=covariance.device,
+            dtype=covariance.dtype,
+        )
+        return noise @ factor.T
+
+    state = mean0 + draw(cov0)
+    states = [state]
+    for control in controls:
+        state = (
+            state @ dynamics.A.T + control @ dynamics.B.T + draw(dynamics.Q)
+        )
+        states.append(state)
+    return torch.stack(states, dim=1)
 
 
 class LaneBeliefTrajectory(GaussianBeliefTrajectory):
@@ -179,7 +214,6 @@ def lane_rollout(
                 traffic_cov_trace,
                 names,
             ),
-            mean_trace,
             {
                 "mean_trace": mean_trace,
                 "cov_trace": cov_trace,

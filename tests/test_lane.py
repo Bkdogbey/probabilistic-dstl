@@ -10,7 +10,9 @@ from PIL import Image
 from models.beliefs import GaussianBeliefTrajectory
 from models.rollouts import LaneBeliefTrajectory, lane_rollout
 from pdstl.predicates import AxisInterval, RelativeAxisInterval
+from experiments import lane
 from planning.environment import (
+    build_lane_merge_environment,
     lane_contains_footprint,
     lane_goal_reached,
     lane_has_collision,
@@ -18,21 +20,22 @@ from planning.environment import (
     lane_subformulas,
 )
 from planning.planner import IterationRecord
-from planning.runners import (
-    _lane_initial_controls,
-    _lane_initial_state,
-    build_environment,
-    run_lane_change,
-    setup_problem,
-)
 from utils import load_config
 from visualization.animation import animate_mpc
 from visualization.live_plots import create_live_view
-from visualization.planning import COLORS, _draw_environment, plot_lane_merge
+from visualization.figures import (
+    COLORS,
+    RHO_INTERVAL,
+    RHO_LOWER,
+    _draw_environment,
+    plot_lane_merge,
+)
 
 
 def test_collision_uses_footprints_and_margins():
-    env = build_environment(load_config("configs/scenarios/lane_change.yaml"))
+    env = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_change.yaml")
+    )
     ego = torch.tensor([0.0, 0.0])
     traffic = torch.tensor([[5.0, 0.0], [100.0, 0.0], [200.0, 0.0]])
     assert lane_has_collision(env, ego, traffic)
@@ -41,13 +44,15 @@ def test_collision_uses_footprints_and_margins():
 
 
 def test_road_contains_the_whole_vehicle_and_taper_front_corner():
-    straight = build_environment(
-        load_config("configs/scenarios/lane_change.yaml")
+    straight = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_change.yaml")
     )
     assert lane_contains_footprint(straight, 0.0, -0.9)
     assert not lane_contains_footprint(straight, 0.0, -0.901)
 
-    merge = build_environment(load_config("configs/scenarios/lane_merge.yaml"))
+    merge = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_merge.yaml")
+    )
     road, ramp = merge.metadata["road"], merge.metadata["ramp"]
     x = 40.0
     front = x + merge.metadata["ego_vehicle"]["width"] / 2
@@ -60,8 +65,8 @@ def test_road_contains_the_whole_vehicle_and_taper_front_corner():
 
 
 def test_dwell_finishes_inside_window_and_merge_front_is_bounded():
-    change = build_environment(
-        load_config("configs/scenarios/lane_change.yaml")
+    change = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_change.yaml")
     )
     task = change.metadata["task"]
     completion = task["start_end_steps"][0] + task["dwell_steps"]
@@ -71,7 +76,9 @@ def test_dwell_finishes_inside_window_and_merge_front_is_bounded():
     )
     assert lane_goal_reached(change, mean, completion, task["dwell_steps"] + 1)
 
-    merge = build_environment(load_config("configs/scenarios/lane_merge.yaml"))
+    merge = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_merge.yaml")
+    )
     limit = (
         merge.metadata["ramp"]["end_x"]
         - merge.metadata["ego_vehicle"]["width"] / 2
@@ -85,7 +92,9 @@ def test_dwell_finishes_inside_window_and_merge_front_is_bounded():
 
 
 def test_completion_formula_matches_sampled_dwell():
-    env = build_environment(load_config("configs/scenarios/lane_change.yaml"))
+    env = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_change.yaml")
+    )
     task = env.metadata["task"]
     steps = env.metadata["task"]["start_end_steps"][1] + 1
     mean = torch.zeros(1, steps, 4)
@@ -116,7 +125,7 @@ def test_completion_formula_matches_sampled_dwell():
 
 @pytest.fixture
 def lane_config(tmp_path):
-    cfg = load_config("configs/scenarios/lane_change.yaml")
+    cfg = load_config("configs/scenarios/lane/lane_change.yaml")
     cfg["H"] = 8
     cfg["task"]["start_window_seconds"] = [0.6, 1.0]
     cfg["task"]["dwell_seconds"] = 0.2
@@ -129,8 +138,8 @@ def lane_config(tmp_path):
 
 def test_relative_beliefs_and_separate_formulae(lane_config):
     cfg, _ = lane_config
-    setup = setup_problem(cfg, with_environment=True)
-    state = _lane_initial_state(setup)
+    setup = lane.build(cfg)
+    state = lane.initial_state_of(setup)
     names = [car["name"] for car in cfg["traffic"]]
     rollout = lane_rollout(
         setup.dyn,
@@ -144,7 +153,7 @@ def test_relative_beliefs_and_separate_formulae(lane_config):
         (cfg["accel_bounds"]["longitudinal"], cfg["accel_bounds"]["lateral"]),
     )
     prediction = rollout(
-        setup.planner._control_parameters(_lane_initial_controls(setup))
+        setup.planner._control_parameters(lane.initial_controls(setup))
     )
     belief = prediction.belief_trajectory
     relative = belief.relative_belief("lead")
@@ -164,7 +173,7 @@ def test_relative_beliefs_and_separate_formulae(lane_config):
         GaussianBeliefTrajectory(
             prediction.aux["mean_trace"], prediction.aux["cov_trace"]
         ).probability_bounds(event)
-    local = lane_local_window(setup.env, 0, state[0], cfg)
+    local = lane_local_window(setup.env, 0)
     formulae = lane_subformulas(local, cfg["H"])
     assert {"road", "safe", "complete", "overall"} <= formulae.keys()
     assert sum(name.startswith("safety_") for name in formulae) == 3
@@ -179,7 +188,7 @@ def test_lane_save_and_live_observer(
 
     cfg, path = lane_config
     monkeypatch.setattr(runners, "RESULTS_DIR", tmp_path)
-    result = run_lane_change(str(path), max_steps=1, show=False, save=True)
+    result = lane.run(str(path), max_steps=1, show=False, save=True)
     assert (tmp_path / "lane_change.pt").exists()
     assert (tmp_path / "lane_change.gif").exists()
     for stem in ("lane_change", "lane_change_trajectory"):
@@ -193,12 +202,11 @@ def test_lane_save_and_live_observer(
         movie.seek(movie.n_frames - 1)
         assert movie.convert("RGB").tobytes() != first
 
-    setup = setup_problem(cfg, with_environment=True)
+    setup = lane.build(cfg)
     fig, axes, observe = create_live_view(
         setup.env,
         result.states[0],
         dt=cfg["dt"],
-        lane=True,
         dynamics=setup.dyn,
         max_iters=2,
     )
@@ -256,7 +264,7 @@ def test_lane_save_and_live_observer(
     assert len(executed.get_xdata()) == 2
     plt.close(fig)
 
-    viewed = run_lane_change(
+    viewed = lane.run(
         str(path), max_steps=1, show=False, save=False, live=True
     )
     torch.testing.assert_close(
@@ -273,8 +281,10 @@ def test_lane_save_and_live_observer(
 
 
 def test_default_lane_completes_with_physical_controls():
-    cfg = load_config("configs/scenarios/lane_change.yaml")
-    result = run_lane_change(show=False, save=False)
+    cfg = load_config("configs/scenarios/lane/lane_change.yaml")
+    result = lane.run(
+        "configs/scenarios/lane/lane_change.yaml", show=False, save=False
+    )
     assert result.stopped_reason == "success"
     assert 1 <= len(result.window_plans) <= cfg["T_SIM"]
     assert (
@@ -293,8 +303,8 @@ def test_default_lane_completes_with_physical_controls():
     assert bool(((speeds >= 0) & (speeds <= 25)).all())
     assert bool((result.applied_controls[:, 0].abs() <= 2.5).all())
     assert bool((result.applied_controls[:, 1].abs() <= 2.0).all())
-    setup = setup_problem(cfg, with_environment=True)
-    first_state = _lane_initial_state(setup)
+    setup = lane.build(cfg)
+    first_state = lane.initial_state_of(setup)
     replay_rollout = lane_rollout(
         setup.dyn,
         first_state[0],
@@ -307,9 +317,7 @@ def test_default_lane_completes_with_physical_controls():
         (cfg["accel_bounds"]["longitudinal"], cfg["accel_bounds"]["lateral"]),
     )
     first = result.window_plans[0]
-    spec = lane_local_window(
-        setup.env, 0, first_state[0], cfg
-    ).get_specification(cfg["H"])
+    spec = lane_local_window(setup.env, 0).get_specification(cfg["H"])
     replay = setup.planner.evaluate_controls(
         replay_rollout, first.controls, spec=spec
     )
@@ -317,7 +325,7 @@ def test_default_lane_completes_with_physical_controls():
         replay.rollout.aux["mean_trace"], first.rollout.aux["mean_trace"]
     )
     assert replay.hard_interval == pytest.approx(first.hard_interval, abs=1e-6)
-    task = build_environment(cfg).metadata["task"]
+    task = build_lane_merge_environment(cfg).metadata["task"]
     witness = max(result.states[-1][5], task["start_end_steps"][0])
     assert witness <= task["start_end_steps"][1]
     assert len(result.window_plans) >= witness + task["dwell_steps"]
@@ -327,20 +335,20 @@ def test_deadline_missed_is_reported(lane_config):
     cfg, path = lane_config
     cfg["task"]["start_window_seconds"] = [0.0, 0.2]
     path.write_text(yaml.safe_dump(cfg))
-    result = run_lane_change(str(path), max_steps=5, show=False, save=False)
+    result = lane.run(str(path), max_steps=5, show=False, save=False)
     assert result.stopped_reason == "deadline_missed"
     assert len(result.window_plans) <= 2
 
 
 def test_on_ramp_merge_tapers_and_completes():
-    cfg = load_config("configs/scenarios/lane_merge.yaml")
-    env = build_environment(cfg)
+    cfg = load_config("configs/scenarios/lane/lane_merge.yaml")
+    env = build_lane_merge_environment(cfg)
     ramp = env.metadata["ramp"]
     road = env.metadata["road"]
     assert ramp["start_x"] < ramp["end_x"]
     assert env.metadata["traffic"][0]["y"] == road["lane_divider"] * 2
-    result = run_lane_change(
-        "configs/scenarios/lane_merge.yaml", show=False, save=False
+    result = lane.run(
+        "configs/scenarios/lane/lane_merge.yaml", show=False, save=False
     )
     assert result.stopped_reason == "success"
     assert len(result.window_plans) <= cfg["T_SIM"]
@@ -352,7 +360,7 @@ def test_on_ramp_merge_tapers_and_completes():
 def test_lane_figures_have_time_labels_red_traffic_and_final_score(
     tmp_path,
 ):
-    config = load_config("configs/scenarios/lane_change.yaml")
+    config = load_config("configs/scenarios/lane/lane_change.yaml")
     config["H"] = 8
     config["T_SIM"] = 1
     config["task"]["start_window_seconds"] = [0.2, 1.0]
@@ -360,13 +368,13 @@ def test_lane_figures_have_time_labels_red_traffic_and_final_score(
     config["planner"]["max_iters"] = 1
     path = tmp_path / "lane_change.yaml"
     path.write_text(yaml.safe_dump(config))
-    result = run_lane_change(str(path), max_steps=1, show=False, save=False)
-    problem = setup_problem(config, device="cpu", with_environment=True)
+    result = lane.run(str(path), max_steps=1, show=False, save=False)
+    problem = lane.build(config, device="cpu")
     figures = plot_lane_merge(result, problem.env, dt=config["dt"])
     trajectory = figures["trajectory"][1]
     trajectory_text = {text.get_text() for text in trajectory.texts}
     assert "t=0 s" in trajectory_text
-    assert any("Final pdSTL: [" in text for text in trajectory_text)
+    assert any("last window" in text for text in trajectory_text)
     assert -3.0 < trajectory.get_xlim()[0] <= 0.0
     traffic = [
         patch
@@ -381,14 +389,14 @@ def test_lane_figures_have_time_labels_red_traffic_and_final_score(
     score_labels = {
         text.get_text() for text in combined_axes[1].get_legend().get_texts()
     }
-    assert {"Hard interval", "Smooth score"} <= score_labels
+    assert {RHO_INTERVAL, f"smooth {RHO_LOWER}"} <= score_labels
     assert {"Dwell-start window", "Completion deadline"} <= score_labels
     assert any(
-        text.get_text().startswith("Final pdSTL: [")
+        text.get_text().startswith("last window")
         for text in combined_axes[1].texts
     )
     animation_fig, animation_axes, movie = animate_mpc(
-        result, problem.env, dt=config["dt"], lane=True
+        result, problem.env, dt=config["dt"]
     )
     animation_anchor = (
         animation_axes[0]
@@ -403,8 +411,8 @@ def test_lane_figures_have_time_labels_red_traffic_and_final_score(
 
 
 def test_merge_shades_only_the_taper_triangle():
-    config = load_config("configs/scenarios/lane_merge.yaml")
-    problem = setup_problem(config, device="cpu", with_environment=True)
+    config = load_config("configs/scenarios/lane/lane_merge.yaml")
+    problem = lane.build(config, device="cpu")
     fig, ax = plt.subplots()
     _draw_environment(ax, problem.env, lane=True)
     shaded = [
@@ -420,15 +428,12 @@ def test_merge_shades_only_the_taper_triangle():
 
 
 def test_live_map_legend_is_outside_axes():
-    config = load_config("configs/scenarios/lane_change.yaml")
-    problem = setup_problem(config, device="cpu", with_environment=True)
-    from planning.runners import _lane_initial_state
-
+    config = load_config("configs/scenarios/lane/lane_change.yaml")
+    problem = lane.build(config, device="cpu")
     fig, axes, _ = create_live_view(
         problem.env,
-        _lane_initial_state(problem),
+        lane.initial_state_of(problem),
         dt=config["dt"],
-        lane=True,
         dynamics=problem.dyn,
     )
     anchor = (

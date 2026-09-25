@@ -1,9 +1,8 @@
-"""Optimizer contracts, the receding-horizon loop, and altitude safety."""
+"""Optimizer contracts and the receding-horizon loop."""
 
 import logging
 from types import SimpleNamespace
 
-import matplotlib
 import pytest
 import torch
 
@@ -16,12 +15,6 @@ from models.rollouts import (
 from pdstl.operators import Always, Eventually, Predicate
 from pdstl.predicates import GreaterThan, LessThan
 from planning.planner import MPCResult, Planner, PlanResult
-from planning.runners import run_altitude_safety, setup_problem
-from utils import load_config
-from visualization.planning import plot_altitude_safety
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 def problem(**config):
@@ -96,7 +89,6 @@ def test_one_iteration_returns_the_updated_controls_and_replays():
     result = planner.optimize_window(rollout, spec=spec)
     assert result.controls.abs().sum() > 0
     assert len(result.loss_history) == 1
-    assert len(result.smooth_history) == 2
     assert len(result.hard_lower_history) == 2
     assert result.selected_iteration == 0
     replay = planner.evaluate_controls(rollout, result.controls, spec=spec)
@@ -127,9 +119,11 @@ def test_best_hard_candidate_wins_and_selection_leaves_gradients_alone():
     assert result.hard_lower_history == pytest.approx(list(scores))
     torch.testing.assert_close(result.controls, observed[0].controls)
 
-    # The same optimization without a threshold: identical iterates and losses,
-    # so hard selection never reached the gradient path.
-    baseline_planner, baseline_rollout, baseline_spec = problem(max_iters=3)
+    # The same optimization without scripted exact scores: identical iterates
+    # and losses, so hard selection never reached the gradient path.
+    baseline_planner, baseline_rollout, baseline_spec = problem(
+        max_iters=3, alpha=0.95
+    )
     baseline = baseline_planner.optimize_window(
         baseline_rollout, spec=baseline_spec
     )
@@ -161,15 +155,42 @@ def test_observer_is_optional_and_does_not_change_optimization():
     assert actual.loss_history == expected.loss_history
 
 
-def test_alpha_neither_stops_nor_selects():
+def test_optimization_stops_at_the_first_iterate_that_reaches_alpha():
     planner, rollout, spec = problem(max_iters=4, alpha=0.95)
     spec.probability_interval = scripted_hard_lower(
-        (0.1, 0.96, 0.97, 0.98, 0.99)
+        (0.1, 0.5, 0.96, 0.98, 0.99)
     )
+    records = []
+    result = planner.optimize_window(
+        rollout, spec=spec, on_iteration=lambda k, r: records.append(k)
+    )
+    assert len(result.loss_history) == 2
+    assert result.selected_iteration == 1
+    assert result.hard_interval[0] == pytest.approx(0.96)
+    assert result.threshold_met
+    assert records[-1] == 1
+
+
+def test_without_alpha_all_iterations_run():
+    planner, rollout, spec = problem(max_iters=4)
     result = planner.optimize_window(rollout, spec=spec)
     assert len(result.loss_history) == 4
-    assert result.hard_interval[0] == pytest.approx(0.99)
-    assert result.threshold_met
+
+
+def test_initial_scores_are_those_of_the_initial_guess():
+    planner, rollout, spec = problem(max_iters=3)
+    guess = torch.full((5, 1), 0.3)
+    initial = planner.evaluate_controls(rollout, guess, spec=spec)
+    result = planner.optimize_window(rollout, spec=spec, init_guess=guess)
+    assert result.initial_hard_lower == pytest.approx(
+        initial.hard_interval[0], abs=1e-6
+    )
+    assert result.initial_smooth_lower == pytest.approx(
+        initial.smooth_lower, abs=1e-6
+    )
+    assert result.hard_lower_history[0] == pytest.approx(
+        result.initial_hard_lower, abs=1e-6
+    )
 
 
 def test_beta_anneals_geometrically():
@@ -208,7 +229,7 @@ def test_probability_only_rollout_and_gradients():
     )
     initial = planner.evaluate_controls(rollout, torch.zeros(5, 1), spec=spec)
     result = planner.optimize_window(rollout, spec=spec)
-    assert result.rollout.nominal_trace is None and result.rollout.aux is None
+    assert result.rollout.aux is None
     assert result.hard_interval[0] > initial.hard_interval[0] + 0.5
 
 
@@ -304,7 +325,7 @@ def test_bounded_warm_start_at_exact_saturation():
 
 
 def test_optimization_moves_away_from_saturated_initial_controls():
-    # Step 0 fixes the exact lower bound at first, so the certificate is flat
+    # Step 0 fixes the exact lower bound at first, so the lower bound is flat
     # while the gradient leaves saturation; give it the whole budget.
     planner, rollout, _ = problem(max_iters=60, w_u=0.0, w_du=0.0)
     spec = Eventually(LessThan(-0.2), interval=[0, 5])
@@ -392,17 +413,17 @@ def test_result_round_trip(tmp_path):
     assert isinstance(loaded, PlanResult)
     torch.testing.assert_close(loaded.controls, result.controls)
     assert loaded.hard_interval == result.hard_interval
-    assert loaded.smooth_history == result.smooth_history
+    assert loaded.hard_lower_history == result.hard_lower_history
 
 
-def test_selection_maximizes_the_exact_lower_bound_not_cost_at_alpha():
-    planner, _, _ = problem(alpha=0.8)
+def test_selection_keeps_the_best_exact_bound_when_none_meets_alpha():
+    planner, _, _ = problem(alpha=0.9)
 
     def candidate(lower, cost):
         return SimpleNamespace(hard_interval=(lower, 1.0), control_cost=cost)
 
     candidates = [
-        (-1, candidate(0.79, 0.1)),
+        (-1, candidate(0.60, 0.1)),
         (0, candidate(0.85, 2.0)),
         (1, candidate(0.82, 1.0)),
     ]
@@ -411,21 +432,21 @@ def test_selection_maximizes_the_exact_lower_bound_not_cost_at_alpha():
     assert selected.hard_interval[0] == 0.85
 
 
-def test_selection_breaks_ties_within_tolerance_by_cost():
-    planner, _, _ = problem(alpha=0.9, candidate_tolerance=1e-3)
+def test_selection_prefers_the_later_iterate_on_a_tie():
+    planner, _, _ = problem()
 
-    def candidate(lower, cost):
-        return SimpleNamespace(hard_interval=(lower, 1.0), control_cost=cost)
+    def candidate(lower):
+        return SimpleNamespace(hard_interval=(lower, 1.0))
 
     candidates = [
-        (-1, candidate(0.70, 2.0)),
-        (0, candidate(0.7005, 1.0)),
-        (1, candidate(0.72, 3.0)),
-        (2, candidate(0.7195, 0.5)),
+        (-1, candidate(0.70)),
+        (0, candidate(0.72)),
+        (1, candidate(0.72)),
+        (2, candidate(0.71)),
     ]
     iteration, selected = planner._select_candidate(candidates)
-    assert iteration == 2
-    assert selected.control_cost == 0.5
+    assert iteration == 1
+    assert selected.hard_interval[0] == 0.72
 
 
 def test_selected_smooth_score_is_reported_at_beta_end():
@@ -451,51 +472,15 @@ def test_selected_smooth_score_is_reported_at_beta_end():
     )
 
 
-@pytest.fixture(scope="module")
-def altitude_problem():
-    s = setup_problem(
-        load_config("configs/scenarios/altitude_safety.yaml"), device="cpu"
+def test_alpha_status_states_whether_the_lower_robustness_meets_alpha():
+    planner, rollout, spec = problem(max_iters=1, alpha=0.0)
+    assert planner.optimize_window(rollout, spec=spec).alpha_status() == (
+        "meets α = 0.00"
     )
-    spec = Always(GreaterThan(s.cfg["threshold"]), interval=[1, s.cfg["H"]])
-    initial = s.planner.evaluate_controls(s.rollout, s.init_guess, spec=spec)
-    return s, spec, initial
-
-
-@pytest.fixture(scope="module")
-def altitude_result():
-    return run_altitude_safety(show=False, save=False)
-
-
-def test_altitude_improves_and_replays(altitude_problem, altitude_result):
-    s, spec, initial = altitude_problem
-    assert altitude_result.controls.shape == (s.cfg["H"], 1)
-    assert initial.hard_interval[0] < 0.5
-    assert altitude_result.hard_interval[0] > 0.95
-    assert altitude_result.smooth_lower > initial.smooth_lower
-    assert altitude_result.controls.abs().max() <= s.dyn.u_max
-    replay = s.planner.evaluate_controls(
-        s.rollout, altitude_result.controls, spec=spec
+    planner, rollout, spec = problem(max_iters=1, alpha=1.0)
+    assert planner.optimize_window(rollout, spec=spec).alpha_status() == (
+        "below α = 1.00"
     )
-    assert replay.hard_interval == pytest.approx(
-        altitude_result.hard_interval, abs=1e-6
-    )
-
-
-def test_altitude_three_panels(altitude_problem, altitude_result, tmp_path):
-    s, _, initial = altitude_problem
-    fig, axes = plot_altitude_safety(
-        altitude_result,
-        initial=initial,
-        dt=s.cfg["dt"],
-        threshold=s.cfg["threshold"],
-        u_max=s.dyn.u_max,
-        show=False,
-        save_path=str(tmp_path / "altitude.png"),
-    )
-    assert len(axes) == 3
-    assert (tmp_path / "altitude.png").exists()
-    assert (tmp_path / "altitude.pdf").exists()
-    for ax in axes:
-        labels = [text.get_text() for text in ax.get_legend().get_texts()]
-        assert len(labels) == len(set(labels))
-    plt.close(fig)
+    planner, rollout, spec = problem(max_iters=1)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.alpha_status() == "no α requested"

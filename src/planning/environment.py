@@ -1,11 +1,12 @@
-"""Rectangular geometry, the reach-avoid task, and lane construction.
+"""Rectangular geometry, the reach-avoid task, and lane construction."""
 
-Probability evaluation belongs to beliefs and pdSTL predicates, never here.
-"""
+import heapq
+from dataclasses import dataclass
+from functools import cache, reduce
+from itertools import permutations, product
+from math import ceil, floor, hypot, isfinite
 
-from dataclasses import dataclass, field
-from functools import reduce
-from math import ceil, floor
+import numpy as np
 
 from pdstl.operators import Always, And, Eventually, Or
 from pdstl.predicates import (
@@ -17,11 +18,7 @@ from pdstl.predicates import (
     RelativeAxisInterval,
 )
 
-# workspace: stay inside; obstacle: keep out; goal: reach; target: visit.
 ROLES = ("workspace", "goal", "obstacle", "target")
-
-
-# Rectangular geometry
 
 
 @dataclass
@@ -53,13 +50,76 @@ class RectangleRegion:
     def y(self):
         return (self.ymin, self.ymax)
 
+    @property
+    def centre(self):
+        return [(self.xmin + self.xmax) / 2, (self.ymin + self.ymax) / 2]
+
 
 class Environment:
-    """Named regions and, for reach-avoid, its visit groups."""
+    """Workspace bounds, obstacles, a goal and visit regions.
+
+    `goal` is (interval, names) and `visits` is [(interval, dwell, names)];
+    several names are alternatives, any one of which satisfies the task.
+    """
 
     def __init__(self):
         self.regions = {}
-        self.visits = []  # [(dwell, [target names])]
+        self.goal = None
+        self.visits = []
+
+    def set_bounds(self, x_range, y_range):
+        """The workspace the trajectory must always stay inside."""
+        self._add("bounds", "workspace", x_range, y_range)
+
+    def add_obstacle(self, x_range, y_range, name=None):
+        """A rectangle the trajectory must always stay out of."""
+        count = len(self.by_role("obstacle"))
+        self._add(
+            name or f"obstacle {count + 1}", "obstacle", x_range, y_range
+        )
+
+    def set_goal(
+        self, x_range=None, y_range=None, any_of=None, interval=None, name=None
+    ):
+        """A region to reach within `interval`, or one of `any_of`."""
+        names = self._alternatives("goal", name, x_range, y_range, any_of)
+        self.goal = (interval, names)
+
+    def add_visit_region(
+        self,
+        x_range=None,
+        y_range=None,
+        any_of=None,
+        dwell=0,
+        interval=None,
+        name=None,
+    ):
+        """A region to enter within `interval` and stay in for `dwell` steps."""
+        label = f"visit {len(self.visits) + 1}"
+        names = self._alternatives(label, name, x_range, y_range, any_of)
+        self.visits.append((interval, int(dwell), names))
+
+    def _alternatives(self, label, name, x_range, y_range, any_of):
+        role = "goal" if label == "goal" else "target"
+        if any_of is None:
+            return [self._add(name or label, role, x_range, y_range).name]
+        return [
+            self._add(
+                box.get("name", f"{label} {chr(ord('a') + k)}"),
+                role,
+                box["x_range"],
+                box["y_range"],
+            ).name
+            for k, box in enumerate(any_of)
+        ]
+
+    def _add(self, name, role, x_range, y_range):
+        (xmin, xmax), (ymin, ymax) = x_range, y_range
+        return self.add_region(
+            RectangleRegion(
+                name, role, float(xmin), float(xmax), float(ymin), float(ymax)
+            )
+        )
 
     def add_region(self, region):
         if region.name in self.regions:
@@ -88,14 +148,14 @@ class Environment:
         return regions[0]
 
     def get_specification(self, horizon):
-        if (
-            isinstance(horizon, bool)
-            or not isinstance(horizon, int)
-            or horizon < 1
-        ):
+        """The pdSTL task over prediction steps 0..horizon."""
+        if not isinstance(horizon, int) or horizon < 1:
             raise ValueError(
                 f"horizon must be a positive integer, got {horizon!r}"
             )
+        return self._specification(horizon)
+
+    def _specification(self, horizon):
         return reach_avoid_specification(self, horizon)
 
 
@@ -122,88 +182,204 @@ def safety_event(environment):
 
 
 def reach_avoid_specification(environment, horizon):
-    """Stay safe, reach any goal, and dwell in one target of each visit group.
+    """Stay safe, reach the goal, and dwell in each visit region.
 
     Args:
-        environment: Environment with a workspace, goals and visit groups.
+        environment: Environment with bounds, a goal and visit regions.
         horizon: Last prediction step H; step 0 is the known initial belief.
 
     Returns:
-        G[1,H] safe & F[1,H] (any goal) & F[1,H-d] (any target held d steps).
+        G[1,H] safe & F[goal interval] goal
+        & F[visit interval] G[0,dwell] visit, for every visit region.
     """
-    goals = environment.by_role("goal")
-    if not goals:
-        raise ValueError("reach-avoid needs at least one goal")
+    if environment.goal is None:
+        raise ValueError("reach-avoid needs a goal")
+    interval, names = environment.goal
     parts = [
         Always(safety_event(environment), [1, horizon]),
-        Eventually(reduce(Or, map(inside, goals)), [1, horizon]),
+        Eventually(_any(environment, names, 0), _window(interval, horizon, 0)),
     ]
-    for dwell, names in environment.visits:
-        if not 0 <= dwell < horizon:
-            raise ValueError(f"dwell {dwell} must lie in [0, H)")
-        stays = [
-            Always(inside(environment.region(name)), [0, dwell])
-            for name in names
-        ]
-        parts.append(Eventually(reduce(Or, stays), [1, horizon - dwell]))
+    for interval, dwell, names in environment.visits:
+        parts.append(
+            Eventually(
+                _any(environment, names, dwell),
+                _window(interval, horizon, dwell),
+            )
+        )
     return reduce(And, parts)
 
 
-def _rectangles(block, role):
-    """`{name: {x: [min, max], y: [min, max]}}` into regions."""
-    if not isinstance(block, dict):
-        raise ValueError(f"{role} regions must be a name -> {{x, y}} mapping")
-    return [
-        RectangleRegion(name, role, *map(float, (*box["x"], *box["y"])))
-        for name, box in block.items()
+def _any(environment, names, dwell):
+    """Inside one of the named regions for `dwell` more steps."""
+    stays = [
+        Always(inside(environment.region(name)), [0, dwell])
+        if dwell
+        else inside(environment.region(name))
+        for name in names
     ]
+    return reduce(Or, stays)
+
+
+def _window(interval, horizon, dwell):
+    """The requested window, defaulting to [1, H - dwell]."""
+    start, end = interval or (1, horizon - dwell)
+    if not 0 <= start <= end <= horizon - dwell:
+        raise ValueError(
+            f"interval {[start, end]} with dwell {dwell} must fit in [0, {horizon}]"
+        )
+    return [start, end]
 
 
 def build_reach_avoid_environment(config):
     """Build the reach-avoid environment from a scenario config.
 
     Args:
-        config: Mapping with `workspace` ({x, y}), `goals` and optional
-            `obstacles` (name -> {x, y}), and optional `visit` groups
-            ({dwell, regions: name -> {x, y}}).
+        config: Mapping with `bounds`, `goal`, and optional `obstacles` and
+            `visit_regions`; see configs/scenarios/reach_avoid/.
 
     Returns:
         The Environment.
     """
-    if "workspace" not in config or not config.get("goals"):
-        raise ValueError("reach-avoid config needs a workspace and goals")
     environment = Environment()
-    blocks = [
-        ({"workspace": config["workspace"]}, "workspace"),
-        (config.get("obstacles") or {}, "obstacle"),
-        (config["goals"], "goal"),
-    ]
-    for block, role in blocks:
-        for region in _rectangles(block, role):
-            environment.add_region(region)
-    for group in config.get("visit") or []:
-        targets = _rectangles(group["regions"], "target")
-        for region in targets:
-            environment.add_region(region)
-        environment.visits.append(
-            (int(group.get("dwell", 0)), [r.name for r in targets])
-        )
+    environment.set_bounds(**config["bounds"])
+    for obstacle in config.get("obstacles") or []:
+        environment.add_obstacle(**obstacle)
+    environment.set_goal(**config["goal"])
+    for visit in config.get("visit_regions") or []:
+        environment.add_visit_region(**visit)
     return environment
 
 
+# Shortest collision-free route: where the optimizer starts
+
+_NEIGHBOURS = [(i, j) for i in (-1, 0, 1) for j in (-1, 0, 1) if i or j]
+
+
+def shortest_route(environment, start, clearance=0.05, resolution=0.05):
+    """Shortest collision-free route from start through the task regions.
+
+    Only a nominal start for the optimizer: `clearance` keeps it off the
+    obstacles, and pdSTL adds any uncertainty-aware separation. The route
+    visits the centre of the goal (or one of its alternatives) and of every
+    visit region, in any order; the shortest combination wins.
+
+    Args:
+        environment: Reach-avoid Environment.
+        start: [x, y] start position.
+        clearance: Distance kept from obstacles and the workspace edge.
+        resolution: Grid cell size of the search.
+
+    Returns:
+        [[x, y], ...] corner points after the start.
+    """
+    grid = _FreeGrid(environment, clearance, resolution)
+    search = cache(grid.search)
+    groups = [
+        [environment.region(name) for name in names]
+        for names in [environment.goal[1]]
+        + [names for _, _, names in environment.visits]
+    ]
+    stops = [
+        [grid.cell(start)] + [grid.cell(region.centre) for region in order]
+        for choice in product(*groups)
+        for order in permutations(choice)
+    ]
+
+    def length(cells):
+        return sum(search(a)[0][b] for a, b in zip(cells, cells[1:]))
+
+    best = min(stops, key=length)
+    if not isfinite(length(best)):
+        raise ValueError(
+            f"no route keeps {clearance} m from every obstacle; "
+            "lower route.clearance or move the obstacles"
+        )
+    route = []
+    for a, b in zip(best, best[1:]):
+        route += grid.shortcut(grid.trace(search(a)[1], a, b))
+    return route
+
+
+def _grown(x, y, region, margin):
+    return (
+        (x >= region.xmin - margin)
+        & (x <= region.xmax + margin)
+        & (y >= region.ymin - margin)
+        & (y <= region.ymax + margin)
+    )
+
+
+class _FreeGrid:
+    """Workspace cells that keep `clearance` from obstacles and the edge."""
+
+    def __init__(self, environment, clearance, resolution):
+        workspace = environment.single_region("workspace")
+        self.step = resolution
+        self.xs = np.arange(workspace.xmin, workspace.xmax, self.step)
+        self.ys = np.arange(workspace.ymin, workspace.ymax, self.step)
+        x, y = np.meshgrid(self.xs, self.ys, indexing="ij")
+        self.free = _grown(x, y, workspace, -clearance)
+        for obstacle in environment.by_role("obstacle"):
+            self.free &= ~_grown(x, y, obstacle, clearance)
+
+    def point(self, cell):
+        return np.array([self.xs[cell[0]], self.ys[cell[1]]])
+
+    def cell(self, point):
+        """The free cell nearest to a point."""
+        i, j = np.nonzero(self.free)
+        k = np.argmin(
+            (self.xs[i] - point[0]) ** 2 + (self.ys[j] - point[1]) ** 2
+        )
+        return int(i[k]), int(j[k])
+
+    def search(self, source):
+        """Dijkstra from one cell: distances to every cell, and parents."""
+        distance = np.full(self.free.shape, np.inf)
+        distance[source] = 0.0
+        parent, queue = {}, [(0.0, source)]
+        while queue:
+            d, (i, j) = heapq.heappop(queue)
+            if d > distance[i, j]:
+                continue
+            for di, dj in _NEIGHBOURS:
+                neighbour = (i + di, j + dj)
+                cost = d + hypot(di, dj)
+                if self._open(neighbour) and cost < distance[neighbour]:
+                    distance[neighbour], parent[neighbour] = cost, (i, j)
+                    heapq.heappush(queue, (cost, neighbour))
+        return distance, parent
+
+    def _open(self, cell):
+        (i, j), (nx, ny) = cell, self.free.shape
+        return 0 <= i < nx and 0 <= j < ny and self.free[i, j]
+
+    def trace(self, parent, source, target):
+        cells = [target]
+        while cells[-1] != source:
+            cells.append(parent[cells[-1]])
+        return cells[::-1]
+
+    def shortcut(self, cells):
+        """Keep only the corners: skip every cell a straight line can."""
+        points = [self.point(cell) for cell in cells]
+        corners, k = [], 0
+        while k < len(points) - 1:
+            m = len(points) - 1
+            while m > k + 1 and not self._visible(points[k], points[m]):
+                m -= 1
+            corners.append(points[m].tolist())
+            k = m
+        return corners
+
+    def _visible(self, p, q):
+        samples = np.linspace(p, q, int(np.linalg.norm(q - p) / self.step) + 2)
+        i = np.rint((samples[:, 0] - self.xs[0]) / self.step).astype(int)
+        j = np.rint((samples[:, 1] - self.ys[0]) / self.step).astype(int)
+        return bool(self.free[i, j].all())
+
+
 # Lane-change construction
-
-
-@dataclass
-class MovingRectangleRegion:
-    """A rectangle whose centre follows a trajectory, one centre per prediction step."""
-
-    name: str
-    role: str
-    centers: object  # [T, 2] tensor or array of centres
-    width: float
-    height: float
-    style: dict = field(default_factory=dict)
 
 
 class LaneMergeEnvironment(Environment):
@@ -213,13 +389,7 @@ class LaneMergeEnvironment(Environment):
         super().__init__()
         self.metadata = dict(metadata or {})
 
-    def get_specification(self, horizon):
-        if (
-            isinstance(horizon, bool)
-            or not isinstance(horizon, int)
-            or horizon < 1
-        ):
-            raise ValueError("horizon must be a positive integer")
+    def _specification(self, horizon):
         return lane_merge_specification(self, horizon)
 
 
@@ -379,11 +549,6 @@ def lane_contains_footprint(environment, x, y):
     return y - half_height >= lower
 
 
-def lane_contains_point(environment, x, y):
-    """Backward-compatible alias for footprint-based road containment."""
-    return lane_contains_footprint(environment, x, y)
-
-
 def lane_target_contains(metadata, mean):
     task = metadata["task"]
     return (
@@ -488,7 +653,7 @@ def build_lane_merge_environment(config, device="cpu"):
     return environment
 
 
-def lane_local_window(environment, step, current_mean, config, streak=0):
+def lane_local_window(environment, step, streak=0):
     """Give a planning window its absolute time and observed dwell progress."""
     window = LaneMergeEnvironment(
         metadata={**environment.metadata, "step": step, "streak": streak}

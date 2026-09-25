@@ -1,7 +1,6 @@
-"""One optimizer and one receding-horizon loop over caller-supplied belief rollouts."""
+"""Gradient ascent on the smooth pdSTL lower bound, and a receding-horizon loop."""
 
 import logging
-import math
 from dataclasses import dataclass, field
 from time import perf_counter
 
@@ -27,8 +26,17 @@ class PlanResult:
     alpha: float | None = None
     threshold_met: bool | None = None
     selected_iteration: int = -1
-    smooth_history: list[float] = field(default_factory=list)
     hard_lower_history: list[float] = field(default_factory=list)
+    initial_hard_lower: float | None = None
+    initial_smooth_lower: float | None = None
+    monte_carlo: tuple[float, float, float] | None = None
+
+    def alpha_status(self):
+        """Whether the lower robustness meets alpha, in words."""
+        if self.alpha is None:
+            return "no α requested"
+        relation = "meets" if self.threshold_met else "below"
+        return f"{relation} α = {self.alpha:.2f}"
 
 
 @dataclass
@@ -53,64 +61,28 @@ class MPCResult:
 
 
 class Planner:
-    """Optimize controls without knowing how the rollout represents uncertainty.
+    """Optimize controls for any belief rollout and pdSTL spec.
 
-    rollout(v) returns a BeliefRollout; dynamics supplies bounds, device, dtype
-    and control dimension. It ascends the sound smooth pdSTL lower bound plus
-    small control regularizers and returns the best exact lower bound.
+    rollout(v) maps unconstrained parameters v to a BeliefRollout. The planner
+    ascends the smooth lower bound (plus small control regularizers). With a
+    threshold alpha it stops at the first iterate whose exact lower robustness
+    reaches alpha; otherwise it runs max_iters steps. It returns the iterate
+    with the highest exact lower robustness.
     """
 
     def __init__(self, dynamics, horizon, config=None):
-        if (
-            isinstance(horizon, bool)
-            or not isinstance(horizon, int)
-            or horizon < 1
-        ):
-            raise ValueError("horizon must be a positive integer")
-        self.dyn, self.horizon = dynamics, horizon
-        self.device = dynamics.device
         defaults = load_config("configs/planning.yaml")
         config = config or {}
         unknown = set(config) - set(defaults)
         if unknown:
             raise ValueError(f"unknown planner settings: {sorted(unknown)}")
+        self.dyn, self.horizon = dynamics, horizon
+        self.device = dynamics.device
         self.cfg = {**defaults, **config}
         self.cfg["smoothing"] = {
             **defaults["smoothing"],
             **config.get("smoothing", {}),
         }
-        unknown_smoothing = set(self.cfg["smoothing"]) - set(
-            defaults["smoothing"]
-        )
-        if unknown_smoothing:
-            raise ValueError(
-                f"unknown smoothing settings: {sorted(unknown_smoothing)}"
-            )
-        if self.cfg["max_iters"] < 1:
-            raise ValueError("max_iters must be positive")
-        alpha = self.cfg["alpha"]
-        if alpha is not None and (
-            isinstance(alpha, bool)
-            or not isinstance(alpha, (int, float))
-            or not math.isfinite(alpha)
-            or not 0 <= alpha <= 1
-        ):
-            raise ValueError("alpha must be null or a finite value in [0, 1]")
-        tolerance = self.cfg["candidate_tolerance"]
-        if (
-            isinstance(tolerance, bool)
-            or not isinstance(tolerance, (int, float))
-            or not math.isfinite(tolerance)
-            or tolerance < 0
-        ):
-            raise ValueError(
-                "candidate_tolerance must be a finite nonnegative number"
-            )
-        if any(
-            self.cfg["smoothing"][key] <= 0
-            for key in ("beta_start", "beta_end")
-        ):
-            raise ValueError("smoothing beta must be positive")
 
     @property
     def control_dim(self):
@@ -181,7 +153,7 @@ class Planner:
                 prediction.belief_trajectory, beta
             ).item()
             control_cost = self._control_cost(controls).item()
-            loss = -self.cfg["w_phi"] * smooth + control_cost
+            loss = self._objective(controls, smooth).item()
             interval = spec.probability_interval(prediction.belief_trajectory)
             hard_interval = tuple(interval.tolist())
             alpha = self.cfg["alpha"]
@@ -198,12 +170,11 @@ class Planner:
                 threshold_met=(
                     None if alpha is None else hard_interval[0] >= alpha
                 ),
-                smooth_history=[smooth],
                 hard_lower_history=[hard_interval[0]],
             )
 
     def evaluate_controls(self, rollout, controls, *, spec):
-        """Replay physical controls using final smoothing and exact reporting semantics."""
+        """Score given controls: smooth bound at beta_end and exact interval."""
         margin = torch.finfo(self.dyn.B.dtype).eps
         return self._evaluate(
             rollout,
@@ -223,24 +194,27 @@ class Planner:
         on_iteration=None,
         callback_every=1,
     ):
-        """Run max_iters Adam steps; return the best exact candidate.
+        """Adam steps from init_guess until the exact bound reaches alpha.
 
-        Forward pass k scores the controls after k updates (candidate k - 1;
-        -1 is the initial guess) and then takes update k. The winner is
-        replayed at beta_end. on_iteration(iteration, IterationRecord)
-        observes sampled candidates.
+        Iterate -1 is the initial guess; its exact and smooth lower bounds
+        (at beta_end) are kept as `initial_hard_lower` / `initial_smooth_lower`.
+        Without alpha, or if alpha is never reached, all max_iters steps run.
+        on_iteration(iteration, record) observes every `callback_every`-th
+        iterate and the last one.
         """
-        if (
-            isinstance(callback_every, bool)
-            or not isinstance(callback_every, int)
-            or callback_every < 1
-        ):
-            raise ValueError("callback_every must be a positive integer")
+        alpha = self.cfg["alpha"]
         max_iters = self.cfg["max_iters"]
         parameters = self._init_controls(init_guess)
+        initial = self._evaluate(
+            rollout,
+            parameters.detach().clone(),
+            spec,
+            self.cfg["smoothing"]["beta_end"],
+            [],
+        )
         started = perf_counter()
         optimizer = torch.optim.Adam([parameters], lr=self.cfg["lr"])
-        candidates, history, smooth_history, hard_history = [], [], [], []
+        candidates, history, hard_history = [], [], []
         for step in range(max_iters + 1):
             iteration = step - 1
             beta = self._beta(min(step, max_iters - 1))
@@ -264,27 +238,28 @@ class Planner:
                 self._control_cost(controls).item(),
             )
             candidates.append((iteration, record))
-            smooth_history.append(record.smooth_lower)
             hard_history.append(record.hard_interval[0])
+            reached = alpha is not None and record.hard_interval[0] >= alpha
             if iteration >= 0:
                 history.append(record.loss)
                 observe = on_iteration is not None and (
                     iteration == 0
                     or (iteration + 1) % callback_every == 0
                     or iteration == max_iters - 1
+                    or reached
                 )
                 if observe:
                     on_iteration(iteration, record)
                 if verbose and iteration % 50 == 0:
                     logger.info(
                         "Iteration %d: loss %.6f, smooth lower %.6f, "
-                        "hard lower %.6f",
+                        "rho_lower %.6f",
                         iteration,
                         record.loss,
                         record.smooth_lower,
                         record.hard_interval[0],
                     )
-            if step == max_iters:
+            if step == max_iters or reached:
                 break
             loss.backward()
             if (
@@ -298,46 +273,24 @@ class Planner:
         result_iteration, selected = self._select_candidate(candidates)
         result = self.evaluate_controls(rollout, selected.controls, spec=spec)
         result.loss_history = history
-        result.smooth_history = smooth_history
         result.hard_lower_history = hard_history
         result.selected_iteration = result_iteration
+        result.initial_hard_lower = initial.hard_interval[0]
+        result.initial_smooth_lower = initial.smooth_lower
         result.planning_time = perf_counter() - started
         return result
 
-    def optimize_multistart(self, rollout, *, spec, init_guesses, **kwargs):
-        """Optimize from each warm start; return (winner, all plans).
+    @staticmethod
+    def _select_candidate(candidates):
+        """Highest exact lower bound; the later iterate wins a tie.
 
-        Gradient ascent cannot move a plan across an obstacle, so each route
-        needs its own start. The winner is picked like a candidate.
+        With early stopping at alpha, this is the iterate that reached alpha.
         """
-        if not init_guesses:
-            raise ValueError("optimize_multistart needs at least one guess")
-        plans = [
-            self.optimize_window(
-                rollout, spec=spec, init_guess=guess, **kwargs
-            )
-            for guess in init_guesses
-        ]
-        _, best = self._select_candidate(list(enumerate(plans)))
-        return best, plans
-
-    def _select_candidate(self, candidates):
-        """Highest exact lower bound; ties go to cheaper, then later, ones."""
-        tolerance = self.cfg["candidate_tolerance"]
-        best = candidates[0]
-        for candidate in candidates[1:]:
-            score = candidate[1].hard_interval[0]
-            best_score = best[1].hard_interval[0]
-            if score > best_score + tolerance or (
-                abs(score - best_score) <= tolerance
-                and candidate[1].control_cost <= best[1].control_cost
-            ):
-                best = candidate
-        return best
+        return max(reversed(candidates), key=lambda c: c[1].hard_interval[0])
 
     @staticmethod
     def shift_controls(controls):
-        """Discard the executed control and hold the last control at the horizon tail."""
+        """Drop the executed control and repeat the last one."""
         return torch.cat((controls[1:], controls[-1:])).detach().clone()
 
     def run_receding_horizon(
@@ -356,17 +309,11 @@ class Planner:
         callback_every=1,
         capture_planning_failures=False,
     ):
-        """Callbacks use (state, step); execute additionally receives physical u_0.
+        """Plan a window, execute its first control, shift, and repeat.
 
-        execute returns a new state rather than mutating recorded states.
-        is_done is pure. on_step(step, updated_state, plan) only observes.
+        make_rollout, make_spec and is_done take (state, step); execute takes
+        (state, control, step) and returns the next state; on_step observes.
         """
-        if (
-            isinstance(max_steps, bool)
-            or not isinstance(max_steps, int)
-            or max_steps < 0
-        ):
-            raise ValueError("max_steps must be a nonnegative integer")
         states, applied, plans = [state], [], []
         failure_detail = None
         guess = init_guess

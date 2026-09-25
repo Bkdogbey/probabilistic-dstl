@@ -10,7 +10,7 @@ from models.rollouts import (
     create_gaussian_belief_trajectory,
     create_probability_belief_trajectory,
 )
-from pdstl.base import BeliefTrajectory, OnlineBeliefTrajectory
+from pdstl.base import BeliefTrajectory
 from pdstl.operators import (
     Always,
     And,
@@ -29,10 +29,8 @@ from pdstl.predicates import (
     HalfSpace,
     InsideRectangle,
     LessThan,
-    MovingRectangularObstaclePredicate,
     OutsideRectangle,
 )
-from planning.environment import MovingRectangleRegion
 
 
 def supplied(*rows):
@@ -190,18 +188,6 @@ def test_validation_can_be_disabled():
     np.testing.assert_allclose(
         Predicate("p")(traj, validate=False)[0, 0].numpy(), [0.8, 0.3]
     )
-
-
-def test_appended_container_matches_the_offline_one():
-    values = [0.9, 0.2, 0.7, 0.4, 0.6]
-    spec = Always(Predicate("p"), interval=[0, 1])
-
-    offline = spec(scalar(values))
-    online = OnlineBeliefTrajectory()
-    for belief in scalar(values):
-        online.append(belief)
-
-    torch.testing.assert_close(spec(online), offline)
 
 
 # --- 3. Boolean bounds -----------------------------------------------------
@@ -1219,45 +1205,3 @@ def test_half_space_gradient_reaches_gaussian_parameters():
     bounds = GaussianBelief(mean, factor @ factor.transpose(-1, -2))
     bounds.probability_bounds(event).sum().backward()
     assert mean.grad.abs().sum() > 0 and factor.grad.abs().sum() > 0
-
-
-def test_moving_rectangle_uses_probability_only_beliefs():
-    centers = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
-    region = MovingRectangleRegion("vehicle", "obstacle", centers, 1.0, 1.0)
-    moving = MovingRectangularObstaclePredicate(region)
-    beliefs = []
-    for center, x_bounds, y_bounds in (
-        (centers[0], [0.2, 0.4], [0.3, 0.5]),
-        (centers[1], [0.6, 0.8], [0.7, 0.9]),
-    ):
-        x, y = center.tolist()
-        event = OutsideRectangle((x - 0.5, x + 0.5), (y - 0.5, y + 0.5))
-        beliefs.append(
-            ProbabilityBelief(
-                {
-                    event.axes[0].name: torch.tensor(
-                        [x_bounds], requires_grad=True
-                    ),
-                    event.axes[1].name: torch.tensor(
-                        [y_bounds], requires_grad=True
-                    ),
-                }
-            )
-        )
-    trace = BeliefTrajectory(beliefs)
-    hard = moving(trace)
-    torch.testing.assert_close(hard[0], torch.tensor([[0.6, 1.0], [0.2, 0.7]]))
-    moving(trace, beta=10)[..., 0].sum().backward()
-    gradient = beliefs[1].bounds[next(iter(beliefs[1].bounds))].grad
-    assert gradient is not None and gradient.abs().sum() > 0
-
-
-def test_moving_rectangle_has_non_degenerate_valid_gaussian_bounds():
-    region = MovingRectangleRegion(
-        "vehicle", "obstacle", torch.tensor([[0.0, 0.0]]), 1.0, 1.0
-    )
-    beliefs = create_gaussian_belief_trajectory(
-        torch.tensor([[0.1, 0.1]]), torch.eye(2).unsqueeze(0) * 0.4
-    )
-    lower, upper = MovingRectangularObstaclePredicate(region)(beliefs)[0, 0]
-    assert 0 <= lower < upper <= 1

@@ -1,35 +1,39 @@
-scenario: {type: lane_merge}
+# Lane change: move into the target lane past three traffic vehicles.
 dynamics: double_integrator
-H: 30
+H: 35
 T_SIM: 40
-seed: 2
+seed: 0
 dt: 0.2
 u_max: 2.5
-q_std: 0.005
+q_std: 0.01
 x0_mean: [0.0, 0.0, 18.0, 0.0]
 x0_cov_scale: 0.01
+
+# Road and traffic configuration
 road: {y_min: -1.8, y_max: 5.4, lane_divider: 1.8}
-ramp: {start_x: 28.0, end_x: 72.0}
 goal: {x_range: [-10.0, 150.0], y_range: [1.8, 5.4]}
 ego_vehicle: {width: 4.5, height: 1.8}
-# Edit x0 for a traffic vehicle's starting x-position and speed for its m/s speed.
 traffic:
-  - {name: lead, x0: 42.0, y: 3.6, speed: 20.0, width: 4.5, height: 1.8}
-  - {name: target_front, x0: 70.0, y: 3.6, speed: 21.0, width: 4.5, height: 1.8}
-  - {name: target_rear, x0: -18.0, y: 3.6, speed: 17.0, width: 4.5, height: 1.8}
-traffic_q_std: 0.005
+  - {name: lead, x0: 30.0, y: 0.0, speed: 14.0, width: 4.5, height: 1.8}
+  - {name: target_front, x0: 38.0, y: 3.6, speed: 19.0, width: 4.5, height: 1.8}
+  - {name: target_rear, x0: -12.0, y: 3.6, speed: 20.0, width: 4.5, height: 1.8}
+traffic_q_std: 0.01
 traffic_cov_scale: 0.01
 safety_margin: {longitudinal: 0.5, lateral: 0.2}
+
+# Task configuration
 task:
   target_center: 3.6
-  target_tolerance: 1.2
+  target_tolerance: 0.9
   start_window_seconds: [2.5, 5.0]
   dwell_seconds: 1.0
 speed_bounds: [0.0, 25.0]
 accel_bounds:
   longitudinal: [-2.5, 2.5]
   lateral: [-2.0, 2.0]
-warm_start: {longitudinal: 0.5, lateral: 0.9, switch_step: 10}
+
+# Planner configuration
+warm_start: {longitudinal: 0.8, lateral: 0.9, switch_step: 10}
 planner:
   w_u: 0.002
   w_du: 0.005

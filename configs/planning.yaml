@@ -1,12 +1,10 @@
-# Optimizer settings shared by all planners. The planner ascends the sound
-# smooth pdSTL lower bound and keeps the candidate with the best exact one.
+# Optimizer defaults; a scenario's `planner:` block overrides them.
 w_phi: 1.0
-w_u: 1.0e-3        # control effort regularizer (tie-breaking only)
-w_du: 1.0e-3       # control smoothness regularizer
+w_u: 1.0e-3
+w_du: 1.0e-3
 lr: 0.05
 max_iters: 300
-smoothing:         # beta anneals geometrically; final gap <= log(window)/beta_end
+smoothing:
   beta_start: 10.0
   beta_end: 200.0
-alpha: null        # certification level to report; never stops or selects
-candidate_tolerance: 1.0e-8
+alpha: null      # stop once exact lower robustness reaches it; null runs all

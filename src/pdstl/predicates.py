@@ -5,9 +5,6 @@ Boolean composition of its two axis intervals, so pdSTL's `beta` relaxes the con
 instead of the belief clamping it.
 """
 
-import torch
-
-from pdstl.base import BeliefTrajectory
 from pdstl.operators import And, Negation, Predicate, STL_Formula
 
 INF = float("inf")
@@ -139,41 +136,3 @@ class OutsideRectangle(_Rectangle):
     """Event X not in R, the complement of InsideRectangle."""
 
     negated = True
-
-
-class MovingRectangularObstaclePredicate(STL_Formula):
-    """Outside a rectangle whose geometry changes at each prediction step."""
-
-    def __init__(self, region):
-        super().__init__()
-        self.name = region.name
-        self.centers = torch.as_tensor(region.centers, dtype=torch.float32)
-        if self.centers.ndim != 2 or self.centers.shape[1] != 2:
-            raise ValueError(
-                "moving rectangle centers must have shape [time, 2]"
-            )
-        self.width, self.height = float(region.width), float(region.height)
-        if self.width <= 0 or self.height <= 0:
-            raise ValueError("moving rectangle dimensions must be positive")
-        self.events = torch.nn.ModuleList()
-        for t, center in enumerate(self.centers):
-            x, y = (float(v) for v in center)
-            self.events.append(
-                OutsideRectangle(
-                    (x - self.width / 2, x + self.width / 2),
-                    (y - self.height / 2, y + self.height / 2),
-                    name=f"{self.name} at step {t}",
-                )
-            )
-
-    @property
-    def is_pointwise(self):
-        return True
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        if len(belief_trajectory) > len(self.events):
-            raise ValueError("moving rectangle has fewer centers than beliefs")
-        bounds = []
-        for t, belief in enumerate(belief_trajectory):
-            bounds.append(self.events[t](BeliefTrajectory([belief]), **kwargs))
-        return torch.cat(bounds, dim=1)

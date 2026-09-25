@@ -1,4 +1,4 @@
-"""Replay a stored MPC result, one executed step at a time."""
+"""GIFs: a reach-avoid plan step by step, and a lane execution."""
 
 from pathlib import Path
 
@@ -7,14 +7,15 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pdstl.predicates import GreaterThan
-from visualization.planning import (
+from visualization.figures import (
     COLORS,
+    RHO_INTERVAL,
+    RHO_LOWER,
+    RHO_UPPER,
     _draw_ego_vehicle,
     _draw_environment,
     _ellipse,
     _ellipse_parameters,
-    _interval_text,
     _move_obstacle,
     _move_ego_vehicle,
     _np,
@@ -35,84 +36,6 @@ def _finish_animation(fig, movie, filename, fps, show):
 
 def _frames(last_step, fps):
     return [0] * fps + list(range(1, last_step + 1)) + [last_step] * fps
-
-
-def animate_altitude(
-    result, *, dt, threshold, filename=None, fps=6, show=False
-):
-    """Reveal the altitude belief and atomic probability over predicted time."""
-    mean = _np(result.rollout.aux["mean_trace"])[0, :, 0]
-    variance = _np(result.rollout.aux["cov_trace"])[0, :, 0, 0]
-    time = dt * np.arange(len(mean))
-    sigma = np.sqrt(np.maximum(variance, 0))
-    bounds = _np(
-        GreaterThan(threshold, dim=0)(result.rollout.belief_trajectory)
-    )[0]
-    fig, (ax_state, ax_prob) = plt.subplots(
-        2, 1, figsize=(8, 6), sharex=True, layout="constrained"
-    )
-    ax_state.fill_between(
-        time,
-        mean - 1.96 * sigma,
-        mean + 1.96 * sigma,
-        color=COLORS["ellipse"],
-        alpha=0.25,
-        label="95% belief band",
-    )
-    ax_state.plot(time, mean, color=COLORS["mean"], alpha=0.25)
-    ax_state.axhline(
-        threshold,
-        color=COLORS["obstacle"],
-        linestyle="--",
-        label="Safety threshold",
-    )
-    (state_line,) = ax_state.plot(
-        [],
-        [],
-        color=COLORS["mean"],
-        linewidth=2,
-        label="Predicted belief mean",
-    )
-    (state_point,) = ax_state.plot(
-        [], [], marker="o", color=COLORS["mean"], markersize=5
-    )
-    ax_state.set_ylabel("altitude [m]")
-    ax_prob.plot(time, bounds[:, 0], color=COLORS["score"], alpha=0.25)
-    (prob_line,) = ax_prob.plot(
-        [], [], color=COLORS["score"], linewidth=2, label="Atomic probability"
-    )
-    ax_prob.set(xlabel="time [s]", ylabel="atomic probability")
-    status = ax_prob.text(
-        0.02,
-        0.05,
-        "",
-        transform=ax_prob.transAxes,
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
-    )
-    for ax in (ax_state, ax_prob):
-        _style(ax, probability=ax is ax_prob)
-        _unique_legend(ax, loc="best")
-
-    def update(step):
-        state_line.set_data(time[: step + 1], mean[: step + 1])
-        state_point.set_data([time[step]], [mean[step]])
-        prob_line.set_data(time[: step + 1], bounds[: step + 1, 0])
-        status.set_text(
-            f"Predicted step {step}/{len(mean) - 1}  ·  "
-            f"atomic P = {bounds[step, 0]:.3f}\n"
-            f"{_interval_text(result.hard_interval)}"
-        )
-        return state_line, state_point, prob_line, status
-
-    movie = animation.FuncAnimation(
-        fig,
-        update,
-        frames=_frames(len(mean) - 1, fps),
-        interval=1000 / fps,
-        blit=False,
-    )
-    _finish_animation(fig, movie, filename, fps, show)
-    return fig, (ax_state, ax_prob), movie
 
 
 def animate_reach_avoid(
@@ -169,7 +92,7 @@ def animate_reach_avoid(
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
     )
     ax.set_title(
-        f"{title} | P↓(φ)={result.hard_interval[0]:.3f}",
+        f"{title} | {RHO_LOWER} = {result.hard_interval[0]:.3f}",
         fontweight="bold",
     )
 
@@ -197,10 +120,8 @@ def animate_reach_avoid(
     return fig, ax, movie
 
 
-def animate_mpc(
-    result, env, *, dt, filename=None, lane=False, fps=6, show=False
-):
-    """Show and save the path, latest plan, moving vehicle, and hard lower bound."""
+def animate_mpc(result, env, *, dt, filename=None, fps=6, show=False):
+    """Replay a lane execution: path, current plan, traffic, and robustness."""
     fig, (ax_map, ax_score) = plt.subplots(
         1,
         2,
@@ -208,28 +129,27 @@ def animate_mpc(
         layout="constrained",
         gridspec_kw={"width_ratios": (1.4, 1)},
     )
-    moving = _draw_environment(ax_map, env, lane=lane)
+    moving = _draw_environment(ax_map, env, lane=True)
     states = np.asarray([_np(state[0])[:2] for state in result.states])
-    ego_patch = _draw_ego_vehicle(ax_map, env, states[0]) if lane else None
+    ego_patch = _draw_ego_vehicle(ax_map, env, states[0])
     plans = result.window_plans
     intervals = np.asarray([plan.hard_interval for plan in plans]).reshape(
         -1, 2
     )
     applied = _np(result.applied_controls)
-    if lane:
-        for index, _vehicle in enumerate(env.metadata["traffic"]):
-            centers = np.asarray(
-                [_np(state[3][index])[:2] for state in result.states]
-            )
-            ax_map.plot(
-                centers[:, 0],
-                centers[:, 1],
-                color=COLORS["traffic"],
-                linestyle=":",
-                linewidth=1.2,
-                label="Traffic path" if index == 0 else "_nolegend_",
-            )
-        ax_map.set_xlim(states[0, 0] - 15, states[0, 0] + 45)
+    for index, _vehicle in enumerate(env.metadata["traffic"]):
+        centers = np.asarray(
+            [_np(state[3][index])[:2] for state in result.states]
+        )
+        ax_map.plot(
+            centers[:, 0],
+            centers[:, 1],
+            color=COLORS["traffic"],
+            linestyle=":",
+            linewidth=1.2,
+            label="Traffic path" if index == 0 else "_nolegend_",
+        )
+    ax_map.set_xlim(states[0, 0] - 15, states[0, 0] + 45)
     ax_map.scatter(
         states[0, 0],
         states[0, 1],
@@ -248,11 +168,7 @@ def animate_mpc(
         label="Executed",
     )
     (planned,) = ax_map.plot(
-        [],
-        [],
-        color=COLORS["planned"],
-        linewidth=1.5,
-        label="Plan",
+        [], [], color=COLORS["planned"], linewidth=1.5, label="Plan"
     )
     (lower_bound,) = ax_score.plot(
         [],
@@ -261,7 +177,7 @@ def animate_mpc(
         linewidth=1.7,
         marker="o",
         markersize=3,
-        label="Hard lower",
+        label=RHO_LOWER,
     )
     (upper_bound,) = ax_score.plot(
         [],
@@ -269,30 +185,29 @@ def animate_mpc(
         color=COLORS["goal"],
         linewidth=1.2,
         linestyle="--",
-        label="Hard upper",
+        label=RHO_UPPER,
     )
     ax_score.set(
         xlabel="time [s]",
-        ylabel="lower satisfaction bound",
+        ylabel="robustness per window",
         xlim=(0, max(dt, len(plans) * dt)),
     )
-    if lane:
-        task = env.metadata["task"]
-        start, end = task["start_end_steps"]
-        ax_score.axvspan(
-            start * dt,
-            (end - task["dwell_steps"]) * dt,
-            color=COLORS["goal"],
-            alpha=0.10,
-            label="Dwell-start window",
-        )
-        ax_score.axvline(
-            end * dt,
-            color=COLORS["obstacle"],
-            linestyle="--",
-            linewidth=1,
-            label="Completion deadline",
-        )
+    task = env.metadata["task"]
+    start, end = task["start_end_steps"]
+    ax_score.axvspan(
+        start * dt,
+        (end - task["dwell_steps"]) * dt,
+        color=COLORS["goal"],
+        alpha=0.10,
+        label="Dwell-start window",
+    )
+    ax_score.axvline(
+        end * dt,
+        color=COLORS["obstacle"],
+        linestyle="--",
+        linewidth=1,
+        label="Completion deadline",
+    )
     _style(ax_score, probability=True)
     status = ax_score.text(
         0.03,
@@ -301,15 +216,9 @@ def animate_mpc(
         transform=ax_score.transAxes,
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
     )
-    if lane:
-        _unique_legend(
-            ax_map,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 1.14),
-            ncol=5,
-        )
-    else:
-        _unique_legend(ax_map, loc="best")
+    _unique_legend(
+        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.14), ncol=5
+    )
     _unique_legend(ax_score, loc="best")
 
     def update(step):
@@ -321,15 +230,13 @@ def animate_mpc(
         lower_bound.set_data(dt * np.arange(step), intervals[:step, 0])
         upper_bound.set_data(dt * np.arange(step), intervals[:step, 1])
         _move_obstacle(moving, env, step, result.states[step])
-        if ego_patch is not None:
-            _move_ego_vehicle(ego_patch, states[step])
-        if lane:
-            ax_map.set_xlim(states[step, 0] - 15, states[step, 0] + 45)
+        _move_ego_vehicle(ego_patch, states[step])
+        ax_map.set_xlim(states[step, 0] - 15, states[step, 0] + 45)
         ax_map.set_title(
             f"Executed step {step}/{len(plans)}  ·  time {step * dt:.1f} s",
             fontsize=11,
         )
-        hard = (
+        interval = (
             "—"
             if step == 0
             else f"[{intervals[step - 1, 0]:.3f}, {intervals[step - 1, 1]:.3f}]"
@@ -338,17 +245,16 @@ def animate_mpc(
             control = "No control applied yet"
         else:
             values = ", ".join(f"{value:.2f}" for value in applied[step - 1])
-            unit = "m/s²" if lane else "m/s"
-            control = f"Applied control: ({values}) {unit}"
+            control = f"Applied control: ({values}) m/s²"
         ending = (
-            f"\nStopping reason: {result.stopped_reason.replace('_', ' ')}"
+            f"\nOutcome: {result.stopped_reason.replace('_', ' ')}"
             if step == len(plans)
             else ""
         )
-        status.set_text(f"Certified pdSTL: {hard}\n{control}{ending}")
+        status.set_text(f"{RHO_INTERVAL} = {interval}\n{control}{ending}")
         return executed, planned, lower_bound, upper_bound, status
 
-    # Hold the first and final states briefly, while retaining every executed step.
+    # Hold the first and final frames briefly.
     movie = animation.FuncAnimation(
         fig,
         update,
