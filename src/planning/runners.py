@@ -37,8 +37,12 @@ def build_dynamics(cfg, device):
 
 
 def build_initial_belief(cfg, device):
+    """Gaussian x0: `x0_cov_scale` is one variance or one per state."""
     mean = torch.tensor(cfg["x0_mean"], device=device, dtype=torch.float32)
-    return mean, torch.eye(len(mean), device=device) * cfg["x0_cov_scale"]
+    variance = torch.as_tensor(
+        cfg["x0_cov_scale"], device=device, dtype=torch.float32
+    )
+    return mean, torch.diag(variance.expand(len(mean)))
 
 
 def build_environment(cfg, device="cpu"):
@@ -51,24 +55,61 @@ def build_environment(cfg, device="cpu"):
 
 
 def _initial_controls(cfg, dyn):
-    """Build a generic goal-directed reach guess or configured fallback."""
-    if cfg.get("scenario", {}).get("type") == "reach_avoid":
-        start = torch.as_tensor(
-            cfg["x0_mean"][: dyn.B.shape[1]],
-            device=dyn.device,
-            dtype=dyn.B.dtype,
-        )
-        goal = cfg["goal"]
-        center = start.new_tensor([sum(goal[axis]) / 2 for axis in ("x", "y")])
-        velocity = ((center - start) / (cfg["H"] * cfg["dt"])).clamp(
-            -dyn.u_max, dyn.u_max
-        )
-        return velocity.repeat(cfg["H"], 1)
+    """Repeat the configured constant control, or start from zero."""
     guess = cfg.get("init_control")
     if guess is None:
         return None
     controls = torch.as_tensor(guess, device=dyn.device, dtype=dyn.B.dtype)
     return controls.repeat(cfg["H"], 1) if controls.ndim == 1 else controls
+
+
+def _route_reference(cfg, route, dtype, arrival=0.8):
+    """Positions along x0 -> route at constant speed, done at `arrival` * H."""
+    points = torch.tensor([cfg["x0_mean"][:2], *route], dtype=dtype)
+    segments = points[1:] - points[:-1]
+    ends = torch.cat((points.new_zeros(1), segments.norm(dim=1).cumsum(0)))
+    progress = (torch.arange(cfg["H"] + 1) / (arrival * cfg["H"])).clamp(max=1)
+    distance = ends[-1] * progress
+    index = (torch.searchsorted(ends, distance, right=True) - 1).clamp(
+        0, len(segments) - 1
+    )
+    length = (ends[index + 1] - ends[index]).clamp_min(1e-9)
+    fraction = ((distance - ends[index]) / length).unsqueeze(1)
+    return points[index] + fraction * segments[index]
+
+
+def route_controls(cfg, dyn, route, kp=4.0, kd=4.0):
+    """Controls that follow a waypoint route: a warm start for one route.
+
+    Args:
+        cfg: Scenario config (x0_mean, H, dt).
+        dyn: Single- or double-integrator dynamics.
+        route: Waypoints [[x, y], ...] after the start.
+        kp, kd: PD gains of the double-integrator tracker.
+
+    Returns:
+        [H, 2] controls within u_max.
+    """
+    reference = _route_reference(cfg, route, dyn.B.dtype)
+    velocity = (reference[1:] - reference[:-1]) / cfg["dt"]
+    if isinstance(dyn, SingleIntegrator):
+        return velocity.clamp(-dyn.u_max, dyn.u_max).to(dyn.device)
+    state = torch.tensor(cfg["x0_mean"], dtype=dyn.B.dtype)
+    controls = []
+    for target, target_velocity in zip(reference[1:], velocity):
+        error = kp * (target - state[:2]) + kd * (target_velocity - state[2:])
+        control = error.clamp(-dyn.u_max, dyn.u_max)
+        state = dyn.A.cpu() @ state + dyn.B.cpu() @ control
+        controls.append(control)
+    return torch.stack(controls).to(dyn.device)
+
+
+def initial_guesses(cfg, dyn):
+    """One warm start per configured route, else the constant guess."""
+    routes = cfg.get("routes")
+    if routes:
+        return [route_controls(cfg, dyn, route) for route in routes.values()]
+    return [_initial_controls(cfg, dyn)]
 
 
 def setup_problem(cfg, *, device=None, with_environment=False):
@@ -78,13 +119,14 @@ def setup_problem(cfg, *, device=None, with_environment=False):
     state = build_initial_belief(cfg, device)
     planner = Planner(dyn, cfg["H"], cfg.get("planner", {}))
     environment = build_environment(cfg, device) if with_environment else None
-    guess = _initial_controls(cfg, dyn)
+    guesses = initial_guesses(cfg, dyn)
     return SimpleNamespace(
         cfg=cfg,
         dyn=dyn,
         state=state,
         planner=planner,
-        init_guess=guess,
+        init_guess=guesses[0],
+        init_guesses=guesses,
         rollout=gaussian_rollout(dyn, *state),
         env=environment,
     )
@@ -100,6 +142,10 @@ def _save_result(result, stem, save):
         torch.save(result, _output_path(stem, ".pt"))
 
 
+def _control_unit(dyn):
+    return "m/s²" if isinstance(dyn, DoubleIntegrator) else "m/s"
+
+
 def _optimization_view(s, label, enabled):
     if not enabled:
         return None, None
@@ -108,7 +154,7 @@ def _optimization_view(s, label, enabled):
     _, _, on_iteration, finish_window = create_optimization_view(
         label,
         max_iters=s.planner.cfg["max_iters"],
-        control_unit="m/s²" if isinstance(s.dyn, DoubleIntegrator) else "m/s",
+        control_unit=_control_unit(s.dyn),
     )
     return on_iteration, finish_window
 
@@ -175,7 +221,7 @@ def run_altitude_safety(
 
 
 def run_reach_avoid(
-    config_path="configs/scenarios/reach_avoid.yaml",
+    config_path,
     *,
     show=False,
     save=True,
@@ -183,51 +229,69 @@ def run_reach_avoid(
     live=False,
     optimization_every=5,
 ):
+    """Plan a reach-avoid scenario; keep the best-certified route.
+
+    Args:
+        config_path: Scenario YAML; outputs are named after its stem.
+        show, save: Display and/or save the figure and animation.
+        verbose: Log optimizer progress.
+        live, optimization_every: Stream candidates to a live view.
+
+    Returns:
+        The PlanResult with the highest exact lower bound.
+    """
     config = load_config(config_path)
+    stem = Path(config_path).stem
     s = setup_problem(config, with_environment=True)
-    spec = s.env.get_specification(s.cfg["H"], s.cfg.get("goal_interval"))
-    initial = s.planner.evaluate_controls(s.rollout, s.init_guess, spec=spec)
+    spec = s.env.get_specification(s.cfg["H"])
+    title = config.get("name", stem)
+    visual = config.get("visualization", {})
     on_iteration, finish_live = None, None
     if live:
         from visualization.live_plots import create_reach_avoid_live_view
 
-        visual = config.get("visualization", {})
         _, _, on_iteration, finish_live = create_reach_avoid_live_view(
             s.env,
             lambda controls: s.planner.evaluate_controls(
                 s.rollout, controls, spec=spec
             ),
             dt=s.cfg["dt"],
-            title=config.get("scenario", {}).get("name", "Reach–Avoid"),
+            title=title,
             max_iters=s.planner.cfg["max_iters"],
             ellipse_every=visual.get("ellipse_every", 4),
             alpha=s.planner.cfg["alpha"],
         )
-    result = s.planner.optimize_window(
+    result, plans = s.planner.optimize_multistart(
         s.rollout,
         spec=spec,
-        init_guess=s.init_guess,
+        init_guesses=s.init_guesses,
         verbose=verbose,
         on_iteration=on_iteration,
         callback_every=optimization_every if on_iteration is not None else 1,
     )
     if finish_live is not None:
         finish_live(result)
+    routes = config.get("routes") or {"initial": None}
+    scores = {
+        name: round(plan.hard_interval[0], 4)
+        for name, plan in zip(routes, plans)
+    }
+    print(f"{title}: exact lower bound per route {scores}", flush=True)
     if show or save:
         from visualization.animation import animate_reach_avoid
         from visualization.planning import plot_reach_avoid
 
-        visual = config.get("visualization", {})
-        title = config.get("scenario", {}).get("name", "Reach–Avoid")
         plot_reach_avoid(
             result,
             s.env,
-            initial=initial,
             dt=s.cfg["dt"],
             u_max=s.dyn.u_max,
+            control_unit=_control_unit(s.dyn),
             title=title,
             ellipse_every=visual.get("ellipse_every", 4),
-            save_path=_output_path("reach_avoid", ".png") if save else None,
+            ellipse_confidence=visual.get("ellipse_confidence", 0.95),
+            alternatives=[plan for plan in plans if plan is not result],
+            save_path=_output_path(stem, ".png") if save else None,
             show=show,
         )
         animate_reach_avoid(
@@ -236,10 +300,10 @@ def run_reach_avoid(
             dt=s.cfg["dt"],
             title=title,
             fps=visual.get("animation_fps", 6),
-            filename=_output_path("reach_avoid", ".gif") if save else None,
+            filename=_output_path(stem, ".gif") if save else None,
             show=show,
         )
-    _save_result(result, "reach_avoid", save)
+    _save_result(result, stem, save)
     return result
 
 

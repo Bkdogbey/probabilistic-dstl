@@ -56,7 +56,8 @@ class Planner:
     """Optimize controls without knowing how the rollout represents uncertainty.
 
     rollout(v) returns a BeliefRollout; dynamics supplies bounds, device, dtype
-    and control dimension. Only the smooth lower score is optimized.
+    and control dimension. It ascends the sound smooth pdSTL lower bound plus
+    small control regularizers and returns the best exact lower bound.
     """
 
     def __init__(self, dynamics, horizon, config=None):
@@ -95,12 +96,6 @@ class Planner:
             or not 0 <= alpha <= 1
         ):
             raise ValueError("alpha must be null or a finite value in [0, 1]")
-        if (
-            isinstance(self.cfg["converge_patience"], bool)
-            or not isinstance(self.cfg["converge_patience"], int)
-            or self.cfg["converge_patience"] < 1
-        ):
-            raise ValueError("converge_patience must be a positive integer")
         tolerance = self.cfg["candidate_tolerance"]
         if (
             isinstance(tolerance, bool)
@@ -228,11 +223,12 @@ class Planner:
         on_iteration=None,
         callback_every=1,
     ):
-        """Optimize a smooth score and select with the configured hard threshold.
+        """Run max_iters Adam steps; return the best exact candidate.
 
-        The initial controls and every post-update iterate are evaluated as
-        internally consistent candidates. An optional observer receives
-        ``(iteration, IterationRecord)`` for sampled post-update candidates.
+        Forward pass k scores the controls after k updates (candidate k - 1;
+        -1 is the initial guess) and then takes update k. The winner is
+        replayed at beta_end. on_iteration(iteration, IterationRecord)
+        observes sampled candidates.
         """
         if (
             isinstance(callback_every, bool)
@@ -240,26 +236,56 @@ class Planner:
             or callback_every < 1
         ):
             raise ValueError("callback_every must be a positive integer")
+        max_iters = self.cfg["max_iters"]
         parameters = self._init_controls(init_guess)
         started = perf_counter()
         optimizer = torch.optim.Adam([parameters], lr=self.cfg["lr"])
-        history, patience = [], 0
-        initial = self._evaluate(
-            rollout, parameters, spec, self._beta(0), history
-        )
-        candidates = [(-1, initial)]
-        smooth_history = [initial.smooth_lower]
-        hard_history = [initial.hard_interval[0]]
-        for iteration in range(self.cfg["max_iters"]):
-            beta = self._beta(iteration)
+        candidates, history, smooth_history, hard_history = [], [], [], []
+        for step in range(max_iters + 1):
+            iteration = step - 1
+            beta = self._beta(min(step, max_iters - 1))
             optimizer.zero_grad()
             prediction = rollout(parameters)
             lower = spec.smooth_lower(prediction.belief_trajectory, beta)
-            loss = self._objective(
-                self._applied_controls(prediction, parameters), lower
-            )
+            controls = self._applied_controls(prediction, parameters)
+            loss = self._objective(controls, lower)
             if not torch.isfinite(loss):
                 raise ValueError("planning loss is not finite")
+            with torch.no_grad():
+                interval = spec.probability_interval(
+                    prediction.belief_trajectory
+                )
+            record = IterationRecord(
+                controls.detach().clone(),
+                loss.item(),
+                lower.item(),
+                tuple(interval.tolist()),
+                beta,
+                self._control_cost(controls).item(),
+            )
+            candidates.append((iteration, record))
+            smooth_history.append(record.smooth_lower)
+            hard_history.append(record.hard_interval[0])
+            if iteration >= 0:
+                history.append(record.loss)
+                observe = on_iteration is not None and (
+                    iteration == 0
+                    or (iteration + 1) % callback_every == 0
+                    or iteration == max_iters - 1
+                )
+                if observe:
+                    on_iteration(iteration, record)
+                if verbose and iteration % 50 == 0:
+                    logger.info(
+                        "Iteration %d: loss %.6f, smooth lower %.6f, "
+                        "hard lower %.6f",
+                        iteration,
+                        record.loss,
+                        record.smooth_lower,
+                        record.hard_interval[0],
+                    )
+            if step == max_iters:
+                break
             loss.backward()
             if (
                 parameters.grad is None
@@ -269,53 +295,8 @@ class Planner:
                     "rollout must supply finite gradients to controls"
                 )
             optimizer.step()
-            candidate = self._evaluate(
-                rollout, parameters, spec, beta, history
-            )
-            if not math.isfinite(candidate.final_loss):
-                raise ValueError("planning loss is not finite after update")
-            candidates.append((iteration, candidate))
-            history.append(candidate.final_loss)
-            smooth_history.append(candidate.smooth_lower)
-            hard_history.append(candidate.hard_interval[0])
-            threshold = self.cfg["alpha"]
-            observe = on_iteration is not None and (
-                iteration == 0
-                or (iteration + 1) % callback_every == 0
-                or iteration == self.cfg["max_iters"] - 1
-            )
-            patience = (
-                patience + 1
-                if threshold is not None
-                and candidate.hard_interval[0] >= threshold
-                else 0
-            )
-            stopping = (
-                threshold is not None
-                and patience >= self.cfg["converge_patience"]
-            )
-            if on_iteration is not None and (observe or stopping):
-                on_iteration(
-                    iteration,
-                    IterationRecord(
-                        candidate.controls.detach().clone(),
-                        candidate.final_loss,
-                        candidate.smooth_lower,
-                        candidate.hard_interval,
-                        beta,
-                        candidate.control_cost,
-                    ),
-                )
-            if stopping:
-                break
-            if verbose and iteration % 50 == 0:
-                logger.info(
-                    "Iteration %d: loss %.6f, smooth lower %.6f",
-                    iteration,
-                    candidate.final_loss,
-                    candidate.smooth_lower,
-                )
-        result_iteration, result = self._select_candidate(candidates)
+        result_iteration, selected = self._select_candidate(candidates)
+        result = self.evaluate_controls(rollout, selected.controls, spec=spec)
         result.loss_history = history
         result.smooth_history = smooth_history
         result.hard_lower_history = hard_history
@@ -323,18 +304,25 @@ class Planner:
         result.planning_time = perf_counter() - started
         return result
 
-    def _select_candidate(self, candidates):
-        """Select a candidate by hard feasibility, then control cost."""
-        alpha = self.cfg["alpha"]
-        if alpha is None:
-            return candidates[-1]
+    def optimize_multistart(self, rollout, *, spec, init_guesses, **kwargs):
+        """Optimize from each warm start; return (winner, all plans).
 
-        feasible = [
-            item for item in candidates if item[1].hard_interval[0] >= alpha
+        Gradient ascent cannot move a plan across an obstacle, so each route
+        needs its own start. The winner is picked like a candidate.
+        """
+        if not init_guesses:
+            raise ValueError("optimize_multistart needs at least one guess")
+        plans = [
+            self.optimize_window(
+                rollout, spec=spec, init_guess=guess, **kwargs
+            )
+            for guess in init_guesses
         ]
-        if feasible:
-            return min(feasible, key=lambda item: item[1].control_cost)
+        _, best = self._select_candidate(list(enumerate(plans)))
+        return best, plans
 
+    def _select_candidate(self, candidates):
+        """Highest exact lower bound; ties go to cheaper, then later, ones."""
         tolerance = self.cfg["candidate_tolerance"]
         best = candidates[0]
         for candidate in candidates[1:]:
@@ -342,7 +330,7 @@ class Planner:
             best_score = best[1].hard_interval[0]
             if score > best_score + tolerance or (
                 abs(score - best_score) <= tolerance
-                and candidate[1].control_cost < best[1].control_cost
+                and candidate[1].control_cost <= best[1].control_cost
             ):
                 best = candidate
         return best

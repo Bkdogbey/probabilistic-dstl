@@ -1,0 +1,28 @@
+# stlpy EitherOr under Gaussian beliefs: dwell in t1 or t2, reach the goal,
+# avoid the block.
+name: Either–Or
+scenario: {type: reach_avoid}
+dynamics: double_integrator   # state [x, y, vx, vy], control = acceleration
+H: 60
+dt: 0.2
+u_max: 1.0
+q_std: 0.003
+x0_mean: [2.0, 2.0, 0.0, 0.0]
+x0_cov_scale: [0.01, 0.01, 0.0, 0.0]
+
+workspace: {x: [0, 10], y: [0, 10]}
+obstacles:
+  block: {x: [3, 5], y: [4, 6]}
+goals:                 # reach any one
+  goal: {x: [7, 8], y: [8, 9]}
+visit:                 # per group: enter one region and stay `dwell` steps
+  - dwell: 5
+    regions:
+      t1: {x: [1, 2], y: [6, 7]}
+      t2: {x: [7, 8], y: [4.5, 5.5]}
+routes:                # one warm start each; the best certified plan wins
+  via_t1: [[1.5, 6.5], [7.5, 8.5]]
+  via_t2: [[7.5, 5.0], [7.5, 8.5]]
+
+planner: {max_iters: 300, lr: 0.01, alpha: 0.9}   # double integrator: small steps
+visualization: {ellipse_every: 6, animation_fps: 8}

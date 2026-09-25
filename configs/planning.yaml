@@ -1,12 +1,12 @@
-# General optimizer settings shared by all planners.
-w_phi: 10.0
-w_u: 0.1
-w_du: 0.1
+# Optimizer settings shared by all planners. The planner ascends the sound
+# smooth pdSTL lower bound and keeps the candidate with the best exact one.
+w_phi: 1.0
+w_u: 1.0e-3        # control effort regularizer (tie-breaking only)
+w_du: 1.0e-3       # control smoothness regularizer
 lr: 0.05
-max_iters: 500
-smoothing:
-  beta_start: 2.0
-  beta_end: 20.0
-alpha: null
-converge_patience: 50
+max_iters: 300
+smoothing:         # beta anneals geometrically; final gap <= log(window)/beta_end
+  beta_start: 10.0
+  beta_end: 200.0
+alpha: null        # certification level to report; never stops or selects
 candidate_tolerance: 1.0e-8

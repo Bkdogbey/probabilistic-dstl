@@ -1,8 +1,9 @@
-"""Behavioral contracts for the canonical optimizer and receding-horizon loop."""
+"""Optimizer contracts, the receding-horizon loop, and altitude safety."""
 
 import logging
 from types import SimpleNamespace
 
+import matplotlib
 import pytest
 import torch
 
@@ -14,7 +15,13 @@ from models.rollouts import (
 )
 from pdstl.operators import Always, Eventually, Predicate
 from pdstl.predicates import GreaterThan, LessThan
-from planning.planner import MPCResult, PlanResult, Planner
+from planning.planner import MPCResult, Planner, PlanResult
+from planning.runners import run_altitude_safety, setup_problem
+from utils import load_config
+from visualization.planning import plot_altitude_safety
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 def problem(**config):
@@ -33,6 +40,26 @@ def problem(**config):
     rollout = gaussian_rollout(dyn, torch.zeros(1), torch.eye(1) * 0.1)
     spec = Eventually(GreaterThan(0.4), interval=[0, 5])
     return planner, rollout, spec
+
+
+def scripted_hard_lower(scores):
+    """Give each distinct candidate trajectory the next scripted hard lower bound.
+
+    Memoizing by trajectory rather than by call order keeps the replay of a
+    selected candidate consistent with the score it was selected on.
+    """
+    assigned, remaining = {}, iter(scores)
+
+    def probability_interval(trajectory):
+        key = tuple(
+            round(value, 4)
+            for value in trajectory.trace.mean.flatten().tolist()
+        )
+        if key not in assigned:
+            assigned[key] = next(remaining)
+        return torch.tensor([assigned[key], 1.0])
+
+    return probability_interval
 
 
 def test_quiet_optimization(caplog):
@@ -84,27 +111,35 @@ def test_one_iteration_returns_the_updated_controls_and_replays():
     assert not result.rollout.belief_trajectory[1].value().requires_grad
 
 
-def test_returns_final_smooth_iterate_even_when_hard_score_worsens():
-    planner, rollout, spec = problem(max_iters=3)
+def test_best_hard_candidate_wins_and_selection_leaves_gradients_alone():
+    scores = (0.30, 0.82, 0.55, 0.40)
+    planner, rollout, spec = problem(max_iters=3, alpha=0.95)
+    spec.probability_interval = scripted_hard_lower(scores)
     observed = []
-    original = spec.probability_interval
-    # Reporting values cannot influence optimization when stopping is disabled.
-    spec.probability_interval = lambda trajectory: -original(trajectory)
     result = planner.optimize_window(
         rollout, spec=spec, on_iteration=lambda k, p: observed.append(p)
     )
-    torch.testing.assert_close(result.controls, observed[-1].controls)
-    assert observed[-1].hard_interval[0] < observed[0].hard_interval[0]
+    # The best exact lower bound wins: the first update, not the final
+    # smooth iterate.
+    assert result.selected_iteration == 0
+    assert not result.threshold_met
+    assert result.hard_interval[0] == pytest.approx(0.82)
+    assert result.hard_lower_history == pytest.approx(list(scores))
+    torch.testing.assert_close(result.controls, observed[0].controls)
+
+    # The same optimization without a threshold: identical iterates and losses,
+    # so hard selection never reached the gradient path.
+    baseline_planner, baseline_rollout, baseline_spec = problem(max_iters=3)
+    baseline = baseline_planner.optimize_window(
+        baseline_rollout, spec=baseline_spec
+    )
+    assert baseline.loss_history == pytest.approx(result.loss_history)
+    torch.testing.assert_close(baseline.controls, observed[-1].controls)
 
 
 def test_later_smooth_updates_cannot_discard_a_feasible_candidate():
-    planner, rollout, spec = problem(
-        max_iters=3, alpha=0.7, converge_patience=3
-    )
-    hard_scores = iter((0.4, 0.8, 0.6, 0.5))
-    spec.probability_interval = lambda trajectory: torch.tensor(
-        [next(hard_scores), 1.0]
-    )
+    planner, rollout, spec = problem(max_iters=3, alpha=0.7)
+    spec.probability_interval = scripted_hard_lower((0.4, 0.8, 0.6, 0.5))
     observed = []
     result = planner.optimize_window(
         rollout, spec=spec, on_iteration=lambda k, p: observed.append(p)
@@ -126,15 +161,18 @@ def test_observer_is_optional_and_does_not_change_optimization():
     assert actual.loss_history == expected.loss_history
 
 
-def test_optional_hard_stopping_and_annealing():
-    planner, rollout, spec = problem(
-        max_iters=20, alpha=0.0, converge_patience=2
+def test_alpha_neither_stops_nor_selects():
+    planner, rollout, spec = problem(max_iters=4, alpha=0.95)
+    spec.probability_interval = scripted_hard_lower(
+        (0.1, 0.96, 0.97, 0.98, 0.99)
     )
     result = planner.optimize_window(rollout, spec=spec)
-    assert len(result.loss_history) == 2
-    assert result.selected_iteration == -1
-    assert result.smoothing_beta == pytest.approx(planner._beta(0))
+    assert len(result.loss_history) == 4
+    assert result.hard_interval[0] == pytest.approx(0.99)
     assert result.threshold_met
+
+
+def test_beta_anneals_geometrically():
     planner, rollout, spec = problem(
         max_iters=4,
         smoothing={"beta_start": 2.0, "beta_end": 20.0},
@@ -266,6 +304,8 @@ def test_bounded_warm_start_at_exact_saturation():
 
 
 def test_optimization_moves_away_from_saturated_initial_controls():
+    # Step 0 fixes the exact lower bound at first, so the certificate is flat
+    # while the gradient leaves saturation; give it the whole budget.
     planner, rollout, _ = problem(max_iters=60, w_u=0.0, w_du=0.0)
     spec = Eventually(LessThan(-0.2), interval=[0, 5])
     result = planner.optimize_window(
@@ -304,7 +344,7 @@ def test_callback_loss_and_scores_describe_its_controls():
     assert result.final_loss == pytest.approx(result.loss_history[-1])
 
 
-def test_sampled_callbacks_include_first_last_and_early_stop():
+def test_sampled_callbacks_include_first_and_last():
     planner, rollout, spec = problem(max_iters=5)
     records = []
     result = planner.optimize_window(
@@ -318,17 +358,6 @@ def test_sampled_callbacks_include_first_last_and_early_stop():
     assert [iteration for iteration, _ in records] == [0, 1, 3, 4]
     for iteration, record in records:
         assert record.loss == pytest.approx(result.loss_history[iteration])
-    planner, rollout, spec = problem(
-        max_iters=20, alpha=0.0, converge_patience=2
-    )
-    records = []
-    planner.optimize_window(
-        rollout,
-        spec=spec,
-        on_iteration=lambda iteration, record: records.append(iteration),
-        callback_every=10,
-    )
-    assert records == [0, 1]
 
 
 def test_receding_horizon_reports_optimization_window_numbers():
@@ -366,7 +395,7 @@ def test_result_round_trip(tmp_path):
     assert loaded.smooth_history == result.smooth_history
 
 
-def test_hard_candidate_selection_prefers_feasibility_then_cost():
+def test_selection_maximizes_the_exact_lower_bound_not_cost_at_alpha():
     planner, _, _ = problem(alpha=0.8)
 
     def candidate(lower, cost):
@@ -378,11 +407,11 @@ def test_hard_candidate_selection_prefers_feasibility_then_cost():
         (1, candidate(0.82, 1.0)),
     ]
     iteration, selected = planner._select_candidate(candidates)
-    assert iteration == 1
-    assert selected.control_cost == 1.0
+    assert iteration == 0
+    assert selected.hard_interval[0] == 0.85
 
 
-def test_hard_candidate_fallback_uses_tolerance_and_cost():
+def test_selection_breaks_ties_within_tolerance_by_cost():
     planner, _, _ = problem(alpha=0.9, candidate_tolerance=1e-3)
 
     def candidate(lower, cost):
@@ -399,10 +428,74 @@ def test_hard_candidate_fallback_uses_tolerance_and_cost():
     assert selected.control_cost == 0.5
 
 
-def test_final_smooth_score_uses_beta_end_even_after_one_update():
+def test_selected_smooth_score_is_reported_at_beta_end():
+    """An early winner is scored at the final smoothing, not its own beta."""
     planner, rollout, spec = problem(
-        max_iters=1, smoothing={"beta_start": 2.0, "beta_end": 20.0}
+        max_iters=4,
+        alpha=0.7,
+        smoothing={"beta_start": 2.0, "beta_end": 20.0},
+    )
+    spec.probability_interval = scripted_hard_lower(
+        (0.4, 0.8, 0.5, 0.45, 0.42)
     )
     result = planner.optimize_window(rollout, spec=spec)
-    expected = spec.smooth_lower(result.rollout.belief_trajectory, 20.0).item()
-    assert result.smooth_lower == pytest.approx(expected)
+    assert result.selected_iteration == 0
+    assert planner._beta(0) == pytest.approx(2.0)
+    assert result.smoothing_beta == pytest.approx(20.0)
+    beliefs = result.rollout.belief_trajectory
+    assert result.smooth_lower == pytest.approx(
+        spec.smooth_lower(beliefs, 20.0).item()
+    )
+    assert result.smooth_lower != pytest.approx(
+        spec.smooth_lower(beliefs, 2.0).item()
+    )
+
+
+@pytest.fixture(scope="module")
+def altitude_problem():
+    s = setup_problem(
+        load_config("configs/scenarios/altitude_safety.yaml"), device="cpu"
+    )
+    spec = Always(GreaterThan(s.cfg["threshold"]), interval=[1, s.cfg["H"]])
+    initial = s.planner.evaluate_controls(s.rollout, s.init_guess, spec=spec)
+    return s, spec, initial
+
+
+@pytest.fixture(scope="module")
+def altitude_result():
+    return run_altitude_safety(show=False, save=False)
+
+
+def test_altitude_improves_and_replays(altitude_problem, altitude_result):
+    s, spec, initial = altitude_problem
+    assert altitude_result.controls.shape == (s.cfg["H"], 1)
+    assert initial.hard_interval[0] < 0.5
+    assert altitude_result.hard_interval[0] > 0.95
+    assert altitude_result.smooth_lower > initial.smooth_lower
+    assert altitude_result.controls.abs().max() <= s.dyn.u_max
+    replay = s.planner.evaluate_controls(
+        s.rollout, altitude_result.controls, spec=spec
+    )
+    assert replay.hard_interval == pytest.approx(
+        altitude_result.hard_interval, abs=1e-6
+    )
+
+
+def test_altitude_three_panels(altitude_problem, altitude_result, tmp_path):
+    s, _, initial = altitude_problem
+    fig, axes = plot_altitude_safety(
+        altitude_result,
+        initial=initial,
+        dt=s.cfg["dt"],
+        threshold=s.cfg["threshold"],
+        u_max=s.dyn.u_max,
+        show=False,
+        save_path=str(tmp_path / "altitude.png"),
+    )
+    assert len(axes) == 3
+    assert (tmp_path / "altitude.png").exists()
+    assert (tmp_path / "altitude.pdf").exists()
+    for ax in axes:
+        labels = [text.get_text() for text in ax.get_legend().get_texts()]
+        assert len(labels) == len(set(labels))
+    plt.close(fig)

@@ -36,3 +36,8 @@ include = ["models*", "pdstl*", "planning*", "visualization*"]
 [tool.setuptools.data-files]
 "share/probabilistic-dstl/configs" = ["configs/*.yaml"]
 "share/probabilistic-dstl/configs/scenarios" = ["configs/scenarios/*.yaml"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: full scenario solves (minutes); deselect with -m 'not slow'",
+]

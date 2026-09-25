@@ -7,23 +7,24 @@ beliefs provide exact axis and half-space probabilities. Rectangle intervals use
 Fréchet bounds. The lane example evaluates collision events on relative Gaussian
 beliefs for three surrounding vehicles.
 
+`beta=None` evaluates exactly; `beta > 0` gives a smooth, **sound** outer
+interval (smooth lower ≤ exact lower), so a smooth lower ≥ α certifies the exact
+one.
+
 ## Planning pipeline
 
 ```text
 YAML scenario → dynamics and initial belief → rollout → atomic probability bounds
-→ pdSTL formula → smooth lower score → bounded control optimization
-→ final hard interval → PlanResult → publication figure
+→ pdSTL formula → sound smooth lower bound → bounded control optimization
+→ highest exact lower bound → PlanResult → publication figure
 ```
 
-`Planner.optimize_window` optimizes only the smooth lower score, control effort,
-and control smoothness. When `alpha` is configured, the hard interval defines
-feasibility, stopping, and candidate selection: the planner returns the
-lowest-cost feasible candidate, or the highest-hard-lower candidate if none is
-feasible. It does not automatically return the last smooth iterate. The hard
-interval is a pdSTL satisfaction interval, not an exact joint trajectory
-probability. `PlanResult` records the selected candidate, its control cost and
-threshold status, and aligned smooth/hard optimization histories. Saturated
-initial controls are moved inside the tanh bound to preserve useful gradients.
+`Planner.optimize_window` **maximizes the exact pdSTL lower bound**: it runs
+`max_iters` Adam steps on the sound smooth bound (plus small `w_u`, `w_du`
+regularizers, no shaping terms) and returns the iterate with the highest exact
+lower bound. `alpha` only labels the result. `Planner.optimize_multistart` runs
+one optimization per warm start and keeps the best certified plan. The exact
+interval is a pdSTL satisfaction interval, not a joint trajectory probability.
 
 `Planner.run_receding_horizon` is the generic MPC loop used by the lane
 planners. It optimizes a local window,
@@ -37,10 +38,8 @@ the outcome.
 
 - `configs/scenarios/altitude_safety.yaml`: altitude belief, atomic probability,
   controls, and final pdSTL interval.
-- `configs/scenarios/reach_avoid.yaml`: a configurable, single-shot stochastic
-  reach–avoid proof of concept. A generic straight-line initialization crosses
-  one asymmetric obstacle; smooth pdSTL optimization must find a safe route and
-  reach the goal during the configured time window.
+- `configs/scenarios/narrow_passage.yaml`, `either_or.yaml`: reach–avoid
+  examples (see below).
 - `configs/scenarios/lane_change.yaml`: four-vehicle lane change with road
   safety, relative collision checks, and a timed target-lane dwell.
 - `configs/scenarios/lane_merge.yaml`: selectable on-ramp merge where the ramp
@@ -60,12 +59,29 @@ Edit traffic directly in `configs/scenarios/lane_change.yaml` or
 in metres and `speed` is the longitudinal speed in m/s. The ego initial state is
 `x0_mean: [x, y, vx, vy]` in the same file.
 
-The reach–avoid publication plot compares the initial and selected belief means,
-shows selected joint 95% Gaussian belief ellipses and controls, and separates
-the smooth optimization surrogate from the hard lower score. Its headline
-reports the selected hard pdSTL interval, requested threshold, control cost, and
-planning time. Lane plots retain their execution diagnostics and live views.
-All planning figures use the shared Matplotlib Tableau palette.
+## Reach–avoid examples
+
+One configurable planner covers every reach–avoid scenario. A config lists
+boxes by role; the task is always the safe region, any goal, and, per `visit`
+group, one target held for `dwell` steps:
+
+```yaml
+workspace: {x: [0, 10], y: [0, 10]}
+obstacles: {block: {x: [3, 5], y: [4, 6]}}
+goals: {goal: {x: [7, 8], y: [8, 9]}}          # reach any one
+visit:                                          # enter one, stay `dwell` steps
+  - dwell: 5
+    regions: {t1: {x: [1, 2], y: [6, 7]}, t2: {x: [7, 8], y: [4.5, 5.5]}}
+routes:                                         # warm starts, one run each
+  via_t1: [[1.5, 6.5], [7.5, 8.5]]
+  via_t2: [[7.5, 5.0], [7.5, 8.5]]
+```
+
+The robot is a double integrator, so plans are curved.
+[`experiments/reach_avoid_examples.ipynb`](experiments/reach_avoid_examples.ipynb)
+runs the stlpy NarrowPassage and EitherOr examples. A 95% ellipse may touch an
+obstacle while a plan is certified: α = 0.9 allows about 1.3σ of clearance per
+step, while a 95% ellipse has radius 2.45σ.
 
 ## Run
 
@@ -75,12 +91,8 @@ python src/main.py
 ```
 
 Edit the `"run"` and `"skip"` flags beside each project block in `src/main.py`.
-The current flags select only the one-shot reach–avoid example.
-`show_plots=True` displays each completed plot before saving it. The
-reach–avoid runner accepts `live=True` to update its candidate belief path and
-separate smooth-surrogate and hard-lower traces during optimization. This
-remains a single-shot optimization, not replanning. `optimization_every`
-controls the live refresh cadence. Lane runners also accept `live`,
+`show_plots=True` displays each completed plot before saving it; `live=True`
+streams optimizer candidates. Lane runners also accept `live`,
 `live_optimization`, and `max_steps`.
 
 Lane collision and road checks use the full axis-aligned vehicle footprint plus
@@ -88,19 +100,16 @@ configured safety margins. A merge succeeds only when the complete target-lane
 dwell finishes inside the time window and before the ego front reaches the ramp
 end.
 
-Each planning window has a certified hard pdSTL interval. The combined plot
-shows both endpoints; the purple smooth score is only the differentiable
-optimization surrogate. Physical success describes the sampled execution, so
+Each planning window has a certified exact pdSTL interval. The combined plot
+shows both endpoints; the purple smooth score is the sound differentiable lower
+bound the optimizer ascends. Physical success describes the sampled execution, so
 it is not itself a probability score. The final reported interval is the last
 window solved before that execution terminated.
 
 ## Experiment notebooks
 
-[`experiments/reach_avoid_demo.ipynb`](experiments/reach_avoid_demo.ipynb)
-loads the editable asymmetric configuration, displays the timed reach–avoid
-formula, optimizes once through the production runner, and shows the initial
-and selected plans, optimizer diagnostics, and animation. The notebook contains
-no stored outputs.
+[`experiments/reach_avoid_examples.ipynb`](experiments/reach_avoid_examples.ipynb)
+runs the narrow-passage and either–or examples through `run_reach_avoid`.
 
 [`experiments/lane_change_merge_demo.ipynb`](experiments/lane_change_merge_demo.ipynb)
 is a from-dynamics-to-optimization walkthrough of both lane scenarios. It
@@ -113,15 +122,13 @@ pip install -e ".[notebook]"
 jupyter lab experiments/
 ```
 
-Its figures and GIF are isolated under `outputs/experiments/reach_avoid/`.
-
 ## Development checks
 
 ```bash
 pip install -e ".[dev]"
 ruff format --check src tests
 flake8 src
-MPLBACKEND=Agg pytest -q
+MPLBACKEND=Agg pytest -q -m "not slow"   # add -m slow for full scenario solves
 ```
 
 ## License

@@ -1,0 +1,31 @@
+# stlpy NarrowPassage under Gaussian beliefs: reach either goal, avoid four
+# obstacles. Centred in a corridor of width w, a step's risk is about
+# 2 Phi(-w / (2 sigma)). The 0.5 m gap certifies (~0.98); the 0.3 m corridor
+# falls below alpha (~0.86); the long route crosses a 1 m strip late, when the
+# belief has grown (sigma ~ 0.3 m), and certifies lowest.
+name: Narrow Passage
+scenario: {type: reach_avoid}
+dynamics: double_integrator   # state [x, y, vx, vy], control = acceleration
+H: 120
+dt: 0.2
+u_max: 1.0
+q_std: 0.002
+x0_mean: [3.0, 3.6, 0.0, 0.0]
+x0_cov_scale: [0.005, 0.005, 0.0, 0.0]
+
+workspace: {x: [0, 12], y: [0, 12]}
+obstacles:
+  centre: {x: [2.0, 5.0], y: [4.0, 6.0]}
+  middle: {x: [5.5, 9.0], y: [3.8, 5.7]}
+  lower: {x: [4.6, 8.0], y: [0.5, 3.5]}
+  upper: {x: [2.2, 4.4], y: [6.4, 11.0]}
+goals:                 # reach any one
+  A: {x: [7, 8], y: [8, 9]}
+  B: {x: [9.5, 10.5], y: [1.5, 2.5]}
+routes:                # one warm start each; the best certified plan wins
+  narrow: [[5.0, 3.65], [8.5, 3.65], [10.0, 2.0]]
+  gap: [[5.25, 3.75], [5.25, 6.3], [7.5, 8.5]]
+  wide: [[1.0, 3.6], [1.0, 11.5], [5.0, 11.5], [7.5, 8.5]]
+
+planner: {max_iters: 300, lr: 0.01, alpha: 0.9}   # double integrator: small steps
+visualization: {ellipse_every: 10, animation_fps: 10}

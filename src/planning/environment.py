@@ -1,7 +1,6 @@
-"""Rectangular geometry, reach-avoid specifications, and lane construction.
+"""Rectangular geometry, the reach-avoid task, and lane construction.
 
-The lane builder also creates moving geometry using NumPy and Torch. Probability
-evaluation belongs to beliefs and pdSTL predicates, never this module.
+Probability evaluation belongs to beliefs and pdSTL predicates, never here.
 """
 
 from dataclasses import dataclass, field
@@ -18,7 +17,8 @@ from pdstl.predicates import (
     RelativeAxisInterval,
 )
 
-ROLES = ("workspace", "goal", "obstacle")
+# workspace: stay inside; obstacle: keep out; goal: reach; target: visit.
+ROLES = ("workspace", "goal", "obstacle", "target")
 
 
 # Rectangular geometry
@@ -26,10 +26,7 @@ ROLES = ("workspace", "goal", "obstacle")
 
 @dataclass
 class RectangleRegion:
-    """An axis-aligned rectangle: a name for formulas, a role for selection, a style for plots.
-
-    `style` is carried but never interpreted here; reading it is visualization's job.
-    """
+    """An axis-aligned rectangle with a name and a role."""
 
     name: str
     role: str
@@ -37,25 +34,19 @@ class RectangleRegion:
     xmax: float
     ymin: float
     ymax: float
-    style: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.role not in ROLES:
             raise ValueError(
-                f"region {self.name!r}: role must be one of {list(ROLES)}, got {self.role!r}"
+                f"region {self.name!r}: role must be one of {list(ROLES)}"
             )
-        if not self.xmin < self.xmax:
+        if not (self.xmin < self.xmax and self.ymin < self.ymax):
             raise ValueError(
-                f"region {self.name!r}: needs xmin < xmax, got [{self.xmin}, {self.xmax}]"
-            )
-        if not self.ymin < self.ymax:
-            raise ValueError(
-                f"region {self.name!r}: needs ymin < ymax, got [{self.ymin}, {self.ymax}]"
+                f"region {self.name!r}: needs min < max on both axes"
             )
 
     @property
     def x(self):
-        """The (min, max) pair, for callers that want the bounds together."""
         return (self.xmin, self.xmax)
 
     @property
@@ -64,10 +55,11 @@ class RectangleRegion:
 
 
 class Environment:
-    """Named geometry and its reach-avoid specification."""
+    """Named regions and, for reach-avoid, its visit groups."""
 
     def __init__(self):
         self.regions = {}
+        self.visits = []  # [(dwell, [target names])]
 
     def add_region(self, region):
         if region.name in self.regions:
@@ -95,7 +87,7 @@ class Environment:
             raise ValueError(f"environment needs exactly one {role!r} region")
         return regions[0]
 
-    def get_specification(self, horizon, goal_interval=None):
+    def get_specification(self, horizon):
         if (
             isinstance(horizon, bool)
             or not isinstance(horizon, int)
@@ -104,103 +96,97 @@ class Environment:
             raise ValueError(
                 f"horizon must be a positive integer, got {horizon!r}"
             )
-        return reach_avoid_specification(self, horizon, goal_interval)
+        return reach_avoid_specification(self, horizon)
 
 
-# Reach-avoid construction and specification
+# Reach-avoid task
 
 
-def reach_avoid_specification(environment, horizon, goal_interval=None):
-    """Stay inside the workspace, avoid obstacles, and reach the goal.
-
-    Safety holds from step 1 through the horizon. The goal must be reached in
-    ``goal_interval``, which defaults to the complete prediction horizon.
-    """
-    goal_interval = [0, horizon] if goal_interval is None else goal_interval
-    if not (
-        isinstance(goal_interval, (list, tuple))
-        and len(goal_interval) == 2
-        and all(
-            isinstance(step, int) and not isinstance(step, bool)
-            for step in goal_interval
-        )
-        and 0 <= goal_interval[0] <= goal_interval[1] <= horizon
-    ):
-        raise ValueError(
-            "goal_interval must be [start, end] with "
-            f"0 <= start <= end <= {horizon}"
-        )
-    events = reach_avoid_events(environment)
-    safe = [events["workspace"], *events["obstacles"]]
-    return Always(reduce(And, safe), interval=[1, horizon]) & Eventually(
-        events["goal"], interval=list(goal_interval)
-    )
+def inside(region):
+    return InsideRectangle(region.x, region.y, name=region.name)
 
 
-def reach_avoid_events(environment):
-    """The environment's named atoms, shared by specification and diagnostic consumers."""
-    workspace = environment.single_region("workspace")
-    goal = environment.single_region("goal")
-    return {
-        "workspace": InsideRectangle(
-            workspace.x, workspace.y, name=workspace.name
-        ),
-        "goal": InsideRectangle(goal.x, goal.y, name=goal.name),
-        "obstacles": [
-            OutsideRectangle(o.x, o.y, name=o.name)
-            for o in environment.by_role("obstacle")
+def outside(region):
+    return OutsideRectangle(region.x, region.y, name=f"¬{region.name}")
+
+
+def safety_event(environment):
+    """Inside the workspace and outside every obstacle."""
+    return reduce(
+        And,
+        [
+            inside(environment.single_region("workspace")),
+            *map(outside, environment.by_role("obstacle")),
         ],
-    }
-
-
-def _rectangle(entry, role, fallback_name):
-    """One `{name, x: [min, max], y: [min, max], style}` block into a region."""
-    if not isinstance(entry, dict):
-        raise ValueError(
-            f"{role} must be a mapping with x and y, got {entry!r}"
-        )
-    name = entry.get("name", fallback_name)
-    for axis in ("x", "y"):
-        pair = entry.get(axis)
-        if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
-            raise ValueError(
-                f"region {name!r}: {axis} must be a [min, max] pair, got {pair!r}"
-            )
-    (xmin, xmax), (ymin, ymax) = entry["x"], entry["y"]
-    return RectangleRegion(
-        name=name,
-        role=role,
-        xmin=float(xmin),
-        xmax=float(xmax),
-        ymin=float(ymin),
-        ymax=float(ymax),
-        style=dict(entry.get("style") or {}),
     )
+
+
+def reach_avoid_specification(environment, horizon):
+    """Stay safe, reach any goal, and dwell in one target of each visit group.
+
+    Args:
+        environment: Environment with a workspace, goals and visit groups.
+        horizon: Last prediction step H; step 0 is the known initial belief.
+
+    Returns:
+        G[1,H] safe & F[1,H] (any goal) & F[1,H-d] (any target held d steps).
+    """
+    goals = environment.by_role("goal")
+    if not goals:
+        raise ValueError("reach-avoid needs at least one goal")
+    parts = [
+        Always(safety_event(environment), [1, horizon]),
+        Eventually(reduce(Or, map(inside, goals)), [1, horizon]),
+    ]
+    for dwell, names in environment.visits:
+        if not 0 <= dwell < horizon:
+            raise ValueError(f"dwell {dwell} must lie in [0, H)")
+        stays = [
+            Always(inside(environment.region(name)), [0, dwell])
+            for name in names
+        ]
+        parts.append(Eventually(reduce(Or, stays), [1, horizon - dwell]))
+    return reduce(And, parts)
+
+
+def _rectangles(block, role):
+    """`{name: {x: [min, max], y: [min, max]}}` into regions."""
+    if not isinstance(block, dict):
+        raise ValueError(f"{role} regions must be a name -> {{x, y}} mapping")
+    return [
+        RectangleRegion(name, role, *map(float, (*box["x"], *box["y"])))
+        for name, box in block.items()
+    ]
 
 
 def build_reach_avoid_environment(config):
-    """Build the environment from a scenario file's geometry.
+    """Build the reach-avoid environment from a scenario config.
 
-    Expects a `workspace` block, a `goal` block, and zero or more `obstacles`.
-    Names, bounds and styles all come from configuration, so the example is
-    changed without editing code.
+    Args:
+        config: Mapping with `workspace` ({x, y}), `goals` and optional
+            `obstacles` (name -> {x, y}), and optional `visit` groups
+            ({dwell, regions: name -> {x, y}}).
+
+    Returns:
+        The Environment.
     """
-    for required in ("workspace", "goal"):
-        if config.get(required) is None:
-            raise ValueError(f"reach-avoid config needs a {required!r} block")
-
+    if "workspace" not in config or not config.get("goals"):
+        raise ValueError("reach-avoid config needs a workspace and goals")
     environment = Environment()
-    environment.add_region(
-        _rectangle(config["workspace"], "workspace", "workspace")
-    )
-    environment.add_region(_rectangle(config["goal"], "goal", "goal"))
-
-    obstacles = config.get("obstacles") or []
-    if not isinstance(obstacles, (list, tuple)):
-        raise ValueError(f"'obstacles' must be a list, got {obstacles!r}")
-    for index, entry in enumerate(obstacles):
-        environment.add_region(
-            _rectangle(entry, "obstacle", f"obstacle_{index}")
+    blocks = [
+        ({"workspace": config["workspace"]}, "workspace"),
+        (config.get("obstacles") or {}, "obstacle"),
+        (config["goals"], "goal"),
+    ]
+    for block, role in blocks:
+        for region in _rectangles(block, role):
+            environment.add_region(region)
+    for group in config.get("visit") or []:
+        targets = _rectangles(group["regions"], "target")
+        for region in targets:
+            environment.add_region(region)
+        environment.visits.append(
+            (int(group.get("dwell", 0)), [r.name for r in targets])
         )
     return environment
 

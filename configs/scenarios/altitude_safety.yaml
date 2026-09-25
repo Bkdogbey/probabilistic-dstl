@@ -14,4 +14,3 @@ planner:
   w_du: 0.01
   max_iters: 120
   alpha: 0.95
-  converge_patience: 3

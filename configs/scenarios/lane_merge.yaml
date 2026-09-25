@@ -34,6 +34,5 @@ planner:
   w_u: 0.002
   w_du: 0.005
   w_phi: 100.0
-  max_iters: 40
+  max_iters: 15
   alpha: 0.95
-  converge_patience: 3

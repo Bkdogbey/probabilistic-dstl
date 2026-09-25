@@ -1,21 +1,14 @@
 """pdSTL operators on [B, N, 2] traces: Frechet Boolean, windowed temporal.
 
-Two evaluation modes, selected by `beta`:
-
-* `beta=None` -- exact. The pair is a StoRI probability interval [lower, upper].
-* `beta > 0`  -- smooth. The pair is a differentiable surrogate for optimization. It is NOT
-  a probability interval: the endpoints need not lie in [0, 1] and need not be ordered. Only
-  its lower value is meant to be read, through `smooth_lower()`.
-
-Use `probability_interval()` for the exact result and `smooth_lower()` for the scalar a
-planner descends.
+`beta=None` is exact: the pair is the pdSTL probability interval.
+`beta > 0` is smooth and sound: an outer interval (lower <= exact lower,
+upper >= exact upper), so `smooth_lower() >= alpha` certifies the exact bound.
 """
 
 import math
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from pdstl.base import check_probability_bounds
 
@@ -96,6 +89,19 @@ class Maxish(torch.nn.Module):
         return _smooth_max(x, beta, dim, keepdim)
 
 
+def _reduce_bounds(operation, x, beta, dim=1, keepdim=True):
+    """Min/max-reduce bound pairs, shifting by log(n)/beta to stay sound."""
+    reduced = operation(x, beta, dim=dim, keepdim=keepdim)
+    if beta is None:
+        return reduced
+    shift = math.log(x.shape[dim]) / beta
+    if isinstance(operation, Minish):
+        # Normalized soft-min overshoots min: pull the lower down.
+        return _pair(reduced[..., 0] - shift, reduced[..., 1])
+    # Normalized soft-max undershoots max: push the upper up.
+    return _pair(reduced[..., 0], reduced[..., 1] + shift)
+
+
 # --- Atomic events ------------------------------------------------------------
 
 
@@ -144,18 +150,13 @@ def _pair(lower, upper):
 
 
 def _conjunction(trace1, trace2, beta=None):
-    """[max(0, L1 + L2 - 1), min(U1, U2)]; both endpoints smooth when beta is set.
+    """[max(0, L1 + L2 - 1), min(U1, U2)].
 
-    The upper is smoothed as well as the lower because `Negation` swaps them: without it a
-    negated conjunction -- every OutsideRectangle -- would carry a hard minimum in the very
-    value the objective differentiates.
+    Smooth mode keeps the unclamped excess (sound, with unit gradient) and a
+    soft-min upper, which Negation turns into every OutsideRectangle lower.
     """
     excess = trace1[..., 0] + trace2[..., 0] - 1.0
-    lower = (
-        torch.clamp(excess, min=0.0)
-        if beta is None
-        else F.softplus(excess, beta=beta)
-    )
+    lower = torch.clamp(excess, min=0.0) if beta is None else excess
     upper = _MIN(
         _pair(trace1[..., 1], trace2[..., 1]), beta, dim=-1, keepdim=False
     )
@@ -337,20 +338,20 @@ class Temporal_Operator(STL_Formula):
     def _rnn_cell(self, x, hc, beta=None):
         h0, _ = hc
         if self._suffix:  # [t, end of trace]
-            output = self.operation(
-                torch.cat([h0, x], dim=1), beta, dim=1, keepdim=True
+            output = _reduce_bounds(
+                self.operation, torch.cat([h0, x], dim=1), beta
             )
             state = (output, None)
         elif self._unbounded:  # [a, inf), a > 0
             d0, h0 = h0
             dh = torch.cat([d0, h0[:, :1, :]], dim=1)
-            output = self.operation(dh, beta, dim=1, keepdim=True)
+            output = _reduce_bounds(self.operation, dh, beta)
             state = ((output, self._apply_shift(h0, x)), None)
         else:  # [a, b]: slot rnn_dim-1-k holds the value k steps ahead
             a, b = int(self._interval[0]), int(self._interval[1])
             new_h0 = self._apply_shift(h0, x)
-            output = self.operation(
-                new_h0[:, : b - a + 1, :], beta, dim=1, keepdim=True
+            output = _reduce_bounds(
+                self.operation, new_h0[:, : b - a + 1, :], beta
             )
             state = (new_h0, None)
         return output, state
@@ -445,13 +446,16 @@ class Until(STL_Formula):
             candidates = []
             for tau in range(t + a, min(t + b, T - 1) + 1):
                 # Inclusive: φ must hold from t through the witness τ.
-                prefix = self.min_op(
-                    phi[:, t : tau + 1, :], beta, dim=1, keepdim=False
+                prefix = _reduce_bounds(
+                    self.min_op, phi[:, t : tau + 1, :], beta, keepdim=False
                 )
                 candidates.append(_conjunction(prefix, psi[:, tau, :], beta))
             results.append(
-                self.max_op(
-                    torch.stack(candidates, dim=1), beta, dim=1, keepdim=False
+                _reduce_bounds(
+                    self.max_op,
+                    torch.stack(candidates, dim=1),
+                    beta,
+                    keepdim=False,
                 )
             )
         return torch.stack(results, dim=1)

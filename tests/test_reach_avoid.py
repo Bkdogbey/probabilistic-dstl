@@ -1,4 +1,6 @@
-"""The configurable asymmetric reach-avoid proof of concept."""
+"""The configurable reach-avoid planner and its two stlpy examples."""
+
+from functools import reduce
 
 import matplotlib
 
@@ -8,289 +10,271 @@ import pytest
 import torch
 from scipy.stats import chi2
 
-from planning.runners import run_reach_avoid, setup_problem
+from models.rollouts import create_gaussian_belief_trajectory
+from pdstl.operators import Always, And, Eventually, Or
+from planning.environment import (
+    Environment,
+    RectangleRegion,
+    build_reach_avoid_environment,
+    inside,
+    outside,
+)
 from planning.planner import IterationRecord
+from planning.runners import run_reach_avoid, setup_problem
 from utils import load_config
 from visualization.animation import animate_reach_avoid
 from visualization.live_plots import create_reach_avoid_live_view
-from visualization.planning import (
-    COLORS,
-    plot_reach_avoid,
-)
+from visualization.planning import plot_reach_avoid
+
+EXAMPLES = ("narrow_passage", "either_or")
+CONFIG = {
+    "workspace": {"x": [0, 10], "y": [0, 10]},
+    "obstacles": {"wall": {"x": [3, 5], "y": [4, 6]}},
+    "goals": {
+        "a": {"x": [7, 8], "y": [8, 9]},
+        "b": {"x": [8, 9], "y": [1, 2]},
+    },
+    "visit": [
+        {
+            "dwell": 2,
+            "regions": {
+                "t1": {"x": [1, 2], "y": [6, 7]},
+                "t2": {"x": [7, 8], "y": [4, 5]},
+            },
+        }
+    ],
+}
 
 
-@pytest.fixture(scope="module")
-def problem():
-    return setup_problem(
-        load_config("configs/scenarios/reach_avoid.yaml"),
-        device="cpu",
-        with_environment=True,
+def _problem(name, **planner):
+    cfg = load_config(f"configs/scenarios/{name}.yaml")
+    cfg["planner"] = {**cfg["planner"], **planner}
+    return setup_problem(cfg, device="cpu", with_environment=True)
+
+
+def _inside(points, region):
+    return (
+        (points[:, 0] >= region.xmin)
+        & (points[:, 0] <= region.xmax)
+        & (points[:, 1] >= region.ymin)
+        & (points[:, 1] <= region.ymax)
     )
 
 
 @pytest.fixture(scope="module")
-def result():
-    return run_reach_avoid(show=False, save=False)
+def short():
+    """A 20-iteration either-or solve from its first route."""
+    problem = _problem("either_or", max_iters=20)
+    spec = problem.env.get_specification(problem.cfg["H"])
+    result = problem.planner.optimize_window(
+        problem.rollout, spec=spec, init_guess=problem.init_guess
+    )
+    return problem, spec, result
 
 
-def test_default_geometry_and_custom_names(problem):
-    assert len(problem.env.by_role("obstacle")) == 1
-    assert problem.cfg["x0_mean"] == [-3.0, 0.0]
-    assert problem.cfg["goal_interval"] == [30, 40]
-    workspace = problem.env.single_region("workspace")
-    goal = problem.env.single_region("goal")
-    assert workspace.x == tuple(problem.cfg["workspace"]["x"])
-    assert workspace.y == tuple(problem.cfg["workspace"]["y"])
-    assert goal.x == tuple(problem.cfg["goal"]["x"])
-    assert goal.y == tuple(problem.cfg["goal"]["y"])
-    assert {
-        region.name: (region.x, region.y)
-        for region in problem.env.by_role("obstacle")
-    } == {
-        obstacle["name"]: (tuple(obstacle["x"]), tuple(obstacle["y"]))
-        for obstacle in problem.cfg["obstacles"]
+# --- Environment and specification -------------------------------------------
+
+
+def test_regions_validate_their_role_bounds_and_names():
+    with pytest.raises(ValueError, match="role must be one of"):
+        RectangleRegion("r", "lava", 0, 1, 0, 1)
+    with pytest.raises(ValueError, match="min < max"):
+        RectangleRegion("r", "goal", 1, 1, 0, 1)
+    environment = Environment()
+    environment.add_region(RectangleRegion("g", "goal", 0, 1, 0, 1))
+    with pytest.raises(ValueError, match="already exists"):
+        environment.add_region(RectangleRegion("g", "goal", 2, 3, 2, 3))
+    with pytest.raises(ValueError, match="no region named"):
+        environment.region("nowhere")
+
+
+def test_builder_reads_every_role_and_visit_group():
+    environment = build_reach_avoid_environment(CONFIG)
+    roles = {name: r.role for name, r in environment.regions.items()}
+    assert roles == {
+        "workspace": "workspace",
+        "wall": "obstacle",
+        "a": "goal",
+        "b": "goal",
+        "t1": "target",
+        "t2": "target",
     }
-    cfg = dict(problem.cfg)
-    cfg["workspace"] = {**cfg["workspace"], "name": "room"}
-    cfg["goal"] = {**cfg["goal"], "name": "destination"}
-    renamed = setup_problem(cfg, device="cpu", with_environment=True)
-    spec = renamed.env.get_specification(cfg["H"], cfg["goal_interval"])
-    assert spec.subformula2.subformula.name == "destination"
-    assert spec.subformula2.interval == [30, 40]
+    assert environment.visits == [(2, ["t1", "t2"])]
+    with pytest.raises(ValueError, match="workspace and goals"):
+        build_reach_avoid_environment({"workspace": CONFIG["workspace"]})
 
 
-def test_initial_controls_are_goal_directed_and_cross_obstacle(problem):
-    expected = torch.tensor([0.8125, 0.0]).repeat(problem.cfg["H"], 1)
-    torch.testing.assert_close(problem.init_guess, expected)
-    initial = problem.planner.evaluate_controls(
-        problem.rollout,
-        problem.init_guess,
-        spec=problem.env.get_specification(
-            problem.cfg["H"], problem.cfg["goal_interval"]
-        ),
+def test_specification_is_built_from_the_roles():
+    environment = build_reach_avoid_environment(CONFIG)
+    region = environment.region
+    H = 12
+    safe = And(inside(region("workspace")), outside(region("wall")))
+    stays = Or(
+        Always(inside(region("t1")), [0, 2]),
+        Always(inside(region("t2")), [0, 2]),
     )
-    points = initial.rollout.aux["mean_trace"][0]
-    obstacle = problem.env.single_region("obstacle")
-    intersects = (
-        (points[:, 0] >= obstacle.xmin)
-        & (points[:, 0] <= obstacle.xmax)
-        & (points[:, 1] >= obstacle.ymin)
-        & (points[:, 1] <= obstacle.ymax)
+    expected = reduce(
+        And,
+        [
+            Always(safe, [1, H]),
+            Eventually(Or(inside(region("a")), inside(region("b"))), [1, H]),
+            Eventually(stays, [1, H - 2]),
+        ],
     )
-    assert intersects.any()
+    steps = torch.linspace(0, 1, H + 1).unsqueeze(-1)
+    mean = torch.tensor([1.5, 1.5]) + steps * torch.tensor([6.0, 7.0])
+    beliefs = create_gaussian_belief_trajectory(
+        mean, torch.full_like(mean, 0.05)
+    )
+    spec = environment.get_specification(H)
+    torch.testing.assert_close(
+        spec.probability_interval(beliefs),
+        expected.probability_interval(beliefs),
+    )
+    torch.testing.assert_close(
+        spec.smooth_lower(beliefs, 50.0), expected.smooth_lower(beliefs, 50.0)
+    )
+    with pytest.raises(ValueError, match="horizon must be a positive"):
+        environment.get_specification(0)
 
 
-def test_reach_avoid_returns_safe_bounded_replayable_plan(problem, result):
-    spec = problem.env.get_specification(
-        problem.cfg["H"], problem.cfg["goal_interval"]
-    )
+# --- Examples ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", EXAMPLES)
+def test_every_route_warm_start_follows_its_route(name):
+    problem = _problem(name)
+    spec = problem.env.get_specification(problem.cfg["H"])
+    routes = problem.cfg["routes"].values()
+    for route, guess in zip(routes, problem.init_guesses):
+        assert guess.abs().max() <= problem.dyn.u_max
+        plan = problem.planner.evaluate_controls(
+            problem.rollout, guess, spec=spec
+        )
+        end = plan.rollout.aux["mean_trace"][0, -1, :2]
+        torch.testing.assert_close(
+            end, torch.tensor(route[-1]), atol=0.3, rtol=0
+        )
+
+
+def test_short_solve_is_bounded_improving_and_replayable(short):
+    problem, spec, result = short
     initial = problem.planner.evaluate_controls(
         problem.rollout, problem.init_guess, spec=spec
     )
     replay = problem.planner.evaluate_controls(
         problem.rollout, result.controls, spec=spec
     )
-    initial_at_final_beta = spec.smooth_lower(
-        initial.rollout.belief_trajectory, result.smoothing_beta
-    )
-    assert result.smooth_lower > initial_at_final_beta
-    assert result.hard_interval[0] >= problem.cfg["planner"]["alpha"]
-    assert result.threshold_met
-    assert result.alpha == problem.cfg["planner"]["alpha"]
-    assert result.control_cost == pytest.approx(
-        problem.planner._control_cost(result.controls).item()
-    )
-    assert len(result.smooth_history) == len(result.loss_history) + 1
-    assert len(result.hard_lower_history) == len(result.loss_history) + 1
-    assert replay.hard_interval == pytest.approx(
-        result.hard_interval, abs=1e-6
-    )
-    torch.testing.assert_close(
-        replay.rollout.aux["mean_trace"], result.rollout.aux["mean_trace"]
-    )
+    assert result.hard_interval[0] >= initial.hard_interval[0]
     assert result.controls.abs().max() <= problem.dyn.u_max
-    points = result.rollout.aux["mean_trace"][0]
-    workspace, goal = (
-        problem.env.single_region("workspace"),
-        problem.env.single_region("goal"),
-    )
-
-    def inside(region):
-        return (
-            (points[:, 0] >= region.xmin)
-            & (points[:, 0] <= region.xmax)
-            & (points[:, 1] >= region.ymin)
-            & (points[:, 1] <= region.ymax)
-        )
-
-    assert inside(workspace).all()
-    goal_steps = torch.nonzero(inside(goal)).flatten()
-    assert any(
-        problem.cfg["goal_interval"][0]
-        <= int(step)
-        <= problem.cfg["goal_interval"][1]
-        for step in goal_steps
-    )
-    assert all(
-        not inside(obstacle).any()
-        for obstacle in problem.env.by_role("obstacle")
-    )
-    obstacle = problem.env.single_region("obstacle")
-    crossing = points[
-        (points[:, 0] >= obstacle.xmin) & (points[:, 0] <= obstacle.xmax)
-    ]
-    assert len(crossing) > 0
-    assert (crossing[:, 1] < obstacle.ymin).all()
+    assert replay.hard_interval == pytest.approx(result.hard_interval)
+    assert len(result.hard_lower_history) == 21
 
 
-def test_gradient_reaches_controls(problem):
-    parameters = problem.planner._control_parameters(
-        problem.init_guess
-    ).requires_grad_()
-    beliefs = problem.rollout(parameters).belief_trajectory
-    spec = problem.env.get_specification(
-        problem.cfg["H"], problem.cfg["goal_interval"]
-    )
-    spec.smooth_lower(beliefs, 2.0).backward()
-    assert (
-        parameters.grad.abs().sum() > 0
-        and torch.isfinite(parameters.grad).all()
-    )
-
-
-def test_publication_figure_is_saved_and_zero_obstacles_plot(
-    problem, result, tmp_path
+def test_figure_legend_is_short_and_ellipses_use_the_confidence(
+    short, tmp_path
 ):
-    path = tmp_path / "reach.png"
-    spec = problem.env.get_specification(
-        problem.cfg["H"], problem.cfg["goal_interval"]
-    )
-    initial = problem.planner.evaluate_controls(
-        problem.rollout, problem.init_guess, spec=spec
-    )
-    fig, axes = plot_reach_avoid(
+    problem, _, result = short
+    fig, (axis, controls, scores) = plot_reach_avoid(
         result,
         problem.env,
-        initial=initial,
-        dt=problem.cfg["dt"],
-        u_max=problem.dyn.u_max,
-        title="Asymmetric Reach–Avoid",
-        save_path=str(path),
-        show=False,
+        control_unit="m/s²",
+        title="Either–Or",
+        ellipse_confidence=0.9,
+        alternatives=[result],
+        save_path=str(tmp_path / "plan.png"),
     )
-    axis, controls_axis, scores_axis = axes
-    assert len(fig.axes) == 3
-    assert path.exists() and path.with_suffix(".pdf").exists()
-    assert axis.get_title() == "Asymmetric Reach–Avoid"
-    assert "Hard pdSTL" in scores_axis.get_title()
-    assert "threshold achieved" in scores_axis.get_title()
-    assert len(controls_axis.lines) == 2
-    assert axis.get_xlim() == pytest.approx(
-        tuple(problem.cfg["workspace"]["x"])
-    )
-    assert axis.get_ylim() == pytest.approx(
-        tuple(problem.cfg["workspace"]["y"])
-    )
-    assert {text.get_text() for text in axis.texts} >= {"G"}
-    assert sum(p.get_label() == "Obstacles" for p in axis.patches) == 1
-    assert {collection.get_label() for collection in axis.collections} >= {
-        "Start",
-        "Terminal belief mean",
-    }
-    first_ellipse = next(
-        patch
-        for patch in axis.patches
-        if patch.get_label() == "95% belief ellipse"
-    )
-    eigenvalue = (
-        torch.linalg.eigvalsh(result.rollout.aux["cov_trace"][0, 0, :2, :2])
-        .max()
-        .item()
-    )
-    assert first_ellipse.width == pytest.approx(
-        2 * (chi2.ppf(0.95, 2) * eigenvalue) ** 0.5
-    )
-    cfg = {**problem.cfg, "obstacles": []}
-    empty = setup_problem(cfg, device="cpu", with_environment=True)
-    empty_fig, empty_axes = plot_reach_avoid(result, empty.env, show=False)
-    empty_axis = empty_axes[0]
-    assert not any(
-        patch.get_label() == "Obstacles" for patch in empty_axis.patches
-    )
-    plt.close(empty_fig)
-    plt.close(fig)
-
-
-def test_plot_honors_configured_region_styles(problem, result):
-    from matplotlib.colors import to_rgba
-
-    cfg = dict(problem.cfg)
-    cfg["obstacles"] = [
-        {
-            **cfg["obstacles"][0],
-            "name": "shifted_wall",
-            "x": [-1.0, -0.25],
-            "y": [2.0, 3.0],
-            "style": {"color": "purple"},
-        }
+    assert (tmp_path / "plan.png").exists()
+    assert (tmp_path / "plan.pdf").exists()
+    labels = [t.get_text() for t in axis.get_legend().get_texts()]
+    assert labels[:-1] == [
+        "Obstacle",
+        "Goal",
+        "Target",
+        "Other routes",
+        "Plan",
+        "90% ellipse",
     ]
-    styled = setup_problem(cfg, device="cpu", with_environment=True)
-    fig, axes = plot_reach_avoid(result, styled.env, show=False)
-    axis = axes[0]
-    obstacle = next(p for p in axis.patches if p.get_label() == "Obstacles")
-    assert styled.env.region("shifted_wall").x == (-1.0, -0.25)
-    assert (obstacle.get_x(), obstacle.get_y()) == (-1.0, 2.0)
-    assert (obstacle.get_width(), obstacle.get_height()) == (0.75, 1.0)
-    assert obstacle.get_facecolor() == to_rgba("purple", alpha=0.45)
-    assert obstacle.get_hatch() == "//"
+    assert labels[-1].startswith("Min P(safe)")
+    assert controls.get_ylabel() == "control [m/s²]"
+    assert "Exact pdSTL" in scores.get_title()
+    ellipse = next(p for p in axis.patches if p.get_label() == "90% ellipse")
+    variance = torch.linalg.eigvalsh(
+        result.rollout.aux["cov_trace"][0, 0, :2, :2]
+    ).max()
+    assert ellipse.width == pytest.approx(
+        2 * (chi2.ppf(0.9, 2) * variance.item()) ** 0.5, rel=1e-5
+    )
     plt.close(fig)
 
 
-def test_live_view_updates_path_and_optimization_trace(problem, result):
-    spec = problem.env.get_specification(
-        problem.cfg["H"], problem.cfg["goal_interval"]
-    )
+def test_live_view_and_animation(short):
+    problem, spec, result = short
     fig, axes, observe, finish = create_reach_avoid_live_view(
         problem.env,
         lambda controls: problem.planner.evaluate_controls(
             problem.rollout, controls, spec=spec
         ),
         dt=problem.cfg["dt"],
-        title="Asymmetric Reach–Avoid",
+        title="Either–Or",
         max_iters=problem.planner.cfg["max_iters"],
         alpha=problem.planner.cfg["alpha"],
     )
-    record = IterationRecord(
-        result.controls,
-        result.final_loss,
-        result.smooth_lower,
-        result.hard_interval,
-        result.smoothing_beta,
+    observe(
+        0,
+        IterationRecord(
+            result.controls,
+            result.final_loss,
+            result.smooth_lower,
+            result.hard_interval,
+            result.smoothing_beta,
+        ),
     )
-    observe(0, record)
     assert len(axes[0].lines[0].get_xdata()) == problem.cfg["H"] + 1
-    assert len(axes[1].lines[0].get_xdata()) == 1
-    assert axes[0].lines[0].get_color() == COLORS["mean"]
-    assert axes[1].lines[0].get_color() == COLORS["score"]
     finish(result)
     plt.close(fig)
-
-
-def test_animation_is_the_same_single_environment_view(problem, result):
     fig, axis, movie = animate_reach_avoid(
-        result,
-        problem.env,
-        dt=problem.cfg["dt"],
-        title="Asymmetric Reach–Avoid",
-        show=False,
-    )
-    assert len(fig.axes) == 1 and fig.axes[0] is axis
-    assert axis.get_title() == (
-        f"Asymmetric Reach–Avoid | P↓(φ)={result.hard_interval[0]:.3f}"
+        result, problem.env, dt=problem.cfg["dt"], title="Either–Or"
     )
     movie._draw_next_frame(1, blit=False)
-    path = axis.lines[1]
-    assert len(path.get_xdata()) == 2
-    assert movie is not None
+    assert len(axis.lines[1].get_xdata()) == 2
     movie._draw_was_started = True
     plt.close(fig)
+
+
+def _certified_and_clear(name, result):
+    problem = _problem(name)
+    points = result.rollout.aux["mean_trace"][0]
+    assert result.threshold_met
+    for obstacle in problem.env.by_role("obstacle"):
+        assert not _inside(points, obstacle).any(), obstacle.name
+    return problem, points
+
+
+@pytest.mark.slow
+def test_narrow_passage_certifies_a_route_clear_of_the_narrow_corridor():
+    result = run_reach_avoid(
+        "configs/scenarios/narrow_passage.yaml", save=False
+    )
+    problem, points = _certified_and_clear("narrow_passage", result)
+    corridor = RectangleRegion("corridor", "obstacle", 5.5, 8.0, 3.5, 3.8)
+    assert not _inside(points, corridor).any()
+    goals = problem.env.by_role("goal")
+    assert any(_inside(points, goal).any() for goal in goals)
+
+
+@pytest.mark.slow
+def test_either_or_dwells_in_one_target_then_reaches_the_goal():
+    result = run_reach_avoid("configs/scenarios/either_or.yaml", save=False)
+    problem, points = _certified_and_clear("either_or", result)
+
+    def longest_stay(region):
+        best = run = 0
+        for is_inside in _inside(points, region).tolist():
+            run = run + 1 if is_inside else 0
+            best = max(best, run)
+        return best
+
+    # always[0, 5] spans six samples.
+    assert max(map(longest_stay, problem.env.by_role("target"))) >= 6
+    assert _inside(points, problem.env.region("goal")).any()

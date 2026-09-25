@@ -28,9 +28,10 @@ with skip_run("skip", "AltitudeSafety") as check, check():
     )
 
 
-# 2. One-shot reach-avoid planning
-with skip_run("run", "ReachAvoid") as check, check():
+# 2. Reach-avoid, stlpy NarrowPassage: reach either goal past four obstacles
+with skip_run("run", "NarrowPassage") as check, check():
     run_reach_avoid(
+        "configs/scenarios/narrow_passage.yaml",
         show=show_plots,
         save=save_plots,
         live=live_plots,
@@ -38,7 +39,18 @@ with skip_run("run", "ReachAvoid") as check, check():
     )
 
 
-# 3. Two-lane change
+# 3. Reach-avoid, stlpy EitherOr: dwell in t1 or t2, then reach the goal
+with skip_run("run", "EitherOr") as check, check():
+    run_reach_avoid(
+        "configs/scenarios/either_or.yaml",
+        show=show_plots,
+        save=save_plots,
+        live=live_plots,
+        optimization_every=optimization_every,
+    )
+
+
+# 4. Two-lane change
 with skip_run("skip", "LaneChange") as check, check():
     run_lane_change(
         show=show_plots,
@@ -49,7 +61,7 @@ with skip_run("skip", "LaneChange") as check, check():
     )
 
 
-# 4. On-ramp merge into the main lane
+# 5. On-ramp merge into the main lane
 with skip_run("skip", "LaneMerge") as check, check():
     run_lane_change(
         "configs/scenarios/lane_merge.yaml",

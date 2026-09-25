@@ -3,14 +3,14 @@
 import numpy as np
 import pytest
 import torch
-from models.dynamics import DoubleIntegrator, SingleIntegrator
+from scipy.stats import norm
+
 from models.beliefs import GaussianBelief
-from models.rollouts import create_gaussian_belief_trajectory
+from models.dynamics import DoubleIntegrator, SingleIntegrator
+from models.rollouts import create_gaussian_belief_trajectory, gaussian_rollout
 from pdstl.base import Belief, BeliefTrajectory
 from pdstl.predicates import GreaterThan, LessThan
-from scipy.stats import norm
 from planning.environment import build_reach_avoid_environment
-from models.rollouts import gaussian_rollout
 from planning.planner import Planner
 
 
@@ -111,7 +111,7 @@ def test_planner_accepts_the_shared_belief_in_a_small_window():
     environment = build_reach_avoid_environment(
         {
             "workspace": {"x": [-5.0, 5.0], "y": [-5.0, 5.0]},
-            "goal": {"x": [0.5, 1.5], "y": [-0.5, 0.5]},
+            "goals": {"goal": {"x": [0.5, 1.5], "y": [-0.5, 0.5]}},
         }
     )
     planner = Planner(SingleIntegrator(), 3, config={"max_iters": 1})

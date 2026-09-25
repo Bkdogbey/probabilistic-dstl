@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from pdstl.predicates import GreaterThan
-from planning.environment import MovingRectangleRegion
+from planning.environment import MovingRectangleRegion, safety_event
 
 COLORS = {
     "mean": "tab:blue",
@@ -22,8 +22,16 @@ COLORS = {
     "score": "tab:purple",
     "ellipse": "tab:cyan",
     "traffic": "tab:red",
+    "target": "goldenrod",
 }
-CHI95_RADIUS = sqrt(-2 * log(0.05))
+
+
+def _chi2_radius(confidence):
+    """Mahalanobis radius of a 2-D Gaussian's `confidence` region."""
+    return sqrt(-2 * log(1 - confidence))
+
+
+CHI95_RADIUS = _chi2_radius(0.95)
 
 
 class VehiclePatch(patches.Polygon):
@@ -113,19 +121,19 @@ def _interval_text(interval):
     return f"pdSTL probability interval: [{lower:.3f}, {upper:.3f}]"
 
 
-def _ellipse_parameters(covariance):
-    """Width, height, and angle of a joint 95% two-dimensional belief ellipse."""
+def _ellipse_parameters(covariance, confidence=0.95):
+    """Width, height, and angle of a joint two-dimensional belief ellipse."""
     covariance = np.asarray(covariance)[:2, :2]
     values, vectors = np.linalg.eigh(covariance)
     order = np.argsort(values)[::-1]
     values, vectors = np.maximum(values[order], 0), vectors[:, order]
     angle = np.degrees(np.arctan2(vectors[1, 0], vectors[0, 0]))
-    width, height = 2 * CHI95_RADIUS * np.sqrt(values)
+    width, height = 2 * _chi2_radius(confidence) * np.sqrt(values)
     return width, height, angle
 
 
-def _ellipse(ax, mean, covariance, *, label=None):
-    width, height, angle = _ellipse_parameters(covariance)
+def _ellipse(ax, mean, covariance, *, label=None, confidence=0.95):
+    width, height, angle = _ellipse_parameters(covariance, confidence)
     ellipse = patches.Ellipse(
         mean[:2],
         width,
@@ -159,30 +167,37 @@ def _ellipse_indices(mean, every, minimum_distance=0.35):
     return selected
 
 
-def _draw_goal_region(ax, region):
-    color = region.style.get("color", COLORS["goal"])
+def _draw_task_region(ax, region):
+    """A goal or target box, tagged with its name."""
+    color = COLORS[region.role]
     ax.add_patch(
         patches.Rectangle(
             (region.xmin, region.ymin),
             region.xmax - region.xmin,
             region.ymax - region.ymin,
             facecolor=color,
-            edgecolor=region.style.get("edgecolor", COLORS["goal"]),
-            alpha=region.style.get("alpha", 0.35),
-            label="Goal",
+            edgecolor=color,
+            alpha=0.35,
+            label=region.role.capitalize(),
         )
     )
     ax.text(
         (region.xmin + region.xmax) / 2,
-        region.ymin + 0.75 * (region.ymax - region.ymin),
-        "G",
-        color=COLORS["goal"],
-        fontsize=16,
+        (region.ymin + region.ymax) / 2,
+        region.name,
+        color=color,
+        fontsize=9,
         fontweight="bold",
         ha="center",
         va="center",
         zorder=9,
     )
+
+
+def _step_safety(result, env):
+    """Exact per-step lower bound of the environment's safety event."""
+    trace = safety_event(env)(result.rollout.belief_trajectory)
+    return _np(trace)[0, :, 0]
 
 
 def _draw_environment(ax, env, *, lane=False):
@@ -291,28 +306,25 @@ def _draw_environment(ax, env, *, lane=False):
                     region.xmax - region.xmin,
                     region.ymax - region.ymin,
                     fill=False,
-                    edgecolor=region.style.get("color", COLORS["workspace"]),
+                    edgecolor=COLORS["workspace"],
                     linewidth=1.3,
-                    label="Workspace",
                 )
             )
             ax.set_xlim(region.xmin, region.xmax)
             ax.set_ylim(region.ymin, region.ymax)
-        elif region.role == "goal" and not lane:
-            _draw_goal_region(ax, region)
+        elif region.role in ("goal", "target") and not lane:
+            _draw_task_region(ax, region)
         elif region.role == "obstacle":
             ax.add_patch(
                 patches.Rectangle(
                     (region.xmin, region.ymin),
                     region.xmax - region.xmin,
                     region.ymax - region.ymin,
-                    facecolor=region.style.get("color", COLORS["obstacle"]),
-                    edgecolor=region.style.get(
-                        "edgecolor", COLORS["obstacle"]
-                    ),
-                    alpha=region.style.get("alpha", 0.45),
-                    hatch=region.style.get("hatch", "//"),
-                    label="Obstacles",
+                    facecolor=COLORS["obstacle"],
+                    edgecolor=COLORS["obstacle"],
+                    alpha=0.45,
+                    hatch="//",
+                    label="Obstacle",
                 )
             )
     ax.set_xlabel("x [m]" if not lane else "x position [m]")
@@ -484,30 +496,41 @@ def plot_reach_avoid(
     result,
     env,
     *,
-    initial=None,
     dt=1.0,
     u_max=1.0,
+    control_unit="m/s",
     title="Reach–Avoid",
     ellipse_every=4,
+    ellipse_confidence=0.95,
+    alternatives=(),
     save_path=None,
     show=False,
 ):
-    """Show the initial and selected plans, controls, and score histories."""
+    """Map, controls, and bound history of a reach-avoid plan.
+
+    Args:
+        result: Selected PlanResult.
+        env: Its Environment.
+        alternatives: Other routes' plans, drawn faintly.
+
+    Returns:
+        (figure, (map, controls, scores) axes).
+    """
     fig = plt.figure(figsize=(13, 7), layout="constrained")
     grid = fig.add_gridspec(2, 2, width_ratios=(1.55, 1.0))
     ax = fig.add_subplot(grid[:, 0])
     ax_controls = fig.add_subplot(grid[0, 1])
     ax_scores = fig.add_subplot(grid[1, 1])
     _draw_environment(ax, env)
-    if initial is not None:
-        initial_mean = _np(initial.rollout.aux["mean_trace"])[0]
+    for alternative in alternatives:
+        other = _np(alternative.rollout.aux["mean_trace"])[0]
         ax.plot(
-            initial_mean[:, 0],
-            initial_mean[:, 1],
-            color=COLORS["workspace"],
-            linestyle="--",
-            linewidth=1.6,
-            label="Initial belief mean",
+            other[:, 0],
+            other[:, 1],
+            color=COLORS["mean"],
+            alpha=0.3,
+            linewidth=1.3,
+            label="Other routes",
             zorder=7,
         )
     mean = _np(result.rollout.aux["mean_trace"])[0]
@@ -517,26 +540,12 @@ def plot_reach_avoid(
         mean[:, 1],
         color=COLORS["mean"],
         linewidth=2.2,
-        label="Selected belief mean",
+        label="Plan",
         zorder=8,
     )
+    ax.scatter(*mean[0, :2], marker="o", s=55, color="black", zorder=10)
     ax.scatter(
-        [mean[0, 0]],
-        [mean[0, 1]],
-        marker="o",
-        s=55,
-        color="black",
-        label="Start",
-        zorder=10,
-    )
-    ax.scatter(
-        [mean[-1, 0]],
-        [mean[-1, 1]],
-        marker="s",
-        s=55,
-        color=COLORS["mean"],
-        label="Terminal belief mean",
-        zorder=10,
+        *mean[-1, :2], marker="s", s=55, color=COLORS["mean"], zorder=10
     )
     indices = _ellipse_indices(mean, ellipse_every)
     for index in indices:
@@ -544,18 +553,31 @@ def plot_reach_avoid(
             ax,
             mean[index],
             covariance[index],
-            label="95% belief ellipse" if index == indices[0] else None,
+            label=f"{100 * ellipse_confidence:g}% ellipse"
+            if index == indices[0]
+            else None,
+            confidence=ellipse_confidence,
         )
+    safety = _step_safety(result, env)
+    worst = 1 + int(np.argmin(safety[1:]))
+    ax.scatter(
+        *mean[worst, :2],
+        marker="x",
+        s=70,
+        color=COLORS["obstacle"],
+        label=f"Min P(safe) = {safety[worst]:.3f}",
+        zorder=11,
+    )
     if result.threshold_met is None:
-        status = "no threshold requested"
+        status = "no alpha requested"
     else:
         status = (
-            "threshold achieved"
+            f"certified ≥ α={result.alpha:.2f}"
             if result.threshold_met
-            else "threshold not achieved"
+            else f"below α={result.alpha:.2f}"
         )
     ax.set_title(title, fontweight="bold")
-    _unique_legend(ax, loc="best")
+    _unique_legend(ax, loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=4)
 
     control_time = dt * np.arange(len(result.controls))
     controls = _np(result.controls)
@@ -568,7 +590,7 @@ def plot_reach_avoid(
             label=label,
         )
     ax_controls.set(
-        ylabel="control [m/s]",
+        ylabel=f"control [{control_unit}]",
         ylim=(-1.1 * u_max, 1.1 * u_max),
         title="Selected controls",
     )
@@ -581,14 +603,14 @@ def plot_reach_avoid(
         result.smooth_history,
         color=COLORS["score"],
         linewidth=1.7,
-        label="Smooth surrogate",
+        label="Smooth lower (sound)",
     )
     ax_scores.plot(
         candidates,
         result.hard_lower_history,
         color=COLORS["mean"],
         linewidth=1.7,
-        label="Hard lower score",
+        label="Exact lower bound",
     )
     if result.alpha is not None:
         ax_scores.axhline(
@@ -596,7 +618,7 @@ def plot_reach_avoid(
             color=COLORS["obstacle"],
             linestyle="--",
             linewidth=1.1,
-            label=f"Required alpha={result.alpha:.2f}",
+            label=f"Certification α={result.alpha:.2f}",
         )
     selected = result.selected_iteration + 1
     ax_scores.scatter(
@@ -609,10 +631,10 @@ def plot_reach_avoid(
     )
     ax_scores.set(
         xlabel="candidate (0 = initial)",
-        ylabel="score",
+        ylabel="probability bound",
         ylim=(-0.03, 1.03),
         title=(
-            f"Hard pdSTL [{result.hard_interval[0]:.3f}, "
+            f"Exact pdSTL [{result.hard_interval[0]:.3f}, "
             f"{result.hard_interval[1]:.3f}] · {status}\n"
             f"cost={result.control_cost:.3f}, "
             f"planning={result.planning_time:.2f} s"

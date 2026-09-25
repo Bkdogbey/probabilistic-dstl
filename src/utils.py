@@ -26,17 +26,17 @@ def load_config(path):
     """Load YAML from the requested path, repository configs, or wheel data."""
     candidate = Path(path)
     if candidate.is_file():
-        return yaml.safe_load(candidate.read_text())
+        return yaml.safe_load(candidate.read_text(encoding="utf-8"))
     if candidate.is_absolute():
         raise FileNotFoundError(candidate)
     repository_file = Path(__file__).resolve().parents[1] / candidate
     if repository_file.is_file():
-        return yaml.safe_load(repository_file.read_text())
+        return yaml.safe_load(repository_file.read_text(encoding="utf-8"))
     installed_file = (
         Path(sys.prefix) / "share" / "probabilistic-dstl" / candidate
     )
     if installed_file.is_file():
-        return yaml.safe_load(installed_file.read_text())
+        return yaml.safe_load(installed_file.read_text(encoding="utf-8"))
     raise FileNotFoundError(path)
 
 
