@@ -1,20 +1,36 @@
-"""pdSTL planning demos.
+"""Run each experiment by setting its block to "run" or "skip".
 
-scenario -> dynamics -> Gaussian beliefs b_0:H(u) -> event probabilities -> pdSTL interval -> Planner"""
+Figures are shown, then saved to outputs/ when closed.
+"""
 
-from planning.runners import run_altitude_safety, run_reach_avoid
-from utils import load_config, skip_run
+from experiments import lane, reach_avoid
+from utils import skip_run
 
-show_plots = load_config("configs/examples.yaml")["show_plots"]
-
-
-# 1. AltitudeSafety: 1-D altitude, Always[1,H](z >= 50 m)
-with skip_run("run", "AltitudeSafety") as check, check():
-    print("\nAltitudeSafety")
-    run_altitude_safety(show=show_plots, save=True)
+REACH_AVOID = "configs/scenarios/reach_avoid"
+LANE = "configs/scenarios/lane"
+LIVE = {"live": True, "optimization_every": 1}  # plot and print each iterate
 
 
-# 2. ReachAvoid: 2-D position, Always[1,H](outside obstacle) and Eventually[1,H](inside goal)
+# 1. Reach-avoid: one obstacle
 with skip_run("run", "ReachAvoid") as check, check():
-    print("\nReachAvoid")
-    run_reach_avoid(show=show_plots, save=True)
+    reach_avoid.run(f"{REACH_AVOID}/obstacle.yaml", **LIVE)
+
+
+# 2. Reach-avoid (stlpy NarrowPassage): goal A or B past four obstacles
+with skip_run("skip", "NarrowPassage") as check, check():
+    reach_avoid.run(f"{REACH_AVOID}/narrow_passage.yaml", **LIVE)
+
+
+# 3. Reach-avoid (stlpy EitherOr): dwell in t1 or t2, then reach the goal
+with skip_run("run", "EitherOr") as check, check():
+    reach_avoid.run(f"{REACH_AVOID}/either_or.yaml", **LIVE)
+
+
+# 4. Lane change into the faster lane
+with skip_run("skip", "LaneChange") as check, check():
+    lane.run(f"{LANE}/lane_change.yaml", live_optimization=True)
+
+
+# 5. On-ramp merge into the main lane
+with skip_run("skip", "LaneMerge") as check, check():
+    lane.run(f"{LANE}/lane_merge.yaml", live_optimization=True)

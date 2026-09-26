@@ -1,371 +1,365 @@
-from typing import NamedTuple
+"""Gradient ascent on the smooth pdSTL lower bound, and a receding-horizon loop."""
+
+import logging
+from dataclasses import dataclass, field
+from time import perf_counter
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
 
-from models.rollouts import BeliefRollout, gaussian_rollout
-from planning import log_utils
+from models.rollouts import BeliefRollout
 from utils import load_config
 
+logger = logging.getLogger(__name__)
 
-class PlanCandidate(NamedTuple):
-    """One scored control sequence; every field comes from the same iterate."""
+
+@dataclass
+class PlanResult:
+    controls: torch.Tensor  # [H, control_dim], physical controls
+    rollout: BeliefRollout
+    smooth_lower: float
+    hard_interval: tuple[float, float]
+    loss_history: list[float]
+    final_loss: float
+    smoothing_beta: float
+    planning_time: float = 0.0
+    control_cost: float = 0.0
+    alpha: float | None = None
+    threshold_met: bool | None = None
+    selected_iteration: int = -1
+    hard_lower_history: list[float] = field(default_factory=list)
+    initial_hard_lower: float | None = None
+    initial_smooth_lower: float | None = None
+    monte_carlo: tuple[float, float, float] | None = None
+
+    def alpha_status(self):
+        """Whether the lower robustness meets alpha, in words."""
+        if self.alpha is None:
+            return "no α requested"
+        relation = "meets" if self.threshold_met else "below"
+        return f"{relation} α = {self.alpha:.2f}"
+
+
+@dataclass
+class IterationRecord:
+    """One post-update iterate, without a rollout or copied history."""
 
     controls: torch.Tensor
-    rollout: BeliefRollout
-    optimization_score: float  # smooth surrogate used for gradients; not a probability bound
-    exact_lower: float
-    pdstl_interval: tuple  # exact [R_lower, R_upper]
-    control_cost: float
-    objective: float
-    iteration: int | None = None
+    loss: float
+    smooth_lower: float
+    hard_interval: tuple[float, float] | None
+    beta: float
+    control_cost: float = 0.0
+
+
+@dataclass
+class MPCResult:
+    states: list
+    applied_controls: torch.Tensor  # [steps, control_dim]
+    window_plans: list[PlanResult]
+    stopped_reason: str
+    failure_detail: str | None = None
 
 
 class Planner:
-    """Gradient-based pdSTL planner over any belief rollout."""
+    """Optimize controls for any belief rollout and pdSTL spec.
 
-    def __init__(self, dynamics, environment, T, config=None):
-        self.dyn = dynamics
-        self.env = environment
-        self.T = T
+    rollout(v) maps unconstrained parameters v to a BeliefRollout. The planner
+    ascends the smooth lower bound (plus small control regularizers) for
+    max_iters steps and returns the iterate with the highest exact lower
+    robustness. Alpha is used only to report whether that iterate meets the
+    requested threshold.
+    """
+
+    def __init__(self, dynamics, horizon, config=None):
+        defaults = load_config("configs/planning.yaml")
+        config = config or {}
+        unknown = set(config) - set(defaults)
+        if unknown:
+            raise ValueError(f"unknown planner settings: {sorted(unknown)}")
+        self.dyn, self.horizon = dynamics, horizon
         self.device = dynamics.device
-
-        defaults, config = load_config("configs/planning.yaml"), config or {}
         self.cfg = {**defaults, **config}
-        self.cfg["smoothing"] = {**defaults["smoothing"], **config.get("smoothing", {})}
-
-    def _control_parameters(self, controls):
-        """Inverse of bound_control, clipped inside the bound."""
-        u_norm = torch.clamp(controls / (self.dyn.u_max + 1e-6), -0.99, 0.99)
-        return 0.5 * torch.log((1 + u_norm) / (1 - u_norm))
-
-    def _init_controls(self, init_guess):
-        if init_guess is not None:
-            v_init = self._control_parameters(init_guess)
-            return nn.Parameter(v_init.to(self.device), requires_grad=True)
-        offset = torch.zeros(self._control_dim, device=self.device)
-        offset[0] = 0.5
-        return nn.Parameter(
-            torch.randn(self.T, self._control_dim, device=self.device) * 0.1 + offset,
-            requires_grad=True,
-        )
+        self.cfg["smoothing"] = {
+            **defaults["smoothing"],
+            **config.get("smoothing", {}),
+        }
 
     @property
-    def _control_dim(self):
+    def control_dim(self):
         return self.dyn.B.shape[1]
 
-    # --- Optional shaping heuristics (legacy; off in the pdSTL demos) -----------
+    def _control_parameters(self, controls, *, margin=1e-3):
+        controls = torch.as_tensor(
+            controls, device=self.device, dtype=self.dyn.B.dtype
+        )
+        if controls.shape != (self.horizon, self.control_dim):
+            raise ValueError("controls must have shape [horizon, control_dim]")
+        if (
+            not torch.isfinite(controls).all()
+            or (controls.abs() > self.dyn.u_max).any()
+        ):
+            raise ValueError(
+                "controls must be finite and within the control bounds"
+            )
+        # A finite inverse is necessary at exact saturation.
+        return torch.atanh(
+            (controls / self.dyn.u_max).clamp(-1 + margin, 1 - margin)
+        )
 
-    def _goal_dist_loss(self, mean_trace):
-        """Squared distance from final position to goal centre."""
-        if self.env.goal is None:
-            return torch.tensor(0.0, device=self.device)
-        gx = sum(self.env.goal["x"]) / 2.0
-        gy = sum(self.env.goal["y"]) / 2.0
-        goal_center = torch.tensor([[gx, gy]], device=self.device)
-        return torch.sum((mean_trace[:, -1, :2] - goal_center) ** 2)
-
-    def _obs_repulsion_loss(self, mean_trace):
-        """Penalise trajectory points that are too close to obstacle centres."""
-        loss = torch.tensor(0.0, device=self.device)
-        margin = self.cfg["obs_margin"]
-
-        for obs in self.env.obstacles:
-            cx = (obs["x"][0] + obs["x"][1]) / 2.0
-            cy = (obs["y"][0] + obs["y"][1]) / 2.0
-            center = torch.tensor([[cx, cy]], device=self.device)
-            radius = max(obs["x"][1] - obs["x"][0], obs["y"][1] - obs["y"][0]) / 2.0 + margin
-            dists = torch.norm(mean_trace[:, :, :2] - center, dim=2)
-            loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
-
-        for obs in self.env.circle_obstacles:
-            center = torch.tensor([obs["center"]], device=self.device)
-            radius = obs["radius"] + margin
-            dists = torch.norm(mean_trace[:, :, :2] - center, dim=2)
-            loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
-
-        for obs in self.env.moving_obstacles:
-            ox = torch.as_tensor(obs["x_traj"], device=self.device)
-            oy = torch.as_tensor(obs["y_traj"], device=self.device)
-            centers = torch.stack([ox, oy], dim=1).unsqueeze(0)  # [1, T+1, 2]
-            radius = max(obs["width"], obs["height"]) / 2.0 + margin
-            dists = torch.norm(mean_trace[:, :, :2] - centers, dim=2)
-            loss = loss + torch.sum(torch.relu(radius - dists) ** 2)
-
-        return loss
-
-    def _visit_loss(self, mean_trace):
-        """Pull trajectory towards visit regions (Eventually semantics)."""
-        loss = torch.tensor(0.0, device=self.device)
-        for region in self.env.visit_regions:
-            vx = (region["x"][0] + region["x"][1]) / 2.0
-            vy = (region["y"][0] + region["y"][1]) / 2.0
-            v_center = torch.tensor([[vx, vy]], device=self.device)
-            dists_sq = torch.sum((mean_trace[:, :, :2] - v_center) ** 2, dim=2)
-            min_dist_sq, _ = torch.min(dists_sq, dim=1)
-            loss = loss + torch.sum(min_dist_sq)
-        return loss
+    def _init_controls(self, init_guess):
+        values = (
+            torch.zeros(
+                self.horizon,
+                self.control_dim,
+                device=self.device,
+                dtype=self.dyn.B.dtype,
+            )
+            if init_guess is None
+            else self._control_parameters(init_guess)
+        )
+        return torch.nn.Parameter(values.detach().clone())
 
     def _control_cost(self, controls):
-        """w_u |u|^2 + w_du (|du|^2 + |u_0|^2)."""
-        smoothness = torch.sum((controls[1:] - controls[:-1]) ** 2) + torch.sum(controls[0] ** 2)
-        return self.cfg["w_u"] * torch.sum(controls**2) + self.cfg["w_du"] * smoothness
-
-    def _objective(self, nominal_trace, controls, optimization_score):
-        """J = -w_phi * optimization_score + control cost + enabled shaping."""
-        objective = -self.cfg["w_phi"] * optimization_score + self._control_cost(controls)
-        shaping = (
-            ("w_dist", self._goal_dist_loss),
-            ("w_obs", self._obs_repulsion_loss),
-            ("w_visit", self._visit_loss),
+        smoothness = (controls[1:] - controls[:-1]).square().sum()
+        return (
+            self.cfg["w_u"] * controls.square().sum()
+            + self.cfg["w_du"] * smoothness
         )
-        for key, term in shaping:
-            if self.cfg[key]:
-                if nominal_trace is None:
-                    raise ValueError(
-                        f"{key} shaping requires a rollout nominal_trace"
-                    )
-                objective = objective + self.cfg[key] * term(nominal_trace)
-        return objective
 
-    def _beta(self, k):
-        """Smoothing beta at iteration k (geometric from beta_start to beta_end), or None if off."""
+    def _objective(self, controls, smooth_lower):
+        return -self.cfg["w_phi"] * smooth_lower + self._control_cost(controls)
+
+    def _applied_controls(self, prediction, parameters):
+        if prediction.aux is not None and "applied_controls" in prediction.aux:
+            return prediction.aux["applied_controls"]
+        return self.dyn.bound_control(parameters)
+
+    def _beta(self, iteration):
         smoothing = self.cfg["smoothing"]
-        if not smoothing["enabled"]:
-            return None
         start, end = smoothing["beta_start"], smoothing["beta_end"]
-        return start * (end / start) ** (k / max(self.cfg["max_iters"] - 1, 1))
-
-    def _scores(self, phi, belief_trajectory, beta=None):
-        """Optimization score (graph kept) and exact pdSTL interval [R_lower, R_upper] (detached)."""
-        if beta is None:
-            exact = phi(belief_trajectory, scale=-1)[0, 0]
-            return exact[0], exact.detach()
-        score = phi(belief_trajectory, scale=beta)[0, 0, 0]
-        with torch.no_grad():
-            exact = phi(belief_trajectory, scale=-1)[0, 0]
-        return score, exact
-
-    def _candidate(self, phi, rollout, v, beta=None):
-        """Score parameters v; returns (PlanCandidate, objective with graph)."""
-        predicted = rollout(v)
-        controls = self.dyn.bound_control(v)
-        score, exact = self._scores(phi, predicted.belief_trajectory, beta)
-        objective = self._objective(predicted.nominal_trace, controls, score)
-
-        candidate = PlanCandidate(
-            controls=controls.detach().clone(),
-            rollout=predicted.detach_diagnostics(),
-            optimization_score=score.item(),
-            exact_lower=exact[0].item(),
-            pdstl_interval=tuple(exact.tolist()),
-            control_cost=self._control_cost(controls).item(),
-            objective=objective.item(),
+        if self.cfg["max_iters"] == 1:
+            return end
+        return start * (end / start) ** (
+            iteration / max(self.cfg["max_iters"] - 1, 1)
         )
-        return candidate, objective
+
+    def _evaluate(self, rollout, parameters, spec, beta, history):
+        with torch.no_grad():
+            prediction = rollout(parameters)
+            controls = (
+                self._applied_controls(prediction, parameters).detach().clone()
+            )
+            smooth = spec.smooth_lower(
+                prediction.belief_trajectory, beta
+            ).item()
+            control_cost = self._control_cost(controls).item()
+            loss = self._objective(controls, smooth).item()
+            interval = spec.probability_interval(prediction.belief_trajectory)
+            hard_interval = tuple(interval.tolist())
+            alpha = self.cfg["alpha"]
+            return PlanResult(
+                controls,
+                prediction,
+                smooth,
+                hard_interval,
+                list(history),
+                loss,
+                beta,
+                control_cost=control_cost,
+                alpha=alpha,
+                threshold_met=(
+                    None if alpha is None else hard_interval[0] >= alpha
+                ),
+                hard_lower_history=[hard_interval[0]],
+            )
 
     def evaluate_controls(self, rollout, controls, *, spec):
-        """Score given controls [T, m]; the optimization score uses the final beta."""
-        v = self._control_parameters(controls.to(self.device))
-        candidate, _ = self._candidate(spec, rollout, v, self._beta(self.cfg["max_iters"] - 1))
-        return candidate
-
-    @staticmethod
-    def _better(candidate, best):
-        """Higher exact lower pdSTL score wins; control cost breaks ties."""
-        if best is None:
-            return True
-        return (candidate.exact_lower, -candidate.control_cost) > (best.exact_lower, -best.control_cost)
-
-    def optimize_window(
-        self, rollout, *, spec=None, env=None, init_guess=None, verbose=False,
-        on_iteration=None,
-    ):
-        """Descend the smooth objective; return the iterate with the best exact pdSTL score.
-
-        Returns (best candidate, objective history). on_iteration(k, candidate) only observes."""
-        saved_env = self.env
-        if env is not None:
-            self.env = env
-        phi = spec if spec is not None else self.env.get_specification(self.T)
-
-        v = self._init_controls(init_guess)
-        optimizer = optim.Adam([v], lr=self.cfg["lr"])
-        best, history, converged_iters = None, [], 0
-
-        if verbose:
-            log_utils._log.info(f"Starting optimisation (max iters: {self.cfg['max_iters']})")
-
-        for k in range(self.cfg["max_iters"]):
-            optimizer.zero_grad()
-            beta = self._beta(k)
-            candidate, objective = self._candidate(phi, rollout, v, beta)
-            candidate = candidate._replace(iteration=k)
-            history.append(candidate.objective)
-            if on_iteration is not None:
-                on_iteration(k, candidate)
-            if self._better(candidate, best):
-                best = candidate
-
-            objective.backward()
-            optimizer.step()
-
-            if candidate.exact_lower >= self.cfg["alpha"]:
-                converged_iters += 1
-                if converged_iters >= self.cfg["converge_patience"]:
-                    if verbose:
-                        log_utils._log.info(f"Converged at iter {k}. Exact lower: {candidate.exact_lower:.4f}")
-                    break
-            else:
-                converged_iters = 0
-
-            # While beta anneals the objective itself moves, so the plateau test waits for a fixed beta.
-            plateau = k > self.cfg["min_iters"] and beta == self._beta(k - 1)
-            if plateau and abs(history[-2] - history[-1]) < self.cfg["loss_tol"]:
-                if verbose:
-                    log_utils._log.info(f"Loss converged at iter {k}.")
-                break
-
-            if verbose and k % 50 == 0:
-                log_utils._log.info(
-                    f"Iter {k:03d} | Objective: {candidate.objective:.4f} | "
-                    f"Exact lower: {candidate.exact_lower:.4f} | Best exact lower: {best.exact_lower:.4f}"
-                )
-
-        self.env = saved_env
-        return best, history
-
-    def run_receding_horizon(
-        self, state, *, make_rollout, execute, is_done, spec, max_steps, init_guess=None
-    ):
-        """Plan, execute the first control, observe, replan until is_done or max_steps."""
-        states, applied, candidates, warm_starts = [state], [], [], []
-        guess = init_guess
-        while not is_done(state) and len(applied) < max_steps:
-            best, _ = self.optimize_window(make_rollout(state), spec=spec, init_guess=guess)
-            warm_starts.append(guess)
-            candidates.append(best)
-            state = execute(state, best.controls[0])
-            states.append(state)
-            applied.append(best.controls[0])
-            guess = self._shift_controls(best.controls)
-
-        return {
-            "states": states,
-            "u_trace": self._stack_controls(applied),
-            "candidates": candidates,
-            "warm_starts": warm_starts,
-            "stopped_reason": "goal_reached" if is_done(state) else "max_steps",
-        }
-
-    def _empty_u_trace(self):
-        return torch.empty(1, 0, self._control_dim, device=self.device)
-
-    def _stack_controls(self, controls):
-        return torch.stack(controls).unsqueeze(0) if controls else self._empty_u_trace()
-
-    def _shift_controls(self, prev_u_sol):
-        if prev_u_sol is None:
-            return None
-        return torch.cat([prev_u_sol[1:], prev_u_sol[-1:]], dim=0)
-
-    # --- Legacy environment scenarios (single shot, MPC, lane change) -------------
-
-    def _goal_center(self, env):
-        if env.goal is None:
-            return None
-        gx, gy = env.goal["x"], env.goal["y"]
-        return torch.tensor([(gx[0] + gx[1]) / 2, (gy[0] + gy[1]) / 2], device=self.device)
-
-    def _log_lane_change_step(self, step, curr_mean, best_p):
-        obs_pos = self.env.moving_obstacle_position(step)
-        if obs_pos is None or step % 5:
-            return
-        obs = torch.as_tensor(obs_pos, device=self.device, dtype=curr_mean.dtype)
-        dist = torch.linalg.norm(curr_mean[:2] - obs).item()
-        log_utils.log_lane_step(step, curr_mean.detach().cpu().numpy(), obs_pos[0], dist, best_p)
-
-    def _lane_change_success(self, curr_mean, success_counter):
-        if self.env.success is None:
-            return success_counter, False
-        success = self.env.success
-        success_counter = success_counter + 1 if success["y_min"] <= curr_mean[1].item() <= success["y_max"] else 0
-        return success_counter, success_counter >= success["consecutive_steps"]
-
-    def _run_mpc(self, x0_mean, x0_cov, *, step_callback=None):
-        """MPC with sampled execution: T_SIM fixed steps (optionally lane change) or MAX_STEPS to goal."""
-        fixed = "T_SIM" in self.cfg
-        lane_change = self.cfg.get("mpc_mode") == "lane_change"
-        goal_center = None if fixed else self._goal_center(self.env)
-        stopped_reason = "T_SIM" if fixed else "MAX_STEPS"
-
-        mean, cov = x0_mean, x0_cov
-        means, covs, controls, p_sat, losses, plans = [mean], [cov], [], [], [], []
-        prev_u, success_counter = None, 0
-
-        for step in range(self.cfg["T_SIM"] if fixed else self.cfg["MAX_STEPS"]):
-            dist = None
-            if goal_center is not None:
-                dist = torch.norm(mean[:2] - goal_center)
-                if dist < self.cfg.get("goal_reached_dist", 1.0):
-                    stopped_reason = "goal_reached"
-                    log_utils.log_goal_reached(step)
-                    break
-
-            env = self.env.make_local_lane_change_window(step, mean, self.cfg) if lane_change else None
-            best, history = self.optimize_window(
-                gaussian_rollout(self.dyn, mean, cov), env=env, init_guess=self._shift_controls(prev_u)
-            )
-            prev_u, plan = best.controls, best.rollout.aux["mean_trace"]
-            plans.append(plan)
-            p_sat.append(best.exact_lower)
-            losses.append(history[-1] if history else 0.0)
-
-            mean, cov = self.dyn.sample_step(mean, cov, best.controls[0])
-            means.append(mean)
-            covs.append(cov)
-            controls.append(best.controls[0])
-
-            if step_callback is not None:
-                step_callback(step, mean, cov, plan, best.exact_lower)
-
-            if lane_change:
-                self._log_lane_change_step(step, mean, best.exact_lower)
-                success_counter, done = self._lane_change_success(mean, success_counter)
-                if done:
-                    stopped_reason = "lane_change_success"
-                    log_utils.log_lane_change_done(self.env.label, step)
-                    break
-            elif not fixed:
-                distance = dist.item() if dist is not None else 0.0
-                log_utils.log_mpc_step(step, mean.cpu().numpy(), distance, best.exact_lower)
-
-        return self._pack_result(
-            torch.stack(means).unsqueeze(0), torch.stack(covs).unsqueeze(0), self._stack_controls(controls),
-            p_sat, losses, plans, mode="mpc_fixed" if fixed else "mpc_goal", stopped_reason=stopped_reason,
+        """Score given controls: smooth bound at beta_end and exact interval."""
+        margin = torch.finfo(self.dyn.B.dtype).eps
+        return self._evaluate(
+            rollout,
+            self._control_parameters(controls, margin=margin),
+            spec,
+            self.cfg["smoothing"]["beta_end"],
+            [],
         )
 
-    def _pack_result(self, mean_trace, cov_trace, u_trace, p_sat_trace, loss_trace, all_plans, *, mode, stopped_reason):
-        return {
-            "mean_trace": mean_trace,
-            "cov_trace": cov_trace,
-            "u_trace": u_trace,
-            "p_sat_trace": p_sat_trace,
-            "loss_trace": loss_trace,
-            "history": loss_trace,
-            "all_plans": all_plans,
-            "best_p": max(p_sat_trace) if p_sat_trace else 0.0,
-            "mode": mode,
-            "stopped_reason": stopped_reason,
-        }
+    def optimize_window(
+        self,
+        rollout,
+        *,
+        spec,
+        init_guess=None,
+        verbose=False,
+        on_iteration=None,
+        callback_every=1,
+    ):
+        """Adam steps from init_guess for max_iters; keep the best exact iterate.
 
-    def solve(self, x0_mean, x0_cov, *, verbose=True, step_callback=None):
-        """Legacy entry: MPC if the config has T_SIM or MAX_STEPS, else one window."""
-        if "T_SIM" in self.cfg or "MAX_STEPS" in self.cfg:
-            return self._run_mpc(x0_mean, x0_cov, step_callback=step_callback)
-        best, history = self.optimize_window(gaussian_rollout(self.dyn, x0_mean, x0_cov), verbose=verbose)
-        return self._pack_result(
-            best.rollout.aux["mean_trace"], best.rollout.aux["cov_trace"], best.controls,
-            [best.exact_lower], history, [], mode="single_shot", stopped_reason="optimized",
+        Iterate -1 is the initial guess; its exact and smooth lower bounds
+        (at beta_end) are kept as `initial_hard_lower` / `initial_smooth_lower`.
+        Alpha only determines the reported threshold status.
+        on_iteration(iteration, record) observes every `callback_every`-th
+        iterate and the last one.
+        """
+        max_iters = self.cfg["max_iters"]
+        parameters = self._init_controls(init_guess)
+        initial = self._evaluate(
+            rollout,
+            parameters.detach().clone(),
+            spec,
+            self.cfg["smoothing"]["beta_end"],
+            [],
+        )
+        started = perf_counter()
+        optimizer = torch.optim.Adam([parameters], lr=self.cfg["lr"])
+        candidates, history, hard_history = [], [], []
+        for step in range(max_iters + 1):
+            iteration = step - 1
+            beta = self._beta(min(step, max_iters - 1))
+            optimizer.zero_grad()
+            prediction = rollout(parameters)
+            lower = spec.smooth_lower(prediction.belief_trajectory, beta)
+            controls = self._applied_controls(prediction, parameters)
+            loss = self._objective(controls, lower)
+            if not torch.isfinite(loss):
+                raise ValueError("planning loss is not finite")
+            with torch.no_grad():
+                interval = spec.probability_interval(
+                    prediction.belief_trajectory
+                )
+            record = IterationRecord(
+                controls.detach().clone(),
+                loss.item(),
+                lower.item(),
+                tuple(interval.tolist()),
+                beta,
+                self._control_cost(controls).item(),
+            )
+            candidates.append((iteration, record))
+            hard_history.append(record.hard_interval[0])
+            if iteration >= 0:
+                history.append(record.loss)
+                observe = on_iteration is not None and (
+                    iteration == 0
+                    or (iteration + 1) % callback_every == 0
+                    or iteration == max_iters - 1
+                )
+                if observe:
+                    on_iteration(iteration, record)
+                if verbose and iteration % 50 == 0:
+                    logger.info(
+                        "Iteration %d: loss %.6f, smooth lower %.6f, "
+                        "rho_lower %.6f",
+                        iteration,
+                        record.loss,
+                        record.smooth_lower,
+                        record.hard_interval[0],
+                    )
+            if step == max_iters:
+                break
+            loss.backward()
+            if (
+                parameters.grad is None
+                or not torch.isfinite(parameters.grad).all()
+            ):
+                raise ValueError(
+                    "rollout must supply finite gradients to controls"
+                )
+            optimizer.step()
+        result_iteration, selected = self._select_candidate(candidates)
+        result = self.evaluate_controls(rollout, selected.controls, spec=spec)
+        result.loss_history = history
+        result.hard_lower_history = hard_history
+        result.selected_iteration = result_iteration
+        result.initial_hard_lower = initial.hard_interval[0]
+        result.initial_smooth_lower = initial.smooth_lower
+        result.planning_time = perf_counter() - started
+        return result
+
+    @staticmethod
+    def _select_candidate(candidates):
+        """Highest exact lower bound; the later iterate wins a tie."""
+        return max(reversed(candidates), key=lambda c: c[1].hard_interval[0])
+
+    @staticmethod
+    def shift_controls(controls):
+        """Drop the executed control and repeat the last one."""
+        return torch.cat((controls[1:], controls[-1:])).detach().clone()
+
+    def run_receding_horizon(
+        self,
+        state,
+        *,
+        make_rollout,
+        execute,
+        make_spec,
+        is_done,
+        max_steps,
+        init_guess=None,
+        verbose=False,
+        on_step=None,
+        on_iteration=None,
+        callback_every=1,
+        capture_planning_failures=False,
+    ):
+        """Plan a window, execute its first control, shift, and repeat.
+
+        make_rollout, make_spec and is_done take (state, step); execute takes
+        (state, control, step) and returns the next state; on_step observes.
+        """
+        states, applied, plans = [state], [], []
+        failure_detail = None
+        guess = init_guess
+        reason = is_done(state, 0)
+        for step in range(max_steps):
+            if reason:
+                break
+            try:
+                plan = self.optimize_window(
+                    make_rollout(state, step),
+                    spec=make_spec(state, step),
+                    init_guess=guess,
+                    verbose=verbose,
+                    on_iteration=(
+                        (
+                            lambda iteration, record, step=step: on_iteration(
+                                step, iteration, record
+                            )
+                        )
+                        if on_iteration is not None
+                        else None
+                    ),
+                    callback_every=callback_every,
+                )
+            except (RuntimeError, ValueError) as error:
+                if not capture_planning_failures:
+                    raise
+                reason = "planning_failure"
+                failure_detail = f"{type(error).__name__}: {error}"
+                break
+            control = plan.controls[0].clone()
+            state = execute(state, control, step)
+            states.append(state)
+            applied.append(control)
+            plans.append(plan)
+            guess = self.shift_controls(plan.controls)
+            reason = is_done(state, step + 1)
+            if on_step is not None:
+                on_step(step, state, plan)
+        controls = (
+            torch.stack(applied)
+            if applied
+            else torch.empty(
+                0, self.control_dim, device=self.device, dtype=self.dyn.B.dtype
+            )
+        )
+        return MPCResult(
+            states,
+            controls,
+            plans,
+            (reason if isinstance(reason, str) else "goal_reached")
+            if reason
+            else "max_steps",
+            failure_detail,
         )

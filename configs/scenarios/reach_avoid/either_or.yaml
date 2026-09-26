@@ -1,0 +1,23 @@
+# Reach-avoid (stlpy EitherOr): dwell in t1 or t2, then reach the goal.
+name: Either–Or
+dynamics: double_integrator
+H: 60
+dt: 0.2
+u_max: 1.0
+q_std: 0.003
+x0_mean: [2.0, 2.0, 0.0, 0.0]
+x0_cov_scale: [0.01, 0.01, 0.0, 0.0]
+
+bounds: {x_range: [0, 10], y_range: [0, 10]}
+obstacles:
+  - {name: block, x_range: [3, 5], y_range: [4, 6]}
+goal: {x_range: [7, 8], y_range: [8, 9]}
+visit_regions:
+  - dwell: 5
+    any_of:
+      - {name: t1, x_range: [1, 2], y_range: [6, 7]}
+      - {name: t2, x_range: [7, 8], y_range: [4.5, 5.5]}
+
+route: {clearance: 0.05, resolution: 0.05}
+planner: {max_iters: 300, lr: 0.01, alpha: 0.9}
+visualization: {ellipse_every: 6, animation_fps: 8}

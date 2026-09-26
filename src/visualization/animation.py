@@ -1,241 +1,266 @@
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.transforms as transforms
-from matplotlib.animation import FuncAnimation
+"""GIFs: a reach-avoid plan step by step, and a lane execution."""
 
-from visualization.planning import (
-    PALETTE,
-    _altitude_axes,
-    _draw_altitude_plan,
-    _plan,
-    _to_np,
-    cov_ellipse_params,
-    draw_env_on_ax,
+from pathlib import Path
+
+import matplotlib
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+import numpy as np
+
+from visualization.figures import (
+    COLORS,
+    RHO_INTERVAL,
+    RHO_LOWER,
+    RHO_UPPER,
+    _draw_ego_vehicle,
+    _draw_environment,
+    _ellipse,
+    _ellipse_parameters,
+    _move_obstacle,
+    _move_ego_vehicle,
+    _np,
+    _style,
+    _unique_legend,
 )
 
 
-def animate_results(
-    mean_trace,
-    cov_trace,
+def _finish_animation(fig, movie, filename, fps, show):
+    if show and matplotlib.get_backend().lower() != "agg":
+        plt.show(block=True)
+    if filename is not None:
+        path = Path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        movie.save(path, writer=animation.PillowWriter(fps=fps))
+    plt.close(fig)
+
+
+def _frames(last_step, fps):
+    return [0] * fps + list(range(1, last_step + 1)) + [last_step] * fps
+
+
+def animate_reach_avoid(
+    result,
     env,
-    filename="trajectory.gif",
-    plan_traces=None,
-    step=1,
-    dt=0.2,
-    robot_dims=None,
-    title="Motion Planning",
-    bounds=None,
+    *,
+    dt,
+    title="Reach–Avoid",
+    filename=None,
+    fps=6,
+    show=False,
 ):
-    """Animate mean trajectory with covariance ellipses; save to file or display."""
-    mean_np = mean_trace.detach().cpu().squeeze().numpy()
-    cov_np = cov_trace.detach().cpu().squeeze().numpy()
-
-    T = mean_np.shape[0]
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    if bounds:
-        ax.set_xlim(bounds[0])
-        ax.set_ylim(bounds[1])
-    else:
-        ax.set_xlim(-5, 15)
-        ax.set_ylim(-4, 8)
-
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-    ax.set_title(title)
-
-    draw_env_on_ax(ax, env, draw_moving_path=False)
-
-    moving_patches = []
-    for obs in env.moving_obstacles:
-        w, h = obs["width"], obs["height"]
-        xt = np.asarray(
-            obs["x_traj"].detach().cpu() if isinstance(obs["x_traj"], torch.Tensor)
-            else obs["x_traj"]
-        )
-        yt = np.asarray(
-            obs["y_traj"].detach().cpu() if isinstance(obs["y_traj"], torch.Tensor)
-            else obs["y_traj"]
-        )
-        rect = patches.Rectangle(
-            (0, 0), w, h,
-            facecolor=PALETTE["obs_moving"]["fill"],
-            edgecolor=PALETTE["obs_moving"]["stroke"],
-            alpha=0.5,
-            label="Moving Obs",
-            zorder=6,
-        )
-        ax.add_patch(rect)
-        moving_patches.append((rect, w, h, xt, yt))
-
-    if robot_dims:
-        robot_rect = patches.Rectangle(
-            (0, 0), robot_dims[0], robot_dims[1],
-            facecolor=PALETTE["ego"]["fill"],
-            edgecolor=PALETTE["ego"]["stroke"],
-            alpha=0.7,
-            label="Ego Vehicle",
-            zorder=10,
-        )
-        ax.add_patch(robot_rect)
-        robot_dot = None
-    else:
-        (robot_dot,) = ax.plot(
-            [], [], color=PALETTE["ego"]["stroke"], marker="o", markersize=8,
-            label="Robot Mean", zorder=10,
-        )
-
-    (trail,) = ax.plot([], [], color=PALETTE["ego"]["stroke"], linewidth=2, alpha=0.6, zorder=9)
-    (plan_line,) = ax.plot(
-        [], [],
-        color=PALETTE["plan"]["stroke"],
-        linestyle="--",
-        linewidth=2,
-        alpha=0.8,
-        label="Planned Horizon",
+    """Reveal one optimized belief trajectory inside its environment."""
+    mean = _np(result.rollout.aux["mean_trace"])[0]
+    covariance = _np(result.rollout.aux["cov_trace"])[0]
+    fig, ax = plt.subplots(figsize=(10, 7), layout="constrained")
+    _draw_environment(ax, env)
+    ax.plot(
+        mean[:, 0],
+        mean[:, 1],
+        color=COLORS["mean"],
+        alpha=0.15,
     )
-
-    ellipse = patches.Ellipse(
-        (0, 0), width=0, height=0, angle=0,
-        facecolor=PALETTE["ego"]["fill"],
-        edgecolor=PALETTE["ego"]["stroke"],
-        alpha=0.25,
+    ax.scatter(
+        [mean[0, 0]],
+        [mean[0, 1]],
+        marker="o",
+        s=55,
+        color="black",
+        zorder=10,
+    )
+    (path,) = ax.plot(
+        [],
+        [],
+        color=COLORS["mean"],
+        linewidth=2.2,
         zorder=8,
     )
-    ax.add_patch(ellipse)
+    (point,) = ax.plot(
+        [],
+        [],
+        marker="s",
+        color=COLORS["mean"],
+        markersize=6,
+        zorder=10,
+    )
+    ellipse = _ellipse(ax, mean[0], covariance[0])
+    status = ax.text(
+        0.02,
+        0.96,
+        "",
+        transform=ax.transAxes,
+        va="top",
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
+    )
+    ax.set_title(
+        f"{title} | {RHO_LOWER} = {result.hard_interval[0]:.3f}",
+        fontweight="bold",
+    )
 
-    time_text = ax.text(0.02, 0.95, "", transform=ax.transAxes)
-
-    def init():
-        if robot_dot:
-            robot_dot.set_data([], [])
-        if robot_dims:
-            robot_rect.set_visible(False)
-        trail.set_data([], [])
-        plan_line.set_data([], [])
-        ellipse.set_width(0)
-        ellipse.set_height(0)
-        time_text.set_text("")
-
-        actors = [trail, ellipse, time_text, plan_line]
-        if robot_dot:
-            actors.append(robot_dot)
-        if robot_dims:
-            actors.append(robot_rect)
-        actors.extend([p[0] for p in moving_patches])
-        return actors
-
-    def update(frame):  # noqa: C901
-        x, y = mean_np[frame, 0], mean_np[frame, 1]
-
-        if bounds is None:
-            ax.set_xlim(x - 8.0, x + 12.0)
-            ax.set_ylim(-4.0, 8.0)
-
-        if robot_dot:
-            robot_dot.set_data([x], [y])
-
-        if robot_dims:
-            robot_rect.set_visible(True)
-            if frame < len(mean_np) - 1:
-                dx = mean_np[frame + 1, 0] - x
-                dy = mean_np[frame + 1, 1] - y
-            else:
-                dx = x - mean_np[frame - 1, 0]
-                dy = y - mean_np[frame - 1, 1]
-
-            theta = np.degrees(np.arctan2(dy, dx))
-            w, h = robot_dims[0], robot_dims[1]
-            t = transforms.Affine2D().translate(-w / 2, -h / 2).rotate_deg(theta).translate(x, y)
-            robot_rect.set_transform(t + ax.transData)
-
-        trail.set_data(mean_np[: frame + 1, 0], mean_np[: frame + 1, 1])
-
-        theta, width, height = cov_ellipse_params(cov_np[frame, :2, :2])
-        ellipse.set_center((x, y))
+    def update(step):
+        path.set_data(mean[: step + 1, 0], mean[: step + 1, 1])
+        point.set_data([mean[step, 0]], [mean[step, 1]])
+        width, height, angle = _ellipse_parameters(covariance[step])
+        ellipse.set_center(mean[step, :2])
         ellipse.set_width(width)
         ellipse.set_height(height)
-        ellipse.set_angle(theta)
-
-        time_text.set_text(f"Time Step: {frame}")
-
-        if plan_traces is not None and frame < len(plan_traces):
-            plan = plan_traces[frame].detach().cpu().squeeze().numpy()
-            plan_line.set_data(plan[:, 0], plan[:, 1])
-        else:
-            plan_line.set_data([], [])
-
-        for rect, w, h, xt, yt in moving_patches:
-            idx = min(frame, len(xt) - 1)
-            rect.set_xy((xt[idx] - w / 2, yt[idx] - h / 2))
-
-        actors = [trail, ellipse, time_text, plan_line]
-        if robot_dot:
-            actors.append(robot_dot)
-        if robot_dims:
-            actors.append(robot_rect)
-        actors.extend([p[0] for p in moving_patches])
-        return actors
-
-    frames = range(0, T, step)
-    ani = FuncAnimation(fig, update, frames=frames, init_func=init, blit=False, interval=100)
-
-    if filename:
-        print(f"Saving animation to {filename}...")
-        try:
-            if filename.endswith(".gif"):
-                ani.save(filename, writer="pillow", fps=20)
-            else:
-                ani.save(filename, writer="ffmpeg", fps=20)
-            print("Animation saved successfully.")
-        except Exception as e:
-            print(f"Warning: Could not save animation (ffmpeg/pillow issue?): {e}")
-            print("Displaying plot instead.")
-            plt.show()
-    else:
-        plt.show()
-
-
-def animate_altitude_optimization(result, *, dt, threshold, u_max, filename=None, fps=6):
-    """One frame per optimizer iterate up to the returned plan, held for one second at the end."""
-    returned = result["returned_iteration"]
-    frames = result["frames"][: returned + 1]
-    H = len(_to_np(frames[0]["controls"]))
-    bands = [
-        (_to_np(f["mean"])[:, 0], 2 * np.sqrt(_to_np(f["cov"])[:, 0, 0])) for f in frames
-    ]
-    low = min((mean - band).min() for mean, band in bands)
-    high = max((mean + band).max() for mean, band in bands)
-    state_ylim = (min(low, threshold) - 0.3, high + 0.3)
-
-    fig, axes = _altitude_axes(dt, H, threshold, u_max, state_ylim)
-    static_lines = [len(ax.lines) for ax in axes]  # threshold and control bounds
-    initial = _plan(result, "initial")
-
-    def update(k):
-        for ax, n_static in zip(axes, static_lines):
-            for artist in list(ax.lines[n_static:]) + list(ax.collections):
-                artist.remove()
-        _draw_altitude_plan(axes, initial, dt=dt, name="Initial", style="--",
-                            color=PALETTE["lane"]["stroke"], alpha=0.5)
-        _draw_altitude_plan(axes, frames[k], dt=dt, name="Iterate", style="-",
-                            color=PALETTE["ego"]["stroke"])
-        for ax in axes:
-            ax.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.01, 1.0))
-        label = (f"Returned plan (iteration {k + 1})" if k == returned
-                 else f"Optimizer iteration {k + 1} / {returned + 1}")
-        fig.suptitle(
-            f"{label}    R_lower = {frames[k]['interval'][0]:.4f}",
-            fontsize=14, fontweight="bold", y=0.985,
+        ellipse.set_angle(angle)
+        status.set_text(
+            f"t = {step * dt:.1f} s  ·  predicted step {step}/{len(mean) - 1}"
         )
+        return path, point, ellipse, status
 
-    fig.subplots_adjust(left=0.07, right=0.72, top=0.91, bottom=0.07, hspace=0.35)
-    sequence = list(range(len(frames))) + [returned] * fps
-    ani = FuncAnimation(fig, update, frames=sequence, blit=False)
-    if filename:
-        ani.save(filename, writer="pillow", fps=fps)
-    plt.close(fig)
-    return ani
+    movie = animation.FuncAnimation(
+        fig,
+        update,
+        frames=_frames(len(mean) - 1, fps),
+        interval=1000 / fps,
+        blit=False,
+    )
+    _finish_animation(fig, movie, filename, fps, show)
+    return fig, ax, movie
+
+
+def animate_mpc(result, env, *, dt, filename=None, fps=6, show=False):
+    """Replay a lane execution: path, current plan, traffic, and robustness."""
+    fig, (ax_map, ax_score) = plt.subplots(
+        1,
+        2,
+        figsize=(11, 5),
+        layout="constrained",
+        gridspec_kw={"width_ratios": (1.4, 1)},
+    )
+    moving = _draw_environment(ax_map, env, lane=True)
+    states = np.asarray([_np(state[0])[:2] for state in result.states])
+    ego_patch = _draw_ego_vehicle(ax_map, env, states[0])
+    plans = result.window_plans
+    intervals = np.asarray([plan.hard_interval for plan in plans]).reshape(
+        -1, 2
+    )
+    applied = _np(result.applied_controls)
+    for index, _vehicle in enumerate(env.metadata["traffic"]):
+        centers = np.asarray(
+            [_np(state[3][index])[:2] for state in result.states]
+        )
+        ax_map.plot(
+            centers[:, 0],
+            centers[:, 1],
+            color=COLORS["traffic"],
+            linestyle=":",
+            linewidth=1.2,
+            label="Traffic path" if index == 0 else "_nolegend_",
+        )
+    ax_map.set_xlim(states[0, 0] - 15, states[0, 0] + 45)
+    ax_map.scatter(
+        states[0, 0],
+        states[0, 1],
+        color=COLORS["executed"],
+        s=28,
+        label="Start",
+        zorder=5,
+    )
+    (executed,) = ax_map.plot(
+        [],
+        [],
+        color=COLORS["executed"],
+        linewidth=2,
+        marker="o",
+        markersize=3,
+        label="Executed",
+    )
+    (planned,) = ax_map.plot(
+        [], [], color=COLORS["planned"], linewidth=1.5, label="Plan"
+    )
+    (lower_bound,) = ax_score.plot(
+        [],
+        [],
+        color=COLORS["goal"],
+        linewidth=1.7,
+        marker="o",
+        markersize=3,
+        label=RHO_LOWER,
+    )
+    (upper_bound,) = ax_score.plot(
+        [],
+        [],
+        color=COLORS["goal"],
+        linewidth=1.2,
+        linestyle="--",
+        label=RHO_UPPER,
+    )
+    ax_score.set(
+        xlabel="time [s]",
+        ylabel="robustness per window",
+        xlim=(0, max(dt, len(plans) * dt)),
+    )
+    task = env.metadata["task"]
+    start, end = task["start_end_steps"]
+    ax_score.axvspan(
+        start * dt,
+        (end - task["dwell_steps"]) * dt,
+        color=COLORS["goal"],
+        alpha=0.10,
+        label="Dwell-start window",
+    )
+    ax_score.axvline(
+        end * dt,
+        color=COLORS["obstacle"],
+        linestyle="--",
+        linewidth=1,
+        label="Completion deadline",
+    )
+    _style(ax_score, probability=True)
+    status = ax_score.text(
+        0.03,
+        0.05,
+        "",
+        transform=ax_score.transAxes,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
+    )
+    _unique_legend(
+        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.14), ncol=5
+    )
+    _unique_legend(ax_score, loc="best")
+
+    def update(step):
+        executed.set_data(states[: step + 1, 0], states[: step + 1, 1])
+        if plans:
+            index = min(step, len(plans) - 1)
+            trace = _np(plans[index].rollout.aux["mean_trace"])[0]
+            planned.set_data(trace[:, 0], trace[:, 1])
+        lower_bound.set_data(dt * np.arange(step), intervals[:step, 0])
+        upper_bound.set_data(dt * np.arange(step), intervals[:step, 1])
+        _move_obstacle(moving, env, step, result.states[step])
+        _move_ego_vehicle(ego_patch, states[step])
+        ax_map.set_xlim(states[step, 0] - 15, states[step, 0] + 45)
+        ax_map.set_title(
+            f"Executed step {step}/{len(plans)}  ·  time {step * dt:.1f} s",
+            fontsize=11,
+        )
+        interval = (
+            "—"
+            if step == 0
+            else f"[{intervals[step - 1, 0]:.3f}, {intervals[step - 1, 1]:.3f}]"
+        )
+        if step == 0:
+            control = "No control applied yet"
+        else:
+            values = ", ".join(f"{value:.2f}" for value in applied[step - 1])
+            control = f"Applied control: ({values}) m/s²"
+        ending = (
+            f"\nOutcome: {result.stopped_reason.replace('_', ' ')}"
+            if step == len(plans)
+            else ""
+        )
+        status.set_text(f"{RHO_INTERVAL} = {interval}\n{control}{ending}")
+        return executed, planned, lower_bound, upper_bound, status
+
+    # Hold the first and final frames briefly.
+    movie = animation.FuncAnimation(
+        fig,
+        update,
+        frames=_frames(len(plans), fps),
+        interval=1000 / fps,
+        blit=False,
+    )
+    _finish_animation(fig, movie, filename, fps, show)
+    return fig, (ax_map, ax_score), movie

@@ -1,0 +1,740 @@
+"""Publication figures from completed pdSTL planning results."""
+
+from math import log, sqrt
+from pathlib import Path
+
+import matplotlib
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+COLORS = {
+    "mean": "tab:blue",
+    "planned": "tab:orange",
+    "executed": "tab:blue",
+    "goal": "tab:green",
+    "obstacle": "tab:red",
+    "workspace": "tab:gray",
+    "score": "tab:purple",
+    "ellipse": "tab:blue",
+    "traffic": "tab:red",
+    "target": "goldenrod",
+}
+
+
+def _chi2_radius(confidence):
+    """Mahalanobis radius of a 2-D Gaussian's `confidence` region."""
+    return sqrt(-2 * log(1 - confidence))
+
+
+CHI95_RADIUS = _chi2_radius(0.95)
+
+# pdSTL lower and upper stochastic robustness of the spec φ. They are a
+# robustness interval, not bounds on the probability that φ holds.
+# mathtext has no \underline; \underset draws the lower-bound bar.
+RHO_LOWER = r"$\underset{\,\_}{\rho}_\varphi$"
+RHO_UPPER = r"$\overline{\rho}_\varphi$"
+RHO_INTERVAL = rf"[{RHO_LOWER}, {RHO_UPPER}]"
+
+
+class VehiclePatch(patches.Polygon):
+    """Top-down car silhouette within its configured collision footprint."""
+
+    def __init__(self, x, y, width, height, **kwargs):
+        self._x, self._y = x, y
+        self._width, self._height = width, height
+        super().__init__(self._vertices(x, y), closed=True, **kwargs)
+
+    def _vertices(self, x, y):
+        w, h = self._width, self._height
+        return [
+            (x, y + 0.20 * h),
+            (x + 0.10 * w, y + 0.05 * h),
+            (x + 0.72 * w, y + 0.05 * h),
+            (x + w, y + 0.28 * h),
+            (x + w, y + 0.72 * h),
+            (x + 0.72 * w, y + 0.95 * h),
+            (x + 0.10 * w, y + 0.95 * h),
+            (x, y + 0.80 * h),
+        ]
+
+    def set_xy(self, xy):
+        coordinates = np.asarray(xy)
+        if coordinates.ndim == 2:
+            return super().set_xy(coordinates)
+        self._x, self._y = coordinates
+        return super().set_xy(self._vertices(self._x, self._y))
+
+    def get_x(self):
+        return self._x
+
+    def get_y(self):
+        return self._y
+
+    def get_width(self):
+        return self._width
+
+    def get_height(self):
+        return self._height
+
+
+def _np(value):
+    return (
+        value.detach().cpu().numpy()
+        if torch.is_tensor(value)
+        else np.asarray(value)
+    )
+
+
+def _unique_legend(ax, **kwargs):
+    handles, labels = ax.get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    if unique:
+        ax.legend(
+            unique.values(),
+            unique.keys(),
+            fontsize=9,
+            framealpha=0.9,
+            **kwargs,
+        )
+
+
+def _finish(fig, save_path, show):
+    """Let the user inspect the figure, then save both publication formats."""
+    if show and matplotlib.get_backend().lower() != "agg":
+        plt.show(block=True)
+    if save_path is not None:
+        stem = Path(save_path).with_suffix("")
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(stem.with_suffix(".png"), dpi=300)
+        fig.savefig(stem.with_suffix(".pdf"))
+    plt.close(fig)
+    return fig
+
+
+def _style(ax, *, probability=False):
+    ax.grid(color=COLORS["workspace"], alpha=0.16, linewidth=0.6)
+    ax.tick_params(labelsize=9)
+    if probability:
+        ax.set_ylim(-0.03, 1.03)
+
+
+def _ellipse_parameters(covariance, confidence=0.95):
+    """Width, height, and angle of a joint two-dimensional belief ellipse."""
+    covariance = np.asarray(covariance)[:2, :2]
+    values, vectors = np.linalg.eigh(covariance)
+    order = np.argsort(values)[::-1]
+    values, vectors = np.maximum(values[order], 0), vectors[:, order]
+    angle = np.degrees(np.arctan2(vectors[1, 0], vectors[0, 0]))
+    width, height = 2 * _chi2_radius(confidence) * np.sqrt(values)
+    return width, height, angle
+
+
+def _ellipse(ax, mean, covariance, *, label=None, confidence=0.95):
+    width, height, angle = _ellipse_parameters(covariance, confidence)
+    ellipse = patches.Ellipse(
+        mean[:2],
+        width,
+        height,
+        angle=angle,
+        facecolor=COLORS["ellipse"],
+        edgecolor=COLORS["mean"],
+        alpha=0.27,
+        linewidth=0.8,
+        label=label,
+    )
+    ax.add_patch(ellipse)
+    return ellipse
+
+
+def _ellipse_indices(mean, every, minimum_distance=0.35):
+    """Temporal ellipse cadence with spatial thinning near stationary states."""
+    candidates = sorted(
+        set(range(0, len(mean), max(1, every))) | {len(mean) - 1}
+    )
+    selected = []
+    for index in candidates:
+        if (
+            not selected
+            or np.linalg.norm(mean[index, :2] - mean[selected[-1], :2])
+            >= minimum_distance
+        ):
+            selected.append(index)
+        elif index == len(mean) - 1:
+            selected[-1] = index
+    return selected
+
+
+def _draw_task_region(ax, region):
+    """A goal or target box, tagged with its name."""
+    color = COLORS[region.role]
+    ax.add_patch(
+        patches.Rectangle(
+            (region.xmin, region.ymin),
+            region.xmax - region.xmin,
+            region.ymax - region.ymin,
+            facecolor=color,
+            edgecolor=color,
+            alpha=0.35,
+            label=region.role.capitalize(),
+        )
+    )
+    ax.text(
+        (region.xmin + region.xmax) / 2,
+        (region.ymin + region.ymax) / 2,
+        region.name,
+        color=color,
+        fontsize=9,
+        fontweight="bold",
+        ha="center",
+        va="center",
+        zorder=9,
+    )
+
+
+def _draw_environment(ax, env, *, lane=False):
+    """Draw configured geometry; return patches for moving traffic, if any."""
+    moving = None
+    if lane:
+        road = env.metadata["road"]
+        ramp = env.metadata.get("ramp")
+        if ramp is None:
+            ax.axhspan(
+                road["y_min"],
+                road["y_max"],
+                color=COLORS["workspace"],
+                alpha=0.08,
+            )
+            for y in (road["y_min"], road["y_max"]):
+                ax.axhline(y, color=COLORS["workspace"], linewidth=1.3)
+            ax.axhline(
+                road["lane_divider"],
+                color=COLORS["workspace"],
+                linestyle="--",
+                linewidth=1.1,
+                label="Lane divider",
+            )
+        else:
+            extent = env.single_region("goal").x
+            start, end = ramp["start_x"], ramp["end_x"]
+            x = np.asarray([extent[0], start, end, extent[1]])
+            lower = np.asarray(
+                [
+                    road["y_min"],
+                    road["y_min"],
+                    road["lane_divider"],
+                    road["lane_divider"],
+                ]
+            )
+            ax.fill_between(
+                [start, end],
+                [road["y_min"], road["lane_divider"]],
+                road["y_min"],
+                color=COLORS["obstacle"],
+                alpha=0.38,
+                label="Non-drivable",
+            )
+            ax.plot(x, lower, color=COLORS["workspace"], linewidth=1.3)
+            ax.axhline(road["y_max"], color=COLORS["workspace"], linewidth=1.3)
+            ax.plot(
+                [extent[0], start],
+                [road["lane_divider"], road["lane_divider"]],
+                color=COLORS["workspace"],
+                linestyle="--",
+                linewidth=1.1,
+                label="Ramp merge line",
+            )
+            ax.scatter(
+                [end],
+                [road["lane_divider"]],
+                marker="x",
+                color=COLORS["workspace"],
+                label="Ramp end",
+            )
+        goal = env.single_region("goal")
+        ax.add_patch(
+            patches.Rectangle(
+                (goal.xmin, goal.ymin),
+                goal.xmax - goal.xmin,
+                goal.ymax - goal.ymin,
+                facecolor=COLORS["goal"],
+                edgecolor="none",
+                alpha=0.10,
+                label="Goal lane",
+            )
+        )
+        moving = {}
+        for index, vehicle in enumerate(env.metadata["traffic"]):
+            name = vehicle["name"]
+            patch = VehiclePatch(
+                vehicle["x0"] - vehicle["width"] / 2,
+                vehicle["y"] - vehicle["height"] / 2,
+                vehicle["width"],
+                vehicle["height"],
+                facecolor=COLORS["traffic"],
+                edgecolor=COLORS["traffic"],
+                alpha=0.65,
+                label="Traffic" if index == 0 else "_nolegend_",
+            )
+            ax.add_patch(patch)
+            moving[name] = patch
+    for region in env.regions.values():
+        if region.role == "workspace" and not lane:
+            ax.add_patch(
+                patches.Rectangle(
+                    (region.xmin, region.ymin),
+                    region.xmax - region.xmin,
+                    region.ymax - region.ymin,
+                    fill=False,
+                    edgecolor=COLORS["workspace"],
+                    linewidth=1.3,
+                )
+            )
+            ax.set_xlim(region.xmin, region.xmax)
+            ax.set_ylim(region.ymin, region.ymax)
+        elif region.role in ("goal", "target") and not lane:
+            _draw_task_region(ax, region)
+        elif region.role == "obstacle":
+            ax.add_patch(
+                patches.Rectangle(
+                    (region.xmin, region.ymin),
+                    region.xmax - region.xmin,
+                    region.ymax - region.ymin,
+                    facecolor=COLORS["obstacle"],
+                    edgecolor=COLORS["obstacle"],
+                    alpha=0.45,
+                    hatch="//",
+                    label="Obstacle",
+                )
+            )
+    ax.set_xlabel("x [m]" if not lane else "x position [m]")
+    ax.set_ylabel("y [m]" if not lane else "y position [m]")
+    ax.set_aspect(1.4 if lane else "equal", adjustable="box")
+    _style(ax)
+    return moving
+
+
+def _draw_ego_vehicle(ax, env, position):
+    """Show the ego footprint at its current sampled position."""
+    size = env.metadata["ego_vehicle"]
+    patch = VehiclePatch(
+        position[0] - size["width"] / 2,
+        position[1] - size["height"] / 2,
+        size["width"],
+        size["height"],
+        facecolor=COLORS["executed"],
+        edgecolor=COLORS["executed"],
+        alpha=0.7,
+        label="Ego",
+        zorder=6,
+    )
+    ax.add_patch(patch)
+    return patch
+
+
+def _move_ego_vehicle(patch, position):
+    patch.set_xy(
+        (
+            position[0] - patch.get_width() / 2,
+            position[1] - patch.get_height() / 2,
+        )
+    )
+
+
+def _move_obstacle(patches_by_name, env, step, state=None):
+    """Move each lane traffic patch to its state (or constant-speed) position."""
+    if patches_by_name is None:
+        return
+    for index, vehicle in enumerate(env.metadata["traffic"]):
+        if state is not None and len(state) > 3:
+            center = _np(state[3][index])[:2]
+        else:
+            center = (
+                vehicle["x0"] + vehicle["speed"] * env.metadata["dt"] * step,
+                vehicle["y"],
+            )
+        patches_by_name[vehicle["name"]].set_xy(
+            (
+                center[0] - vehicle["width"] / 2,
+                center[1] - vehicle["height"] / 2,
+            )
+        )
+
+
+def _selected_windows(count, maximum=5):
+    if count <= maximum:
+        return list(range(count))
+    return sorted(set(np.linspace(0, count - 1, maximum, dtype=int)))
+
+
+def plot_reach_avoid(
+    result,
+    env,
+    *,
+    dt=1.0,
+    u_max=1.0,
+    control_unit="m/s",
+    title="Reach–Avoid",
+    ellipse_every=4,
+    ellipse_confidence=0.95,
+    save_path=None,
+    show=False,
+):
+    """Map, controls, and lower-robustness history of a reach-avoid plan.
+
+    Args:
+        result: Selected PlanResult.
+        env: Its Environment.
+
+    Returns:
+        (figure, (map, controls, scores) axes).
+    """
+    fig = plt.figure(figsize=(13, 7), layout="constrained")
+    grid = fig.add_gridspec(2, 2, width_ratios=(1.55, 1.0))
+    ax = fig.add_subplot(grid[:, 0])
+    ax_controls = fig.add_subplot(grid[0, 1])
+    ax_scores = fig.add_subplot(grid[1, 1])
+    _draw_environment(ax, env)
+    mean = _np(result.rollout.aux["mean_trace"])[0]
+    covariance = _np(result.rollout.aux["cov_trace"])[0]
+    ax.plot(
+        mean[:, 0],
+        mean[:, 1],
+        color=COLORS["mean"],
+        linewidth=2.2,
+        label="Plan",
+        zorder=8,
+    )
+    ax.scatter(*mean[0, :2], marker="o", s=55, color="black", zorder=10)
+    ax.scatter(
+        *mean[-1, :2], marker="s", s=55, color=COLORS["mean"], zorder=10
+    )
+    indices = _ellipse_indices(mean, ellipse_every)
+    for index in indices:
+        _ellipse(
+            ax,
+            mean[index],
+            covariance[index],
+            label=f"{100 * ellipse_confidence:g}% ellipse"
+            if index == indices[0]
+            else None,
+            confidence=ellipse_confidence,
+        )
+    ax.set_title(title, fontweight="bold")
+    _unique_legend(ax, loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=5)
+
+    control_time = dt * np.arange(len(result.controls))
+    controls = _np(result.controls)
+    for dimension, label in enumerate(("u_x", "u_y")):
+        ax_controls.step(
+            control_time,
+            controls[:, dimension],
+            where="post",
+            linewidth=1.6,
+            label=label,
+        )
+    ax_controls.set(
+        ylabel=f"control [{control_unit}]",
+        ylim=(-1.1 * u_max, 1.1 * u_max),
+        title="Selected controls",
+    )
+    _style(ax_controls)
+    _unique_legend(ax_controls, loc="best")
+
+    ax_scores.plot(
+        np.arange(len(result.hard_lower_history)),
+        result.hard_lower_history,
+        color=COLORS["mean"],
+        linewidth=1.7,
+        label=f"{RHO_LOWER} (lower bound)",
+    )
+    if result.alpha is not None:
+        ax_scores.axhline(
+            result.alpha,
+            color=COLORS["obstacle"],
+            linestyle="--",
+            linewidth=1.1,
+            label=f"threshold α = {result.alpha:.2f}",
+        )
+    selected = result.selected_iteration + 1
+    ax_scores.scatter(
+        [selected],
+        [result.hard_interval[0]],
+        color=COLORS["mean"],
+        marker="s",
+        zorder=5,
+        label="Selected plan",
+    )
+    if result.monte_carlo is not None:
+        rate, lower, upper = result.monte_carlo
+        ax_scores.errorbar(
+            [selected],
+            [rate],
+            yerr=[[rate - lower], [upper - rate]],
+            color=COLORS["score"],
+            marker="D",
+            markersize=5,
+            capsize=3,
+            linestyle="none",
+            zorder=6,
+            label=r"Monte Carlo $P(\varphi)$",
+        )
+    change = f"{result.hard_interval[0]:.3f}"
+    if result.initial_hard_lower is not None:
+        change = f"{result.initial_hard_lower:.3f} → {change}"
+    ax_scores.set(
+        xlabel="iteration (0 = initial guess)",
+        ylabel=f"lower robustness {RHO_LOWER}",
+        ylim=(-0.03, 1.03),
+        title=f"{RHO_LOWER}: {change} · {result.alpha_status()}",
+    )
+    _style(ax_scores, probability=True)
+    _unique_legend(ax_scores, loc="best")
+    _finish(fig, save_path, show)
+    return fig, (ax, ax_controls, ax_scores)
+
+
+def _mark_lane_task_window(ax, env, dt):
+    task = env.metadata["task"]
+    start, end = task["start_end_steps"]
+    latest_start = end - task["dwell_steps"]
+    ax.axvspan(
+        start * dt,
+        latest_start * dt,
+        color=COLORS["goal"],
+        alpha=0.10,
+        label="Dwell-start window",
+    )
+    ax.axvline(
+        end * dt,
+        color=COLORS["obstacle"],
+        linestyle="--",
+        linewidth=1,
+        label="Completion deadline",
+    )
+
+
+def _plot_execution(result, env, *, dt, save_path, show):
+    fig = plt.figure(figsize=(14, 6), layout="constrained")
+    grid = fig.add_gridspec(2, 2, height_ratios=(0.55, 1))
+    ax_map = fig.add_subplot(grid[0, :])
+    ax_score = fig.add_subplot(grid[1, 0])
+    ax_control = fig.add_subplot(grid[1, 1])
+    moving = _draw_environment(ax_map, env, lane=True)
+    means = np.asarray([_np(state[0])[:2] for state in result.states])
+    ax_map.plot(
+        means[:, 0],
+        means[:, 1],
+        color=COLORS["executed"],
+        linewidth=2,
+        label="Executed",
+        zorder=5,
+    )
+    ax_map.scatter(
+        [means[0, 0]],
+        [means[0, 1]],
+        color=COLORS["executed"],
+        s=26,
+        label="Start",
+        zorder=6,
+    )
+    for index in _selected_windows(len(result.window_plans)):
+        plan = _np(result.window_plans[index].rollout.aux["mean_trace"])[0]
+        ax_map.plot(
+            plan[:, 0],
+            plan[:, 1],
+            color=COLORS["planned"],
+            linewidth=1.1,
+            alpha=0.6,
+            label="Plan",
+        )
+    _draw_ego_vehicle(ax_map, env, means[-1])
+    for index, _vehicle in enumerate(env.metadata["traffic"]):
+        positions = np.asarray(
+            [_np(state[3][index])[:2] for state in result.states]
+        )
+        ax_map.plot(
+            positions[:, 0],
+            positions[:, 1],
+            color=COLORS["traffic"],
+            linestyle=":",
+            linewidth=1.2,
+            label="Traffic path" if index == 0 else "_nolegend_",
+        )
+    _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
+    ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
+    reason = result.stopped_reason.replace("_", " ")
+    ax_map.text(
+        0.98,
+        0.95,
+        f"Outcome: {reason}",
+        transform=ax_map.transAxes,
+        fontsize=9,
+        ha="right",
+        va="top",
+    )
+    _unique_legend(
+        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.12), ncol=6
+    )
+    intervals = np.asarray(
+        [plan.hard_interval for plan in result.window_plans]
+    )
+    time = dt * np.arange(len(intervals))
+    if len(intervals):
+        ax_score.fill_between(
+            time,
+            intervals[:, 0],
+            intervals[:, 1],
+            color=COLORS["goal"],
+            alpha=0.24,
+            label=RHO_INTERVAL,
+        )
+        ax_score.plot(time, intervals[:, 0], color=COLORS["goal"])
+        ax_score.plot(
+            time, intervals[:, 1], color=COLORS["goal"], linestyle="--"
+        )
+        ax_score.plot(
+            time,
+            [plan.smooth_lower for plan in result.window_plans],
+            color=COLORS["score"],
+            marker="o",
+            markersize=3,
+            linewidth=1.2,
+            label=f"smooth {RHO_LOWER}",
+        )
+        ax_score.text(
+            0.98,
+            0.05,
+            f"last window {RHO_INTERVAL} = "
+            f"[{intervals[-1, 0]:.3f}, {intervals[-1, 1]:.3f}]",
+            transform=ax_score.transAxes,
+            ha="right",
+            fontsize=9,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+        )
+    _mark_lane_task_window(ax_score, env, dt)
+    ax_score.set(xlabel="executed time [s]", ylabel="robustness per window")
+    _style(ax_score, probability=True)
+    _unique_legend(ax_score, loc="best")
+    controls = _np(result.applied_controls)
+    for dimension in range(controls.shape[1]):
+        ax_control.step(
+            dt * np.arange(len(controls)),
+            controls[:, dimension],
+            where="post",
+            linewidth=1.4,
+            label=("Longitudinal" if dimension == 0 else "Lateral"),
+        )
+    ax_control.set(xlabel="time [s]", ylabel="applied control [m/s²]")
+    _style(ax_control)
+    _unique_legend(ax_control, loc="best")
+    _finish(fig, save_path, show)
+    return fig, (ax_map, ax_score, ax_control)
+
+
+def plot_lane_merge(result, env, *, dt, save_path=None, show=False):
+    """Save one combined result and one local-scale lane trajectory view."""
+
+    combined = _plot_execution(
+        result, env, dt=dt, save_path=save_path, show=show
+    )
+
+    def output(kind):
+        if save_path is None:
+            return None
+        stem = Path(save_path).with_suffix("")
+        return stem.with_name(f"{stem.name}_{kind}.png")
+
+    means = np.asarray([_np(state[0])[:2] for state in result.states])
+
+    trajectory_fig, ax_map = plt.subplots(
+        figsize=(12, 4.2), layout="constrained"
+    )
+    moving = _draw_environment(ax_map, env, lane=True)
+    ax_map.plot(
+        means[:, 0],
+        means[:, 1],
+        color=COLORS["executed"],
+        linewidth=2,
+        label="Executed",
+        zorder=5,
+    )
+    ax_map.scatter(
+        means[0, 0],
+        means[0, 1],
+        color=COLORS["executed"],
+        s=25,
+        label="Start",
+        zorder=6,
+    )
+    for index in _selected_windows(len(result.window_plans)):
+        plan = _np(result.window_plans[index].rollout.aux["mean_trace"])[0]
+        ax_map.plot(
+            plan[:, 0],
+            plan[:, 1],
+            color=COLORS["planned"],
+            linewidth=1.1,
+            alpha=0.55,
+            label="Plan",
+        )
+    for index, _vehicle in enumerate(env.metadata["traffic"]):
+        positions = np.asarray(
+            [_np(state[3][index])[:2] for state in result.states]
+        )
+        ax_map.plot(
+            positions[:, 0],
+            positions[:, 1],
+            color=COLORS["traffic"],
+            linestyle=":",
+            linewidth=1.2,
+            label="Traffic path" if index == 0 else "_nolegend_",
+        )
+    _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
+    _draw_ego_vehicle(ax_map, env, means[-1])
+    ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
+
+    elapsed = dt * np.arange(len(means))
+    used = set()
+    for second in range(int(np.floor(elapsed[-1])) + 1):
+        index = int(np.argmin(np.abs(elapsed - second)))
+        if index in used:
+            continue
+        used.add(index)
+        ax_map.annotate(
+            f"t={second} s",
+            means[index],
+            xytext=(4, 8 if second % 2 == 0 else -15),
+            textcoords="offset points",
+            fontsize=8,
+            color=COLORS["executed"],
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.72,
+                "pad": 1,
+            },
+        )
+    ax_map.text(
+        0.99,
+        0.04,
+        (
+            f"Outcome: {result.stopped_reason.replace('_', ' ')}\n"
+            f"last window {RHO_INTERVAL} = "
+            f"[{result.window_plans[-1].hard_interval[0]:.3f}, "
+            f"{result.window_plans[-1].hard_interval[1]:.3f}]"
+            if result.window_plans
+            else f"Outcome: {result.stopped_reason.replace('_', ' ')}"
+        ),
+        transform=ax_map.transAxes,
+        ha="right",
+        fontsize=9,
+    )
+    _unique_legend(
+        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.12), ncol=7
+    )
+    _finish(trajectory_fig, output("trajectory"), show)
+    return {
+        "combined": combined,
+        "trajectory": (trajectory_fig, ax_map),
+    }

@@ -1,81 +1,64 @@
+"""Configuration and device helpers shared by the scenario runners."""
+
 import os
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
-import numpy as np
 import torch
 import yaml
 
 
 def get_device():
-    """CPU unless PDSTL_DEVICE is set or PDSTL_USE_CUDA=1 (some lab CUDA installs fail to initialise)."""
+    """Use the requested device, then CUDA if available, then CPU."""
     requested = os.environ.get("PDSTL_DEVICE")
     if requested:
         return torch.device(requested)
-    if os.environ.get("PDSTL_USE_CUDA") == "1" and torch.cuda.is_available():
+    if (
+        torch.cuda.is_available()
+        and os.environ.get("PDSTL_USE_CUDA", "1") != "0"
+    ):
         return torch.device("cuda")
     return torch.device("cpu")
 
 
 def load_config(path):
-    """Load a YAML file; relative paths resolve from the project root."""
-    if not os.path.isabs(path):
-        # Resolve relative paths from the project root (two levels above this file)
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(root, path)
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    """Load YAML from the requested path, repository configs, or wheel data."""
+    candidate = Path(path)
+    if candidate.is_file():
+        return yaml.safe_load(candidate.read_text(encoding="utf-8"))
+    if candidate.is_absolute():
+        raise FileNotFoundError(candidate)
+    repository_file = Path(__file__).resolve().parents[1] / candidate
+    if repository_file.is_file():
+        return yaml.safe_load(repository_file.read_text(encoding="utf-8"))
+    installed_file = (
+        Path(sys.prefix) / "share" / "probabilistic-dstl" / candidate
+    )
+    if installed_file.is_file():
+        return yaml.safe_load(installed_file.read_text(encoding="utf-8"))
+    raise FileNotFoundError(path)
 
 
-class SkipWith(Exception):
-    pass
+class _SkippedRun(Exception):
+    """Leave a disabled project block without executing its body."""
 
 
 @contextmanager
-def skip_run(flag, f):
-    """Context manager that runs or skips a block: flag is 'run' or 'skip'."""
+def skip_run(flag, label):
+    """Keep the project-by-project ``with skip_run(...), check()`` entry point."""
+    if flag not in ("run", "skip"):
+        raise ValueError("run flag must be 'run' or 'skip'")
 
     @contextmanager
-    def check_active():
-        deactivated = ["skip"]
-        p = ColorPrint()  # printing options
-        if flag in deactivated:
-            p.print_skip("{:>12}  {:>2}  {:>12}".format("Skipping the block", "|", f))
-            raise SkipWith()
-        else:
-            p.print_run("{:>12}  {:>3}  {:>12}".format("Running the block", "|", f))
-            yield
+    def check():
+        if flag == "skip":
+            print(f"Skipping {label}", flush=True)
+            raise _SkippedRun
+        print(f"Running {label}", flush=True)
+        yield
 
     try:
-        yield check_active
-    except SkipWith:
+        yield check
+    except _SkippedRun:
         pass
-
-
-class ColorPrint:
-    @staticmethod
-    def print_skip(message, end="\n"):
-        sys.stderr.write("\x1b[33m" + message.strip() + "\x1b[0m" + end)
-        sys.stderr.flush()
-
-    @staticmethod
-    def print_run(message, end="\n"):
-        sys.stdout.write("\x1b[1;32m" + message.strip() + "\x1b[0m" + end)
-        sys.stdout.flush()
-
-
-def to_steps(interval_sec, t):
-    """Map an interval in seconds to the nearest indices of a uniform time grid [a, b]; b may be inf."""
-    t = np.asarray(t)
-    if t.ndim != 1 or len(t) < 2:
-        raise ValueError("time vector must be one-dimensional with at least two samples")
-    differences = np.diff(t)
-    if not np.all(differences > 0):
-        raise ValueError("time vector must be strictly increasing")
-    if not np.allclose(differences, differences[0]):
-        raise ValueError("time vector must be uniformly spaced")
-
-    dt = float(differences[0])
-    a = int(round(interval_sec[0] / dt))
-    b = np.inf if np.isinf(interval_sec[1]) else int(round(interval_sec[1] / dt))
-    return [a, b]
