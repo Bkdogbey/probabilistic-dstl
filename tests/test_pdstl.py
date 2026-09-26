@@ -6,10 +6,7 @@ import torch
 from scipy.stats import norm
 
 from models.beliefs import GaussianBelief, ProbabilityBelief
-from models.rollouts import (
-    create_gaussian_belief_trajectory,
-    create_probability_belief_trajectory,
-)
+from models.rollouts import create_probability_belief_trajectory
 from pdstl.base import BeliefTrajectory
 from pdstl.operators import (
     Always,

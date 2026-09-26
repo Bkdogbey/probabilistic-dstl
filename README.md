@@ -36,9 +36,8 @@ At every iteration, it evaluates the exact ρ̲_φ and retains the iterate with
 the highest value; a later iterate wins an exact tie. It runs all
 `max_iters` updates, since the smooth bound tightens as β anneals toward
 `beta_end` and the exact bound can dip before it recovers. `alpha` only
-reports whether the
-selected plan meets the required satisfaction level. The initial guess's
-exact and smooth ρ̲_φ are recorded (`initial_hard_lower`,
+reports whether the selected plan meets the required satisfaction level. The
+initial guess's exact and smooth ρ̲_φ are recorded (`initial_hard_lower`,
 `initial_smooth_lower`), so each run prints what the optimization improved.
 
 `Planner.run_receding_horizon` is the MPC loop used by the lane experiment:

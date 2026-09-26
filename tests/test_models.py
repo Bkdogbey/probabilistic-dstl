@@ -257,7 +257,9 @@ def test_gaussian_belief_rejects_a_symmetric_non_positive_semidefinite_covarianc
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_large_deterministic_trajectory_avoids_eigensolver(device, monkeypatch):
+def test_large_deterministic_trajectory_avoids_eigensolver(
+    device, monkeypatch
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
 
@@ -267,7 +269,9 @@ def test_large_deterministic_trajectory_avoids_eigensolver(device, monkeypatch):
     monkeypatch.setattr(torch.linalg, "eigvalsh", unexpected_eigensolver)
     mean = torch.zeros(5000, 41, 2, device=device)
     mean[::2, :, 0] = 1.0
-    trajectory = create_gaussian_belief_trajectory(mean, torch.zeros_like(mean))
+    trajectory = create_gaussian_belief_trajectory(
+        mean, torch.zeros_like(mean)
+    )
     bounds = trajectory.probability_bounds(GreaterThan(0.5))
     expected = (mean[..., 0] >= 0.5).to(mean.dtype)
     torch.testing.assert_close(bounds, torch.stack((expected, expected), -1))
