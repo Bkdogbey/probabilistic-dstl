@@ -155,7 +155,7 @@ def test_observer_is_optional_and_does_not_change_optimization():
     assert actual.loss_history == expected.loss_history
 
 
-def test_optimization_stops_at_the_first_iterate_that_reaches_alpha():
+def test_alpha_reports_satisfaction_without_stopping_optimization():
     planner, rollout, spec = problem(max_iters=4, alpha=0.95)
     spec.probability_interval = scripted_hard_lower(
         (0.1, 0.5, 0.96, 0.98, 0.99)
@@ -164,11 +164,11 @@ def test_optimization_stops_at_the_first_iterate_that_reaches_alpha():
     result = planner.optimize_window(
         rollout, spec=spec, on_iteration=lambda k, r: records.append(k)
     )
-    assert len(result.loss_history) == 2
-    assert result.selected_iteration == 1
-    assert result.hard_interval[0] == pytest.approx(0.96)
+    assert len(result.loss_history) == 4
+    assert result.selected_iteration == 3
+    assert result.hard_interval[0] == pytest.approx(0.99)
     assert result.threshold_met
-    assert records[-1] == 1
+    assert records == list(range(4))
 
 
 def test_without_alpha_all_iterations_run():

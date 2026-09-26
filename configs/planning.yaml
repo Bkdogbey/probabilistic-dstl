@@ -7,4 +7,4 @@ max_iters: 300
 smoothing:
   beta_start: 10.0
   beta_end: 200.0
-alpha: null      # stop once exact lower robustness reaches it; null runs all
+alpha: null      # report whether the selected exact lower bound meets it

@@ -32,12 +32,14 @@ sequence u⁽⁰⁾ it takes Adam steps on
 
     −w_φ · smooth ρ̲_φ(u) + w_u Σ‖u‖² + w_du Σ‖Δu‖²
 
-and stops at the first iterate whose exact ρ̲_φ reaches the threshold
-`alpha`, rather than pushing toward 1 (with `alpha: null`, or if α is never
-reached, it runs all `max_iters` steps). It returns the iterate with the
-highest exact ρ̲_φ, which under early stopping is the one that reached α. The initial guess's exact and
-smooth ρ̲_φ are recorded (`initial_hard_lower`, `initial_smooth_lower`), so
-each run prints what the optimization improved.
+At every iteration, it evaluates the exact ρ̲_φ and retains the iterate with
+the highest value; a later iterate wins an exact tie. It runs all
+`max_iters` updates, since the smooth bound tightens as β anneals toward
+`beta_end` and the exact bound can dip before it recovers. `alpha` only
+reports whether the
+selected plan meets the required satisfaction level. The initial guess's
+exact and smooth ρ̲_φ are recorded (`initial_hard_lower`,
+`initial_smooth_lower`), so each run prints what the optimization improved.
 
 `Planner.run_receding_horizon` is the MPC loop used by the lane experiment:
 plan a window, execute its first control, shift, and repeat until an outcome

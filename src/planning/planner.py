@@ -64,10 +64,10 @@ class Planner:
     """Optimize controls for any belief rollout and pdSTL spec.
 
     rollout(v) maps unconstrained parameters v to a BeliefRollout. The planner
-    ascends the smooth lower bound (plus small control regularizers). With a
-    threshold alpha it stops at the first iterate whose exact lower robustness
-    reaches alpha; otherwise it runs max_iters steps. It returns the iterate
-    with the highest exact lower robustness.
+    ascends the smooth lower bound (plus small control regularizers) for
+    max_iters steps and returns the iterate with the highest exact lower
+    robustness. Alpha is used only to report whether that iterate meets the
+    requested threshold.
     """
 
     def __init__(self, dynamics, horizon, config=None):
@@ -194,15 +194,14 @@ class Planner:
         on_iteration=None,
         callback_every=1,
     ):
-        """Adam steps from init_guess until the exact bound reaches alpha.
+        """Adam steps from init_guess for max_iters; keep the best exact iterate.
 
         Iterate -1 is the initial guess; its exact and smooth lower bounds
         (at beta_end) are kept as `initial_hard_lower` / `initial_smooth_lower`.
-        Without alpha, or if alpha is never reached, all max_iters steps run.
+        Alpha only determines the reported threshold status.
         on_iteration(iteration, record) observes every `callback_every`-th
         iterate and the last one.
         """
-        alpha = self.cfg["alpha"]
         max_iters = self.cfg["max_iters"]
         parameters = self._init_controls(init_guess)
         initial = self._evaluate(
@@ -239,14 +238,12 @@ class Planner:
             )
             candidates.append((iteration, record))
             hard_history.append(record.hard_interval[0])
-            reached = alpha is not None and record.hard_interval[0] >= alpha
             if iteration >= 0:
                 history.append(record.loss)
                 observe = on_iteration is not None and (
                     iteration == 0
                     or (iteration + 1) % callback_every == 0
                     or iteration == max_iters - 1
-                    or reached
                 )
                 if observe:
                     on_iteration(iteration, record)
@@ -259,7 +256,7 @@ class Planner:
                         record.smooth_lower,
                         record.hard_interval[0],
                     )
-            if step == max_iters or reached:
+            if step == max_iters:
                 break
             loss.backward()
             if (
@@ -282,10 +279,7 @@ class Planner:
 
     @staticmethod
     def _select_candidate(candidates):
-        """Highest exact lower bound; the later iterate wins a tie.
-
-        With early stopping at alpha, this is the iterate that reached alpha.
-        """
+        """Highest exact lower bound; the later iterate wins a tie."""
         return max(reversed(candidates), key=lambda c: c[1].hard_interval[0])
 
     @staticmethod
@@ -329,7 +323,7 @@ class Planner:
                     verbose=verbose,
                     on_iteration=(
                         (
-                            lambda iteration, record: on_iteration(
+                            lambda iteration, record, step=step: on_iteration(
                                 step, iteration, record
                             )
                         )

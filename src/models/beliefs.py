@@ -56,8 +56,11 @@ def _validate(mean, covariance):
     """Shape, finiteness, symmetry and positive semi-definiteness."""
     if not torch.is_tensor(mean) or mean.ndim < 2:
         raise ValueError("GaussianBelief mean must have shape [..., D]")
+    if not torch.is_tensor(covariance):
+        raise ValueError("GaussianBelief covariance must be a tensor")
+    diagonal = covariance.shape == mean.shape
     expected = mean.shape + mean.shape[-1:]
-    if covariance.shape != expected:
+    if not diagonal and covariance.shape != expected:
         raise ValueError(
             f"covariance must be {tuple(expected)}, got {tuple(covariance.shape)}"
         )
@@ -65,6 +68,12 @@ def _validate(mean, covariance):
         raise ValueError("GaussianBelief mean must be finite")
     if not torch.isfinite(covariance).all():
         raise ValueError("GaussianBelief covariance must be finite")
+    if diagonal:
+        # Diagonal variances are the eigenvalues. Avoid a large CUDA solver
+        # batch when Monte Carlo trajectories have deterministic beliefs.
+        if bool((covariance < -1e-6).any()):
+            raise ValueError("covariance must be positive semi-definite")
+        return
     # Tolerances, not equality: A P A^T accumulates round-off.
     if not torch.allclose(covariance, covariance.transpose(-1, -2), atol=1e-5):
         raise ValueError("covariance must be symmetric")
@@ -80,9 +89,9 @@ class GaussianBelief(Belief):
     """
 
     def __init__(self, mean, covariance, validate=True):
-        covariance = _as_full_covariance(mean, covariance)
         if validate:
             _validate(mean, covariance)
+        covariance = _as_full_covariance(mean, covariance)
         self.mean, self.covariance = mean, covariance
 
     def value(self):
