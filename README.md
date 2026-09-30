@@ -42,8 +42,8 @@ initial guess's exact and smooth ρ̲_φ are recorded (`initial_hard_lower`,
 
 `Planner.run_receding_horizon` is the MPC loop used by the lane experiment:
 plan a window, execute its first control, shift, and repeat until an outcome
-(success, collision, road violation, deadline missed, planning failure, step
-limit).
+(success, collision, road or speed violation, deadline missed, planning failure,
+step limit).
 
 ## Reach–avoid
 
@@ -85,6 +85,44 @@ with a 95% interval, and the figure shows both.
 road checks use the full vehicle footprint plus safety margins. A merge
 succeeds only when the target-lane dwell finishes inside the time window and
 before the ramp end. Each planning window reports its exact [ρ̲_φ, ρ̄_φ].
+
+Each window's formula is reach-and-stay: safe over the whole horizon, finish
+the dwell in time, then remain in the target lane with lateral speed within
+`task.settle_lateral_speed` (default 0.3 m/s) until the horizon end. Once the
+dwell is done, windows drop the timing and ramp-end terms and only require
+staying safe, in lane and settled. The closed loop keeps running for
+`task.settle_seconds` (default 1.0 s) after the true dwell completes, still
+monitoring truth, and reports `success` only after that settling period.
+
+Lane simulation keeps physical truth separate from the planner's beliefs.
+Initial ego and traffic states are sampled from the configured Gaussian
+priors. After each action, the simulator advances those true states with
+process noise, generates independent noisy observations of `[x, y, vx, vy]`,
+and applies a full-state Kalman update to the predicted beliefs. The first
+planning window uses the prior; the first observation follows its action.
+
+`observation.ego_std` and `observation.traffic_std` configure measurement
+standard deviations as a positive scalar or four values (units m, m, m/s,
+m/s). Both default to `0.1` per component. These are illustrative sensor
+settings, independent of `q_std` and `traffic_q_std` (process noise).
+
+The planner uses posterior means/covariances and estimates dwell progress
+from the posterior mean. The physical monitor independently tracks true dwell
+progress and evaluates success, collision, road and speed violations on truth.
+Executed paths and vehicle drawings show truth; live belief ellipses remain
+centered on the estimates. Saved `LaneState` records contain both.
+
+Speed bounds constrain the nominal plan. Physical Gaussian disturbances are
+not clipped: a sampled speed outside the bounds reports `speed_violation`.
+This preserves the linear-Gaussian plant/estimator model. Each future planning
+window remains an open-loop prediction, without anticipated measurement
+updates; task-progress estimates are not a probabilistic history filter.
+
+`lane.trial` uses a local generator seeded from the scenario, and accepts
+explicit initial states, process disturbances, observation noise, or a
+`torch.Generator` for reproducible trials without changing global RNG state.
+Custom initial states must be `LaneState` records with truth and beliefs;
+older saved state tuples remain plottable.
 
 ## Scope: what the numbers mean
 

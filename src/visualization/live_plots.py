@@ -14,6 +14,7 @@ from visualization.figures import (
     _ellipse,
     _ellipse_indices,
     _ellipse_parameters,
+    _ego_truth,
     _move_ego_vehicle,
     _move_obstacle,
     _np,
@@ -215,7 +216,8 @@ def create_live_view(
     ax_score = fig.add_subplot(grid[1, 1])
     ax_windows = fig.add_subplot(grid[2, 1])
     moving = _draw_environment(ax_map, env, lane=True)
-    initial = _np(initial_state[0])[:2]
+    initial = _np(_ego_truth(initial_state))[:2]
+    _move_obstacle(moving, env, 0, initial_state)
     ego_patch = _draw_ego_vehicle(ax_map, env, initial)
     executed = [initial]
     window_scores = []
@@ -329,7 +331,7 @@ def create_live_view(
     def on_step(step, state, plan):
         nonlocal current_state
         current_state = state
-        executed.append(_np(state[0])[:2])
+        executed.append(_np(_ego_truth(state))[:2])
         points = np.asarray(executed)
         line_exec.set_data(points[:, 0], points[:, 1])
         trace = _np(plan.rollout.aux["mean_trace"])[0]

@@ -342,13 +342,22 @@ def _move_ego_vehicle(patch, position):
     )
 
 
+def _ego_truth(state):
+    """Physical ego state; older saved tuples used their mean as truth."""
+    return getattr(state, "ego_true", state[0])
+
+
+def _traffic_truth(state):
+    return getattr(state, "traffic_true", state[3])
+
+
 def _move_obstacle(patches_by_name, env, step, state=None):
     """Move each lane traffic patch to its state (or constant-speed) position."""
     if patches_by_name is None:
         return
     for index, vehicle in enumerate(env.metadata["traffic"]):
         if state is not None and len(state) > 3:
-            center = _np(state[3][index])[:2]
+            center = _np(_traffic_truth(state)[index])[:2]
         else:
             center = (
                 vehicle["x0"] + vehicle["speed"] * env.metadata["dt"] * step,
@@ -522,7 +531,7 @@ def _plot_execution(result, env, *, dt, save_path, show):
     ax_score = fig.add_subplot(grid[1, 0])
     ax_control = fig.add_subplot(grid[1, 1])
     moving = _draw_environment(ax_map, env, lane=True)
-    means = np.asarray([_np(state[0])[:2] for state in result.states])
+    means = np.asarray([_np(_ego_truth(state))[:2] for state in result.states])
     ax_map.plot(
         means[:, 0],
         means[:, 1],
@@ -552,7 +561,7 @@ def _plot_execution(result, env, *, dt, save_path, show):
     _draw_ego_vehicle(ax_map, env, means[-1])
     for index, _vehicle in enumerate(env.metadata["traffic"]):
         positions = np.asarray(
-            [_np(state[3][index])[:2] for state in result.states]
+            [_np(_traffic_truth(state)[index])[:2] for state in result.states]
         )
         ax_map.plot(
             positions[:, 0],
@@ -646,7 +655,7 @@ def plot_lane_merge(result, env, *, dt, save_path=None, show=False):
         stem = Path(save_path).with_suffix("")
         return stem.with_name(f"{stem.name}_{kind}.png")
 
-    means = np.asarray([_np(state[0])[:2] for state in result.states])
+    means = np.asarray([_np(_ego_truth(state))[:2] for state in result.states])
 
     trajectory_fig, ax_map = plt.subplots(
         figsize=(12, 4.2), layout="constrained"
@@ -680,7 +689,7 @@ def plot_lane_merge(result, env, *, dt, save_path=None, show=False):
         )
     for index, _vehicle in enumerate(env.metadata["traffic"]):
         positions = np.asarray(
-            [_np(state[3][index])[:2] for state in result.states]
+            [_np(_traffic_truth(state)[index])[:2] for state in result.states]
         )
         ax_map.plot(
             positions[:, 0],

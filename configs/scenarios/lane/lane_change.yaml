@@ -8,6 +8,10 @@ u_max: 2.5
 q_std: 0.01
 x0_mean: [0.0, 0.0, 18.0, 0.0]
 x0_cov_scale: 0.01
+# Full-state measurements [x, y, vx, vy]; std units are [m, m, m/s, m/s].
+observation:
+  ego_std: [0.1, 0.1, 0.1, 0.1]
+  traffic_std: [0.1, 0.1, 0.1, 0.1]
 
 # Road and traffic configuration
 road: {y_min: -1.8, y_max: 5.4, lane_divider: 1.8}
@@ -27,6 +31,8 @@ task:
   target_tolerance: 0.9
   start_window_seconds: [2.5, 5.0]
   dwell_seconds: 1.0
+  settle_seconds: 1.0         # keep running after the dwell to show settling
+  settle_lateral_speed: 0.3   # |vy| bound [m/s] once in the target lane
 speed_bounds: [0.0, 25.0]
 accel_bounds:
   longitudinal: [-2.5, 2.5]

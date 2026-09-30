@@ -16,6 +16,8 @@ from visualization.figures import (
     _draw_environment,
     _ellipse,
     _ellipse_parameters,
+    _ego_truth,
+    _traffic_truth,
     _move_obstacle,
     _move_ego_vehicle,
     _np,
@@ -130,7 +132,9 @@ def animate_mpc(result, env, *, dt, filename=None, fps=6, show=False):
         gridspec_kw={"width_ratios": (1.4, 1)},
     )
     moving = _draw_environment(ax_map, env, lane=True)
-    states = np.asarray([_np(state[0])[:2] for state in result.states])
+    states = np.asarray(
+        [_np(_ego_truth(state))[:2] for state in result.states]
+    )
     ego_patch = _draw_ego_vehicle(ax_map, env, states[0])
     plans = result.window_plans
     intervals = np.asarray([plan.hard_interval for plan in plans]).reshape(
@@ -139,7 +143,7 @@ def animate_mpc(result, env, *, dt, filename=None, fps=6, show=False):
     applied = _np(result.applied_controls)
     for index, _vehicle in enumerate(env.metadata["traffic"]):
         centers = np.asarray(
-            [_np(state[3][index])[:2] for state in result.states]
+            [_np(_traffic_truth(state)[index])[:2] for state in result.states]
         )
         ax_map.plot(
             centers[:, 0],

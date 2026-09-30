@@ -421,9 +421,30 @@ def lane_subformulas(environment, horizon):
         dim=1,
         name="Target lane occupancy",
     )
+    speed = task["settle_lateral_speed"]
+    settled = AxisInterval(-speed, speed, dim=3, name="Lateral speed settled")
     dwell = task["dwell_steps"]  # number of elapsed transitions
     absolute_start, absolute_end = task["start_end_steps"]
     credit = lane_dwell_credit(metadata, step, streak)
+
+    def stay_from(start):
+        """Remain in the target lane with settled lateral speed afterwards."""
+        return Always(target & settled, [start, horizon])
+
+    if metadata.get("completed"):
+        # Dwell is done: no timing or ramp-end check, just stay and settle.
+        stay = stay_from(0)
+        return {
+            "road": road_atom,
+            **{
+                f"safety_{name}": predicate
+                for name, predicate in safety.items()
+            },
+            "safe": all_safe,
+            "complete": stay,
+            "stay": stay,
+            "overall": all_safe & stay,
+        }
 
     def completion_from_start(start, duration):
         finish = start + duration
@@ -450,18 +471,19 @@ def lane_subformulas(environment, horizon):
             for candidate in range(start, latest_start + 1)
         ]
     completion = reduce(Or, [formula for formula, _finish in candidates])
-    overall = reduce(
+    stay = reduce(Or, [stay_from(finish) for _formula, finish in candidates])
+    # Safety covers the whole window, not just up to the dwell finish, so
+    # the plan cannot drift off the road or into traffic after completing.
+    overall = all_safe & reduce(
         Or,
-        [
-            Always(safe_atom, [0, finish]) & formula
-            for formula, finish in candidates
-        ],
+        [formula & stay_from(finish) for formula, finish in candidates],
     )
     return {
         "road": road_atom,
         **{f"safety_{name}": predicate for name, predicate in safety.items()},
         "safe": all_safe,
         "complete": completion,
+        "stay": stay,
         "overall": overall,
     }
 
@@ -623,6 +645,8 @@ def build_lane_merge_environment(config, device="cpu"):
     task = dict(config["task"])
     dt = config["dt"]
     task["dwell_steps"] = ceil(task["dwell_seconds"] / dt)
+    task["settle_steps"] = ceil(task.get("settle_seconds", 1.0) / dt)
+    task.setdefault("settle_lateral_speed", 0.3)
     task["start_end_steps"] = (
         ceil(task["start_window_seconds"][0] / dt),
         floor(task["start_window_seconds"][1] / dt),
@@ -653,10 +677,18 @@ def build_lane_merge_environment(config, device="cpu"):
     return environment
 
 
-def lane_local_window(environment, step, streak=0):
-    """Give a planning window its absolute time and observed dwell progress."""
+def lane_local_window(environment, step, streak=0, completed=False):
+    """Give a planning window its absolute time and observed dwell progress.
+
+    `completed` switches to the post-dwell task: stay in lane and settle.
+    """
     window = LaneMergeEnvironment(
-        metadata={**environment.metadata, "step": step, "streak": streak}
+        metadata={
+            **environment.metadata,
+            "step": step,
+            "streak": streak,
+            "completed": completed,
+        }
     )
     window.regions = environment.regions
     return window

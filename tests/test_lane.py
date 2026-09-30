@@ -123,6 +123,39 @@ def test_completion_formula_matches_sampled_dwell():
     )
 
 
+def test_completed_spec_requires_staying_settled_not_ramp_timing():
+    env = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_merge.yaml")
+    )
+    task = env.metadata["task"]
+    steps = 6
+    mean = torch.zeros(1, steps, 4)
+    mean[..., 0] = env.metadata["ramp"]["end_x"] + 20.0
+    mean[..., 1] = task["target_center"]
+    traffic = torch.zeros(1, steps, 3, 4)
+    traffic[..., 0] = -100.0
+
+    def overall(ego_mean, step):
+        beliefs = LaneBeliefTrajectory(
+            ego_mean,
+            torch.zeros(1, steps, 4, 4),
+            traffic,
+            torch.zeros(1, steps, 3, 4, 4),
+            [vehicle["name"] for vehicle in env.metadata["traffic"]],
+        )
+        window = lane_local_window(env, step, completed=True)
+        return lane_subformulas(window, steps - 1)[
+            "overall"
+        ].probability_interval(beliefs)
+
+    # Past the ramp end and after the deadline, staying in lane still holds.
+    end = task["start_end_steps"][1]
+    torch.testing.assert_close(overall(mean, end + 3), torch.ones(2))
+    drifting = mean.clone()
+    drifting[..., 3] = task["settle_lateral_speed"] + 0.5
+    torch.testing.assert_close(overall(drifting, end + 3), torch.zeros(2))
+
+
 @pytest.fixture
 def lane_config(tmp_path):
     cfg = load_config("configs/scenarios/lane/lane_change.yaml")
@@ -147,7 +180,7 @@ def test_relative_beliefs_and_separate_formulae(lane_config):
         state[1],
         state[3],
         state[4],
-        cfg["traffic_q_std"] ** 2 * torch.eye(4),
+        cfg["traffic_q_std"] ** 2 * torch.eye(4, device=setup.dyn.device),
         names,
         cfg["speed_bounds"],
         (cfg["accel_bounds"]["longitudinal"], cfg["accel_bounds"]["lateral"]),
@@ -178,7 +211,7 @@ def test_relative_beliefs_and_separate_formulae(lane_config):
     assert {"road", "safe", "complete", "overall"} <= formulae.keys()
     assert sum(name.startswith("safety_") for name in formulae) == 3
     lower, upper = formulae["overall"].probability_interval(belief)
-    assert 0 <= lower <= upper <= 1
+    assert 0 <= lower <= upper + 1e-6 <= 1 + 1e-6
 
 
 def test_lane_save_and_live_observer(
@@ -218,9 +251,9 @@ def test_lane_save_and_live_observer(
         for item in ax_map.patches
         if item.get_label() in {"Traffic", "_nolegend_"}
     ]
-    for vehicle, patch in zip(cfg["traffic"], traffic_patches):
+    for truth, patch in zip(result.states[0].traffic_true, traffic_patches):
         assert patch.get_x() + patch.get_width() / 2 == pytest.approx(
-            vehicle["x0"]
+            truth[0].item()
         )
     legend = [item.get_text() for item in ax_map.get_legend().get_texts()]
     assert len(legend) == len(set(legend))
@@ -233,7 +266,7 @@ def test_lane_save_and_live_observer(
         line for line in ax_map.lines if line.get_label() == "Executed"
     )
     planned = next(line for line in ax_map.lines if line.get_label() == "Plan")
-    assert list(executed.get_xdata()) == [cfg["x0_mean"][0]]
+    assert list(executed.get_xdata()) == [result.states[0].ego_true[0].item()]
     plan = result.window_plans[0]
     observe.on_iteration(
         0,
@@ -291,7 +324,7 @@ def test_default_lane_completes_with_physical_controls():
         len(result.window_plans[0].loss_history) <= cfg["planner"]["max_iters"]
     )
     lower, upper = result.window_plans[0].hard_interval
-    assert 0 <= lower <= upper <= 1
+    assert 0 <= lower <= upper + 1e-6 <= 1 + 1e-6
     for index, plan in enumerate(result.window_plans):
         torch.testing.assert_close(
             result.applied_controls[index], plan.controls[0]
@@ -299,7 +332,7 @@ def test_default_lane_completes_with_physical_controls():
         torch.testing.assert_close(
             plan.controls, plan.rollout.aux["applied_controls"]
         )
-    speeds = torch.stack([state[0][2] for state in result.states])
+    speeds = torch.stack([state.ego_true[2] for state in result.states])
     assert bool(((speeds >= 0) & (speeds <= 25)).all())
     assert bool((result.applied_controls[:, 0].abs() <= 2.5).all())
     assert bool((result.applied_controls[:, 1].abs() <= 2.0).all())
@@ -311,7 +344,7 @@ def test_default_lane_completes_with_physical_controls():
         first_state[1],
         first_state[3],
         first_state[4],
-        cfg["traffic_q_std"] ** 2 * torch.eye(4),
+        cfg["traffic_q_std"] ** 2 * torch.eye(4, device=setup.dyn.device),
         [car["name"] for car in cfg["traffic"]],
         cfg["speed_bounds"],
         (cfg["accel_bounds"]["longitudinal"], cfg["accel_bounds"]["lateral"]),
@@ -326,9 +359,10 @@ def test_default_lane_completes_with_physical_controls():
     )
     assert replay.hard_interval == pytest.approx(first.hard_interval, abs=1e-6)
     task = build_lane_merge_environment(cfg).metadata["task"]
-    witness = max(result.states[-1][5], task["start_end_steps"][0])
+    witness = max(result.states[-1].true_entry, task["start_end_steps"][0])
     assert witness <= task["start_end_steps"][1]
     assert len(result.window_plans) >= witness + task["dwell_steps"]
+    _assert_settled_in_lane(result, task, cfg)
 
 
 def test_deadline_missed_is_reported(lane_config):
@@ -352,9 +386,25 @@ def test_on_ramp_merge_tapers_and_completes():
     )
     assert result.stopped_reason == "success"
     assert len(result.window_plans) <= cfg["T_SIM"]
-    assert float(result.states[-1][0][1]) >= road["lane_divider"]
+    assert float(result.states[-1].ego_true[1]) >= road["lane_divider"]
     lower, upper = result.window_plans[-1].hard_interval
-    assert 0 <= lower <= upper <= 1
+    assert 0 <= lower <= upper + 1e-6 <= 1 + 1e-6
+    _assert_settled_in_lane(result, env.metadata["task"], cfg)
+
+
+def _assert_settled_in_lane(result, task, cfg):
+    """The run kept going past the dwell and left the ego settled in lane."""
+    final = result.states[-1]
+    assert final.true_completed is not None
+    assert len(result.window_plans) == (
+        final.true_completed + task["settle_steps"]
+    )
+    y, vy = float(final.ego_true[1]), float(final.ego_true[3])
+    assert abs(y - task["target_center"]) <= task["target_tolerance"]
+    assert abs(vy) <= task["settle_lateral_speed"] + 0.1
+    top = cfg["road"]["y_max"] - cfg["ego_vehicle"]["height"] / 2
+    plan = result.window_plans[-1].rollout.aux["mean_trace"][0]
+    assert float(plan[:, 1].max()) <= top
 
 
 def test_lane_figures_have_time_labels_red_traffic_and_final_score(
