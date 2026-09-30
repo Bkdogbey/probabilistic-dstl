@@ -1,6 +1,7 @@
 """Gradient ascent on the smooth pdSTL lower bound, and a receding-horizon loop."""
 
 import logging
+import math
 from dataclasses import dataclass, field
 from time import perf_counter
 
@@ -83,6 +84,18 @@ class Planner:
             **defaults["smoothing"],
             **config.get("smoothing", {}),
         }
+        if not math.isfinite(self.cfg["w_margin"]) or self.cfg["w_margin"] < 0:
+            raise ValueError("w_margin must be finite and non-negative")
+        if not math.isfinite(self.cfg["margin_target"]):
+            raise ValueError("margin_target must be finite")
+        if self.cfg["margin_normalization"] not in ("none", "std"):
+            raise ValueError("margin_normalization must be 'none' or 'std'")
+        floor = self.cfg["margin_sigma_floor"]
+        if not math.isfinite(floor) or floor <= 0:
+            raise ValueError("margin_sigma_floor must be finite and positive")
+        beta = self.cfg["margin_beta"]
+        if beta is not None and (not math.isfinite(beta) or beta <= 0):
+            raise ValueError("margin_beta must be finite and positive or null")
 
     @property
     def control_dim(self):
@@ -126,8 +139,32 @@ class Planner:
             + self.cfg["w_du"] * smoothness
         )
 
-    def _objective(self, controls, smooth_lower):
-        return -self.cfg["w_phi"] * smooth_lower + self._control_cost(controls)
+    def _objective(self, controls, smooth_lower, margin_penalty=0.0):
+        loss = -self.cfg["w_phi"] * smooth_lower + self._control_cost(controls)
+        if self.cfg["w_margin"]:
+            loss = loss + self.cfg["w_margin"] * margin_penalty
+        return loss
+
+    def _auxiliary(self, spec, supplied=None):
+        if self.cfg["w_margin"] == 0:
+            return None
+        if supplied is not None:
+            return supplied
+        from baselines.det_stl import from_pdstl
+
+        return from_pdstl(
+            spec,
+            normalization=self.cfg["margin_normalization"],
+            sigma_floor=self.cfg["margin_sigma_floor"],
+        )
+
+    def _margin_penalty(self, prediction, auxiliary):
+        if auxiliary is None:
+            return 0.0
+        margin = auxiliary.robustness(
+            prediction.belief_trajectory, beta=self.cfg["margin_beta"]
+        )
+        return torch.relu(self.cfg["margin_target"] - margin).mean()
 
     def _applied_controls(self, prediction, parameters):
         if prediction.aux is not None and "applied_controls" in prediction.aux:
@@ -143,7 +180,9 @@ class Planner:
             iteration / max(self.cfg["max_iters"] - 1, 1)
         )
 
-    def _evaluate(self, rollout, parameters, spec, beta, history):
+    def _evaluate(
+        self, rollout, parameters, spec, beta, history, auxiliary=None
+    ):
         with torch.no_grad():
             prediction = rollout(parameters)
             controls = (
@@ -153,7 +192,9 @@ class Planner:
                 prediction.belief_trajectory, beta
             ).item()
             control_cost = self._control_cost(controls).item()
-            loss = self._objective(controls, smooth).item()
+            loss = self._objective(
+                controls, smooth, self._margin_penalty(prediction, auxiliary)
+            ).item()
             interval = spec.probability_interval(prediction.belief_trajectory)
             hard_interval = tuple(interval.tolist())
             alpha = self.cfg["alpha"]
@@ -173,7 +214,9 @@ class Planner:
                 hard_lower_history=[hard_interval[0]],
             )
 
-    def evaluate_controls(self, rollout, controls, *, spec):
+    def evaluate_controls(
+        self, rollout, controls, *, spec, auxiliary_robustness=None
+    ):
         """Score given controls: smooth bound at beta_end and exact interval."""
         margin = torch.finfo(self.dyn.B.dtype).eps
         return self._evaluate(
@@ -182,6 +225,7 @@ class Planner:
             spec,
             self.cfg["smoothing"]["beta_end"],
             [],
+            self._auxiliary(spec, auxiliary_robustness),
         )
 
     def optimize_window(
@@ -193,6 +237,7 @@ class Planner:
         verbose=False,
         on_iteration=None,
         callback_every=1,
+        auxiliary_robustness=None,
     ):
         """Adam steps from init_guess for max_iters; keep the best exact iterate.
 
@@ -203,6 +248,7 @@ class Planner:
         iterate and the last one.
         """
         max_iters = self.cfg["max_iters"]
+        auxiliary = self._auxiliary(spec, auxiliary_robustness)
         parameters = self._init_controls(init_guess)
         initial = self._evaluate(
             rollout,
@@ -210,6 +256,7 @@ class Planner:
             spec,
             self.cfg["smoothing"]["beta_end"],
             [],
+            auxiliary,
         )
         started = perf_counter()
         optimizer = torch.optim.Adam([parameters], lr=self.cfg["lr"])
@@ -221,7 +268,9 @@ class Planner:
             prediction = rollout(parameters)
             lower = spec.smooth_lower(prediction.belief_trajectory, beta)
             controls = self._applied_controls(prediction, parameters)
-            loss = self._objective(controls, lower)
+            loss = self._objective(
+                controls, lower, self._margin_penalty(prediction, auxiliary)
+            )
             if not torch.isfinite(loss):
                 raise ValueError("planning loss is not finite")
             with torch.no_grad():
@@ -268,7 +317,12 @@ class Planner:
                 )
             optimizer.step()
         result_iteration, selected = self._select_candidate(candidates)
-        result = self.evaluate_controls(rollout, selected.controls, spec=spec)
+        result = self.evaluate_controls(
+            rollout,
+            selected.controls,
+            spec=spec,
+            auxiliary_robustness=auxiliary,
+        )
         result.loss_history = history
         result.hard_lower_history = hard_history
         result.selected_iteration = result_iteration

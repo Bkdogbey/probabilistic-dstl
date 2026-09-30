@@ -30,7 +30,7 @@ py-modules = ["utils"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["experiments*", "models*", "pdstl*", "planning*", "visualization*"]
+include = ["baselines*", "experiments*", "models*", "pdstl*", "planning*", "visualization*"]
 
 [tool.setuptools.data-files]
 "share/probabilistic-dstl/configs" = ["configs/*.yaml"]

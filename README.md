@@ -16,6 +16,7 @@ gradients.
 | Piece | Role |
 |---|---|
 | `src/pdstl/` | the semantics: predicates, Boolean and temporal operators |
+| `src/baselines/det_stl.py` | independent STLCG-style recurrent mean robustness and formula conversion |
 | `src/models/` | dynamics, Gaussian beliefs, belief rollouts, trajectory sampling |
 | `src/planning/environment.py` | builds environments and their pdSTL specs (reach–avoid, lane) |
 | `src/planning/planner.py` | the optimization: one window, or receding horizon |
@@ -39,6 +40,41 @@ the highest value; a later iterate wins an exact tie. It runs all
 reports whether the selected plan meets the required satisfaction level. The
 initial guess's exact and smooth ρ̲_φ are recorded (`initial_hard_lower`,
 `initial_smooth_lower`), so each run prints what the optimization improved.
+
+Optional deterministic guidance adds
+`w_margin * max(0, margin_target - rho_aux)` to that objective. It is disabled
+by default (`w_margin: 0`). To enable it, add `w_margin: 0.1` to a scenario's
+`planner:` settings. The baseline converts the existing pdSTL formula once
+per window; it shares the rollout, predicates, and temporal windows without
+changing pdSTL interval semantics or exact-score candidate selection.
+
+`margin_normalization: std` uses Gaussian z-score atomic margins, with
+`margin_sigma_floor` handling zero variance. `none` uses ordinary mean
+margins. `margin_beta: null` evaluates hard deterministic robustness; a
+positive value enables STLCG log-sum-exp smoothing independently of pdSTL's
+beta schedule. This term is optimization guidance, not a probability bound
+or a guarantee that a plan meets alpha. Its weight may change the solution.
+
+The recurrent baseline supports all current pdSTL operators, including
+inclusive `Until`, nested finite windows, and suffix windows. Its public
+traces use forward time and omit incomplete origins. Suffix reductions seed
+each observed value once, avoiding duplicated terminal padding in smooth
+robustness (including Until prefixes). Arbitrary probability-only predicates
+need an explicit geometric auxiliary evaluator. For a standalone
+deterministic comparison:
+
+```python
+from baselines.det_stl import from_pdstl
+
+det_spec = from_pdstl(spec)  # raw mean robustness
+rho = det_spec.robustness(prediction.belief_trajectory)
+```
+
+The recurrence and reductions are adapted from
+[StanfordASL/STLCG](https://github.com/StanfordASL/stlcg), with its MIT notice
+retained in the module. This adapter covers the STL grammar used here; it
+does not reproduce upstream expression visualization, experimental AGM
+robustness, `Then`, or integral extensions.
 
 `Planner.run_receding_horizon` is the MPC loop used by the lane experiment:
 plan a window, execute its first control, shift, and repeat until an outcome

@@ -84,6 +84,61 @@ def test_loss_is_only_smooth_score_effort_and_smoothness():
     )
 
 
+def test_recurrent_hinge_supplies_gradient_when_probability_underflows():
+    from pdstl.predicates import GreaterThan
+
+    planner, rollout, _ = problem(w_margin=0.1, w_u=0.0, w_du=0.0)
+    spec = Eventually(GreaterThan(10.0), [1, 5])
+    parameters = planner._init_controls(None)
+    prediction = rollout(parameters)
+    lower = spec.smooth_lower(prediction.belief_trajectory, 10.0)
+    assert lower.item() == 0.0
+    auxiliary = planner._auxiliary(spec)
+    loss = planner._objective(
+        planner.dyn.bound_control(parameters),
+        lower,
+        planner._margin_penalty(prediction, auxiliary),
+    )
+    loss.backward()
+    assert torch.isfinite(parameters.grad).all()
+    assert parameters.grad.abs().sum() > 0
+
+
+def test_auxiliary_disabled_is_identical_and_never_evaluated():
+    class Unused:
+        def robustness(self, *args, **kwargs):
+            raise AssertionError("disabled auxiliary must not be evaluated")
+
+    first, rollout, spec = problem(max_iters=3)
+    second, _, _ = problem(max_iters=3, w_margin=0.0)
+    expected = first.optimize_window(rollout, spec=spec)
+    actual = second.optimize_window(
+        rollout, spec=spec, auxiliary_robustness=Unused()
+    )
+    torch.testing.assert_close(
+        actual.controls, expected.controls, rtol=0, atol=0
+    )
+    assert actual.loss_history == expected.loss_history
+    assert actual.hard_interval == expected.hard_interval
+
+
+def test_hinge_candidate_selection_remains_hard_pdstl_and_replays():
+    planner, rollout, spec = problem(
+        max_iters=4, w_margin=0.1, margin_beta=2.0
+    )
+    records = []
+    result = planner.optimize_window(
+        rollout, spec=spec, on_iteration=lambda _, r: records.append(r)
+    )
+    assert (
+        result.hard_interval[0]
+        >= max(r.hard_interval[0] for r in records) - 1e-6
+    )
+    replay = planner.evaluate_controls(rollout, result.controls, spec=spec)
+    assert replay.final_loss == pytest.approx(result.final_loss)
+    assert replay.hard_interval == pytest.approx(result.hard_interval)
+
+
 def test_one_iteration_returns_the_updated_controls_and_replays():
     planner, rollout, spec = problem(max_iters=1)
     result = planner.optimize_window(rollout, spec=spec)
