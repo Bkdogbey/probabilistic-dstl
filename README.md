@@ -54,6 +54,14 @@ margins. `margin_beta: null` evaluates hard deterministic robustness; a
 positive value enables STLCG log-sum-exp smoothing independently of pdSTL's
 beta schedule. This term is optimization guidance, not a probability bound
 or a guarantee that a plan meets alpha. Its weight may change the solution.
+`cd src && python -m experiments.hinge_comparison` compares pdSTL alone with
+both hinges on the reach-avoid scenarios, from route and zero controls, and
+saves a timestamped folder under `outputs/hinge_comparison/`. Adding
+`ablation <earlier folder>` screens hinge weights and hard/smooth auxiliary
+robustness on the obstacle cold start (full and goal-only formulas) with
+per-iterate diagnostics, transfers the best setting of each hinge to the
+other scenarios, and runs matched-noise lane MPC trials only if a hinge
+improved full-task satisfaction.
 
 The recurrent baseline supports all current pdSTL operators, including
 inclusive `Until`, nested finite windows, and suffix windows. Its public
