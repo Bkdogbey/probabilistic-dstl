@@ -107,10 +107,20 @@ class DetSTL_Formula(nn.Module):
 
 
 class DetPredicate(DetSTL_Formula):
-    """Atomic geometry copied from a pdSTL event without registering its module."""
+    """Atomic geometry copied from a pdSTL event without registering its module.
 
-    def __init__(self, event):
+    Each signed margin m (aT x <= b, or one finite side of an axis interval)
+    is m - tighten * sigma, sigma being the belief's standard deviation along
+    that margin: a per-constraint chance constraint at level Phi(tighten).
+    `negated` evaluates the complement as max(-m - tighten * sigma), so
+    tightening shrinks the satisfying set on either polarity.
+    """
+
+    def __init__(self, event, tighten=0.0, negated=False):
         super().__init__()
+        if not math.isfinite(tighten) or tighten < 0:
+            raise ValueError("tighten must be finite and non-negative")
+        self.tighten, self.negated = float(tighten), bool(negated)
         self.name = event.name
         if isinstance(event, AxisInterval):
             self.kind = "axis"
@@ -143,36 +153,58 @@ class DetPredicate(DetSTL_Formula):
             )
         return trace.mean
 
+    def _variance(self, trajectory, normal):
+        if torch.is_tensor(trajectory):
+            raise ValueError(
+                "tightening requires a Gaussian belief trajectory"
+            )
+        if self.kind == "halfspace":
+            covariance = trajectory.trace.covariance
+            return torch.einsum("i,...ij,j->...", normal, covariance, normal)
+        if self.vehicle is not None:
+            index = trajectory.names.index(self.vehicle)
+            return trajectory.relative_cov[:, :, index, self.dim, self.dim]
+        return trajectory.trace.covariance[..., self.dim, self.dim]
+
     def robustness_trace(self, trajectory, beta=None):
-        mean = self._mean(trajectory)
+        mean, normal = self._mean(trajectory), None
         if self.kind == "halfspace":
             normal = mean.new_tensor(self.a)
             if normal.shape != mean.shape[-1:]:
                 raise ValueError(
                     "half-space normal must match the state dimension"
                 )
-            return (self.b - mean @ normal).unsqueeze(-1)
-        if self.vehicle is not None:
-            if not hasattr(trajectory, "relative_mean"):
-                raise ValueError(
-                    "relative predicates require a lane belief trajectory"
-                )
-            index = trajectory.names.index(self.vehicle)
-            coordinate = trajectory.relative_mean[:, :, index, self.dim]
+            margins = [self.b - mean @ normal]
         else:
-            if self.dim >= mean.shape[-1]:
-                raise ValueError("predicate dimension is outside the state")
-            coordinate = mean[..., self.dim]
-        margins = []
-        if math.isfinite(self.lower):
-            margins.append(coordinate - self.lower)
-        if math.isfinite(self.upper):
-            margins.append(self.upper - coordinate)
-        if not margins:
-            return torch.full_like(coordinate.unsqueeze(-1), math.inf)
-        return _reduce(
-            torch.stack(margins, dim=-1), beta, minimum=True, dim=-1
-        )
+            if self.vehicle is not None:
+                if not hasattr(trajectory, "relative_mean"):
+                    raise ValueError(
+                        "relative predicates require a lane belief trajectory"
+                    )
+                index = trajectory.names.index(self.vehicle)
+                coordinate = trajectory.relative_mean[:, :, index, self.dim]
+            else:
+                if self.dim >= mean.shape[-1]:
+                    raise ValueError(
+                        "predicate dimension is outside the state"
+                    )
+                coordinate = mean[..., self.dim]
+            margins = []
+            if math.isfinite(self.lower):
+                margins.append(coordinate - self.lower)
+            if math.isfinite(self.upper):
+                margins.append(self.upper - coordinate)
+            if not margins:
+                full = -math.inf if self.negated else math.inf
+                return torch.full_like(coordinate.unsqueeze(-1), full)
+        tightening = 0.0
+        if self.tighten:
+            # Floor before sqrt: its derivative is otherwise undefined at zero.
+            sigma = self._variance(trajectory, normal).clamp_min(1e-12).sqrt()
+            tightening = self.tighten * sigma
+        sign = -1 if self.negated else 1
+        margins = torch.stack([sign * m - tightening for m in margins], dim=-1)
+        return _reduce(margins, beta, minimum=not self.negated, dim=-1)
 
 
 class _DetBinary(DetSTL_Formula):
@@ -341,29 +373,43 @@ class DetUntil(DetSTL_Formula):
         return torch.cat(outputs, dim=1)
 
 
-def from_pdstl(spec):
+def from_pdstl(spec, tighten=0.0):
     """Compile the same predicates/windows into an independent recurrent graph.
 
-    Atomic margins are evaluated on the belief mean (raw mean robustness).
+    Atomic margins are evaluated on the belief mean; `tighten` > 0 shifts
+    each by tighten * sigma (tightened STL, per-constraint chance
+    constraints at level Phi(tighten)). Negations are pushed onto the
+    predicates so that tightening never loosens a negated constraint.
     """
 
-    def convert(node):
+    def convert(node, negated=False):
         if isinstance(node, (_Rectangle, pd.Implies)):
-            return convert(node.equivalent)
+            return convert(node.equivalent, negated)
         if isinstance(node, pd.Negation):
-            return DetNegation(convert(node.subformula))
+            return convert(node.subformula, not negated)
+        if isinstance(node, (AxisInterval, HalfSpace)):
+            return DetPredicate(node, tighten, negated)
         if isinstance(node, (pd.And, pd.Or)):
-            cls = DetAnd if isinstance(node, pd.And) else DetOr
-            return cls(convert(node.subformula1), convert(node.subformula2))
+            cls = DetAnd if isinstance(node, pd.And) != negated else DetOr
+            return cls(
+                convert(node.subformula1, negated),
+                convert(node.subformula2, negated),
+            )
         if isinstance(node, (pd.Always, pd.Eventually)):
-            cls = DetAlways if isinstance(node, pd.Always) else DetEventually
-            return cls(convert(node.subformula), node._interval)
+            cls = (
+                DetAlways
+                if isinstance(node, pd.Always) != negated
+                else DetEventually
+            )
+            return cls(convert(node.subformula, negated), node._interval)
         if isinstance(node, pd.Until):
+            if negated:
+                if tighten:
+                    raise TypeError("tightened negated Until is unsupported")
+                return DetNegation(convert(node))
             return DetUntil(
                 convert(node.left), convert(node.right), node._interval
             )
-        if isinstance(node, (AxisInterval, HalfSpace)):
-            return DetPredicate(node)
         raise TypeError(
             f"unsupported auxiliary formula: {type(node).__name__}"
         )

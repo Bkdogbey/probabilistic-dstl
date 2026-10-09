@@ -327,3 +327,12 @@ def test_sampled_trajectories_match_the_predicted_belief():
     torch.testing.assert_close(
         torch.cov(paths[:, -1].T), covariance[0, -1], atol=5e-3, rtol=0
     )
+
+
+def test_double_integrator_accepts_per_state_process_noise():
+    scalar = DoubleIntegrator(q_std=0.1)
+    torch.testing.assert_close(scalar.Q, 0.01 * torch.eye(4))
+    position_only = DoubleIntegrator(q_std=[0.1, 0.2, 0.0, 0.0])
+    torch.testing.assert_close(
+        position_only.Q, torch.diag(torch.tensor([0.01, 0.04, 0.0, 0.0]))
+    )

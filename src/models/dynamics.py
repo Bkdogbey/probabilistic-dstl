@@ -51,7 +51,11 @@ class SingleIntegrator(Dynamics):
 
 
 class DoubleIntegrator(Dynamics):
-    """Acceleration control. State [px, py, vx, vy], control [ax, ay]."""
+    """Acceleration control. State [px, py, vx, vy], control [ax, ay].
+
+    q_std is one standard deviation for every state, or one per state:
+    Q = diag(q_std^2).
+    """
 
     def __init__(self, dt=0.2, u_max=1.0, q_std=0.02, device="cpu"):
         super().__init__(dt, u_max, device)
@@ -62,4 +66,5 @@ class DoubleIntegrator(Dynamics):
         B[2, 0] = B[3, 1] = dt
         self.register_buffer("A", A)
         self.register_buffer("B", B)
-        self.register_buffer("Q", q_std**2 * torch.eye(4, device=device))
+        q_std = torch.as_tensor(q_std, dtype=A.dtype, device=device)
+        self.register_buffer("Q", torch.diag(q_std.expand(4) ** 2))

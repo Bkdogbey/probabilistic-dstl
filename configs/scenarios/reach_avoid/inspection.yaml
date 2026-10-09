@@ -1,0 +1,38 @@
+name: Gap or Detour
+# One decision: the narrow gap (walls on both sides) or the wide opening.
+# phi = G[0,H] safe & (not dock) U[0,H-d] (G[0,d] A | G[0,d] B)
+#       & F[0,H-m] G[0,m] dock
+dynamics: double_integrator
+H: 100
+dt: 0.2
+u_max: 1.0
+# Position-only process noise. `run` plans at this level (inside the band
+# where tightened STL and pdSTL disagree); `sweep` rescales the vector so its
+# first entry takes each value in sweep.levels.
+q_std: [0.028, 0.028, 0.0, 0.0]
+x0_mean: [1.5, 1.5, 0.0, 0.0]
+x0_cov_scale: 0.0  # known start: position spread is q * sqrt(k)
+bounds: {x_range: [0, 12], y_range: [0, 12]}
+walls:
+  - {name: left wall, x_range: [0.0, 4.2], y_range: [5.0, 5.8]}
+  - {name: right wall, x_range: [4.8, 9.2], y_range: [5.0, 5.8]}
+regions:  # role inspect: any one, for `dwell` steps; role dock: hold at the end
+  A: {role: inspect, x_range: [3.6, 5.4], y_range: [7.0, 8.6]}
+  B: {role: inspect, x_range: [9.8, 11.8], y_range: [9.0, 11.0]}
+  dock: {role: dock, x_range: [7.0, 8.8], y_range: [7.2, 9.0]}
+dwell: 10  # steps inside an inspection zone before the dock may be entered
+hold: 10   # final steps held inside the dock
+routes:  # shortest first; `via` is the passage crossed, bounded along `lateral`
+  gap:  # w = 0.6 m between the walls: the binding two-sided constraint
+    via: {x_range: [4.2, 4.8], y_range: [5.0, 5.8], lateral: x}
+    waypoints: [[4.5, 4.6], [4.5, 6.2], [4.5, 7.8], [7.9, 8.1]]
+  detour:
+    via: {x_range: [9.2, 12.0], y_range: [5.0, 5.8], lateral: x}
+    waypoints: [[10.6, 4.4], [10.6, 6.4], [10.8, 10.0], [7.9, 8.1]]
+sweep:
+  levels: [0.005, 0.01, 0.015, 0.02, 0.022, 0.024, 0.025, 0.026, 0.027,
+           0.028, 0.029, 0.03, 0.033, 0.036]
+  workers: 14  # noise levels planned in parallel, one CPU process each
+monte_carlo: {samples: 20000, seed: 0}
+planner: {max_iters: 300, lr: 0.01, alpha: 0.95}
+visualization: {ellipse_every: 10, map_level: 0.028}

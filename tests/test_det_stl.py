@@ -238,3 +238,73 @@ def test_two_sided_axis_margin():
         from_pdstl(AxisInterval(-1, 2))(mean)[..., 0],
         torch.tensor([[-1.0, 1.0, -1.0]]),
     )
+
+
+def gaussian_point(mean, variance):
+    """One-step belief [1,1,D] with diagonal covariance."""
+    mean = torch.tensor([[mean]])
+    covariance = torch.diag(torch.tensor(variance)).expand(1, 1, -1, -1)
+    return create_gaussian_belief_trajectory(mean, covariance)
+
+
+def test_tightening_subtracts_z_sigma_from_every_margin():
+    beliefs = gaussian_point([1.0, 2.0], [0.25, 4.0])
+    halfspace = from_pdstl(HalfSpace([1.0, 0.0], 3.0), tighten=2.0)
+    torch.testing.assert_close(  # 3 - 1 - 2 * 0.5
+        halfspace.robustness(beliefs), torch.tensor([1.0])
+    )
+    axis = from_pdstl(AxisInterval(-1.0, 5.0, dim=1), tighten=1.0)
+    torch.testing.assert_close(  # min(2 + 1, 5 - 2) - 1 * 2
+        axis.robustness(beliefs), torch.tensor([1.0])
+    )
+    untightened = from_pdstl(AxisInterval(-1.0, 5.0, dim=1), tighten=0.0)
+    torch.testing.assert_close(
+        untightened.robustness(beliefs),
+        from_pdstl(AxisInterval(-1.0, 5.0, dim=1)).robustness(beliefs),
+    )
+
+
+def test_tightened_negation_shrinks_the_satisfying_set():
+    # Outside the box [0,2]x[0,2]: nearest side is x = 2.5 - 2 = 0.5.
+    beliefs = gaussian_point([2.5, 1.0], [0.04, 0.04])
+    box = ([0.0, 2.0], [0.0, 2.0])
+    loose = from_pdstl(OutsideRectangle(*box)).robustness(beliefs)
+    tight = from_pdstl(OutsideRectangle(*box), tighten=1.0).robustness(beliefs)
+    torch.testing.assert_close(loose, torch.tensor([0.5]))
+    torch.testing.assert_close(tight, torch.tensor([0.3]))  # 0.5 - 0.2
+    inside = from_pdstl(InsideRectangle(*box), tighten=1.0)
+    torch.testing.assert_close(  # min(2.5, -0.5, 1, 1) - 0.2
+        inside.robustness(beliefs), torch.tensor([-0.7])
+    )
+    with pytest.raises(TypeError, match="negated Until"):
+        from_pdstl(
+            Negation(Until(GreaterThan(0), GreaterThan(1), [0, 1])),
+            tighten=1.0,
+        )
+    with pytest.raises(ValueError, match="Gaussian"):
+        from_pdstl(GreaterThan(0), tighten=1.0)(torch.zeros(1, 3, 1))
+
+
+@pytest.mark.parametrize("sigma", [0.15, 0.17, 0.2])
+def test_centred_gap_pdstl_is_exact_and_tightened_stl_checks_each_wall(sigma):
+    """A gap of width w: pdSTL gives 2 Phi(z) - 1, tightened STL Phi(z)."""
+    width, alpha = 0.6, 0.95
+    normal = torch.distributions.Normal(0.0, 1.0)
+    z = width / 2 / sigma
+    beliefs = gaussian_point([0.0, 0.0], [sigma**2, 0.0])
+    walls = And(
+        OutsideRectangle([-5.0, -width / 2], [-1.0, 1.0]),
+        OutsideRectangle([width / 2, 5.0], [-1.0, 1.0]),
+    )
+    per_wall = normal.cdf(torch.tensor(z))
+    # The misses are disjoint, so the Frechet lower bound is exact.
+    torch.testing.assert_close(
+        walls.probability_interval(beliefs),
+        torch.stack([2 * per_wall - 1, per_wall]),
+        rtol=0,
+        atol=1e-5,
+    )
+    z_alpha = normal.icdf(torch.tensor(alpha)).item()
+    rho = from_pdstl(walls, tighten=z_alpha).robustness(beliefs).item()
+    assert rho == pytest.approx(width / 2 - z_alpha * sigma, abs=1e-5)
+    assert (rho >= 0) == (per_wall.item() >= alpha)
