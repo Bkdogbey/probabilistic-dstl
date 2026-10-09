@@ -2,11 +2,9 @@
 w_phi: 1.0
 w_u: 1.0e-3
 w_du: 1.0e-3
-w_margin: 0.0  # optional deterministic STL hinge; zero preserves pdSTL-only planning
+w_margin: 0.0  # mean-robustness STL hinge; 10.0 enables it, zero preserves pdSTL-only planning
 margin_target: 0.0
-margin_normalization: std  # none: raw mean margins; std: Gaussian z-score margins
-margin_sigma_floor: 1.0e-3
-margin_beta: null  # null: hard STL robustness; positive: STLCG log-sum-exp smoothing
+margin_beta: 10.0  # STLCG log-sum-exp smoothing; null: hard STL robustness
 lr: 0.05
 max_iters: 300
 smoothing:

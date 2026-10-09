@@ -42,26 +42,17 @@ initial guess's exact and smooth ρ̲_φ are recorded (`initial_hard_lower`,
 `initial_smooth_lower`), so each run prints what the optimization improved.
 
 Optional deterministic guidance adds
-`w_margin * max(0, margin_target - rho_aux)` to that objective. It is disabled
-by default (`w_margin: 0`). To enable it, add `w_margin: 0.1` to a scenario's
-`planner:` settings. The baseline converts the existing pdSTL formula once
-per window; it shares the rollout, predicates, and temporal windows without
-changing pdSTL interval semantics or exact-score candidate selection.
-
-`margin_normalization: std` uses Gaussian z-score atomic margins, with
-`margin_sigma_floor` handling zero variance. `none` uses ordinary mean
-margins. `margin_beta: null` evaluates hard deterministic robustness; a
-positive value enables STLCG log-sum-exp smoothing independently of pdSTL's
-beta schedule. This term is optimization guidance, not a probability bound
-or a guarantee that a plan meets alpha. Its weight may change the solution.
-`cd src && python -m experiments.hinge_comparison` compares pdSTL alone with
-both hinges on the reach-avoid scenarios, from route and zero controls, and
-saves a timestamped folder under `outputs/hinge_comparison/`. Adding
-`ablation <earlier folder>` screens hinge weights and hard/smooth auxiliary
-robustness on the obstacle cold start (full and goal-only formulas) with
-per-iterate diagnostics, transfers the best setting of each hinge to the
-other scenarios, and runs matched-noise lane MPC trials only if a hinge
-improved full-task satisfaction.
+`w_margin * max(0, margin_target - rho_aux)` to that objective, where
+`rho_aux` is STLCG-style robustness of the same formula on the belief mean,
+smoothed with log-sum-exp at `margin_beta` (default 10; `null` is hard
+robustness). It is off by default (`w_margin: 0`); add `w_margin: 10` to a
+scenario's `planner:` settings to enable it. It matters from poor initial
+guesses (e.g. zero controls), where the exact lower bound is 0 and its
+gradient vanishes: the hinge supplies a direction, then switches itself off
+once the mean plan satisfies the formula. From a good initial guess it leaves
+the selected plan unchanged. It shares the rollout, predicates, and temporal
+windows, does not change pdSTL semantics or exact-score candidate selection,
+and is guidance only, not a probability bound.
 
 The recurrent baseline supports all current pdSTL operators, including
 inclusive `Until`, nested finite windows, and suffix windows. Its public

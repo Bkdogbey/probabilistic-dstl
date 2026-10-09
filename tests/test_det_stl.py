@@ -154,7 +154,7 @@ def test_boolean_geometry_and_conversion_do_not_change_pdstl():
     spec = And(Always(avoid, [1, 2]), Eventually(goal, [1, 2]))
     original = spec(beliefs).clone()
     state = {k: v.clone() for k, v in spec.state_dict().items()}
-    auxiliary = from_pdstl(spec, normalization="std")
+    auxiliary = from_pdstl(spec)
     torch.testing.assert_close(
         auxiliary.robustness(beliefs), torch.tensor([-0.25])
     )
@@ -177,21 +177,16 @@ def test_implication_and_negation():
     )
 
 
-def test_halfspace_projection_and_zero_variance_gradients():
+def test_halfspace_projection_and_gradients():
     mean = torch.tensor([[[1.0, 2.0], [2.0, 1.0]]], requires_grad=True)
-    covariance = torch.zeros(1, 2, 2, 2, requires_grad=True)
-    beliefs = create_gaussian_belief_trajectory(mean, covariance)
-    auxiliary = from_pdstl(
-        HalfSpace([2.0, 1.0], 5.0), normalization="std", sigma_floor=0.5
-    )
-    rho = auxiliary(beliefs)
-    torch.testing.assert_close(rho[..., 0], torch.tensor([[2.0, 0.0]]))
+    beliefs = create_gaussian_belief_trajectory(mean, torch.zeros(1, 2, 2, 2))
+    rho = from_pdstl(HalfSpace([2.0, 1.0], 5.0))(beliefs)
+    torch.testing.assert_close(rho[..., 0], torch.tensor([[1.0, 0.0]]))
     rho.sum().backward()
     assert torch.isfinite(mean.grad).all()
-    assert torch.isfinite(covariance.grad).all()
 
 
-def test_relative_lane_margin_uses_relative_variance():
+def test_relative_lane_margin_uses_relative_mean():
     mean = torch.zeros(1, 3, 4)
     traffic = torch.tensor(
         [
@@ -209,8 +204,8 @@ def test_relative_lane_margin_uses_relative_variance():
     )
     spec = RelativeAxisInterval("car", 2, math.inf, dim=0)
     torch.testing.assert_close(
-        from_pdstl(spec, normalization="std")(beliefs)[..., 0],
-        torch.tensor([[0.5, 1.0, 1.5]]),
+        from_pdstl(spec)(beliefs)[..., 0],
+        torch.tensor([[1.0, 2.0, 3.0]]),
     )
 
 
@@ -233,8 +228,6 @@ def test_bad_inputs_fail_before_incomplete_or_unsupported_evaluation():
         from_pdstl(Predicate("p"))
     with pytest.raises(ValueError, match="available trace"):
         from_pdstl(Always(GreaterThan(0), [0, 3]))(torch.zeros(1, 3, 1))
-    with pytest.raises(ValueError, match="Gaussian"):
-        from_pdstl(GreaterThan(0), normalization="std")(torch.zeros(1, 3, 1))
     with pytest.raises(ValueError, match="beta"):
         from_pdstl(GreaterThan(0))(torch.zeros(1, 3, 1), beta=-1)
 

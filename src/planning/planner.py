@@ -88,11 +88,6 @@ class Planner:
             raise ValueError("w_margin must be finite and non-negative")
         if not math.isfinite(self.cfg["margin_target"]):
             raise ValueError("margin_target must be finite")
-        if self.cfg["margin_normalization"] not in ("none", "std"):
-            raise ValueError("margin_normalization must be 'none' or 'std'")
-        floor = self.cfg["margin_sigma_floor"]
-        if not math.isfinite(floor) or floor <= 0:
-            raise ValueError("margin_sigma_floor must be finite and positive")
         beta = self.cfg["margin_beta"]
         if beta is not None and (not math.isfinite(beta) or beta <= 0):
             raise ValueError("margin_beta must be finite and positive or null")
@@ -152,11 +147,7 @@ class Planner:
             return supplied
         from baselines.det_stl import from_pdstl
 
-        return from_pdstl(
-            spec,
-            normalization=self.cfg["margin_normalization"],
-            sigma_floor=self.cfg["margin_sigma_floor"],
-        )
+        return from_pdstl(spec)
 
     def _margin_penalty(self, prediction, auxiliary):
         if auxiliary is None:

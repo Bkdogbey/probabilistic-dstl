@@ -109,13 +109,8 @@ class DetSTL_Formula(nn.Module):
 class DetPredicate(DetSTL_Formula):
     """Atomic geometry copied from a pdSTL event without registering its module."""
 
-    def __init__(self, event, normalization="none", sigma_floor=1e-3):
+    def __init__(self, event):
         super().__init__()
-        if normalization not in ("none", "std"):
-            raise ValueError("normalization must be 'none' or 'std'")
-        if not math.isfinite(sigma_floor) or sigma_floor <= 0:
-            raise ValueError("sigma_floor must be finite and positive")
-        self.normalization, self.sigma_floor = normalization, sigma_floor
         self.name = event.name
         if isinstance(event, AxisInterval):
             self.kind = "axis"
@@ -136,44 +131,27 @@ class DetPredicate(DetSTL_Formula):
                 f"unsupported auxiliary predicate: {type(event).__name__}"
             )
 
-    def _moments(self, trajectory):
+    def _mean(self, trajectory):
         if torch.is_tensor(trajectory):
             if trajectory.ndim != 3 or trajectory.shape[1] == 0:
                 raise ValueError("mean trace must have shape [B,T,D], T > 0")
-            if self.normalization == "std":
-                raise ValueError(
-                    "std normalization requires a Gaussian belief trajectory"
-                )
-            return trajectory, None
+            return trajectory
         trace = getattr(trajectory, "trace", None)
         if trace is None or not hasattr(trace, "mean"):
             raise ValueError(
                 "auxiliary robustness requires a mean-bearing belief trajectory"
             )
-        return trace.mean, trace.covariance
-
-    def _standardize(self, margin, variance):
-        if self.normalization == "none":
-            return margin
-        # Floor variance before sqrt: its derivative is otherwise undefined at zero.
-        sigma = variance.clamp_min(self.sigma_floor**2).sqrt()
-        return margin / sigma
+        return trace.mean
 
     def robustness_trace(self, trajectory, beta=None):
-        mean, covariance = self._moments(trajectory)
+        mean = self._mean(trajectory)
         if self.kind == "halfspace":
             normal = mean.new_tensor(self.a)
             if normal.shape != mean.shape[-1:]:
                 raise ValueError(
                     "half-space normal must match the state dimension"
                 )
-            margin = self.b - mean @ normal
-            variance = (
-                None
-                if covariance is None
-                else torch.einsum("i,...ij,j->...", normal, covariance, normal)
-            )
-            return self._standardize(margin, variance).unsqueeze(-1)
+            return (self.b - mean @ normal).unsqueeze(-1)
         if self.vehicle is not None:
             if not hasattr(trajectory, "relative_mean"):
                 raise ValueError(
@@ -181,25 +159,15 @@ class DetPredicate(DetSTL_Formula):
                 )
             index = trajectory.names.index(self.vehicle)
             coordinate = trajectory.relative_mean[:, :, index, self.dim]
-            variance = trajectory.relative_cov[:, :, index, self.dim, self.dim]
         else:
             if self.dim >= mean.shape[-1]:
                 raise ValueError("predicate dimension is outside the state")
             coordinate = mean[..., self.dim]
-            variance = (
-                None
-                if covariance is None
-                else covariance[..., self.dim, self.dim]
-            )
         margins = []
         if math.isfinite(self.lower):
-            margins.append(
-                self._standardize(coordinate - self.lower, variance)
-            )
+            margins.append(coordinate - self.lower)
         if math.isfinite(self.upper):
-            margins.append(
-                self._standardize(self.upper - coordinate, variance)
-            )
+            margins.append(self.upper - coordinate)
         if not margins:
             return torch.full_like(coordinate.unsqueeze(-1), math.inf)
         return _reduce(
@@ -373,11 +341,10 @@ class DetUntil(DetSTL_Formula):
         return torch.cat(outputs, dim=1)
 
 
-def from_pdstl(spec, normalization="none", sigma_floor=1e-3):
+def from_pdstl(spec):
     """Compile the same predicates/windows into an independent recurrent graph.
 
-    Raw mean robustness is a deterministic baseline. 'std' uses Gaussian
-    standardized atomic margins as auxiliary optimization guidance.
+    Atomic margins are evaluated on the belief mean (raw mean robustness).
     """
 
     def convert(node):
@@ -396,7 +363,7 @@ def from_pdstl(spec, normalization="none", sigma_floor=1e-3):
                 convert(node.left), convert(node.right), node._interval
             )
         if isinstance(node, (AxisInterval, HalfSpace)):
-            return DetPredicate(node, normalization, sigma_floor)
+            return DetPredicate(node)
         raise TypeError(
             f"unsupported auxiliary formula: {type(node).__name__}"
         )
