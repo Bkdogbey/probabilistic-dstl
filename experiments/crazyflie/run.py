@@ -107,8 +107,9 @@ def cmd_plan(cfg, args):
 # --- fly -------------------------------------------------------------------
 
 
-def confirm(cfg, t, xyz, info):
-    """Show the plan and ask before flying; True to fly."""
+def confirm(cfg, t, xyz, info, figure):
+    """Show the plan (close the window to continue), then ask; True to fly."""
+    print(f"Plan figure: {figure}")
     plots.plot_plan(cfg, t, xyz, info, show=True)
     return input("Fly this plan? [y/N] ").strip().lower() == "y"
 
@@ -216,7 +217,11 @@ def cmd_fly(cfg, args):
             return 1
     t, xyz, info, directory = get_plan(cfg, replan=args.replan)
     print(describe(info, t))
-    if not (args.dry_run or args.yes or confirm(cfg, t, xyz, info)):
+    if not (
+        args.dry_run
+        or args.yes
+        or confirm(cfg, t, xyz, info, directory / "plan.png")
+    ):
         print("Not flown.")
         return 1
 

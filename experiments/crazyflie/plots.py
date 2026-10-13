@@ -7,16 +7,40 @@ of one plan. Each figure is saved as PNG (300 dpi) and PDF.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import matplotlib
-import matplotlib.patches as patches
-import matplotlib.pyplot as plt
-import numpy as np
 
-import analysis
-import trajectory
-from planners import CHI2_95_2D
+
+def _pick_backend():
+    """Tk for windows, Agg without a display; never Qt.
+
+    In the ROS flight environment Qt clashes with the OpenCV that ROS Sugar
+    imports (missing ``xcb`` plugin, symbol errors), so the default Qt
+    backend would crash the pre-flight plan window. ``MPLBACKEND`` wins.
+    """
+    if os.environ.get("MPLBACKEND"):
+        return
+    has_display = os.environ.get("DISPLAY") or os.environ.get(
+        "WAYLAND_DISPLAY"
+    )
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        has_display = False
+    matplotlib.use("TkAgg" if has_display else "Agg")
+
+
+_pick_backend()
+
+import matplotlib.patches as patches  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+import analysis  # noqa: E402
+import trajectory  # noqa: E402
+from planners import CHI2_95_2D  # noqa: E402
 
 # Same roles and colours as src/visualization/figures.py.
 COLORS = {
