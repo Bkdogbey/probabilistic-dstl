@@ -2,6 +2,7 @@
 
     python experiments/crazyflie/run.py plan                 # plan + figure
     python experiments/crazyflie/run.py fly --dry-run        # simulated drone
+    python experiments/crazyflie/run.py fly --dry-run --ros  # ... via ROS Sugar
     python experiments/crazyflie/run.py fly                  # real flight
     python experiments/crazyflie/run.py analyze [RUN] [--all]
 
@@ -112,14 +113,19 @@ def confirm(cfg, t, xyz, info):
     return input("Fly this plan? [y/N] ").strip().lower() == "y"
 
 
-def launch(cfg, t, xyz, log):
+def launch(cfg, t, xyz, log, connect_fn=flight.connect):
     """Fly through ROS Sugar; returns the run summary."""
     from ros_sugar import Launcher
 
     from component import FlightComponent
 
     component = FlightComponent(
-        component_name="crazyflie_flight", cfg=cfg, t=t, xyz=xyz, log=log
+        component_name="crazyflie_flight",
+        cfg=cfg,
+        t=t,
+        xyz=xyz,
+        log=log,
+        connect_fn=connect_fn,
     )
     launcher = Launcher()
     launcher.add_pkg(
@@ -129,11 +135,38 @@ def launch(cfg, t, xyz, log):
         launcher.bringup()
     except KeyboardInterrupt:
         pass
-    component.stop.set()
+    finally:
+        # ROS is down. An unfinished flight is told to stop (it lands), and
+        # the process waits for it: never exit with the drone airborne.
+        component.stop.set()
+        wait_for_mission(component.mission)
     summary_file = log.dir / "summary.json"
     if component.summary is None and not summary_file.exists():
         return log.finish("error", "flight component did not run")
     return component.summary or json.loads(summary_file.read_text())
+
+
+def wait_for_mission(mission):
+    """Join the mission thread; Ctrl-C while landing only prints a note."""
+    while mission is not None and mission.is_alive():
+        try:
+            mission.join(timeout=0.5)
+        except KeyboardInterrupt:
+            print("Landing and cleaning up; waiting for the flight to end.")
+
+
+def launch_safely(cfg, t, xyz, log, connect_fn):
+    """``launch``, but a startup failure still closes the log."""
+    try:
+        return launch(cfg, t, xyz, log, connect_fn)
+    except Exception as exc:
+        logger.exception("Launch failed")
+        summary_file = log.dir / "summary.json"
+        if summary_file.exists():
+            return json.loads(summary_file.read_text())
+        return log.finish(
+            "error", f"launch failed: {type(exc).__name__}: {exc}"
+        )
 
 
 def plot_flight(run_dir):
@@ -155,10 +188,11 @@ FLIGHT_STACK = {
 }
 
 
-def missing_flight_stack():
-    """Modules a real flight needs that cannot be imported here."""
+def missing_flight_stack(modules=tuple(FLIGHT_STACK)):
+    """Flight-stack ``modules`` that cannot be imported here."""
     missing = []
-    for module, hint in FLIGHT_STACK.items():
+    for module in modules:
+        hint = FLIGHT_STACK[module]
         try:
             importlib.import_module(module)
         except ImportError as exc:
@@ -167,8 +201,11 @@ def missing_flight_stack():
 
 
 def cmd_fly(cfg, args):
-    if not args.dry_run:
-        missing = missing_flight_stack()
+    use_ros = args.ros or not args.dry_run
+    if use_ros:
+        missing = missing_flight_stack(
+            ("ros_sugar",) if args.dry_run else tuple(FLIGHT_STACK)
+        )
         if missing:
             print("Cannot fly from this Python environment; missing:")
             for line in missing:
@@ -184,24 +221,14 @@ def cmd_fly(cfg, args):
     log = FlightLog(cfg, t, xyz, plan_info=info, dry_run=args.dry_run)
     shutil.copy(directory / "plan.png", log.dir / "plan.png")
     print(f"Run {log.run_id} -> {log.dir}")
+    connect_fn = flight.connect
     if args.dry_run:
         home = (xyz[0, 0], xyz[0, 1], 0.0)
-        summary = flight.run_flight(
-            cfg, t, xyz, log, connect_fn=lambda c: flight.SimDrone(home=home)
-        )
+        connect_fn = lambda c: flight.SimDrone(home=home)  # noqa: E731
+    if not use_ros:
+        summary = flight.run_flight(cfg, t, xyz, log, connect_fn=connect_fn)
     else:
-        try:
-            summary = launch(cfg, t, xyz, log)
-        except Exception as exc:  # startup failure: still close the log
-            logger.exception("Launch failed")
-            summary_file = log.dir / "summary.json"
-            summary = (
-                json.loads(summary_file.read_text())
-                if summary_file.exists()
-                else log.finish(
-                    "error", f"launch failed: {type(exc).__name__}: {exc}"
-                )
-            )
+        summary = launch_safely(cfg, t, xyz, log, connect_fn)
     plot_flight(log.dir)
 
     print(
@@ -241,6 +268,11 @@ def parse(argv):
         sub.add_argument("--method", choices=list(planners.PLANNERS))
     fly.add_argument(
         "--dry-run", action="store_true", help="simulated drone, no ROS/radio"
+    )
+    fly.add_argument(
+        "--ros",
+        action="store_true",
+        help="with --dry-run: run the simulated drone through ROS Sugar",
     )
     fly.add_argument("--yes", action="store_true", help="skip the prompt")
     fly.add_argument("--replan", action="store_true", help="ignore saved plan")

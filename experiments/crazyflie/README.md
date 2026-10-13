@@ -148,14 +148,46 @@ bound is below α, flagged as such.
 
 ## Setup
 
-- **Planning and analysis:** the repo's `pdstl` environment (torch,
-  matplotlib).
-- **Flight:** one Python environment with ROS 2, `ros_sugar`, `cflib`, numpy, PyYAML, matplotlib,
-  `irobot` and `trossen_arm`. Install `irobot` with `pip install -e` from
-  `Bkdogbey/irobot`, branch `crazyflie`; irobot's `__init__` imports
-  `trossen_arm`, so that package is needed too. Saved plans in `plans/`
-  let the flight machine fly without torch, as long as the config is
-  unchanged.
+**Planning and analysis:** the repo's `pdstl` environment (torch and
+matplotlib). pdSTL plans need torch, so plan there; flights reuse the
+saved plan as long as the config is unchanged.
+
+**Flight:** the conda ROS 2 Humble environment `ros_env`, with ROS Sugar
+built in its own workspace `~/sugar_ws`. One-time setup (already done on
+this machine):
+
+```bash
+conda activate ros_env
+pip install -e ~/Research/irobot          # also installs trossen_arm
+git clone https://github.com/automatika-robotics/sugarcoat ~/sugar_ws/src/sugarcoat
+cd ~/sugar_ws && colcon build --packages-select automatika_ros_sugar \
+    --cmake-args -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python \
+    -DPython3_EXECUTABLE=$CONDA_PREFIX/bin/python -DPython_FIND_STRATEGY=LOCATION
+```
+
+Every flight session:
+
+```bash
+conda activate ros_env
+source ~/sugar_ws/install/setup.bash
+python experiments/crazyflie/run.py fly --dry-run --ros   # rehearse the ROS path
+python experiments/crazyflie/run.py fly                   # real flight
+```
+
+`fly` checks for ROS Sugar, cflib and irobot before planning or
+prompting, and says what is missing.
+
+Under ROS Sugar the mission runs in its own thread, so a shutdown can
+reach it. On Ctrl-C:
+
+1. The flight stops and lands.
+2. `summary.json` records `interrupted`.
+3. The process waits for the landing before exiting. A second Ctrl-C
+   while landing is ignored.
+
+ROS Sugar itself prints an `RCLError ... context is not valid` traceback
+from its executor threads during shutdown. It is harmless; the launcher
+still reports `ALL COMPONENTS EXITED SUCCESSFULLY`.
 
 ## Tests
 

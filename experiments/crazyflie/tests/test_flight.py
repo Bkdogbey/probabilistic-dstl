@@ -436,7 +436,7 @@ def test_missing_flight_stack_stops_before_logging(cfg, cfg_file, capsys):
 
 
 def test_launch_failure_still_writes_summary(cfg, cfg_file, monkeypatch):
-    monkeypatch.setattr(run, "missing_flight_stack", lambda: [])
+    monkeypatch.setattr(run, "missing_flight_stack", lambda *a: [])
 
     def broken_launch(*args):
         raise RuntimeError("no ROS daemon")
@@ -449,8 +449,32 @@ def test_launch_failure_still_writes_summary(cfg, cfg_file, monkeypatch):
     assert "launch failed" in summary["error"]
 
 
+def test_launch_waits_for_the_mission_to_land(monkeypatch):
+    landed = threading.Event()
+
+    def mission():
+        time.sleep(0.3)
+        landed.set()
+
+    thread = threading.Thread(target=mission)
+    thread.start()
+    joins = []
+    original = thread.join
+
+    def interrupted_join(timeout=None):
+        if not joins:  # a Ctrl-C while landing must not abandon the flight
+            joins.append(1)
+            raise KeyboardInterrupt
+        return original(timeout)
+
+    monkeypatch.setattr(thread, "join", interrupted_join)
+    run.wait_for_mission(thread)
+    assert landed.is_set() and not thread.is_alive()
+    run.wait_for_mission(None)  # never started: nothing to wait for
+
+
 def test_declined_flight_does_not_fly(cfg, cfg_file, monkeypatch):
-    monkeypatch.setattr(run, "missing_flight_stack", lambda: [])
+    monkeypatch.setattr(run, "missing_flight_stack", lambda *a: [])
     monkeypatch.setattr("builtins.input", lambda prompt: "n")
     monkeypatch.setattr(run, "launch", lambda *a: pytest.fail("flew"))
     assert run.main(["--config", cfg_file(), "fly"]) == 1
