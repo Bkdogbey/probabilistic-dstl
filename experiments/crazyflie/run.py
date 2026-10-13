@@ -21,6 +21,7 @@ Exits 0 on success; ``fly`` only when the attempt completed.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import shutil
@@ -143,7 +144,37 @@ def plot_flight(run_dir):
         logger.exception("Could not plot %s", run_dir)
 
 
+# Imported by a real flight; each entry says how to provide it.
+FLIGHT_STACK = {
+    "ros_sugar": "ROS 2 + automatika_ros_sugar (source ROS first)",
+    "cflib": "pip install cflib",
+    "irobot.src.robots.crazyflie": (
+        "pip install -e ~/Research/irobot (branch crazyflie; also needs "
+        "trossen_arm)"
+    ),
+}
+
+
+def missing_flight_stack():
+    """Modules a real flight needs that cannot be imported here."""
+    missing = []
+    for module, hint in FLIGHT_STACK.items():
+        try:
+            importlib.import_module(module)
+        except ImportError as exc:
+            missing.append(f"{module}: {hint} [{exc}]")
+    return missing
+
+
 def cmd_fly(cfg, args):
+    if not args.dry_run:
+        missing = missing_flight_stack()
+        if missing:
+            print("Cannot fly from this Python environment; missing:")
+            for line in missing:
+                print(f"  - {line}")
+            print("Nothing was flown or logged. Use --dry-run to simulate.")
+            return 1
     t, xyz, info, directory = get_plan(cfg, replan=args.replan)
     print(describe(info, t))
     if not (args.dry_run or args.yes or confirm(cfg, t, xyz, info)):
@@ -159,7 +190,18 @@ def cmd_fly(cfg, args):
             cfg, t, xyz, log, connect_fn=lambda c: flight.SimDrone(home=home)
         )
     else:
-        summary = launch(cfg, t, xyz, log)
+        try:
+            summary = launch(cfg, t, xyz, log)
+        except Exception as exc:  # startup failure: still close the log
+            logger.exception("Launch failed")
+            summary_file = log.dir / "summary.json"
+            summary = (
+                json.loads(summary_file.read_text())
+                if summary_file.exists()
+                else log.finish(
+                    "error", f"launch failed: {type(exc).__name__}: {exc}"
+                )
+            )
     plot_flight(log.dir)
 
     print(

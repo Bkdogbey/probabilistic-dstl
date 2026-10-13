@@ -427,7 +427,30 @@ def test_pipeline_pdstl_dry_run(cfg, cfg_file):
     assert all(r["passed"] for r in loaded["summary"]["rings"])
 
 
+def test_missing_flight_stack_stops_before_logging(cfg, cfg_file, capsys):
+    if not run.missing_flight_stack():
+        pytest.skip("flight stack installed; this checks the offline path")
+    assert run.main(["--config", cfg_file(), "fly", "--yes"]) == 1
+    assert "ros_sugar" in capsys.readouterr().out
+    assert analysis.run_dirs(config.resolve(cfg, "dir")) == []
+
+
+def test_launch_failure_still_writes_summary(cfg, cfg_file, monkeypatch):
+    monkeypatch.setattr(run, "missing_flight_stack", lambda: [])
+
+    def broken_launch(*args):
+        raise RuntimeError("no ROS daemon")
+
+    monkeypatch.setattr(run, "launch", broken_launch)
+    assert run.main(["--config", cfg_file(), "fly", "--yes"]) == 1
+    (run_dir,) = analysis.run_dirs(config.resolve(cfg, "dir"))
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["outcome"] == "error"
+    assert "launch failed" in summary["error"]
+
+
 def test_declined_flight_does_not_fly(cfg, cfg_file, monkeypatch):
+    monkeypatch.setattr(run, "missing_flight_stack", lambda: [])
     monkeypatch.setattr("builtins.input", lambda prompt: "n")
     monkeypatch.setattr(run, "launch", lambda *a: pytest.fail("flew"))
     assert run.main(["--config", cfg_file(), "fly"]) == 1
