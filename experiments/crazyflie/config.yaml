@@ -77,6 +77,9 @@ flight:
   home_tolerance: 0.08
   transit_z: 0.65
   stream_hz: 20
+  # A streamed command later than this aborts the trajectory and lands
+  # (no catch-up burst). Two stream periods.
+  max_lateness_s: 0.1
   start_tolerance: 0.03
   start_timeout_s: 15.0
   settle_s: 1.0
@@ -91,7 +94,15 @@ positioning:
   spread_limit: 0.08
   timeout_s: 12.0
 
+# Experiment-owned log blocks (telemetry.py), one row per device packet:
+# state = x, y, vx, vy, ctrltarget.x, ctrltarget.y; alt = z, vz,
+# ctrltarget.z, vbat. Safety decisions need both blocks fresher than
+# stale_s; rows go through a bounded queue to one writer thread.
+telemetry:
+  period_ms: 50           # both blocks, 20 Hz; multiple of 10 ms
+  stale_s: 0.3
+  queue_size: 20000
+
 logging:
   dir: logs               # one folder per flight attempt
   plans_dir: plans        # plans/<name>/<method>/, reused while in sync
-  telemetry_hz: 20

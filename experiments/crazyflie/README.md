@@ -57,34 +57,71 @@ using `environment.py`. Each saved plan stores a **signature** of
 the saved plan only while that signature still matches the config;
 otherwise it plans again, so a flight can never use a stale plan.
 
-**Fly** (`flight.py`, `component.py`, `flight_log.py`). The ROS Sugar
-`FlightComponent` runs `flight.run_flight` in these steps:
+**Fly** (`flight.py`, `telemetry.py`, `flight_log.py`, `component.py`).
+The ROS Sugar `FlightComponent` runs `flight.run_flight` in these steps:
 
-1. Connect with irobot `CrazyflieBase`.
+1. Connect with irobot `CrazyflieBase`, start the experiment's own log
+   blocks and wait for the first fresh snapshot.
 2. Reset the Kalman filter and wait for a stable position estimate.
 3. Take off with the high-level commander. If the drone is not within
    `home_tolerance` of the start, it climbs to `transit_z` first.
 4. Fly to the start and settle there.
 5. Stream the trajectory as 20 Hz position setpoints, aborting if the
    geofence or the radio link is lost.
-6. Land, disarm and disconnect.
+6. Land, stop telemetry, disarm and disconnect.
 
 Any error or Ctrl-C lands the drone if it is airborne, then disarms and
-disconnects. Every attempt writes `logs/<UTC>_<name>_<method>_<hex>/`
-containing:
+disconnects.
+
+**Telemetry contract** (`telemetry.py`):
+
+- **Log blocks:** two experiment-owned blocks, both at
+  `telemetry.period_ms`:
+  - `state` = `stateEstimate.x/y/vx/vy` and `ctrltarget.x/y`
+  - `alt` = `stateEstimate.z/vz`, `ctrltarget.z` and `pm.vbat`
+- **One row per packet:** every row is one device packet, with its
+  24-bit device timestamp and host receive time. Nothing cached is
+  logged twice.
+- **Fresh data for safety:** every safety decision (geofence, start gate,
+  positioning, landing height) uses a *snapshot*:
+  - x/y come from the newest `state` packet and z from the newest `alt`
+    packet
+  - both must be fresher than `telemetry.stale_s` and sampled within 1.5
+    periods of each other
+
+  Otherwise the flight aborts and lands.
+- **No disk I/O in callbacks:** callbacks only update the latest packet
+  and `put_nowait` the row into a bounded queue. One writer thread writes
+  and flushes each batch. A full queue drops rows and counts them.
+- **Command timing:** each streamed command logs its reference time
+  `t_ref`, send time and lateness. A command later than
+  `flight.max_lateness_s` aborts the trajectory instead of being sent
+  late, so there is never a catch-up burst.
+
+Every attempt writes `logs/<UTC>_<name>_<method>_<hex>/` containing:
 
 - `config.yaml`, `trajectory.csv` and `plan.json`: what was flown
-- `commands.csv` and `telemetry.csv`: flushed on every row, so partial
-  runs keep their data
-- `summary.json`: outcome, last phase, error, tracking error, ring
-  passage and the plan signature
+- `commands.csv`: `t_send, t_ref, k, x, y, z, yaw, lateness_s, phase`
+- `state.csv`: `device_ms, t_recv, x, y, vx, vy, target_x, target_y,
+  phase`
+- `alt.csv`: `device_ms, t_recv, z, vz, target_z, vbat, phase`
+- `events.csv`: phase changes, stale landings, aborts and log-block
+  errors
+- `summary.json`, including a `data` block with:
+  - rows and dropped rows per file
+  - writer errors
+  - queue depth and write lag
+  - device-time gaps and rate per block
+  - command lateness (p50, p99, max)
 - `plan.png` and `flight.png`
 
 **Analyze** (`analysis.py`, `plots.py`). For each run, analyze reports:
 
 - the plan's probability
-- tracking error: the estimated position against the commanded setpoint
-  at the same time
+- tracking error: the estimate against the **active controller target
+  from the same packet** (device clock, no host alignment). This
+  measures flight performance; it is not process noise.
+- data quality: device-time gaps, command lateness, dropped rows
 - the closest flown approach to each ring
 
 The flight figure overlays the flown path on the plan and its

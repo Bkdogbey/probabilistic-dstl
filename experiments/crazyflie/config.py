@@ -46,9 +46,11 @@ REQUIRED = {
         "settle_s",
         "hold_end_s",
         "max_speed",
+        "max_lateness_s",
     ],
     "positioning": ["reset_wait_s", "window", "spread_limit", "timeout_s"],
-    "logging": ["dir", "plans_dir", "telemetry_hz"],
+    "telemetry": ["period_ms", "stale_s", "queue_size"],
+    "logging": ["dir", "plans_dir"],
 }
 POSITIVE = {
     "planning": ["height"],
@@ -63,9 +65,10 @@ POSITIVE = {
         "start_tolerance",
         "start_timeout_s",
         "max_speed",
+        "max_lateness_s",
     ],
     "positioning": ["window", "spread_limit", "timeout_s"],
-    "logging": ["telemetry_hz"],
+    "telemetry": ["period_ms", "stale_s", "queue_size"],
 }
 
 
@@ -101,6 +104,13 @@ def _check_geometry(cfg):
     planning = cfg["planning"]
     if list(planning["start"]) == list(planning["goal"]):
         raise ValueError("config 'planning.start' and 'goal' must differ")
+    tel = cfg["telemetry"]
+    if tel["period_ms"] % 10:
+        raise ValueError(
+            "config 'telemetry.period_ms' must be a multiple of 10"
+        )
+    if not tel["stale_s"] > tel["period_ms"] / 1000:
+        raise ValueError("config 'telemetry.stale_s' must exceed one period")
     for ring in cfg["environment"]["rings"]["regions"]:
         if len(ring["center"]) != 3 or not ring["radius"] > 0:
             raise ValueError(f"config ring {ring.get('name')} is invalid")

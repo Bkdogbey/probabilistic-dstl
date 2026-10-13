@@ -262,16 +262,15 @@ def plot_run(run, save_path=None, show=False):
     """
     cfg = run["cfg"]
     t_plan, xyz_plan = run["plan"]
-    tel = run["telemetry"]
     segment = analysis.trajectory_segment(run)
 
-    fig = plt.figure(figsize=(11, 7), constrained_layout=True)
-    grid = fig.add_gridspec(4, 2, width_ratios=[1.1, 1])
+    fig = plt.figure(figsize=(11, 8.5), constrained_layout=True)
+    grid = fig.add_gridspec(5, 2, width_ratios=[1.1, 1])
     top = fig.add_subplot(grid[:, 0])
     draw_arena(top, cfg)
     _goal(top, cfg, run["plan_info"])
     _uncertainty(top, t_plan, xyz_plan, run["plan_info"])
-    top.plot(*tel["xyz"][:, :2].T, color="0.6", lw=0.8, label="flown (all)")
+    top.plot(*run["flown"][:, :2].T, color="0.6", lw=0.8, label="flown (all)")
     top.plot(
         *xyz_plan[:, :2].T,
         color=COLORS["planned"],
@@ -290,7 +289,7 @@ def plot_run(run, save_path=None, show=False):
     _endpoints(top, xyz_plan)
     _legend(top, loc="upper left")
 
-    axes = [fig.add_subplot(grid[i, 1]) for i in range(4)]
+    axes = [fig.add_subplot(grid[i, 1]) for i in range(5)]
     for ax in axes[1:]:
         ax.sharex(axes[0])
     for i, name in enumerate("xyz"):
@@ -319,9 +318,9 @@ def plot_run(run, save_path=None, show=False):
     if segment is not None:
         error = np.linalg.norm(segment[1] - segment[2], axis=1)
         err_ax.plot(segment[0], error, color=COLORS["executed"], lw=1.5)
-    err_ax.set_ylabel("error [m]")
-    err_ax.set_xlabel("trajectory time [s]")
+    err_ax.set_ylabel("error vs\ntarget [m]")
     _style(err_ax)
+    _timing(axes[4], run)
 
     s = run["summary"] or {"outcome": "unfinished"}
     method = run["plan_info"].get("method", "?")
@@ -330,6 +329,30 @@ def plot_run(run, save_path=None, show=False):
         title += f", RMSE {s['tracking']['rmse_m']:.3f} m"
     fig.suptitle(title, fontsize=11)
     return _finish(fig, save_path, show)
+
+
+def _timing(ax, run):
+    """Command lateness over reference time, with the abort limit."""
+    cmd = run["commands"]
+    streamed = np.isfinite(cmd["lateness"])
+    ax.plot(
+        cmd["t_ref"][streamed],
+        1000 * cmd["lateness"][streamed],
+        color=COLORS["executed"],
+        lw=1,
+    )
+    limit = run["cfg"]["flight"]["max_lateness_s"]
+    ax.axhline(
+        1000 * limit, color=COLORS["obstacle"], ls="--", lw=1, label="limit"
+    )
+    gaps = sum(
+        b["gaps"] for b in analysis.data_quality(run)["blocks"].values()
+    )
+    ax.set_title(f"device-time gaps: {gaps}", fontsize=8, loc="right")
+    ax.set_ylabel("lateness [ms]")
+    ax.set_xlabel("trajectory time [s]")
+    _legend(ax, loc="upper right")
+    _style(ax)
 
 
 def plot_repeats(runs, save_path=None, show=False):

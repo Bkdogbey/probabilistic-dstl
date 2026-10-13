@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 
+import numpy as np
 import pytest
 import yaml
 
@@ -15,6 +16,7 @@ import flight
 import planners
 import plots
 import run
+import telemetry
 from flight_log import FlightLog
 
 AWAY = (0.5, -0.1, 0.0)  # placed away from the start
@@ -59,7 +61,9 @@ def test_nominal_dry_run_logs_everything(cfg):
         "trajectory.csv",
         "plan.json",
         "commands.csv",
-        "telemetry.csv",
+        "state.csv",
+        "alt.csv",
+        "events.csv",
         "summary.json",
     ):
         assert (log.dir / name).exists()
@@ -71,15 +75,48 @@ def test_nominal_dry_run_logs_everything(cfg):
         "trajectory",
         "land",
     ]
-    assert "positioning" in _phases(log.dir / "telemetry.csv")
-    assert summary["telemetry_rows"] == len(_rows(log.dir / "telemetry.csv"))
+    assert "positioning" in _phases(log.dir / "state.csv")
     assert summary["tracking"]["rmse_m"] < 0.2
     assert drone.calls[-5:] == LANDED
     assert drone.calls.index("arm") < drone.calls.index("takeoff")
     # Away from the start: climb to transit_z, cross, then descend.
     assert drone.calls.count("go_to") == 2
     commands = _rows(log.dir / "commands.csv")
-    assert float(commands[0]["z_cmd"]) == cfg["flight"]["transit_z"]
+    assert float(commands[0]["z"]) == cfg["flight"]["transit_z"]
+
+
+def test_every_row_is_one_device_packet(cfg):
+    summary, log = _fly(cfg, flight.SimDrone(home=AWAY))
+    data = summary["data"]
+    for block in ("state", "alt"):
+        rows = _rows(log.dir / f"{block}.csv")
+        assert data["rows"][block] == len(rows) > 10
+        ms = [int(r["device_ms"]) for r in rows]
+        assert all(b > a for a, b in zip(ms, ms[1:]))  # never repeated
+        assert data["blocks"][block]["gaps"] == 0
+        assert data["dropped_rows"][block] == 0
+    assert data["writer_errors"] == []
+    state = _rows(log.dir / "state.csv")
+    assert {"target_x", "target_y", "vx", "vy"} <= set(state[0])
+    events = [r["detail"] for r in _rows(log.dir / "events.csv")]
+    assert events[:2] == ["connect", "positioning"]
+
+
+def test_streamed_commands_log_reference_time_and_lateness(cfg):
+    summary, log = _fly(cfg, flight.SimDrone(home=AWAY))
+    streamed = [
+        r
+        for r in _rows(log.dir / "commands.csv")
+        if r["phase"] == "trajectory"
+    ]
+    period = 1.0 / cfg["flight"]["stream_hz"]
+    for k, row in enumerate(streamed):
+        assert int(row["k"]) == k
+        assert float(row["t_ref"]) == pytest.approx(k * period)
+        assert 0 <= float(row["lateness_s"]) < cfg["flight"]["max_lateness_s"]
+    lateness = summary["data"]["lateness"]
+    assert lateness["streamed"] == len(streamed)
+    assert lateness["max_s"] < cfg["flight"]["max_lateness_s"]
 
 
 def test_placed_at_start_takes_off_directly(cfg):
@@ -88,7 +125,7 @@ def test_placed_at_start_takes_off_directly(cfg):
     assert summary["outcome"] == "completed"
     assert drone.calls.count("go_to") == 1
     commands = _rows(log.dir / "commands.csv")
-    assert float(commands[0]["z_cmd"]) == cfg["planning"]["height"]
+    assert float(commands[0]["z"]) == cfg["planning"]["height"]
 
 
 def test_flown_ring_passage_is_reported(cfg):
@@ -127,7 +164,7 @@ def test_error_mid_trajectory_lands_and_keeps_partial_logs(cfg):
     commands = _rows(log.dir / "commands.csv")
     assert sum(r["phase"] == "trajectory" for r in commands) == 10
     assert commands[-1]["phase"] == "cleanup_land"
-    assert len(_rows(log.dir / "telemetry.csv")) > 0
+    assert len(_rows(log.dir / "state.csv")) > 0
 
 
 def test_stop_request_interrupts_and_lands(cfg):
@@ -184,6 +221,120 @@ def test_geofence_violation_aborts(cfg):
     assert "disconnect" in drone.calls
 
 
+# --- freshness, timing and the writer ------------------------------------------
+
+
+@pytest.mark.parametrize("block", [None, "alt"])
+def test_stale_telemetry_aborts_and_lands(cfg, block):
+    drone = flight.SimDrone(home=AWAY, stall_after=10, stall_block=block)
+    summary, log = _fly(cfg, drone)
+    assert summary["outcome"] == "error"
+    assert summary["last_phase"] == "trajectory"
+    assert "StaleState" in summary["error"]
+    assert drone.calls[-5:] == LANDED
+    kinds = [r["kind"] for r in _rows(log.dir / "events.csv")]
+    assert "stale" in kinds and "abort" in kinds  # landed without height
+    assert len(_rows(log.dir / "state.csv")) > 0  # partial logs kept
+
+
+class _StallingDrone(flight.SimDrone):
+    """Blocks inside the 5th streamed setpoint, like a scheduling stall."""
+
+    def send_position_setpoint(self, *args):
+        super().send_position_setpoint(*args)
+        if self._setpoints == 5:
+            time.sleep(0.3)
+
+
+def test_late_executor_aborts_instead_of_bursting(cfg):
+    drone = _StallingDrone(home=AWAY)
+    summary, log = _fly(cfg, drone)
+    assert summary["outcome"] == "error"
+    assert "executor late" in summary["error"]
+    streamed = [
+        r
+        for r in _rows(log.dir / "commands.csv")
+        if r["phase"] == "trajectory"
+    ]
+    assert len(streamed) == 5  # nothing sent after the stall
+    assert drone.calls[-5:] == LANDED
+
+
+def test_full_queue_drops_rows_without_affecting_flight(cfg, monkeypatch):
+    cfg["telemetry"]["queue_size"] = 5
+    write = FlightLog._write
+
+    def slow_write(self, name, row):  # ~20 rows/s, below the arrival rate
+        time.sleep(0.05)
+        write(self, name, row)
+
+    monkeypatch.setattr(FlightLog, "_write", slow_write)
+    summary, _ = _fly(cfg, flight.SimDrone(home=AWAY))
+    assert summary["outcome"] == "completed"
+    assert sum(summary["data"]["dropped_rows"].values()) > 0
+    assert summary["data"]["max_queue_depth"] <= 5
+
+
+def test_callbacks_never_wait_for_disk(cfg, monkeypatch):
+    t, xyz, _ = planners.s_path(cfg)
+    log = FlightLog(cfg, t, xyz)
+    monkeypatch.setattr(
+        FlightLog, "_write", lambda self, name, row: time.sleep(0.2)
+    )
+    feed = telemetry.StateFeed(50, sink=log.packet)
+    slowest = 0.0
+    for i in range(20):
+        started = time.perf_counter()
+        feed.on_packet("state", 1000 + 50 * i, (0.1, 0.2, 0, 0, 0.1, 0.2))
+        feed.on_packet("alt", 1000 + 50 * i, (0.5, 0, 0.5, 3.9))
+        slowest = max(slowest, time.perf_counter() - started)
+    assert slowest < 0.005
+    assert feed.snapshot(1.0)["xyz"].tolist() == [0.1, 0.2, 0.5]
+    monkeypatch.undo()
+    log.finish("error", "test")
+
+
+def test_snapshot_rules():
+    now = [0.0]
+    feed = telemetry.StateFeed(50, clock=lambda: now[0])
+    with pytest.raises(telemetry.StaleState, match="no telemetry"):
+        feed.snapshot(0.3)
+    feed.on_packet("state", 1000, (1, 2, 0, 0, 1, 2))
+    feed.on_packet("alt", 1010, (0.5, 0, 0.5, 3.9))
+    assert feed.snapshot(0.3)["xyz"].tolist() == [1, 2, 0.5]
+    feed.on_packet("alt", 1200, (0.5, 0, 0.5, 3.9))  # 200 ms apart
+    with pytest.raises(telemetry.StaleState, match="apart"):
+        feed.snapshot(0.3)
+    feed.on_packet("state", 1200, (1, 2, 0, 0, 1, 2))
+    now[0] = 0.5
+    with pytest.raises(telemetry.StaleState, match="old"):
+        feed.snapshot(0.3)
+
+
+def test_device_clock_wrap_and_gaps(cfg):
+    wrap = telemetry.CLOCK_WRAP
+    assert telemetry.unwrap_ms([wrap - 50, wrap - 1, 49, 99]).tolist() == [
+        wrap - 50,
+        wrap - 1,
+        wrap + 49,
+        wrap + 99,
+    ]
+    assert telemetry.device_diff_ms(10, wrap - 40) == 50
+
+    drone = flight.SimDrone(
+        home=AWAY, device_origin_ms=wrap - 500, drop_every=7
+    )
+    summary, log = _fly(cfg, drone)
+    assert summary["outcome"] == "completed"
+    raw = [int(r["device_ms"]) for r in _rows(log.dir / "state.csv")]
+    assert max(raw) > wrap - 500 and min(raw) < 1000  # wrapped in flight
+    loaded = analysis.load_run(log.dir)
+    steps = set(map(int, np.diff(loaded["state"]["device_ms"])))
+    assert steps <= {50, 100}  # unwrapped; drops show up as 100 ms gaps
+    state = summary["data"]["blocks"]["state"]
+    assert state["gaps"] > 0 and state["max_gap_ms"] == 100
+
+
 def test_missing_hardware_stack_fails_cleanly(cfg):
     try:
         import irobot  # noqa: F401
@@ -213,12 +364,16 @@ def test_analysis_matches_logged_summary(cfg):
     loaded = analysis.load_run(log.dir)
     assert loaded["summary"] == summary
     assert loaded["plan_info"]["method"] == "s_path"
-    assert analysis.metrics(loaded) == {
-        "tracking": summary["tracking"],
-        "rings": summary["rings"],
-    }
-    tau, flown, reference = analysis.trajectory_segment(loaded)
-    assert tau[0] >= 0 and flown.shape == reference.shape
+    recomputed = analysis.metrics(loaded)
+    assert recomputed["tracking"] == summary["tracking"]
+    assert recomputed["rings"] == summary["rings"]
+    assert summary["tracking"]["reference"].startswith("active controller")
+    # Tracking error is against ctrltarget from the same packet.
+    tau, flown, target = analysis.trajectory_segment(loaded)
+    state = loaded["state"]
+    k = state["phase"] == "trajectory"
+    assert np.allclose(target[:, 0], state["target_x"][k])
+    assert tau[0] == 0 and np.all(np.diff(tau) > 0)
 
 
 def test_partial_run_can_be_analysed_and_plotted(cfg, tmp_path):
