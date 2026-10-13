@@ -179,7 +179,9 @@ def plot_flight(run_dir):
 
 # Imported by a real flight; each entry says how to provide it.
 FLIGHT_STACK = {
-    "ros_sugar": "ROS 2 + automatika_ros_sugar (source ROS first)",
+    "ros_sugar": (
+        "conda activate ros_env && source ~/sugar_ws/install/setup.bash"
+    ),
     "cflib": "pip install cflib",
     "irobot.src.robots.crazyflie": (
         "pip install -e ~/Research/irobot (branch crazyflie; also needs "
