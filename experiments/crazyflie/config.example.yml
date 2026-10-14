@@ -34,6 +34,7 @@ u_max: 0.40        # per-axis velocity command limit
 
 fans:              # numeric fan setting per condition; null = not yet chosen
   "off": 0         # quoted: bare `off` is a YAML boolean
+  "low": null      # choose a repeatable, measured low setting
   "high": null
 fan_position: null   # [x, y, z] of the fan
 fan_direction: null  # unit vector [x, y] of its airflow

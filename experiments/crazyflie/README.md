@@ -1,164 +1,287 @@
 # Crazyflie pdSTL experiment
 
-## Setup
+Run the experiment with four commands: `plan`, `fly`, `fit`, and `analyze`.
+Each flight streams world-frame horizontal velocities at a fixed altitude,
+rotated into the body frame using measured yaw. ROS Sugar and irobot's
+`CrazyflieBase` handle the hardware integration.
 
-Run every command from this directory (`experiments/crazyflie`).
+Use three fan conditions: **off, low, high**. Compare three planners:
 
-1. **Python environment.** Use the ROS environment for everything: planning,
-   dry runs, flights, fitting and analysis. Once, install what it lacks:
+| Condition | Reference or model | Uncertainty used in planning |
+|---|---|---|
+| `deterministic` | Fixed reference, shared across fan conditions | No |
+| `mean_model` | Fitted mean dynamics | No |
+| `pdstl` | Same fitted dynamics and task | Yes |
 
-   ```bash
-   conda activate ros_env
-   pip install torch --index-url https://download.pytorch.org/whl/cpu   # pdSTL core
-   pip install cflib
-   pip install -e ~/Research/irobot --no-deps   # --no-deps skips trossen-arm
-   ```
+`mean_model` versus `pdstl` isolates the effect of uncertainty. They share
+the initial control guess, velocity limits, control costs and optimization
+budget.
 
-   Then, in every new terminal:
+## Current flight behavior
 
-   ```bash
-   conda activate ros_env
-   source ~/sugar_ws/install/setup.bash
-   cd ~/Research/probabilistic-dstl/experiments/crazyflie
-   ```
+The current executor takes off, reaches the start, flies the mission, holds
+briefly, and lands at the endpoint. The reference is still a polyline.
+The requested smooth reference and automatic return to the start are
+pending implementation; the commands below do not provide them yet.
 
-   `fly` checks for ROS Sugar, cflib and irobot before connecting, and says
-   how to install whichever is missing.
-2. **Local configuration.** `config.yml` is not tracked by git. Create it from
-   the template, then enter the measured arena:
+Before a hardware pilot, fix `wait_for_positioning` so a missing or stale
+initial state packet waits for fresh samples instead of applying `np.ptp`
+to an empty window. The runbook adds no extra interactive preflight steps.
 
-   ```bash
-   cp config.example.yml config.yml
-   ```
+## 1. Set up the environment once
 
-   The template's geometry is a placeholder from the RA-L arena. Before the
-   first real flight, check `workspace`, `radio_uri`, `altitude` and
-   `start`. Identification and evaluation flights stay locked until
-   `measured: true`.
+Use the existing ROS environment. Adjust the three local paths below if
+your repositories or workspace are elsewhere.
 
-## First flight
+```bash
+conda activate ros_env
+cd ~/Research/probabilistic-dstl/experiments/crazyflie
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e "../..[crazyflie]"
+pip install -e ~/Research/irobot --no-deps
+```
+
+`--no-deps` skips irobot's unrelated trossen-arm dependency. ROS Sugar must
+already be built in your ROS workspace. In every new terminal:
+
+```bash
+conda activate ros_env
+source ~/sugar_ws/install/setup.bash
+cd ~/Research/probabilistic-dstl/experiments/crazyflie
+```
+
+Planning, fitting and analysis use this environment too. Dry runs need
+neither ROS nor a radio connection. Real flights check that ROS Sugar,
+cflib and irobot are importable before connecting.
+
+## 2. Enter the measured arena and fan settings
+
+For a new setup only:
+
+```bash
+cp config.example.yml config.yml
+```
+
+If `config.yml` already contains your measurements, edit that file rather
+than replacing it. It is ignored by git.
+
+Enter the radio URI, workspace, obstacle footprints, airframe radius,
+altitude, start, goal and reference waypoints. The template geometry is a
+placeholder from the RA-L arena. Check that `flight.transit_z` clears the
+measured obstacles if the drone must travel to the start above them.
+
+Set up the three fan conditions in your local file:
+
+```yaml
+fans:
+  "off": 0
+  "low": null
+  "high": null
+```
+
+Replace both `null` values with repeatable numeric settings chosen during
+pilots. Record `fan_position: [x, y, z]` and
+`fan_direction: [dx, dy]` using a unit direction vector. Keep the position
+and direction fixed across conditions; change only the fan setting.
+An airflow measurement at the flight area is useful if available.
+
+**The program records the selected fan setting; it does not control the
+fan. Set it manually before each flight.**
+
+Once the geometry and fan setup are measured, set `measured: true`.
+Identification and evaluation flights require this flag and a numeric
+setting for the selected fan. Pilot flights can run before it is set.
+
+## 3. Run the first deterministic pilot with the fan off
 
 ```bash
 python run.py plan --condition deterministic
-python run.py fly --purpose pilot --dry-run
-python run.py fly --purpose pilot                # ROS env sourced
+python run.py fly --purpose pilot --fan off --dry-run
+python run.py fly --purpose pilot --fan off
 python run.py analyze --trial latest
 ```
 
-No paths or ids to type. `fly` uses the newest plan for the condition (and
-fan) made under the current `config.yml`; `analyze --trial` takes `latest`.
-To pick another, pass an id (`--plan deterministic_reference_20261014T174111Z`)
-or a unique part of a trial id (`--trial 174113`).
+Inspect `plans/<plan id>.png` before the hardware flight. `fly` prints the
+plan figure, duration, altitude, start and maximum speed, then asks once
+whether the fan is set and the arena is clear.
 
-1. **Generate the plan** and inspect the path figure saved next to it
-   (`plans/<plan id>.png`).
-2. **Run the simulated flight** (`--dry-run`: no radio, no ROS).
-3. **Fly the same plan on hardware.** Before asking for confirmation, `fly`
-   prints:
-   - the plan figure path
-   - duration, altitude, start and maximum speed
-4. **Inspect the trial.** `analyze --trial` prints:
-   - command lateness and state-packet gaps
-   - the start state and battery
+`analyze --trial latest` prints command lateness, state-packet gaps, start
+state, battery and task checks. Its commanded-versus-measured figure is
+saved as `logs/<trial id>/flight.png`. Repeat a few pilots until execution
+and logging are repeatable.
 
-   It also saves the commanded-versus-measured figure as
-   `logs/<trial id>/flight.png`.
+Then choose the active fan settings with pilot flights, one at a time:
 
-## Overview
-
-The drone flies horizontal velocity commands at a fixed altitude.
-
-1. Deterministic flights set up execution and collect identification data.
-2. A tracking model is fitted and checked on held-out flights.
-3. `mean_model` plans (STL robustness of the predicted mean) are compared with
-   `pdstl` plans (pdSTL lower bound). Both use the same task, model,
-   initialization, limits and optimization budget.
-
-```text
-config.yml ─▶ plan (deterministic) ─▶ fly (identification) ─▶ fit ─▶ reports/
-                                                                       │
-          analyze ◀── fly (evaluation) ◀── plan (mean_model | pdstl) ◀─┘
+```bash
+python run.py fly --purpose pilot --fan low
+python run.py analyze --trial latest
+python run.py fly --purpose pilot --fan high
+python run.py analyze --trial latest
 ```
+
+For routine pilots, `fly` selects the newest matching plan and `latest`
+selects the newest trial. Use explicit saved plan ids for final evaluation.
+Pilots and simulated flights do not enter model fitting or evaluation.
+
+## 4. Collect identification flights at each fan setting
+
+Freeze the reference geometry, speed, start gate and fan setup before this
+stage. Save the deterministic plan id printed in step 3.
+
+Repeat the same reference **15 completed identification flights per fan**:
+off, low and high. With `holdout_every: 3`, this gives 10 fitting and
+5 held-out flights per fan. This is an example acquisition budget, not a
+flight gate. The splitter counts completed identification flights only.
+
+For each attempt, set the physical fan, run one flight, then inspect it:
+
+```bash
+python run.py fly --purpose identification --fan off --plan <reference-plan-id>
+python run.py analyze --trial latest
+```
+
+Use the same two commands with `--fan low`, then `--fan high`. Replace
+`<reference-plan-id>` with the actual id; do not type the angle brackets.
+Run flights individually so you can reset the arena and inspect the data.
+Every recorded attempt is retained, including aborted attempts.
+
+For the current fitter, use reference flights from the same start. It
+pools initial states per fan. The separate excitation sequences start at
+`excitation.start`; mixing those starts into identification would distort
+the initial belief used for reference planning. To inspect an excitation
+without including it in fitting, use `--purpose pilot`:
+
+```bash
+python run.py plan --condition deterministic --sequence steps_x
+python run.py fly --purpose pilot --sequence steps_x --fan off
+```
+
+The other available sequences are `steps_y` and `diagonal`. Their initial
+belief must be handled separately before including them in model fitting.
+
+## 5. Fit and inspect the held-out model checks
+
+```bash
+python run.py fit
+```
+
+This saves `reports/model_<UTC>.json` and its validation figure. Confirm
+that the report includes off, low and high, each with held-out flights.
+Inspect multi-step prediction error versus spread, residual bias and
+correlation, and position coverage. A 2-D Gaussian predicts approximately
+39.3%, 86.5% and 95% coverage for the reported ellipse thresholds.
+
+The current code reports validation but does not enforce an acceptance
+decision. If spread is underestimated or residuals have strong structure,
+revise the model using fitting data and validate again before evaluation.
+Do not tune on final evaluation flights. Save the chosen model report path.
+
+The fitter currently reads all completed identification trials in `logs/`.
+Keep one arena/fan protocol in that directory; archive older campaigns
+outside it before starting a different protocol. Changing fan settings or
+geometry requires new compatible data and a new model.
+
+## 6. Generate both model-based plans for all three fans
+
+Use the explicit report path so every plan uses the chosen model version:
+
+```bash
+python run.py plan --condition mean_model --fan off --model reports/<model-id>.json
+python run.py plan --condition pdstl --fan off --model reports/<model-id>.json
+python run.py plan --condition mean_model --fan low --model reports/<model-id>.json
+python run.py plan --condition pdstl --fan low --model reports/<model-id>.json
+python run.py plan --condition mean_model --fan high --model reports/<model-id>.json
+python run.py plan --condition pdstl --fan high --model reports/<model-id>.json
+```
+
+Replace `<model-id>` with the printed model id. Inspect all six figures and
+their feasibility and score outputs. A rejected plan is not flown; revise
+the task or model transparently and regenerate plans before freezing them.
+
+Run preliminary model-based flights as **pilots**, using their saved ids:
+
+```bash
+python run.py fly --condition mean_model --purpose pilot --fan off --plan <mean-plan-id>
+python run.py fly --condition pdstl --purpose pilot --fan off --plan <pdstl-plan-id>
+```
+
+Repeat for low and high with the corresponding ids. Check that predictions
+transfer to these commands. Then freeze the configuration, model report
+and seven plan ids: one reference plus two model-based plans per fan.
+
+## 7. Run the final evaluation
+
+At each fan setting, compare all three conditions. Set the physical fan
+before each attempt and use the frozen ids:
+
+```bash
+python run.py fly --condition deterministic --purpose evaluation --fan off --plan <reference-plan-id>
+python run.py fly --condition mean_model --purpose evaluation --fan off --plan <mean-off-plan-id>
+python run.py fly --condition pdstl --purpose evaluation --fan off --plan <pdstl-off-plan-id>
+```
+
+Repeat for low and high using their matching model-based plan ids. Rotate
+the order between repetitions: deterministic/mean_model/pdstl, then
+mean_model/pdstl/deterministic, then pdstl/deterministic/mean_model. Balance
+fan-block order across sessions. Record unusual events with `--note`.
+
+Choose the run count before evaluation. An example budget is:
+
+| Flights | Per fan | Three fans |
+|---|---:|---:|
+| Identification: 10 fitting + 5 held out | 15 | 45 |
+| Deterministic evaluation | 20 | 60 |
+| Mean-model evaluation | 20 | 60 |
+| pdSTL evaluation | 20 | 60 |
+| Total, excluding pilots | 75 | 225 |
+
+Start with pilots rather than immediately collecting this full dataset.
+Do not refit or replace plans partway through final evaluation.
+
+## 8. Analyze the evaluation flights
+
+```bash
+python run.py analyze
+```
+
+Outputs are `results/summary.csv`, `results/summary.md` and
+`results/paths.png`. They compare condition × fan success counts and
+Clopper–Pearson intervals, clearance, endpoint error and exclusions.
+
+The current analysis groups by condition and fan, so one evaluation
+campaign must use the frozen configuration and plans. Archive old campaign
+logs before evaluating a changed setup; keep those records elsewhere.
+
+The reported pdSTL score is a **pointwise stochastic-robustness score**,
+not a bound on the probability of whole-flight success. Report it alongside
+empirical success without treating the two as the same quantity.
+Task-violation aborts count as failures. Data faults, errors and interruptions
+are currently excluded with reasons; report those counts too. Every attempt
+gets metadata, command and state files. Dry-run trials are excluded from
+fitting and evaluation.
+
+## Files and offline checks
 
 | File | Role |
 |---|---|
-| `config.example.yml`, `config.py` | Template for the local `config.yml`; all inputs as one typed `Config` |
-| `run.py` | Entry point: `plan`, `fly`, `fit`, `analyze` |
-| `planner.py` | Task geometry and pdSTL spec, reference/excitation commands, both planners, plan files |
-| `flight.py` | Preflight, start gate, 20 Hz velocity streaming, abort, landing, ROS Sugar launch, `SimDrone` |
-| `logger.py` | `logs/<trial>/commands.csv`, `state.csv`, `metadata.json`; loading and time alignment |
-| `tracking_model.py` | `TrackingModel` (first-order velocity lag with fan bias `c_f` and noise `Q_f`), fit, validation |
-| `analysis.py` | Mission outcomes, success with Clopper–Pearson CIs, figures, single-trial check |
+| `config.example.yml`, `config.py` | Configuration template and typed inputs |
+| `run.py` | `plan`, `fly`, `fit`, `analyze` entry points |
+| `planner.py` | Geometry, reference/excitation commands and both planners |
+| `flight.py` | Flight phases, velocity streaming, aborts, ROS launch and simulator |
+| `logger.py` | Per-attempt records and time alignment |
+| `tracking_model.py` | Shared velocity lag; fan-specific bias, noise and initial belief |
+| `analysis.py` | Task outcomes, timing checks, coverage and figures |
 
-`planner.py` is not named `planning.py` because that would shadow the core
-`planning` package in `src/`.
+The planner file is named `planner.py` to avoid shadowing the core
+`planning` package. The pdSTL core in `src/` is unchanged.
 
-## All commands
+Run the experiment's offline checks from this directory:
 
 ```bash
-python run.py plan --condition deterministic                      # fixed reference
-python run.py plan --condition deterministic --sequence steps_x   # identification excitation
-python run.py fly --purpose pilot --dry-run                       # newest plan, simulated
-python run.py fly --purpose identification --fan off              # newest deterministic plan
-python run.py analyze --trial latest                              # timing + commanded vs measured
-python run.py fit                                                 # reports/model_<UTC>.json + .png
-python run.py plan --condition pdstl --fan off                    # newest report by default
-python run.py plan --condition mean_model --fan off
-python run.py fly --condition pdstl --purpose evaluation --fan off
-python run.py analyze                                             # results/summary.{csv,md}, paths.png
-pytest tests -q                                                   # offline checks, SimDrone
+python -m pytest tests -q
 ```
 
-`--dry-run` flies the simulated drone with no radio and no ROS. Its trials
-are marked `dry_run` and never used by `fit` or `analyze`.
-
-## Rules that keep the data honest
-
-- **Measure first.** Identification and evaluation flights refuse to fly
-  until `measured: true` and the chosen fan's setting, position and direction
-  are filled in. Pilot flights are always allowed.
-- **Plans are frozen.** Each plan is a new file in `plans/` that records:
-  - the config hash and model id/hash
-  - the predicted μ/Σ and per-step safe and goal probabilities
-  - its score: hard pdSTL lower bound, or mean robustness
-
-  `fly` refuses a plan made with a different config, an infeasible one, or one
-  that missed its threshold (`planner.alpha`, `mean_model.min_robustness`).
-- **Every attempt is recorded.** `metadata.json` is written before
-  connecting. If the flight aborts or fails, it still gets the outcome, the
-  abort kind and phase, and whatever data exists.
-- **Accounting.**
-  - A `TaskViolation` abort (geofence or altitude) counts as a failed flight.
-  - A `DataFault` (stale state, lost link, late command, start gate),
-    errors and interruptions are excluded, with the reason listed.
-- **Held-out data.** Within each fan, every `model.holdout_every`-th
-  identification flight is held out of fitting and used only for validation.
-- **Model bound ≠ flight outcome.** A plan's pdSTL score is reported next to
-  the empirical success rate, never merged with it.
-
-## Execution details
-
-- **Aborts land.** On any abort the executor calls
-  `send_notify_setpoint_stop`, then lands with the high-level commander. It
-  does not just stop transmitting. On firmware without a supervisor, check
-  what happens when communication is lost.
-- **Command timing.** The mission starts once the drone is within
-  `start_tolerance` of the start and below `start_speed`, after `settle`
-  seconds and a recheck. Command `k` is due at `t0 + k/20 s`. Each 0.2 s plan
-  step is sent 4 times, rotated into the body frame using the measured yaw.
-  A command more than `max_lateness_s` late aborts the flight.
-- **State log.** One 20 Hz block carries `x y z vx vy yaw`, so a state sample
-  is never stitched together from two packets. The device clock is mapped to
-  host time by the smallest receive delay.
-
-## Milestones
-
-1. **A repeatable deterministic reference flight with aligned command and
-   state logs.** Check it with `analyze --trial`: lateness, packet gaps, the
-   start state, and commanded vs measured velocity.
-2. Repeated reference and excitation flights per fan, then `fit`. Check
-   held-out error vs spread, coverage (39.3/86.5/95%), residual bias and
-   correlation, and calibration.
-3. Preliminary `mean_model`/`pdstl` flights to check the model transfers.
-   Then freeze the geometry, model and plans, and alternate the two
-   conditions within each fan for the final comparison.
+Abort handling hands control back to the high-level commander and attempts
+landing. During a mission, fresh state/link, geofence, altitude and command
+timing checks remain active. Each 0.2 s velocity is sent four times at
+20 Hz; state logging carries `x y z vx vy yaw` in one 24-byte block.
