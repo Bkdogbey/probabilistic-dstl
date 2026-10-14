@@ -18,6 +18,7 @@ import os
 import signal
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -52,29 +53,38 @@ def world_to_body(v, yaw_deg):
 
 
 class StateFeed:
-    """Newest state packet, forwarded to the log; [x, y, z, vx, vy, yaw]."""
+    """Recent state packets, forwarded to the log; [x, y, z, vx, vy, yaw]."""
 
     def __init__(self, log, clock=time.monotonic):
         self.log, self.clock = log, clock
-        self._latest = None
+        self._recent = deque(maxlen=400)  # (host time, values)
         self._lock = threading.Lock()
 
     def on_state(self, device_ms, data):
         t = self.clock()
         values = [data[name] for name in STATE_VARS]
         with self._lock:
-            self._latest = (t, np.array(values))
+            self._recent.append((t, np.array(values)))
         self.log.state([t, device_ms, *values])
 
     def snapshot(self, stale_s):
         with self._lock:
-            latest = self._latest
+            latest = self._recent[-1] if self._recent else None
         if latest is None:
             raise DataFault("no state received")
         age = self.clock() - latest[0]
         if age > stale_s:
             raise DataFault(f"state {age:.3f} s old (limit {stale_s} s)")
         return latest[1]
+
+    def window(self, seconds, stale_s):
+        """States of the last `seconds` [n, 6]; None until they are all there."""
+        self.snapshot(stale_s)  # raises if stale
+        now = self.clock()
+        with self._lock:
+            states = [v for t, v in self._recent if now - t <= seconds]
+            oldest = self._recent[0][0]
+        return np.array(states) if now - oldest >= seconds else None
 
 
 def start_logging(cf, cfg, feed, log, make_config=None):
@@ -146,7 +156,10 @@ def _monitor(drone, feed, cfg, stop, seconds):
 
 
 def wait_for_positioning(drone, feed, cfg, stop, samples=10):
-    """Reset the Kalman filter; return the mean of a stable 1 s window."""
+    """Reset the Kalman filter; return the mean of a stable 1 s window.
+
+    Only x and y must be steady: z reads +-0.05 m on the ground.
+    """
     drone.cf.param.set_value("kalman.resetEstimation", "1")
     _wait(stop, 0.1)
     drone.cf.param.set_value("kalman.resetEstimation", "0")
@@ -160,18 +173,27 @@ def wait_for_positioning(drone, feed, cfg, stop, samples=10):
             ]
         except DataFault:
             window = []
-        if len(window) == samples:
-            spread = np.ptp(window, axis=0)
-            if spread.max() <= cfg.flight.position_spread:
-                return np.mean(window, axis=0)
+        steady = np.ptp(window, axis=0)[:2].max() <= cfg.flight.position_spread
+        if len(window) == samples and steady:
+            return np.mean(window, axis=0)
         if time.monotonic() > deadline:
             raise DataFault("position estimate did not settle")
 
 
-def _at_start(s, start, cfg):
+def at_start(feed, start, cfg):
+    """Is the last `start_window` s, averaged, at the start and at rest?
+
+    The velocity estimate is noisy (0.2-0.3 m/s at rest), so a single sample
+    never passes; the window mean does.
+    """
+    f = cfg.flight
+    window = feed.window(f.start_window, f.stale_s)
+    if window is None:
+        return False
+    mean = window.mean(axis=0)
     return (
-        np.linalg.norm(s[:2] - start[:2]) <= cfg.flight.start_tolerance
-        and np.linalg.norm(s[3:5]) <= cfg.flight.start_speed
+        np.linalg.norm(mean[:2] - start[:2]) <= f.start_tolerance
+        and np.linalg.norm(mean[3:5]) <= f.start_speed
     )
 
 
@@ -206,12 +228,13 @@ def fly(drone, feed, plan, cfg, log, stop, status):
 
     log.set_phase("start_gate")
     deadline = time.monotonic() + f.start_timeout
-    while not _at_start(_check(drone, feed, cfg), start, cfg):
+    while not at_start(feed, start, cfg):
+        _check(drone, feed, cfg)
         if time.monotonic() > deadline:
             raise DataFault("start position/velocity not reached")
         _wait(stop, 0.05)
     _monitor(drone, feed, cfg, stop, f.settle)
-    if not _at_start(_check(drone, feed, cfg), start, cfg):
+    if not at_start(feed, start, cfg):
         raise DataFault("drifted from the start while settling")
 
     log.set_phase("mission")

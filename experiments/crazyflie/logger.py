@@ -162,3 +162,21 @@ def aligned_states(trial):
         [np.interp(grid, t, s[c]) for c in ("x", "y", "vx", "vy")], 1
     )
     return states, controls[: len(grid) - 1]
+
+
+def find_trial(ref="latest", root=LOGS):
+    """A trial by id, unique id fragment, or "latest"."""
+    trials = sorted(
+        d for d in root.glob("*/") if (d / "metadata.json").exists()
+    )
+    matches = (
+        trials[-1:]
+        if ref == "latest"
+        else [d for d in trials if ref in d.name]
+    )
+    if len(matches) != 1:
+        raise SystemExit(
+            f"{len(matches)} trials match {ref!r}"
+            + (f": {[d.name for d in matches]}" if matches else f" in {root}")
+        )
+    return load_trial(matches[0])

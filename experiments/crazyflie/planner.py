@@ -235,7 +235,7 @@ def make_plan(
         "altitude": cfg.altitude,
         "start": list(start),
         "velocities": np.asarray(velocities).tolist(),
-        "config_hash": cfg.hash,
+        "config_hash": cfg.plan_hash,
         "model_id": None if model is None else model.report_id,
         "model_hash": None if model is None else model.report_hash,
         "prediction": pred,
@@ -257,13 +257,35 @@ def save_plan(plan):
     return path
 
 
+def find_plan(ref, cfg, condition, name):
+    """The plan to fly: a path or id if given, else the newest for this config.
+
+    None when no saved plan matches (the caller makes one or says so).
+
+    `name` is the sequence (deterministic) or "fan-<fan>" (model plans).
+    """
+    if ref is None:
+        for path in sorted(
+            PLANS.glob(f"{condition}_{name}_*.json"), reverse=True
+        ):
+            if json.loads(path.read_text())["config_hash"] == cfg.plan_hash:
+                return path
+        return None
+    path = Path(ref)
+    if not path.exists():
+        path = PLANS / f"{Path(ref).stem}.json"
+    if not path.exists():
+        raise SystemExit(f"no plan {ref!r} (looked in {PLANS})")
+    return path
+
+
 def load_plan(path, cfg):
     """A saved plan, refused if the config changed or it is not flyable."""
     plan = json.loads(Path(path).read_text())
-    if plan["config_hash"] != cfg.hash:
+    if plan["config_hash"] != cfg.plan_hash:
         raise ValueError(
-            f"plan {plan['id']} was made with config {plan['config_hash']}, "
-            f"current config is {cfg.hash}; re-plan"
+            f"plan {plan['id']} was made with a different task/path "
+            f"({plan['config_hash']}, now {cfg.plan_hash}); re-plan"
         )
     if plan["problems"]:
         raise ValueError(

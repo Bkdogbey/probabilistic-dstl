@@ -7,7 +7,15 @@ import analysis
 import numpy as np
 import pytest
 import tracking_model
-from flight import DataFault, SimDrone, run_flight, world_to_body
+from flight import (
+    STATE_VARS,
+    DataFault,
+    SimDrone,
+    StateFeed,
+    at_start,
+    run_flight,
+    world_to_body,
+)
 from logger import TrialLog, aligned_states, load_trial
 from planner import (
     Task,
@@ -25,6 +33,15 @@ def test_world_to_body():
     assert np.allclose(world_to_body((0.3, 0.1), 0.0), (0.3, 0.1))
     # Facing +y: world +x is the body's right (-y).
     assert np.allclose(world_to_body((0.3, 0.0), 90.0), (0.0, -0.3))
+
+
+def test_plan_hash_ignores_flight_tuning_but_not_the_path(cfg):
+    tuned = replace(
+        cfg, flight=replace(cfg.flight, start_speed=0.2), measured=True
+    )
+    assert tuned.hash != cfg.hash and tuned.plan_hash == cfg.plan_hash
+    moved = replace(cfg, reference={**cfg.reference, "speed": 0.1})
+    assert moved.plan_hash != cfg.plan_hash
 
 
 def test_reference_reaches_goal_within_limits(cfg):
@@ -108,6 +125,33 @@ def test_connect_failure_still_records_the_attempt(cfg, tmp_path):
         meta["outcome"] == "aborted"
         and trial["meta"]["abort_phase"] == "connect"
     )
+
+
+def gate_verdicts(cfg, position, velocity, seconds=8, seed=0):
+    """at_start on noisy hover data: 0.02 m position and 0.15 m/s velocity noise."""
+    rng, now = np.random.default_rng(seed), [0.0]
+
+    class Log:
+        def state(self, row):
+            pass
+
+    feed = StateFeed(Log(), lambda: now[0])
+    out = []
+    for k in range(seconds * cfg.stream_hz):
+        now[0] = k / cfg.stream_hz
+        x, y = np.add(position, rng.normal(0, 0.02, 2))
+        vx, vy = np.add(velocity, rng.normal(0, 0.15, 2))
+        values = [x, y, cfg.altitude, vx, vy, 0.0]
+        feed.on_state(k * 50, dict(zip(STATE_VARS, values)))
+        if now[0] > 2:
+            out.append(at_start(feed, np.array(cfg.start), cfg))
+    return np.array(out)
+
+
+def test_start_gate_passes_noisy_hover_but_rejects_offset_and_motion(cfg):
+    assert gate_verdicts(cfg, cfg.start, (0, 0)).mean() > 0.9
+    assert not gate_verdicts(cfg, np.add(cfg.start, (0.12, 0)), (0, 0)).any()
+    assert not gate_verdicts(cfg, cfg.start, (0.3, 0)).any()
 
 
 # Tracking model
@@ -197,7 +241,10 @@ def test_model_plans_have_matched_provenance(cfg):
             model,
             score,
         )
-        assert plan["model_hash"] == "abc" and plan["config_hash"] == cfg.hash
+        assert (
+            plan["model_hash"] == "abc"
+            and plan["config_hash"] == cfg.plan_hash
+        )
         assert len(plan["prediction"]["mean"]) == cfg.steps + 1
         assert len(plan["prediction"]["safe_probability"]) == cfg.steps + 1
 

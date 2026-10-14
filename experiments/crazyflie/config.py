@@ -6,7 +6,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
 import yaml
@@ -44,6 +44,7 @@ class Flight:
     home_tolerance: float
     start_tolerance: float
     start_speed: float
+    start_window: float
     start_timeout: float
     settle: float
     hold_end: float
@@ -52,6 +53,29 @@ class Flight:
     geofence_margin: float
     position_spread: float
     position_timeout: float
+
+
+PLAN_FIELDS = (
+    "workspace", "obstacles", "start", "goal", "airframe_radius", "reference",
+    "altitude", "duration", "dt", "stream_hz", "u_max", "excitation",
+    "planner", "mean_model",
+)  # fmt: skip
+
+
+def _digest(value):
+    text = json.dumps(asdict_any(value), sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def asdict_any(value):
+    """json-ready form of dataclasses, tuples and containers of them."""
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {k: asdict_any(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [asdict_any(v) for v in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -91,8 +115,13 @@ class Config:
 
     @property
     def hash(self):
-        text = json.dumps(asdict(self), sort_keys=True)
-        return hashlib.sha256(text.encode()).hexdigest()[:12]
+        """Whole configuration; recorded with every trial."""
+        return _digest(asdict(self))
+
+    @property
+    def plan_hash(self):
+        """Only what defines a plan; flight tuning and fan settings may change."""
+        return _digest({name: getattr(self, name) for name in PLAN_FIELDS})
 
     def ready_for_data(self, fan):
         """Why identification/evaluation flights may not fly yet, or None."""
@@ -106,7 +135,13 @@ class Config:
 
 
 def load(path=HERE / "config.yml"):
-    raw = yaml.safe_load(Path(path).read_text())
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Create it from the template, then edit it:\n"
+            f"  cd {HERE} && cp config.example.yml {path.name}"
+        )
+    raw = yaml.safe_load(path.read_text())
     cfg = Config(
         **{
             **raw,

@@ -11,8 +11,8 @@ import config
 
 @pytest.fixture
 def cfg():
-    """The real config with short waits, so simulated flights take seconds."""
-    base = config.load()
+    """The tracked template with short waits, so simulated flights take seconds."""
+    base = config.load(config.HERE / "config.example.yml")
     return replace(
         base,
         flight=replace(

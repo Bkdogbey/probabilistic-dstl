@@ -1,5 +1,71 @@
 # Crazyflie pdSTL experiment
 
+## Setup
+
+Run every command from this directory (`experiments/crazyflie`).
+
+1. **Python environment.** Use the ROS environment for everything: planning,
+   dry runs, flights, fitting and analysis. Once, install what it lacks:
+
+   ```bash
+   conda activate ros_env
+   pip install torch --index-url https://download.pytorch.org/whl/cpu   # pdSTL core
+   pip install cflib
+   pip install -e ~/Research/irobot --no-deps   # --no-deps skips trossen-arm
+   ```
+
+   Then, in every new terminal:
+
+   ```bash
+   conda activate ros_env
+   source ~/sugar_ws/install/setup.bash
+   cd ~/Research/probabilistic-dstl/experiments/crazyflie
+   ```
+
+   `fly` checks for ROS Sugar, cflib and irobot before connecting, and says
+   how to install whichever is missing.
+2. **Local configuration.** `config.yml` is not tracked by git. Create it from
+   the template, then enter the measured arena:
+
+   ```bash
+   cp config.example.yml config.yml
+   ```
+
+   The template's geometry is a placeholder from the RA-L arena. Before the
+   first real flight, check `workspace`, `radio_uri`, `altitude` and
+   `start`. Identification and evaluation flights stay locked until
+   `measured: true`.
+
+## First flight
+
+```bash
+python run.py plan --condition deterministic
+python run.py fly --purpose pilot --dry-run
+python run.py fly --purpose pilot                # ROS env sourced
+python run.py analyze --trial latest
+```
+
+No paths or ids to type. `fly` uses the newest plan for the condition (and
+fan) made under the current `config.yml`; `analyze --trial` takes `latest`.
+To pick another, pass an id (`--plan deterministic_reference_20261014T174111Z`)
+or a unique part of a trial id (`--trial 174113`).
+
+1. **Generate the plan** and inspect the path figure saved next to it
+   (`plans/<plan id>.png`).
+2. **Run the simulated flight** (`--dry-run`: no radio, no ROS).
+3. **Fly the same plan on hardware.** Before asking for confirmation, `fly`
+   prints:
+   - the plan figure path
+   - duration, altitude, start and maximum speed
+4. **Inspect the trial.** `analyze --trial` prints:
+   - command lateness and state-packet gaps
+   - the start state and battery
+
+   It also saves the commanded-versus-measured figure as
+   `logs/<trial id>/flight.png`.
+
+## Overview
+
 The drone flies horizontal velocity commands at a fixed altitude.
 
 1. Deterministic flights set up execution and collect identification data.
@@ -16,7 +82,7 @@ config.yml ─▶ plan (deterministic) ─▶ fly (identification) ─▶ fit �
 
 | File | Role |
 |---|---|
-| `config.yml`, `config.py` | All inputs, as one typed `Config` |
+| `config.example.yml`, `config.py` | Template for the local `config.yml`; all inputs as one typed `Config` |
 | `run.py` | Entry point: `plan`, `fly`, `fit`, `analyze` |
 | `planner.py` | Task geometry and pdSTL spec, reference/excitation commands, both planners, plan files |
 | `flight.py` | Preflight, start gate, 20 Hz velocity streaming, abort, landing, ROS Sugar launch, `SimDrone` |
@@ -27,22 +93,18 @@ config.yml ─▶ plan (deterministic) ─▶ fly (identification) ─▶ fit �
 `planner.py` is not named `planning.py` because that would shadow the core
 `planning` package in `src/`.
 
-## Commands
-
-Run from this directory. Real flights need ROS Sugar, cflib and irobot
-(`conda activate ros_env && source ~/sugar_ws/install/setup.bash`,
-`pip install cflib`, `pip install -e ~/Research/irobot`).
+## All commands
 
 ```bash
 python run.py plan --condition deterministic                      # fixed reference
 python run.py plan --condition deterministic --sequence steps_x   # identification excitation
-python run.py fly --plan plans/<id>.json --purpose pilot --fan off --dry-run
-python run.py fly --plan plans/<id>.json --purpose identification --fan off
-python run.py analyze --trial <trial_id>                          # timing + commanded vs measured
+python run.py fly --purpose pilot --dry-run                       # newest plan, simulated
+python run.py fly --purpose identification --fan off              # newest deterministic plan
+python run.py analyze --trial latest                              # timing + commanded vs measured
 python run.py fit                                                 # reports/model_<UTC>.json + .png
 python run.py plan --condition pdstl --fan off                    # newest report by default
 python run.py plan --condition mean_model --fan off
-python run.py fly --plan plans/<id>.json --purpose evaluation --fan off
+python run.py fly --condition pdstl --purpose evaluation --fan off
 python run.py analyze                                             # results/summary.{csv,md}, paths.png
 pytest tests -q                                                   # offline checks, SimDrone
 ```
