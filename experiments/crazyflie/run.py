@@ -1,201 +1,100 @@
-"""Crazyflie pipeline: plan -> fly -> analyze.
+"""Crazyflie pdSTL experiment: plan, fly, fit, analyze.
 
-    python experiments/crazyflie/run.py plan                 # plan + figure
-    python experiments/crazyflie/run.py fly --dry-run        # simulated drone
-    python experiments/crazyflie/run.py fly --dry-run --ros  # ... via ROS Sugar
-    python experiments/crazyflie/run.py fly                  # real flight
-    python experiments/crazyflie/run.py analyze [RUN] [--all]
-
-``--method s_path|pdstl`` overrides ``planning.method`` for one command.
-
-plan     config.yaml -> planners.plan -> trajectory.check
-         -> plans/<name>/<method>/{trajectory.csv, plan.json, plan.png}
-fly      reuse that plan while its signature matches the config (else plan
-         again) -> show it and confirm -> FlightLog -> ROS Sugar component
-         (or SimDrone) -> logs/<run_id>/ with summary.json and flight.png
-analyze  logs/<run_id>/ -> metrics, flight figure; --all -> runs.csv and
-         the repeated-runs overlay
-
-Exits 0 on success; ``fly`` only when the attempt completed.
+python run.py plan --condition deterministic [--sequence reference|<excitation>]
+python run.py plan --condition mean_model|pdstl --fan off [--model reports/X.json]
+python run.py fly --plan plans/X.json --purpose pilot --fan off [--dry-run]
+python run.py fit
+python run.py analyze [--trial TRIAL_ID]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
-import json
 import logging
-import shutil
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
-import analysis
 import config
-import flight
-import planners
-import plots
-import trajectory
-from flight_log import FlightLog
-
-logger = logging.getLogger(__name__)
-
-
-# --- plan ------------------------------------------------------------------
-
-
-def get_plan(cfg, replan=False):
-    """The config's plan: reused if saved and in sync, else planned.
-
-    A new plan is validated with ``trajectory.check`` before it is saved,
-    so an invalid plan is never stored or flown.
-
-    Returns:
-        ``(t, xyz, info, directory)``.
-    """
-    directory = planners.plan_dir(cfg, config.resolve(cfg, "plans_dir"))
-    saved = None if replan else planners.load_plan(directory)
-    if saved and saved[2]["signature"] == planners.signature(cfg):
-        print(f"Using saved plan {directory}")
-        t, xyz, info = saved
-        check(cfg, t, xyz)
-        return t, xyz, info, directory
-    reason = (
-        "replan requested"
-        if replan
-        else (
-            "no saved plan"
-            if saved is None
-            else "config changed since last plan"
-        )
-    )
-    print(f"Planning with {cfg['planning']['method']} ({reason})")
-    t, xyz, info = planners.plan(cfg)
-    check(cfg, t, xyz)
-    info = planners.save_plan(directory, cfg, t, xyz, info)
-    plots.plot_plan(cfg, t, xyz, info, directory / "plan")
-    return t, xyz, info, directory
-
-
-def check(cfg, t, xyz):
-    """Raise ValueError unless the plan is flyable in this arena."""
-    trajectory.check(
-        t, xyz, cfg["bounds"], cfg["flight"]["max_speed"], cfg["environment"]
-    )
-
-
-def describe(info, t):
-    """One line about a plan."""
-    text = f"{info['method']}: {len(t)} points, {t[-1]:.1f} s"
-    if "p_lower" in info:
-        text += f", P(phi) in [{info['p_lower']:.3f}, {info['p_upper']:.3f}]"
-    if "monte_carlo" in info:
-        text += f", Monte Carlo {info['monte_carlo']['rate']:.3f}"
-    if info.get("alpha_met") is False:
-        text += f" (below alpha = {info['alpha']})"
-    return text
-
-
-def cmd_plan(cfg, args):
-    t, xyz, info, directory = get_plan(cfg, replan=True)
-    print(describe(info, t))
-    print(f"Plan saved in {directory}")
-    if not args.no_show:
-        plots.plot_plan(cfg, t, xyz, info, show=True)
-    return 0
-
-
-# --- fly -------------------------------------------------------------------
-
-
-def confirm(cfg, t, xyz, info, figure):
-    """Show the plan (close the window to continue), then ask; True to fly."""
-    print(f"Plan figure: {figure}")
-    plots.plot_plan(cfg, t, xyz, info, show=True)
-    return input("Fly this plan? [y/N] ").strip().lower() == "y"
-
-
-def launch(cfg, t, xyz, log, connect_fn=flight.connect):
-    """Fly through ROS Sugar; returns the run summary."""
-    from ros_sugar import Launcher
-
-    from component import FlightComponent
-
-    component = FlightComponent(
-        component_name="crazyflie_flight",
-        cfg=cfg,
-        t=t,
-        xyz=xyz,
-        log=log,
-        connect_fn=connect_fn,
-    )
-    launcher = Launcher()
-    launcher.add_pkg(
-        components=[component], activate_all_components_on_start=True
-    )
-    try:
-        launcher.bringup()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # ROS is down. An unfinished flight is told to stop (it lands), and
-        # the process waits for it: never exit with the drone airborne.
-        component.stop.set()
-        wait_for_mission(component.mission)
-    summary_file = log.dir / "summary.json"
-    if component.summary is None and not summary_file.exists():
-        return log.finish("error", "flight component did not run")
-    return component.summary or json.loads(summary_file.read_text())
-
-
-def wait_for_mission(mission):
-    """Join the mission thread; Ctrl-C while landing only prints a note."""
-    while mission is not None and mission.is_alive():
-        try:
-            mission.join(timeout=0.5)
-        except KeyboardInterrupt:
-            print("Landing and cleaning up; waiting for the flight to end.")
-
-
-def launch_safely(cfg, t, xyz, log, connect_fn):
-    """``launch``, but a startup failure still closes the log."""
-    try:
-        return launch(cfg, t, xyz, log, connect_fn)
-    except Exception as exc:
-        logger.exception("Launch failed")
-        summary_file = log.dir / "summary.json"
-        if summary_file.exists():
-            return json.loads(summary_file.read_text())
-        return log.finish(
-            "error", f"launch failed: {type(exc).__name__}: {exc}"
-        )
-
-
-def plot_flight(run_dir):
-    """Save the post-flight figure; a plotting error never masks the run."""
-    try:
-        plots.plot_run(analysis.load_run(run_dir), run_dir / "flight")
-    except Exception:
-        logger.exception("Could not plot %s", run_dir)
-
+import numpy as np
+from logger import LOGS, TrialLog, all_trials, load_trial
+from planner import (
+    CONDITIONS,
+    Task,
+    excitation_velocities,
+    load_plan,
+    make_plan,
+    plan_mean,
+    plan_pdstl,
+    reference_velocities,
+    save_plan,
+)
 
 # Imported by a real flight; each entry says how to provide it.
 FLIGHT_STACK = {
-    "ros_sugar": (
-        "conda activate ros_env && source ~/sugar_ws/install/setup.bash"
-    ),
+    "ros_sugar": "conda activate ros_env && source ~/sugar_ws/install/setup.bash",
     "cflib": "pip install cflib",
-    "irobot.src.robots.crazyflie": (
-        "pip install -e ~/Research/irobot (branch crazyflie; also needs "
-        "trossen_arm)"
-    ),
+    "irobot": "pip install -e ~/Research/irobot",
 }
 
 
-def missing_flight_stack(modules=tuple(FLIGHT_STACK)):
-    """Flight-stack ``modules`` that cannot be imported here."""
+def cmd_plan(cfg, args):
+    import analysis
+
+    task = Task(cfg)
+    if args.condition == "deterministic":
+        if args.sequence == "reference":
+            v, start, mission = reference_velocities(cfg), cfg.start, True
+        else:
+            v = excitation_velocities(cfg, args.sequence)
+            start, mission = cfg.excitation["start"], False
+        plan = make_plan(
+            cfg,
+            "deterministic",
+            args.sequence,
+            start,
+            v,
+            task,
+            mission=mission,
+        )
+    else:
+        from tracking_model import REPORTS, load_model
+
+        if args.fan is None:
+            sys.exit("model plans need --fan")
+        reports = sorted(REPORTS.glob("model_*.json"))
+        path = args.model or (reports[-1] if reports else None)
+        if path is None:
+            sys.exit("no model report; run `fit` first")
+        model = load_model(path, args.fan, cfg)
+        init = np.clip(reference_velocities(cfg), -cfg.u_max, cfg.u_max)
+        optimize = plan_pdstl if args.condition == "pdstl" else plan_mean
+        controls, score = optimize(cfg, task, model, init)
+        plan = make_plan(
+            cfg,
+            args.condition,
+            f"fan-{args.fan}",
+            cfg.start,
+            controls,
+            task,
+            args.fan,
+            model,
+            score,
+        )
+    path = save_plan(plan)
+    figure = analysis.plot_plan(plan, task, cfg, path.with_suffix(".png"))
+    print(
+        f"{plan['id']}: {len(plan['velocities'])} steps of {cfg.dt} s, "
+        f"score {plan['score']}, problems {plan['problems'] or 'none'}"
+    )
+    print(f"  {path}\n  {figure}")
+
+
+def missing_flight_stack():
     missing = []
-    for module in modules:
-        hint = FLIGHT_STACK[module]
+    for module, hint in FLIGHT_STACK.items():
         try:
             importlib.import_module(module)
         except ImportError as exc:
@@ -204,104 +103,139 @@ def missing_flight_stack(modules=tuple(FLIGHT_STACK)):
 
 
 def cmd_fly(cfg, args):
-    use_ros = args.ros or not args.dry_run
-    if use_ros:
-        missing = missing_flight_stack(
-            ("ros_sugar",) if args.dry_run else tuple(FLIGHT_STACK)
+    import analysis
+    from flight import SimDrone, launch, run_flight
+
+    plan = load_plan(args.plan, cfg)
+    if plan["fan"] is not None and plan["fan"] != args.fan:
+        sys.exit(
+            f"plan {plan['id']} is for fan {plan['fan']!r}, not {args.fan!r}"
         )
-        if missing:
-            print("Cannot fly from this Python environment; missing:")
-            for line in missing:
-                print(f"  - {line}")
-            print("Nothing was flown or logged. Use --dry-run to simulate.")
-            return 1
-    t, xyz, info, directory = get_plan(cfg, replan=args.replan)
-    print(describe(info, t))
-    if not (
-        args.dry_run
-        or args.yes
-        or confirm(cfg, t, xyz, info, directory / "plan.png")
-    ):
-        print("Not flown.")
-        return 1
+    if args.purpose != "pilot" and (reason := cfg.ready_for_data(args.fan)):
+        sys.exit(f"refusing a {args.purpose} flight: {reason}")
+    if not args.dry_run and (missing := missing_flight_stack()):
+        print("Cannot fly from this Python environment; missing:")
+        print("\n".join(f"  - {line}" for line in missing))
+        sys.exit("Nothing was flown or logged. Use --dry-run to simulate.")
 
-    log = FlightLog(cfg, t, xyz, plan_info=info, dry_run=args.dry_run)
-    shutil.copy(directory / "plan.png", log.dir / "plan.png")
-    print(f"Run {log.run_id} -> {log.dir}")
-    connect_fn = flight.connect
-    if args.dry_run:
-        home = (xyz[0, 0], xyz[0, 1], 0.0)
-        connect_fn = lambda c: flight.SimDrone(home=home)  # noqa: E731
-    if not use_ros:
-        summary = flight.run_flight(cfg, t, xyz, log, connect_fn=connect_fn)
-    else:
-        summary = launch_safely(cfg, t, xyz, log, connect_fn)
-    plot_flight(log.dir)
-
+    setting = cfg.fans.get(args.fan)
     print(
-        f"Outcome: {summary['outcome']} (last phase {summary['last_phase']})"
+        f"{plan['id']} ({plan['condition']}), {len(plan['velocities'])} x "
+        f"{cfg.dt} s at z = {cfg.altitude} m, start {plan['start']}, "
+        f"fan {args.fan} (setting {setting}), purpose {args.purpose}"
+        + (" [DRY RUN]" if args.dry_run else "")
     )
-    if summary.get("error"):
-        print(f"Error: {summary['error']}")
-    if summary.get("tracking"):
-        print(f"Tracking RMSE: {summary['tracking']['rmse_m']:.3f} m")
-    print(f"Logs: {log.dir}")
-    return 0 if summary["outcome"] == "completed" else 1
+    if (
+        not args.dry_run
+        and input("Fan set, arena clear? [y/N] ").lower() != "y"
+    ):
+        sys.exit("aborted before connecting")
+
+    log = TrialLog(
+        {
+            "purpose": args.purpose,
+            "condition": plan["condition"],
+            "plan_id": plan["id"],
+            "plan_hash": hashlib.sha256(
+                Path(args.plan).read_bytes()
+            ).hexdigest()[:12],
+            "model_id": plan["model_id"],
+            "fan": args.fan,
+            "fan_setting": setting,
+            "fan_position": cfg.fan_position,
+            "fan_direction": cfg.fan_direction,
+            "dry_run": args.dry_run,
+            "note": args.note,
+            "dt": cfg.dt,
+            "steps": len(plan["velocities"]),
+            "repeats": cfg.repeats,
+            "stream_hz": cfg.stream_hz,
+            "altitude": cfg.altitude,
+            "altitude_tolerance": cfg.altitude_tolerance,
+            "config_hash": cfg.hash,
+            "config": asdict(cfg),
+            "git_commit": config.git_commit(),
+        }
+    )
+    if args.dry_run:
+        home = (*plan["start"], 0.0)
+        meta = run_flight(cfg, plan, log, connect_fn=lambda _: SimDrone(home))
+    else:
+        meta = launch(cfg, plan, log)
+    print(f"Trial {meta['trial_id']}: {meta['outcome']}")
+    figure = analysis.check_trial(load_trial(log.dir), Task(cfg), cfg)
+    if figure:
+        print(f"  {figure}")
 
 
-# --- analyze ---------------------------------------------------------------
+def cmd_fit(cfg, args):
+    from analysis import plot_validation
+    from tracking_model import fit, save_report
+
+    report = fit(cfg, all_trials())
+    path = save_report(report)
+    plot_validation(report, path.with_suffix(".png"))
+    print(
+        f"{report['id']}: tau {np.round(report['tau'], 3).tolist()} s, "
+        f"gain {np.round(report['gain'], 3).tolist()}\n  {path}"
+    )
+    for fan, v in report["validation"].items():
+        coverage = ", ".join(
+            f"{k}: {c[0]:.2f} [{c[1]:.2f}, {c[2]:.2f}]"
+            for k, c in v["coverage"].items()
+        )
+        print(
+            f"  fan {fan}: {v['flights']} held out; final error "
+            f"{v['final_error'][0]:.3f} m; {coverage}; brier {v['brier'][0]:.3f}"
+        )
 
 
 def cmd_analyze(cfg, args):
-    return analysis.report(
-        config.resolve(cfg, "dir"),
-        run_dir=args.run,
-        all_runs=args.all,
-        show=not args.no_show,
-    )
+    import analysis
 
-
-# --- entry point -----------------------------------------------------------
-
-
-def parse(argv):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", type=Path, default=config.DEFAULT)
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    plan = commands.add_parser("plan", help="plan and plot, no flight")
-    fly = commands.add_parser("fly", help="fly the plan (plans if needed)")
-    for sub in (plan, fly):
-        sub.add_argument("--method", choices=list(planners.PLANNERS))
-    fly.add_argument(
-        "--dry-run", action="store_true", help="simulated drone, no ROS/radio"
-    )
-    fly.add_argument(
-        "--ros",
-        action="store_true",
-        help="with --dry-run: run the simulated drone through ROS Sugar",
-    )
-    fly.add_argument("--yes", action="store_true", help="skip the prompt")
-    fly.add_argument("--replan", action="store_true", help="ignore saved plan")
-
-    analyze = commands.add_parser("analyze", help="metrics and figures")
-    analyze.add_argument("run", nargs="?", type=Path, help="run directory")
-    analyze.add_argument("--all", action="store_true", help="every run")
-    for sub in (plan, analyze):
-        sub.add_argument("--no-show", action="store_true")
-    return parser.parse_args(argv)
+    task = Task(cfg)
+    if args.trial:
+        print(analysis.check_trial(load_trial(LOGS / args.trial), task, cfg))
+        return
+    trials = all_trials()
+    analysis.summarize(trials, task)
+    analysis.plot_paths(trials, task, cfg)
+    print((analysis.RESULTS / "summary.md").read_text())
 
 
 def main(argv=None):
-    """CLI entry point; returns the process exit code."""
-    args = parse(argv)
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    cfg = config.load(args.config, method=getattr(args, "method", None))
-    command = {"plan": cmd_plan, "fly": cmd_fly, "analyze": cmd_analyze}
-    return command[args.command](cfg, args)
+    parser.add_argument("--config", default=config.HERE / "config.yml")
+    sub = parser.add_subparsers(dest="action", required=True)
+    p = sub.add_parser("plan")
+    p.add_argument("--condition", choices=CONDITIONS, required=True)
+    p.add_argument("--sequence", default="reference")
+    p.add_argument("--fan")
+    p.add_argument("--model")
+    f = sub.add_parser("fly")
+    f.add_argument("--plan", required=True)
+    f.add_argument(
+        "--purpose",
+        choices=("pilot", "identification", "evaluation"),
+        required=True,
+    )
+    f.add_argument("--fan", required=True)
+    f.add_argument("--dry-run", action="store_true")
+    f.add_argument("--note", default="")
+    sub.add_parser("fit")
+    a = sub.add_parser("analyze")
+    a.add_argument("--trial")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    cfg = config.load(args.config)
+    {"plan": cmd_plan, "fly": cmd_fly, "fit": cmd_fit, "analyze": cmd_analyze}[
+        args.action
+    ](cfg, args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

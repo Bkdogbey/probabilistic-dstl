@@ -1,146 +1,137 @@
-"""Load and validate ``config.yaml``.
-
-Every pipeline stage reads the same validated dict, so a missing or
-invalid value fails here, before planning or flight, with its key name.
-"""
+"""The experiment configuration as one typed, frozen object."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import yaml
 
 HERE = Path(__file__).resolve().parent
-DEFAULT = HERE / "config.yaml"
-
-REQUIRED = {
-    "radio": ["uri"],
-    "planning": ["method", "start", "goal", "height", "s_path", "pdstl"],
-    "planning.s_path": ["amplitude", "speed", "dt"],
-    "planning.pdstl": [
-        "dynamics",
-        "H",
-        "dt",
-        "u_max",
-        "q_std",
-        "x0_var",
-        "goal_half_width",
-        "seed",
-        "monte_carlo_samples",
-        "planner",
-    ],
-    "bounds": ["x", "y", "z", "margin"],
-    "environment": ["obstacles", "rings"],
-    "environment.obstacles": ["enabled", "clearance", "boxes"],
-    "environment.rings": ["enabled", "regions"],
-    "flight": [
-        "connect_timeout_s",
-        "takeoff_speed",
-        "transit_speed",
-        "land_speed",
-        "home_tolerance",
-        "transit_z",
-        "stream_hz",
-        "start_tolerance",
-        "start_timeout_s",
-        "settle_s",
-        "hold_end_s",
-        "max_speed",
-        "max_lateness_s",
-    ],
-    "positioning": ["reset_wait_s", "window", "spread_limit", "timeout_s"],
-    "telemetry": ["period_ms", "stale_s", "queue_size"],
-    "logging": ["dir", "plans_dir"],
-}
-POSITIVE = {
-    "planning": ["height"],
-    "planning.s_path": ["speed", "dt"],
-    "planning.pdstl": ["H", "dt", "u_max", "q_std", "goal_half_width"],
-    "flight": [
-        "connect_timeout_s",
-        "takeoff_speed",
-        "transit_speed",
-        "land_speed",
-        "stream_hz",
-        "start_tolerance",
-        "start_timeout_s",
-        "max_speed",
-        "max_lateness_s",
-    ],
-    "positioning": ["window", "spread_limit", "timeout_s"],
-    "telemetry": ["period_ms", "stale_s", "queue_size"],
-}
+ROOT = HERE.parents[1]
+sys.path.insert(0, str(ROOT / "src"))  # the pdSTL core (models, planning, ...)
 
 
-def section(cfg, dotted):
-    """``section(cfg, "planning.pdstl")`` -> ``cfg["planning"]["pdstl"]``."""
-    for key in dotted.split("."):
-        cfg = cfg.get(key) if isinstance(cfg, dict) else None
-    return cfg
+@dataclass(frozen=True)
+class Box:
+    x: tuple[float, float]
+    y: tuple[float, float]
+    name: str = ""
 
-
-def _check_keys(cfg):
-    for where, keys in REQUIRED.items():
-        found = section(cfg, where) or {}
-        missing = [k for k in keys if k not in found]
-        if missing:
-            raise ValueError(f"config '{where}' is missing {missing}")
-    for where, keys in POSITIVE.items():
-        for key in keys:
-            if not section(cfg, where)[key] > 0:
-                raise ValueError(f"config '{where}.{key}' must be > 0")
-
-
-def _check_geometry(cfg):
-    bounds = cfg["bounds"]
-    for axis in "xyz":
-        lo, hi = bounds[axis]
-        if not lo < hi:
-            raise ValueError(f"config 'bounds.{axis}' must satisfy lo < hi")
-    if bounds["margin"] < 0:
-        raise ValueError("config 'bounds.margin' must be >= 0")
-    if not bounds["z"][0] <= cfg["flight"]["transit_z"] <= bounds["z"][1]:
-        raise ValueError("config 'flight.transit_z' must lie in bounds.z")
-    planning = cfg["planning"]
-    if list(planning["start"]) == list(planning["goal"]):
-        raise ValueError("config 'planning.start' and 'goal' must differ")
-    tel = cfg["telemetry"]
-    if tel["period_ms"] % 10:
-        raise ValueError(
-            "config 'telemetry.period_ms' must be a multiple of 10"
+    def grown(self, margin):
+        return Box(
+            (self.x[0] - margin, self.x[1] + margin),
+            (self.y[0] - margin, self.y[1] + margin),
+            self.name,
         )
-    if not tel["stale_s"] > tel["period_ms"] / 1000:
-        raise ValueError("config 'telemetry.stale_s' must exceed one period")
-    for ring in cfg["environment"]["rings"]["regions"]:
-        if len(ring["center"]) != 3 or not ring["radius"] > 0:
-            raise ValueError(f"config ring {ring.get('name')} is invalid")
+
+    @property
+    def centre(self):
+        return ((self.x[0] + self.x[1]) / 2, (self.y[0] + self.y[1]) / 2)
 
 
-def load(path=DEFAULT, method=None):
-    """Load, optionally override ``planning.method``, and validate.
+@dataclass(frozen=True)
+class Flight:
+    connect_timeout: float
+    takeoff_speed: float
+    transit_speed: float
+    transit_z: float
+    land_speed: float
+    home_tolerance: float
+    start_tolerance: float
+    start_speed: float
+    start_timeout: float
+    settle: float
+    hold_end: float
+    stale_s: float
+    max_lateness_s: float
+    geofence_margin: float
+    position_spread: float
+    position_timeout: float
 
-    Args:
-        path: YAML file.
-        method: If given, replaces ``planning.method``.
 
-    Returns:
-        The config dict.
+@dataclass(frozen=True)
+class Config:
+    measured: bool
+    radio_uri: str
+    altitude: float
+    altitude_tolerance: float
+    airframe_radius: float
+    workspace: Box
+    obstacles: tuple[Box, ...]
+    start: tuple[float, float]
+    goal: Box
+    reference: dict
+    duration: float
+    dt: float
+    stream_hz: int
+    u_max: float
+    fans: dict
+    fan_position: list | None
+    fan_direction: list | None
+    excitation: dict
+    flight: Flight
+    model: dict
+    planner: dict
+    mean_model: dict
 
-    Raises:
-        ValueError: A required key is missing or a value is invalid.
-    """
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    if not isinstance(cfg, dict) or not cfg.get("name"):
-        raise ValueError("config needs a non-empty 'name'")
-    if method is not None and isinstance(cfg.get("planning"), dict):
-        cfg["planning"]["method"] = method
-    _check_keys(cfg)
-    _check_geometry(cfg)
+    @property
+    def steps(self):
+        """Mission horizon H in planning steps."""
+        return round(self.duration / self.dt)
+
+    @property
+    def repeats(self):
+        """Streamed commands per planning step."""
+        return round(self.stream_hz * self.dt)
+
+    @property
+    def hash(self):
+        text = json.dumps(asdict(self), sort_keys=True)
+        return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+    def ready_for_data(self, fan):
+        """Why identification/evaluation flights may not fly yet, or None."""
+        if not self.measured:
+            return "config.yml has measured: false"
+        if self.fans.get(fan) is None:
+            return f"fan setting {fan!r} is not chosen"
+        if fan != "off" and None in (self.fan_position, self.fan_direction):
+            return "fan position/direction are not measured"
+        return None
+
+
+def load(path=HERE / "config.yml"):
+    raw = yaml.safe_load(Path(path).read_text())
+    cfg = Config(
+        **{
+            **raw,
+            "workspace": Box(**raw["workspace"]),
+            "obstacles": tuple(Box(**box) for box in raw["obstacles"]),
+            "start": tuple(raw["start"]),
+            "goal": Box(**raw["goal"], name="goal"),
+            "flight": Flight(**raw["flight"]),
+        }
+    )
+    if abs(cfg.steps * cfg.dt - cfg.duration) > 1e-9:
+        raise ValueError("duration must be a whole number of dt steps")
+    if abs(cfg.repeats - cfg.stream_hz * cfg.dt) > 1e-9:
+        raise ValueError("stream_hz * dt must be a whole number")
     return cfg
 
 
-def resolve(cfg, key):
-    """Absolute directory for ``logging.<key>`` (relative to this folder)."""
-    path = Path(cfg["logging"][key])
-    return path if path.is_absolute() else HERE / path
+def git_commit():
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None

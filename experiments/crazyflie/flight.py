@@ -1,57 +1,121 @@
-"""Crazyflie flight execution: connect, position check, fly, land, clean up.
+"""One flight attempt: preflight, start gate, timed velocity commands, landing.
 
-``drone`` is an irobot ``CrazyflieBase`` (connection and arming) or a
-``SimDrone`` for dry runs. State comes only from the experiment's own
-timestamped log blocks (``telemetry.py``): every safety decision uses a
-fresh ``StateFeed.snapshot`` and aborts on stale data. Takeoff, transit to
-the start and landing use the cflib high-level commander; the timed
-trajectory is streamed as low-level position setpoints, as in irobot's
-``CrazyflieController._move_to``, and aborts if a command would be sent
-later than ``flight.max_lateness_s``.
+`drone` is an irobot `CrazyflieBase` (radio link, arming) or a `SimDrone`.
+The high-level commander takes off, reaches the start and lands; the
+mission streams world-frame velocities as body-frame hover setpoints at
+`stream_hz`. Every safety decision uses a fresh state packet.
+
+Abort kinds: `TaskViolation` (left the workspace or altitude band: a task
+failure) and `DataFault` (stale state, lost link, late command: not a task
+outcome). Either one lands through the high-level commander.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import os
+import signal
 import threading
 import time
-import traceback
-from collections import deque
 
 import numpy as np
 
-import telemetry
-import trajectory
-
 logger = logging.getLogger(__name__)
+
+STATE_VARS = [
+    "stateEstimate.x",
+    "stateEstimate.y",
+    "stateEstimate.z",
+    "stateEstimate.vx",
+    "stateEstimate.vy",
+    "stateEstimate.yaw",
+]
+
+
+class TaskViolation(RuntimeError):
+    """The drone left the geofence or the altitude band."""
+
+
+class DataFault(RuntimeError):
+    """Stale state, lost link, late command or a failed preflight check."""
 
 
 class Interrupted(Exception):
-    """Raised when a stop is requested (Ctrl-C or ROS shutdown)."""
+    """Stop requested (Ctrl-C or ROS shutdown)."""
+
+
+def world_to_body(v, yaw_deg):
+    """Rotate a world-frame XY velocity into the body frame."""
+    c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
+    return c * v[0] + s * v[1], -s * v[0] + c * v[1]
+
+
+class StateFeed:
+    """Newest state packet, forwarded to the log; [x, y, z, vx, vy, yaw]."""
+
+    def __init__(self, log, clock=time.monotonic):
+        self.log, self.clock = log, clock
+        self._latest = None
+        self._lock = threading.Lock()
+
+    def on_state(self, device_ms, data):
+        t = self.clock()
+        values = [data[name] for name in STATE_VARS]
+        with self._lock:
+            self._latest = (t, np.array(values))
+        self.log.state([t, device_ms, *values])
+
+    def snapshot(self, stale_s):
+        with self._lock:
+            latest = self._latest
+        if latest is None:
+            raise DataFault("no state received")
+        age = self.clock() - latest[0]
+        if age > stale_s:
+            raise DataFault(f"state {age:.3f} s old (limit {stale_s} s)")
+        return latest[1]
+
+
+def start_logging(cf, cfg, feed, log, make_config=None):
+    """One state block at stream_hz (6 floats, 24 bytes) and a 1 Hz battery block."""
+    if make_config is None:
+        from cflib.crazyflie.log import LogConfig as make_config
+    state = make_config(name="state", period_in_ms=1000 // cfg.stream_hz)
+    for name in STATE_VARS:
+        state.add_variable(name, "float")
+    battery = make_config(name="battery", period_in_ms=1000)
+    battery.add_variable("pm.vbat", "float")
+    blocks = [state, battery]
+    for conf in blocks:
+        cf.log.add_config(conf)
+        conf.error_cb.add_callback(
+            lambda conf, msg: log.event(f"log error {msg}")
+        )
+    state.data_received_cb.add_callback(
+        lambda ts, data, _: feed.on_state(ts, data)
+    )
+    battery.data_received_cb.add_callback(
+        lambda ts, data, _: log.battery(data["pm.vbat"])
+    )
+    for conf in blocks:
+        conf.start()
+    return blocks
 
 
 def connect(cfg):
-    """Open the radio link with irobot and wait for the first telemetry."""
-    from irobot.src.robots.crazyflie import CrazyflieBase, CrazyflieConfig
+    """Open the radio with irobot; stay disarmed until positioning is stable."""
+    from irobot import CrazyflieBase, CrazyflieConfig
 
-    timeout = cfg["flight"]["connect_timeout_s"]
     drone = CrazyflieBase(
-        CrazyflieConfig(uri=cfg["radio"]["uri"], connect_timeout=timeout)
+        CrazyflieConfig(
+            uri=cfg.radio_uri, connect_timeout=cfg.flight.connect_timeout
+        )
     )
-    try:
-        if not drone.is_connected:
-            raise RuntimeError(f"could not connect to {cfg['radio']['uri']}")
-        deadline = time.monotonic() + timeout
-        while not drone.state_ready:
-            if time.monotonic() > deadline:
-                raise RuntimeError("no state estimate received after connect")
-            time.sleep(0.1)
-        # irobot arms on connect; stay disarmed until positioning is stable.
-        drone.disarm()
-    except BaseException:
+    if not drone.is_connected:
         drone.disconnect()
-        raise
+        raise DataFault(f"could not connect to {cfg.radio_uri}")
+    drone.disarm()  # irobot arms on connect
     return drone
 
 
@@ -60,254 +124,292 @@ def _wait(stop, seconds):
         raise Interrupted("stop requested")
 
 
-def _position(feed, cfg):
-    """Fresh position for a decision; raises ``telemetry.StaleState``."""
-    return feed.snapshot(cfg["telemetry"]["stale_s"])["xyz"]
-
-
-def _inside(pos, bounds, margin):
-    return all(
-        bounds[a][0] - margin <= pos[i] <= bounds[a][1] + margin
-        for i, a in enumerate("xyz")
-    )
-
-
 def _check(drone, feed, cfg):
-    """Abort (raise) on a lost link, stale state or a geofence violation."""
+    """Fresh state, or abort on a lost link or a geofence violation."""
     if not drone.is_connected:
-        raise RuntimeError("radio link lost")
-    pos = _position(feed, cfg)
-    if not _inside(pos, cfg["bounds"], cfg["bounds"]["margin"]):
-        raise RuntimeError(f"geofence violated at {np.round(pos, 3).tolist()}")
+        raise DataFault("radio link lost")
+    s = feed.snapshot(cfg.flight.stale_s)
+    m, ws = cfg.flight.geofence_margin, cfg.workspace
+    if not (
+        ws.x[0] - m <= s[0] <= ws.x[1] + m
+        and ws.y[0] - m <= s[1] <= ws.y[1] + m
+    ):
+        raise TaskViolation(f"geofence at ({s[0]:.2f}, {s[1]:.2f})")
+    return s
 
 
 def _monitor(drone, feed, cfg, stop, seconds):
-    """Wait ``seconds`` while checking the link, freshness and geofence."""
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         _check(drone, feed, cfg)
         _wait(stop, min(0.05, end - time.monotonic()))
 
 
-def wait_for_telemetry(feed, cfg, stop):
-    """Wait until the first fresh snapshot arrives."""
-    deadline = time.monotonic() + cfg["flight"]["connect_timeout_s"]
-    while True:
-        try:
-            return _position(feed, cfg)
-        except telemetry.StaleState:
-            if time.monotonic() > deadline:
-                raise
-        _wait(stop, 0.05)
-
-
-def wait_for_positioning(drone, feed, cfg, stop):
-    """Reset the Kalman filter and wait for a stable position estimate.
-
-    Ported from irobot's ``examples/waypoint_flight.py``
-    (``reset_estimator`` / ``wait_for_stable_estimate``).
-    """
-    p = cfg["positioning"]
+def wait_for_positioning(drone, feed, cfg, stop, samples=10):
+    """Reset the Kalman filter; return the mean of a stable 1 s window."""
     drone.cf.param.set_value("kalman.resetEstimation", "1")
     _wait(stop, 0.1)
     drone.cf.param.set_value("kalman.resetEstimation", "0")
-    _wait(stop, p["reset_wait_s"])
-
-    window = deque(maxlen=p["window"])
-    spread = np.full(3, np.inf)
-    deadline = time.monotonic() + p["timeout_s"]
+    deadline = time.monotonic() + cfg.flight.position_timeout
+    window = []
     while True:
-        window.append(_position(feed, cfg))
-        if len(window) == window.maxlen:
-            samples = np.asarray(window)
-            spread = samples.max(axis=0) - samples.min(axis=0)
-            if spread.max() <= p["spread_limit"]:
-                return samples.mean(axis=0)
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"position estimate not stable after {p['timeout_s']} s "
-                f"(last spread {np.round(spread, 3).tolist()} m)"
-            )
         _wait(stop, 0.1)
+        try:
+            window = (window + [feed.snapshot(cfg.flight.stale_s)[:3]])[
+                -samples:
+            ]
+        except DataFault:
+            window = []
+        if len(window) == samples:
+            spread = np.ptp(window, axis=0)
+            if spread.max() <= cfg.flight.position_spread:
+                return np.mean(window, axis=0)
+        if time.monotonic() > deadline:
+            raise DataFault("position estimate did not settle")
 
 
-def _land(drone, feed, cfg, log):
-    """Hand control back to the high-level commander and land.
-
-    The landing duration uses the fresh height; with stale telemetry it
-    assumes the highest planned altitude, so the descent is never faster
-    than ``land_speed``.
-    """
-    cf = drone.cf
-    cf.commander.send_notify_setpoint_stop()
-    try:
-        pos = _position(feed, cfg)
-    except telemetry.StaleState:
-        log.event("stale", "landing without fresh height")
-        pos = np.array([np.nan, np.nan, cfg["flight"]["transit_z"]])
-    duration = max(pos[2], 0.1) / cfg["flight"]["land_speed"]
-    cf.high_level_commander.land(0.0, duration)
-    log.command((pos[0], pos[1], 0.0))
-    time.sleep(duration + 0.5)
-    cf.high_level_commander.stop()
+def _at_start(s, start, cfg):
+    return (
+        np.linalg.norm(s[:2] - start[:2]) <= cfg.flight.start_tolerance
+        and np.linalg.norm(s[3:5]) <= cfg.flight.start_speed
+    )
 
 
-def fly(drone, feed, t, xyz, cfg, log, stop, status):
-    """Nominal flight. Sets ``status['airborne']`` once takeoff is sent."""
-    f = cfg["flight"]
-    hl = drone.cf.high_level_commander
+def fly(drone, feed, plan, cfg, log, stop, status):
+    """Nominal attempt; sets status['airborne'] once takeoff is sent."""
+    f, hl = cfg.flight, drone.cf.high_level_commander
 
     log.set_phase("positioning")
     home = wait_for_positioning(drone, feed, cfg, stop)
-    floor = (home[0], home[1], cfg["bounds"]["z"][0])  # ignore ground z
-    if not _inside(floor, cfg["bounds"], cfg["bounds"]["margin"]):
-        raise RuntimeError(f"home {np.round(home, 3).tolist()} outside bounds")
-    logger.info("Position stable at %s", np.round(home, 3).tolist())
-
-    # As on RA-L: take off straight to the start height when placed at the
-    # start, otherwise climb to transit_z and cross over the arena.
-    start = xyz[0]
-    direct = np.linalg.norm(home[:2] - start[:2]) <= f["home_tolerance"]
-    height = float(start[2]) if direct else f["transit_z"]
+    start = np.array([*plan["start"], cfg.altitude])
+    # Placed at the start: climb straight to the altitude. Otherwise cross
+    # the arena at transit_z, above the obstacles.
+    direct = np.linalg.norm(home[:2] - start[:2]) <= f.home_tolerance
+    height = cfg.altitude if direct else f.transit_z
 
     log.set_phase("takeoff")
     drone.arm()
     _wait(stop, 1.0)
-    duration = height / f["takeoff_speed"]
+    duration = height / f.takeoff_speed
     hl.takeoff(height, duration)
     status["airborne"] = True
-    log.command((home[0], home[1], height))
-    _monitor(drone, feed, cfg, stop, duration + f["settle_s"])
+    _monitor(drone, feed, cfg, stop, duration + f.settle)
 
     log.set_phase("to_start")
-    legs = [start] if direct else [(start[0], start[1], height), start]
-    for leg in legs:
-        leg = np.asarray(leg, dtype=float)
-        distance = np.linalg.norm(leg - _position(feed, cfg))
-        duration = max(distance / f["transit_speed"], 1.0)
+    for leg in [start] if direct else [[*start[:2], height], start]:
+        distance = np.linalg.norm(
+            np.asarray(leg) - _check(drone, feed, cfg)[:3]
+        )
+        duration = max(distance / f.transit_speed, 1.0)
         hl.go_to(*leg, 0.0, duration)
-        log.command(leg)
         _monitor(drone, feed, cfg, stop, duration)
-    deadline = time.monotonic() + f["start_timeout_s"]
-    while np.linalg.norm(_position(feed, cfg) - start) > f["start_tolerance"]:
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"start not reached within {f['start_tolerance']} m "
-                f"(at {np.round(_position(feed, cfg), 3).tolist()})"
-            )
-        _monitor(drone, feed, cfg, stop, 0.1)
-    _monitor(drone, feed, cfg, stop, f["settle_s"])
 
-    log.set_phase("trajectory")
-    stream(drone, feed, t, xyz, cfg, log, stop)
+    log.set_phase("start_gate")
+    deadline = time.monotonic() + f.start_timeout
+    while not _at_start(_check(drone, feed, cfg), start, cfg):
+        if time.monotonic() > deadline:
+            raise DataFault("start position/velocity not reached")
+        _wait(stop, 0.05)
+    _monitor(drone, feed, cfg, stop, f.settle)
+    if not _at_start(_check(drone, feed, cfg), start, cfg):
+        raise DataFault("drifted from the start while settling")
+
+    log.set_phase("mission")
+    stream(drone, feed, plan, cfg, log, stop)
 
     log.set_phase("land")
-    _land(drone, feed, cfg, log)
+    land(drone, feed, cfg)
     status["airborne"] = False
     log.set_phase("landed")
 
 
-def stream(drone, feed, t, xyz, cfg, log, stop):
-    """Send the trajectory on its schedule ``t_begin + k * period``.
+def stream(drone, feed, plan, cfg, log, stop):
+    """Send command k at mission_t0 + k / stream_hz, then hold still.
 
-    Every command logs its reference time and lateness. A command later
-    than ``max_lateness_s`` aborts instead of being sent, so a scheduling
-    stall never turns into a burst of stale setpoints.
+    Each planned velocity is repeated `cfg.repeats` times. A command that
+    would be later than max_lateness_s aborts instead of being sent.
+    Logged per command: plan step (-1 while holding), reference and sent
+    time, lateness, world and body velocity, and the yaw used.
     """
-    f = cfg["flight"]
-    period = 1.0 / f["stream_hz"]
-    end = t[-1] + f["hold_end_s"]
-    t_begin = time.monotonic()
-    for k in range(math.floor(end / period) + 1):
-        lateness = time.monotonic() - (t_begin + k * period)
-        if lateness > f["max_lateness_s"]:
-            raise RuntimeError(
-                f"executor late by {lateness:.3f} s at k={k} "
-                f"(limit {f['max_lateness_s']} s)"
-            )
-        setpoint = trajectory.at(t, xyz, k * period)
-        drone.cf.commander.send_position_setpoint(*setpoint, 0.0)
-        log.command(setpoint, t_ref=k * period, k=k, lateness=lateness)
-        _check(drone, feed, cfg)
-        _wait(stop, t_begin + (k + 1) * period - time.monotonic())
+    f, period = cfg.flight, 1.0 / cfg.stream_hz
+    velocities = np.repeat(np.asarray(plan["velocities"]), cfg.repeats, axis=0)
+    hold = round(f.hold_end * cfg.stream_hz)
+    t0 = time.monotonic()
+    log.mission_start(t0, feed.snapshot(f.stale_s))
+    for k in range(len(velocities) + hold):
+        lateness = time.monotonic() - (t0 + k * period)
+        if lateness > f.max_lateness_s:
+            raise DataFault(f"command {k} late by {lateness:.3f} s")
+        s = _check(drone, feed, cfg)
+        if abs(s[2] - cfg.altitude) > cfg.altitude_tolerance:
+            raise TaskViolation(f"altitude {s[2]:.2f} m")
+        mission = k < len(velocities)
+        v = velocities[k] if mission else (0.0, 0.0)
+        body = world_to_body(v, s[5])
+        drone.cf.commander.send_hover_setpoint(*body, 0.0, cfg.altitude)
+        log.command(
+            [
+                k,
+                k // cfg.repeats if mission else -1,
+                k * period,
+                time.monotonic(),
+                lateness,
+                *v,
+                s[5],
+                *body,
+                cfg.altitude,
+            ]
+        )
+        _wait(stop, t0 + (k + 1) * period - time.monotonic())
 
 
-def safe_shutdown(drone, feed, cfg, log, airborne, blocks):
-    """Land if airborne, stop telemetry, disarm, disconnect; never raises."""
+def land(drone, feed, cfg):
+    """Hand back to the high-level commander and land from the fresh height."""
+    cf = drone.cf
+    cf.commander.send_notify_setpoint_stop()
+    try:
+        z = feed.snapshot(cfg.flight.stale_s)[2]
+    except DataFault:
+        z = cfg.flight.transit_z  # the highest planned height: never too fast
+    duration = max(z, 0.1) / cfg.flight.land_speed
+    cf.high_level_commander.land(0.0, duration)
+    time.sleep(duration + 0.5)
+    cf.high_level_commander.stop()
+
+
+def safe_shutdown(drone, feed, cfg, airborne, blocks):
+    """Land if airborne, stop logging, disarm, disconnect; never raises."""
     if drone is None:
         return
     if airborne:
         try:
-            _land(drone, feed, cfg, log)
+            land(drone, feed, cfg)
         except Exception:
             logger.exception("Landing failed; stopping motors")
             try:
                 drone.cf.commander.send_stop_setpoint()
             except Exception:
                 logger.exception("Stop setpoint failed")
-    telemetry.stop(blocks)
-    for step in (drone.disarm, drone.disconnect):
+    for step in [conf.stop for conf in blocks] + [
+        drone.disarm,
+        drone.disconnect,
+    ]:
         try:
             step()
         except Exception:
-            logger.exception("Cleanup step %s failed", step.__name__)
+            logger.exception("Cleanup step failed")
 
 
-def run_flight(cfg, t, xyz, log, stop=None, connect_fn=connect):
-    """Run one attempt end to end; always cleans up and writes the summary."""
+def run_flight(cfg, plan, log, stop=None, connect_fn=connect):
+    """One attempt end to end; always cleans up and writes the log."""
     stop = stop or threading.Event()
-    drone, blocks = None, []
-    status = {"airborne": False}
-    outcome, error, tb = "error", None, None
-    feed = telemetry.StateFeed(
-        cfg["telemetry"]["period_ms"],
-        sink=log.packet,
-        on_error=log.block_error,
-    )
+    drone, blocks, status = None, [], {"airborne": False}
+    feed = StateFeed(log)
+    outcome, reason, kind = "error", None, "error"
     try:
-        log.set_phase("connect")
         drone = connect_fn(cfg)
-        blocks = telemetry.start(
-            drone.cf, cfg, feed, getattr(drone, "LogConfig", None)
+        blocks = start_logging(
+            drone.cf, cfg, feed, log, getattr(drone, "LogConfig", None)
         )
-        wait_for_telemetry(feed, cfg, stop)
-        fly(drone, feed, t, xyz, cfg, log, stop, status)
-        outcome = "completed"
+        fly(drone, feed, plan, cfg, log, stop, status)
+        outcome, kind = "completed", None
     except (KeyboardInterrupt, Interrupted):
-        outcome, error = "interrupted", f"interrupted during {log.phase}"
-        logger.warning("Flight %s", error)
+        outcome, reason, kind = "interrupted", "stop requested", "interrupted"
+    except (TaskViolation, DataFault) as exc:
+        outcome, reason, kind = "aborted", str(exc), type(exc).__name__
     except Exception as exc:
-        error, tb = f"{type(exc).__name__}: {exc}", traceback.format_exc()
-        logger.error("Flight failed during %s: %s", log.phase, error)
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.exception("Flight failed during %s", log.phase)
     finally:
         phase = log.phase
         if status["airborne"]:
             log.set_phase("cleanup_land")
-        safe_shutdown(drone, feed, cfg, log, status["airborne"], blocks)
-        summary = log.finish(outcome, error, phase=phase, traceback=tb)
-    return summary
+        safe_shutdown(drone, feed, cfg, status["airborne"], blocks)
+    if reason:
+        logger.warning("Flight %s during %s: %s", outcome, phase, reason)
+    return log.finish(outcome, reason, kind, phase)
 
 
-class _Caller:
-    """cflib ``Caller`` stand-in."""
+def launch(cfg, plan, log, connect_fn=connect):
+    """Fly inside a ROS Sugar component; returns the trial metadata."""
+    from ros_sugar import Launcher
+    from ros_sugar.core import BaseComponent
 
-    def __init__(self):
-        self.callbacks = []
+    class FlightComponent(BaseComponent):
+        """Runs the mission on its own thread.
 
-    def add_callback(self, callback):
-        self.callbacks.append(callback)
+        `_execute_once` runs in a timer callback; blocking it would also
+        block the lifecycle callbacks that deliver shutdown (which land).
+        """
+
+        def __init__(self, **kwargs):
+            self.stop, self.mission, self.result = (
+                threading.Event(),
+                None,
+                None,
+            )
+            super().__init__(**kwargs)
+
+        def _execute_once(self):
+            self.mission = threading.Thread(target=self._fly, name="mission")
+            self.mission.start()
+
+        def _fly(self):
+            try:
+                self.result = run_flight(cfg, plan, log, self.stop, connect_fn)
+            finally:
+                if not self.stop.is_set():  # finished: end Launcher.bringup()
+                    os.kill(os.getpid(), signal.SIGINT)
+
+        def _execution_step(self):
+            pass
+
+        def custom_on_deactivate(self):
+            self.stop.set()
+            return super().custom_on_deactivate()
+
+        def custom_on_shutdown(self):
+            self.stop.set()
+            return super().custom_on_shutdown()
+
+    component = FlightComponent(component_name="crazyflie_flight")
+    launcher = Launcher()
+    launcher.add_pkg(
+        components=[component], activate_all_components_on_start=True
+    )
+    try:
+        launcher.bringup()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Never exit while airborne: an unfinished mission lands first.
+        component.stop.set()
+        while component.mission is not None and component.mission.is_alive():
+            try:
+                component.mission.join(timeout=0.5)
+            except KeyboardInterrupt:
+                print(
+                    "Landing and cleaning up; waiting for the flight to end."
+                )
+    return component.result or log.finish(
+        "error", "component did not run", "error"
+    )
+
+
+# Simulation for tests and --dry-run
+
+
+class _Caller(list):
+    add_callback = list.append
 
     def call(self, *args):
-        for callback in self.callbacks:
+        for callback in self:
             callback(*args)
 
 
 class SimLogConfig:
-    """The part of cflib's ``LogConfig`` that ``telemetry.start`` uses."""
-
     def __init__(self, name, period_in_ms):
-        self.name, self.period_in_ms = name, period_in_ms
-        self.variables = []
+        self.name, self.period_in_ms, self.variables = name, period_in_ms, []
         self.data_received_cb, self.error_cb = _Caller(), _Caller()
         self.started = False
 
@@ -322,145 +424,99 @@ class SimLogConfig:
 
 
 class SimDrone:
-    """Stand-in for an irobot ``CrazyflieBase`` and its ``cf``.
+    """Stand-in for `CrazyflieBase` and its `cf`, simulated at 100 Hz.
 
-    The position follows the commanded target with a first-order lag. An
-    emitter thread sends every started log block once per period, with a
-    24-bit device-ms counter (starting at ``device_origin_ms``), noisy
-    position, finite-difference velocity and the active target. Commands
-    are recorded in ``calls``.
-
-    Fault knobs: ``fail_on`` names a command that raises; ``fail_after``
-    makes the n-th streamed setpoint raise; ``stall_after`` stops all
-    packets (or only ``stall_block``) once n setpoints were streamed;
-    ``drop_every`` skips every n-th tick (the device clock still advances);
-    ``callback_delay_s`` delays each callback.
+    High-level moves are linear in time; hover setpoints drive a
+    first-order velocity lag (time constant `tau`) at a fixed `yaw`.
+    `fail_after` makes the n-th hover setpoint raise; `stall_after` stops
+    state packets after n hover setpoints.
     """
 
     LogConfig = SimLogConfig
-    VBAT = 3.9
 
     def __init__(
         self,
-        home=(0.5, -0.2, 0.0),
-        tau=0.05,
-        noise=0.0,
-        fail_on=(),
+        home=(1.0, -2.0, 0.0),
+        yaw=0.0,
+        tau=0.3,
         fail_after=None,
         stall_after=None,
-        stall_block=None,
-        drop_every=None,
-        callback_delay_s=0.0,
-        device_origin_ms=123_456,
-        seed=0,
     ):
         self.cf = self.commander = self.high_level_commander = self.param = (
             self.log
         ) = self
-        self.calls = []
-        self.is_connected = True
-        self.state_ready = True
-        self.current_vx = self.current_vy = self.current_yaw = 0.0
-        self._pos = np.asarray(home, dtype=float)
-        self._seg = (self._pos.copy(), self._pos.copy(), 0.0, 0.0)
-        self._last = time.monotonic()
-        self._tau, self._noise = tau, noise
-        self._rng = np.random.default_rng(seed)
-        self._fail_on, self._fail_after = set(fail_on), fail_after
-        self._stall_after, self._stall_block = stall_after, stall_block
-        self._drop_every, self._delay = drop_every, callback_delay_s
-        self._origin = device_origin_ms
-        self._setpoints = 0
-        self._configs = []
+        self.calls, self.configs, self.is_connected = [], [], True
+        self.pos, self.vel = np.array(home, float), np.zeros(3)
+        self.yaw, self.tau = yaw, tau
+        self.fail_after, self.stall_after, self.setpoints = (
+            fail_after,
+            stall_after,
+            0,
+        )
+        self._move = (
+            None  # (from, to, t_start, duration) or ("hover", v_body, z)
+        )
         self._lock = threading.Lock()
-        threading.Thread(target=self._emit_loop, daemon=True).start()
+        threading.Thread(target=self._run, daemon=True).start()
 
-    def _record(self, name):
-        self.calls.append(name)
-        if name in self._fail_on:
-            raise RuntimeError(f"simulated {name} failure")
-
-    def _target(self, now):
-        p0, p1, t0, dur = self._seg
-        a = 1.0 if dur <= 0 else min(max((now - t0) / dur, 0.0), 1.0)
-        return p0 + a * (p1 - p0)
-
-    def _move(self, goal, duration):
-        with self._lock:
+    def _run(self, period=0.01):
+        start = last = time.monotonic()
+        tick = 0
+        while self.is_connected:
+            time.sleep(period)
+            tick += 1
             now = time.monotonic()
-            self._seg = (
-                self._target(now),
+            with self._lock:
+                self._step(now - last)
+                values = dict(
+                    zip(STATE_VARS, [*self.pos, *self.vel[:2], self.yaw])
+                )
+                values["pm.vbat"] = 3.9
+            last = now
+            device_ms = 123_456 + round(1000 * (now - start))
+            stalled = (
+                self.stall_after is not None
+                and self.setpoints >= self.stall_after
+            )
+            for conf in list(self.configs):
+                due = tick % (conf.period_in_ms // 10) == 0
+                if (
+                    conf.started
+                    and due
+                    and not (stalled and conf.name == "state")
+                ):
+                    data = {v: values[v] for v in conf.variables}
+                    conf.data_received_cb.call(device_ms, data, conf)
+
+    def _step(self, dt):
+        if self._move is None:
+            return
+        if isinstance(self._move[0], str):  # ("hover", v_body, z)
+            _, (vx, vy), z = self._move
+            target = np.array([*world_to_body((vx, vy), -self.yaw), 0.0])
+            self.vel += (target - self.vel) * (1 - math.exp(-dt / self.tau))
+            self.pos += self.vel * dt
+            self.pos[2] += (z - self.pos[2]) * min(dt / 0.1, 1.0)
+            return
+        start, goal, t_start, duration = self._move
+        a = min((time.monotonic() - t_start) / max(duration, 1e-9), 1.0)
+        new = start + a * (goal - start)
+        self.vel = (new - self.pos) / dt
+        self.pos = new
+
+    def _goto(self, goal, duration):
+        with self._lock:
+            self._move = (
+                self.pos.copy(),
                 np.asarray(goal, float),
-                now,
+                time.monotonic(),
                 duration,
             )
 
-    def _true_position(self):
-        with self._lock:
-            now = time.monotonic()
-            gain = 1.0 - math.exp(-(now - self._last) / self._tau)
-            self._pos = self._pos + gain * (self._target(now) - self._pos)
-            self._last = now
-            return self._pos.copy(), self._target(now)
+    def _record(self, name):
+        self.calls.append(name)
 
-    def _read(self):
-        return self._true_position()[0] + self._rng.normal(0.0, self._noise, 3)
-
-    current_x = property(lambda self: self._read()[0])
-    current_y = property(lambda self: self._read()[1])
-    current_z = property(lambda self: self._read()[2])
-
-    # --- log blocks -----------------------------------------------------------
-
-    def add_config(self, conf):
-        """``cf.log.add_config``."""
-        self._configs.append(conf)
-
-    def _emit_loop(self):
-        tick, previous = 0, None
-        while self.is_connected:
-            period_ms = self._configs[0].period_in_ms if self._configs else 50
-            time.sleep(period_ms / 1000)
-            tick += 1
-            pos, target = self._true_position()
-            velocity = (
-                np.zeros(3)
-                if previous is None
-                else (pos - previous) / (period_ms / 1000)
-            )
-            previous = pos
-            if self._drop_every and tick % self._drop_every == 0:
-                continue
-            device_ms = (self._origin + tick * period_ms) % (1 << 24)
-            seen = self._rng.normal(0.0, self._noise, 3) + pos
-            values = {
-                "stateEstimate.x": seen[0],
-                "stateEstimate.y": seen[1],
-                "stateEstimate.z": seen[2],
-                "stateEstimate.vx": velocity[0],
-                "stateEstimate.vy": velocity[1],
-                "stateEstimate.vz": velocity[2],
-                "ctrltarget.x": target[0],
-                "ctrltarget.y": target[1],
-                "ctrltarget.z": target[2],
-                "pm.vbat": self.VBAT,
-            }
-            for conf in list(self._configs):
-                stalled = (
-                    self._stall_after is not None
-                    and self._setpoints >= self._stall_after
-                )
-                if stalled and self._stall_block in (None, conf.name):
-                    continue
-                if not conf.started:
-                    continue
-                if self._delay:
-                    time.sleep(self._delay)
-                data = {v: values[v] for v in conf.variables}
-                conf.data_received_cb.call(device_ms, data, conf)
-
-    # --- irobot CrazyflieBase ---------------------------------------------------
-
+    # CrazyflieBase
     def arm(self):
         self._record("arm")
 
@@ -471,38 +527,42 @@ class SimDrone:
         self._record("disconnect")
         self.is_connected = False
 
-    # --- cf.param -------------------------------------------------------------
-
+    # cf.param, cf.log
     def set_value(self, name, value):
         self._record(f"param {name}={value}")
 
-    # --- cf.high_level_commander --------------------------------------------
+    def add_config(self, conf):
+        self.configs.append(conf)
 
+    # cf.high_level_commander
     def takeoff(self, height, duration):
         self._record("takeoff")
-        self._move((*self._target(time.monotonic())[:2], height), duration)
+        self._goto([*self.pos[:2], height], duration)
 
     def go_to(self, x, y, z, yaw, duration):
         self._record("go_to")
-        self._move((x, y, z), duration)
+        self._goto([x, y, z], duration)
 
     def land(self, height, duration):
         self._record("land")
-        self._move((*self._target(time.monotonic())[:2], height), duration)
+        self._goto([*self.pos[:2], height], duration)
 
     def stop(self):
         self._record("hl_stop")
 
-    # --- cf.commander ---------------------------------------------------------
-
-    def send_position_setpoint(self, x, y, z, yaw):
-        self._setpoints += 1
-        if self._fail_after is not None and self._setpoints > self._fail_after:
-            raise RuntimeError("simulated failure during trajectory")
-        self._move((x, y, z), 0.0)
+    # cf.commander
+    def send_hover_setpoint(self, vx, vy, yawrate, z):
+        self.setpoints += 1
+        if self.fail_after is not None and self.setpoints > self.fail_after:
+            raise RuntimeError("simulated radio failure")
+        with self._lock:
+            self._move = ("hover", (vx, vy), z)
 
     def send_notify_setpoint_stop(self):
         self._record("notify_setpoint_stop")
+        with self._lock:
+            self.vel[:] = 0.0
+            self._move = None
 
     def send_stop_setpoint(self):
         self._record("stop_setpoint")
