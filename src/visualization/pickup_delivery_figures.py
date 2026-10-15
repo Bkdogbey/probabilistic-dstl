@@ -14,7 +14,7 @@ import torch
 
 from experiments import pickup_delivery as pdl
 from experiments import task_checker
-from visualization.figures import _draw_environment, _ellipse
+from visualization.figures import _draw_environment, _ellipse, _unique_legend
 
 # Fixed categorical order (reference palette slots 1-4) plus a marker each, so
 # identity never rests on colour alone.
@@ -135,7 +135,7 @@ def figure_scenario(directory, records, manifest, out, method="pdstl"):
             f"{rate:.2f}",
             fontsize=9,
         )
-        ax.legend(fontsize=7, loc="lower right")
+        _unique_legend(ax, loc="lower right")
     fig.suptitle(
         "R3 plans (median-success instance per noise level); ellipses are "
         "pointwise covariance contours, not trajectory tubes",
