@@ -159,6 +159,73 @@ explicit initial states, process disturbances, observation noise, or a
 Custom initial states must be `LaneState` records with truth and beliefs;
 older saved state tuples remain plottable.
 
+## Pickup–delivery study
+
+A 2D warehouse (`configs/scenarios/pickup_delivery/warehouse.yaml`): two racks
+leave a 1.2 m slot and a wider route above; pickups P1 (right of the slot) and
+P2 (upper-left aisle), scanner C, delivery D. The robot is a point (radius 0);
+uncertainty margins are never robot size. Double integrator, state
+`[px, py, vx, vy]`, `x' = A x + B u + w` with `w ~ N(0, q² I₄)` on all four
+states, `|u_i| ≤ 1 m/s²`, dt = 0.2 s, H = 100 control steps (H + 1 samples),
+dwell d = 10 steps (11 inclusive samples). The handoff's H = 75 failed the
+nominal feasibility gate; the YAML records the sweep and the noise calibration.
+
+Tasks (`experiments/pickup_delivery.specification`), all windows in steps:
+
+    S  = G[0,H](W ∧ ¬O1 ∧ ¬O2),   L = G[0,d] P1 ∨ G[0,d] P2
+    R1 = S ∧ F[0,H] D
+    R2 = S ∧ F[0,H-d] L ∧ F[0,H] D
+    R3 = S ∧ (¬C U[0,H-d] L) ∧ (¬D U[0,H] C) ∧ F[0,H] D
+
+`Until` is strong and inclusive (the left side holds through the witness).
+With P/C/D pairwise disjoint this is the intended order: load before any scan,
+scan before any delivery. Safety here is `G[0,H]`; the reach–avoid scenarios
+use `G[1,H]`. `check_lookahead` asserts no formula needs a sample after H.
+
+Evidence is kept separate:
+
+- **Evaluation:** hard pdSTL matches an independent numpy reference of the
+  Fréchet / min–max / inclusive-Until recurrences (`tests/test_pickup_delivery.py`).
+- **Differentiation:** directional finite differences in float64. The smooth
+  lower stays at or below the hard lower on R1–R3 in the tests, and every
+  record logs the signed smooth − hard gap; this is checked, not assumed.
+- **Optimization:** the hard pdSTL score of each returned plan, initial and
+  selected, within a shared wall-time budget.
+- **Execution:** fresh open-loop samples of the same dynamics, scored by
+  `experiments/task_checker.py` (numpy only, no pdSTL), with a failure bitmask
+  and Clopper–Pearson intervals.
+
+Methods share the start bank (four ordered pickup→C→D starts: P1/P2 × slot /
+bypass, so route and order come from initialization for every method), effort
+terms, and budget: nominal mean-STLCG and time-varying-margin STLCG
+(`from_pdstl(spec, margin_k=k)`: each literal tightened by k·√(aᵀΣ_t a) from
+the same predicted covariance) optimize robustness in metres; pdSTL optimizes
+its smooth lower score; CMA-ES optimizes the same smooth pdSTL objective
+without gradients. Each method selects on its own hard score; all returned
+plans are re-scored with hard pdSTL. `w_margin` stays 0.
+
+```bash
+PYTHONPATH=src python -m experiments.pickup_delivery_study smoke
+PYTHONPATH=src python -m experiments.pickup_delivery_study tune --workers 6
+PYTHONPATH=src python -m experiments.pickup_delivery_study pilot --workers 4
+PYTHONPATH=src python -m experiments.pickup_delivery_study plots --exp pilot
+PYTHONPATH=src python -m experiments.pickup_delivery_study estimate --exp pilot
+# full batch (not run by default): main, spec, horizon, score_diag, scaling
+```
+
+Records go to `outputs/pickup_delivery/<exp>/records.jsonl` (one row per
+trial, every attempted trial kept, with seeds, commits and timings), artifacts
+to `artifacts/`, figures and tables to `figures/`. A rerun resumes; a changed
+config needs a new `--exp`.
+
+Limitations: the score is stochastic robustness (see Scope), not a trajectory
+satisfaction probability, and no score threshold is a probability guarantee.
+Covariance does not depend on the controls, so plans only adapt the mean. No
+faithful RSTL reproduction is included; a sigmoid of sampled robustness would
+be a separately named baseline. Product (independence) conjunction is not
+added. CMA-ES in 200 dimensions under a short budget is a weak optimizer, so
+it bounds gradient usefulness only loosely.
+
 ## Scope: what the numbers mean
 
 1. **ρ̲_φ is a robustness, not P(φ).** `Always` takes the minimum over time of

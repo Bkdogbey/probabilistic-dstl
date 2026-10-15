@@ -539,3 +539,18 @@ def test_alpha_status_states_whether_the_lower_robustness_meets_alpha():
     planner, rollout, spec = problem(max_iters=1)
     result = planner.optimize_window(rollout, spec=spec)
     assert result.alpha_status() == "no α requested"
+
+
+def test_time_budget_stops_early_and_histories_cover_every_iterate():
+    planner, rollout, spec = problem(max_iters=500, time_budget=1e-9)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.stop_reason == "time_budget"
+    assert result.evaluations == 1  # only the initial guess was scored
+    planner, rollout, spec = problem(max_iters=4)
+    result = planner.optimize_window(rollout, spec=spec)
+    assert result.stop_reason == "max_iters"
+    assert result.evaluations == len(result.hard_lower_history) == 5
+    assert len(result.smooth_lower_history) == len(result.elapsed_history) == 5
+    assert result.elapsed_history == sorted(result.elapsed_history)
+    with pytest.raises(ValueError, match="time_budget"):
+        problem(time_budget=0)

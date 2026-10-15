@@ -107,11 +107,18 @@ class DetSTL_Formula(nn.Module):
 
 
 class DetPredicate(DetSTL_Formula):
-    """Atomic geometry copied from a pdSTL event without registering its module."""
+    """Atomic geometry copied from a pdSTL event without registering its module.
 
-    def __init__(self, event):
+    `margin_k > 0` tightens the atom by k standard deviations of its own
+    projection, sqrt(a^T Sigma_t a), at every step; `polarity` is -1 when the
+    atom sits under an odd number of negations, so the tightening always
+    shrinks what the formula must satisfy.
+    """
+
+    def __init__(self, event, margin_k=0.0, polarity=1):
         super().__init__()
         self.name = event.name
+        self.margin_k, self.polarity = float(margin_k), polarity
         if isinstance(event, AxisInterval):
             self.kind = "axis"
             self.lower, self.upper, self.dim = (
@@ -126,6 +133,7 @@ class DetPredicate(DetSTL_Formula):
             )
         elif isinstance(event, HalfSpace):
             self.kind, self.a, self.b = "halfspace", tuple(event.a), event.b
+            self.vehicle = None
         else:
             raise TypeError(
                 f"unsupported auxiliary predicate: {type(event).__name__}"
@@ -144,6 +152,43 @@ class DetPredicate(DetSTL_Formula):
         return trace.mean
 
     def robustness_trace(self, trajectory, beta=None):
+        rho = self._raw_trace(trajectory, beta)
+        if not self.margin_k:
+            return rho
+        return self._tightened(rho, self._sigma(trajectory))
+
+    def _sigma(self, trajectory):
+        """[B, T, 1] std of the atom's projection under the belief covariance."""
+        covariance = getattr(
+            getattr(trajectory, "trace", None), "covariance", None
+        )
+        if covariance is None or self.vehicle is not None:
+            raise ValueError(
+                "uncertainty margins need a Gaussian belief trajectory"
+            )
+        if self.kind == "halfspace":
+            normal = covariance.new_tensor(self.a)
+            variance = torch.einsum(
+                "i,...ij,j->...", normal, covariance, normal
+            )
+        else:
+            variance = covariance[..., self.dim, self.dim]
+        return variance.clamp_min(0).sqrt().unsqueeze(-1)
+
+    def _tightened(self, rho, sigma):
+        """Margin-adjusted robustness of this literal.
+
+        Args:
+            rho: [B, T, 1] nominal robustness of the atom on the mean.
+            sigma: [B, T, 1] standard deviation of the atom's projection.
+
+        Returns:
+            [B, T, 1] robustness after the k-sigma uncertainty margin.
+        """
+        # Under a negation (polarity -1) the atom grows, so its negation shrinks.
+        return rho - self.polarity * self.margin_k * sigma
+
+    def _raw_trace(self, trajectory, beta):
         mean = self._mean(trajectory)
         if self.kind == "halfspace":
             normal = mean.new_tensor(self.a)
@@ -341,29 +386,36 @@ class DetUntil(DetSTL_Formula):
         return torch.cat(outputs, dim=1)
 
 
-def from_pdstl(spec):
+def from_pdstl(spec, margin_k=0.0):
     """Compile the same predicates/windows into an independent recurrent graph.
 
     Atomic margins are evaluated on the belief mean (raw mean robustness).
+    `margin_k > 0` gives the time-varying-margin baseline: each literal is
+    tightened by margin_k standard deviations of the predicted covariance.
     """
 
-    def convert(node):
+    def convert(node, polarity=1):
         if isinstance(node, (_Rectangle, pd.Implies)):
-            return convert(node.equivalent)
+            return convert(node.equivalent, polarity)
         if isinstance(node, pd.Negation):
-            return DetNegation(convert(node.subformula))
+            return DetNegation(convert(node.subformula, -polarity))
         if isinstance(node, (pd.And, pd.Or)):
             cls = DetAnd if isinstance(node, pd.And) else DetOr
-            return cls(convert(node.subformula1), convert(node.subformula2))
+            return cls(
+                convert(node.subformula1, polarity),
+                convert(node.subformula2, polarity),
+            )
         if isinstance(node, (pd.Always, pd.Eventually)):
             cls = DetAlways if isinstance(node, pd.Always) else DetEventually
-            return cls(convert(node.subformula), node._interval)
+            return cls(convert(node.subformula, polarity), node._interval)
         if isinstance(node, pd.Until):
             return DetUntil(
-                convert(node.left), convert(node.right), node._interval
+                convert(node.left, polarity),
+                convert(node.right, polarity),
+                node._interval,
             )
         if isinstance(node, (AxisInterval, HalfSpace)):
-            return DetPredicate(node)
+            return DetPredicate(node, margin_k, polarity)
         raise TypeError(
             f"unsupported auxiliary formula: {type(node).__name__}"
         )

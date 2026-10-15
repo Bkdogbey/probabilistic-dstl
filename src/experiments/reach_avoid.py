@@ -5,6 +5,7 @@ The regions and settings come from a YAML in configs/scenarios/reach_avoid/.
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from models.dynamics import SingleIntegrator
@@ -89,7 +90,9 @@ def run(
     return result
 
 
-def straight_line_guess(cfg, dyn, waypoints, kp=4.0, kd=4.0):
+def straight_line_guess(
+    cfg, dyn, waypoints, kp=4.0, kd=4.0, holds=None, arrival=0.8
+):
     """Controls whose mean path follows straight lines through waypoints.
 
     Args:
@@ -97,11 +100,15 @@ def straight_line_guess(cfg, dyn, waypoints, kp=4.0, kd=4.0):
         dyn: Single- or double-integrator dynamics.
         waypoints: [[x, y], ...] after the start.
         kp, kd: PD gains of the double-integrator tracker.
+        holds: Optional {waypoint index: steps} pauses of the reference.
+        arrival: Fraction of H at which the reference reaches the end.
 
     Returns:
         [H, 2] controls within u_max.
     """
-    reference = _straight_line_reference(cfg, waypoints, dyn.B.dtype)
+    reference = _straight_line_reference(
+        cfg, waypoints, dyn.B.dtype, arrival=arrival, holds=holds
+    )
     velocity = (reference[1:] - reference[:-1]) / cfg["dt"]
     if isinstance(dyn, SingleIntegrator):
         return velocity.clamp(-dyn.u_max, dyn.u_max).to(dyn.device)
@@ -115,19 +122,45 @@ def straight_line_guess(cfg, dyn, waypoints, kp=4.0, kd=4.0):
     return torch.stack(controls).to(dyn.device)
 
 
-def _straight_line_reference(cfg, waypoints, dtype, arrival=0.8):
-    """Positions along x0 -> waypoints at constant speed, done at arrival*H."""
+def _straight_line_reference(cfg, waypoints, dtype, arrival=0.8, holds=None):
+    """Positions along x0 -> waypoints at constant speed, done at arrival*H.
+
+    `holds` {waypoint index: steps} keeps the reference at that waypoint.
+    """
     points = torch.tensor([cfg["x0_mean"][:2], *waypoints], dtype=dtype)
     segments = points[1:] - points[:-1]
     ends = torch.cat((points.new_zeros(1), segments.norm(dim=1).cumsum(0)))
-    progress = (torch.arange(cfg["H"] + 1) / (arrival * cfg["H"])).clamp(max=1)
-    distance = ends[-1] * progress
+    steps = torch.arange(cfg["H"] + 1, dtype=dtype)
+    if not holds:
+        progress = (steps / (arrival * cfg["H"])).clamp(max=1)
+        distance = ends[-1] * progress
+    else:
+        distance = _held_distance(steps, ends, holds, arrival * cfg["H"])
     index = (torch.searchsorted(ends, distance, right=True) - 1).clamp(
         0, len(segments) - 1
     )
     length = (ends[index + 1] - ends[index]).clamp_min(1e-9)
     fraction = ((distance - ends[index]) / length).unsqueeze(1)
     return points[index] + fraction * segments[index]
+
+
+def _held_distance(steps, ends, holds, finish):
+    """Arc length at each step: constant speed, paused for each hold."""
+    paused = sum(holds.values())
+    if paused >= finish:
+        raise ValueError("holds leave no time to move before arrival")
+    speed = float(ends[-1]) / (finish - paused)
+    times, lengths, clock = [0.0], [0.0], 0.0
+    for k in range(1, len(ends)):
+        clock += float(ends[k] - ends[k - 1]) / speed
+        times.append(clock)
+        lengths.append(float(ends[k]))
+        if holds.get(k - 1):
+            clock += holds[k - 1]
+            times.append(clock)
+            lengths.append(float(ends[k]))
+    distance = np.interp(steps.numpy(), times, lengths)
+    return torch.as_tensor(distance, dtype=steps.dtype)
 
 
 def _live_view(s, title, visual):

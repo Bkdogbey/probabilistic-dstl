@@ -288,14 +288,35 @@ def shortest_route(environment, start, clearance=0.05, resolution=0.05):
     def length(cells):
         return sum(search(a)[0][b] for a, b in zip(cells, cells[1:]))
 
-    best = min(stops, key=length)
-    if not isfinite(length(best)):
+    return _connect(grid, search, min(stops, key=length), clearance)
+
+
+def route_through(environment, start, stops, clearance=0.05, resolution=0.05):
+    """Shortest collision-free route from start through `stops` in order.
+
+    Args:
+        environment: Environment with a workspace and obstacles.
+        start: [x, y] start position.
+        stops: [[x, y], ...] points to pass, in this order.
+        clearance, resolution: As in `shortest_route`.
+
+    Returns:
+        [[x, y], ...] corner points after the start; each stop is a corner.
+    """
+    grid = _FreeGrid(environment, clearance, resolution)
+    cells = [grid.cell(point) for point in [start, *stops]]
+    return _connect(grid, cache(grid.search), cells, clearance)
+
+
+def _connect(grid, search, cells, clearance):
+    """Shortcut corner points along the grid's shortest legs between cells."""
+    if not isfinite(sum(search(a)[0][b] for a, b in zip(cells, cells[1:]))):
         raise ValueError(
             f"no route keeps {clearance} m from every obstacle; "
             "lower route.clearance or move the obstacles"
         )
     route = []
-    for a, b in zip(best, best[1:]):
+    for a, b in zip(cells, cells[1:]):
         route += grid.shortcut(grid.trace(search(a)[1], a, b))
     return route
 

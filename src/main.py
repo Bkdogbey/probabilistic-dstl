@@ -34,3 +34,10 @@ with skip_run("skip", "LaneChange") as check, check():
 # 5. On-ramp merge into the main lane
 with skip_run("skip", "LaneMerge") as check, check():
     lane.run(f"{LANE}/lane_merge.yaml", live_optimization=True)
+
+
+# 6. Pickup-delivery study (smoke trial; other blocks: see README)
+with skip_run("skip", "PickupDelivery") as check, check():
+    from experiments import pickup_delivery_study
+
+    pickup_delivery_study.main(["smoke", "--workers", "1"])

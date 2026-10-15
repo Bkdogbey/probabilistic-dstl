@@ -1,0 +1,134 @@
+# 2D pickup–scanner–delivery study (README "Pickup–delivery study").
+# Geometry is robot-centre = point robot (radius 0): racks are the physical
+# rack footprints, regions are unchanged. Margins in the margin baseline
+# represent position uncertainty only, never robot size.
+name: Warehouse pickup-delivery
+dynamics: double_integrator  # state [px, py, vx, vy], control [ax, ay]
+dt: 0.2
+u_max: 1.0                   # m/s^2 per axis (existing command limit)
+# H: control intervals (H + 1 state samples). The handoff's initial 75 (15 s)
+# failed the nominal feasibility gate: with u_max = 1 m/s^2 no start completed
+# R3 on its mean path at H = 75 (P2 alone needs ~13.5 s of straight-line
+# bang-bang travel plus the 2 s dwell, before corners). H = 100 (20 s) is the
+# shortest tested horizon (75/90/100/110/125) at which both pickups are
+# nominally feasible on all 36 test+tune instances (2026-10-14 sweep).
+H: 100
+dwell: 10                    # intervals: G[0, 10] spans 11 inclusive samples
+x0_mean: [1.0, 1.0, 0.0, 0.0]
+x0_cov_scale: [0.01, 0.01, 0.0, 0.0]  # diagonal variances (m^2, (m/s)^2)
+
+# Process noise Q = q_std^2 I_4 on all four states (models/dynamics.py).
+# Levels fixed 2026-10-14 on tune instances 1000-1002 with tune-only seeds,
+# start bank only (no optimization), by the pre-declared rule: low leaves the
+# slot route essentially unaffected (P1-slot hard/MC ~0.9), high clearly
+# degrades it (P1-slot hard 0.35-0.49, MC 0.65-0.79) while the task stays
+# nominally feasible. q = 0.004 zeroed the hard R3 score of every start.
+noise: {low: 0.001, medium: 0.002, high: 0.003}
+
+bounds: {x_range: [0, 10], y_range: [0, 10]}
+obstacles:
+  - {name: rack_low, x_range: [2.5, 6.5], y_range: [0.0, 4.4]}
+  - {name: rack_high, x_range: [2.5, 6.5], y_range: [5.6, 7.0]}
+regions:
+  P1: {x_range: [6.8, 8.0], y_range: [4.4, 5.6]}
+  P2: {x_range: [0.6, 1.8], y_range: [6.4, 7.6]}
+  C: {x_range: [8.4, 9.4], y_range: [6.0, 7.0]}
+  D: {x_range: [8.4, 9.6], y_range: [8.4, 9.6]}
+# Classification only (not in any formula): where a route crosses.
+corridors:
+  slot: {x_range: [2.5, 6.5], y_range: [4.4, 5.6]}
+  bypass: {x_range: [2.5, 6.5], y_range: [7.0, 10.0]}
+
+# Shared start bank: via points fix each route's geometric class; every
+# start is ordered pickup -> C -> D and holds in the pickup for the dwell.
+route: {clearance: 0.3, resolution: 0.1}
+starts:
+  P1-slot: {pickup: P1, before: [[2.3, 5.0], [6.7, 5.0]], after: []}
+  P1-bypass: {pickup: P1, before: [[2.3, 7.6], [6.7, 7.6]], after: []}
+  P2-bypass: {pickup: P2, before: [], after: [[2.3, 7.6], [6.7, 7.6]]}
+  P2-slot: {pickup: P2, before: [], after: [[2.3, 5.0], [6.7, 5.0]]}
+hold_steps: 18               # reference pause in the pickup (>= dwell + 1)
+init: {kp: 1.0, kd: 2.0, arrival: 0.95}  # PD tracker of the start references
+
+# Instance i draws from seed `seed + i`; tuning ids never overlap test ids.
+instances:
+  seed: 20261014
+  start_jitter: 0.3          # uniform +- m on the start mean position
+  region_jitter: 0.15        # uniform +- m shift of each task region
+  max_draws: 50
+  test_ids: [0, 29]          # inclusive range
+  tune_ids: [1000, 1005]
+
+# Methods share starts, effort terms, and the per-trial wall-time budget.
+# Tuned on tune instances only (exp tune, tune2, tune3), rule fixed in
+# advance: highest mean execution success, ties within 0.005 broken by the
+# higher median final hard pdSTL score. lr = 0.003 won for all three (tune2);
+# margin k = 1.0 (tie with 0.5, higher hard) and CMA sigma0 = 0.01 (tie with
+# 0.03, higher hard) won in tune3. Frozen before the pilot.
+methods:
+  pdstl: {kind: pdstl, planner: {lr: 0.003, max_iters: 300}}
+  nominal: {kind: margin, k: 0.0, beta: 10.0, planner: {lr: 0.003, max_iters: 300}}
+  margin: {kind: margin, k: 1.0, beta: 10.0, planner: {lr: 0.003, max_iters: 300}}
+  cma: {kind: cma, sigma0: 0.01, beta: 200.0}
+
+# Seed bases: execution seeds are shared by methods on the same instance,
+# noise and spec (paired comparison) and never used for tuning or selection.
+evaluation_seed: 7
+tune_seed: 900000
+diagnostic_seed: 500000
+plan_seed: 31
+
+# Study blocks (python -m experiments.pickup_delivery_study <block>).
+# `instances` is a list of ids or a named range ("test", "tune"); budget_s is
+# the per-trial optimization wall time shared by every method; rollouts are
+# fresh execution samples per selected plan.
+blocks:
+  smoke:
+    budget_s: 8
+    rollouts: 50
+    runs: [{instances: [0], noise: [medium], specs: [R3], methods: [pdstl]}]
+  tune:  # held-out tune instances and tune seeds only
+    seed: tune_seed
+    budget_s: 40
+    rollouts: 400
+    runs: [{instances: tune, noise: [medium], specs: [R3]}]
+    # Round 1 (exp tune): lr {0.01, 0.03, 0.1}; only 0.01 improved on the
+    # starts; margin k {0.5, 1, 2} ~equal, 3 worse. Round 2 (exp tune2): lr
+    # {0.001, 0.003, 0.01} -> 0.003 for all. Round 3 (exp tune3): k, sigma0.
+    grid:
+      margin: {k: [0.5, 1.0, 2.0]}
+      cma: {sigma0: [0.003, 0.01, 0.03]}
+  pilot:  # developmental, not paper results
+    budget_s: 60
+    rollouts: 200
+    runs:
+      - {instances: [0, 1], noise: [low, medium, high], specs: [R3], methods: [nominal, margin, pdstl]}
+      - {instances: [0], noise: [medium], specs: [R1, R2], methods: [nominal, margin, pdstl]}
+      - {instances: [0], noise: [low, high], specs: [R3], methods: [cma]}
+  main:
+    budget_s: 120
+    rollouts: 5000
+    runs:
+      - {instances: test, noise: [low, medium, high], specs: [R3], methods: [nominal, margin, pdstl]}
+      - {instances: [0, 1, 2, 3, 4], noise: [low, high], specs: [R3], methods: [cma]}
+  spec:  # R3 at medium comes from `main` (same instances, budget, seeds)
+    budget_s: 120
+    rollouts: 5000
+    runs: [{instances: test, noise: [medium], specs: [R1, R2], methods: [nominal, margin, pdstl]}]
+  horizon:  # dwell fixed at 10 steps; every [0, H] window scales with H
+    budget_s: 120
+    rollouts: 1000
+    horizons: [60, 80, 100, 150, 200]
+    runs: [{instances: [0, 1, 2], noise: [medium], specs: [R3], methods: [nominal, margin, pdstl]}]
+  score_diag:  # separate diagnostic seeds; never used to select or tune
+    seed: diagnostic_seed
+    budget_s: 40
+    rollouts: 1000
+    stride: 5
+    runs: [{instances: [0, 1, 2], noise: [low, medium, high], specs: [R3], methods: [pdstl]}]
+  scaling:
+    lengths: [50, 100, 200, 400]
+    families: [GF, FG, until]
+    beta: 50.0
+    warmup: 2
+    repeats: 5

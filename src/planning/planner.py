@@ -31,6 +31,10 @@ class PlanResult:
     initial_hard_lower: float | None = None
     initial_smooth_lower: float | None = None
     monte_carlo: tuple[float, float, float] | None = None
+    smooth_lower_history: list[float] = field(default_factory=list)
+    elapsed_history: list[float] = field(default_factory=list)
+    stop_reason: str = "max_iters"
+    evaluations: int = 0
 
     def alpha_status(self):
         """Whether the lower robustness meets alpha, in words."""
@@ -91,6 +95,9 @@ class Planner:
         beta = self.cfg["margin_beta"]
         if beta is not None and (not math.isfinite(beta) or beta <= 0):
             raise ValueError("margin_beta must be finite and positive or null")
+        budget = self.cfg["time_budget"]
+        if budget is not None and (not math.isfinite(budget) or budget <= 0):
+            raise ValueError("time_budget must be finite and positive or null")
 
     @property
     def control_dim(self):
@@ -234,7 +241,9 @@ class Planner:
 
         Iterate -1 is the initial guess; its exact and smooth lower bounds
         (at beta_end) are kept as `initial_hard_lower` / `initial_smooth_lower`.
-        Alpha only determines the reported threshold status.
+        Alpha only determines the reported threshold status. A `time_budget`
+        (seconds) stops early after the iterate that exceeds it; the beta
+        schedule still follows max_iters, and `stop_reason` records which.
         on_iteration(iteration, record) observes every `callback_every`-th
         iterate and the last one.
         """
@@ -252,6 +261,8 @@ class Planner:
         started = perf_counter()
         optimizer = torch.optim.Adam([parameters], lr=self.cfg["lr"])
         candidates, history, hard_history = [], [], []
+        smooth_history, elapsed, stop_reason = [], [], "max_iters"
+        budget = self.cfg["time_budget"]
         for step in range(max_iters + 1):
             iteration = step - 1
             beta = self._beta(min(step, max_iters - 1))
@@ -278,6 +289,8 @@ class Planner:
             )
             candidates.append((iteration, record))
             hard_history.append(record.hard_interval[0])
+            smooth_history.append(record.smooth_lower)
+            elapsed.append(perf_counter() - started)
             if iteration >= 0:
                 history.append(record.loss)
                 observe = on_iteration is not None and (
@@ -298,6 +311,9 @@ class Planner:
                     )
             if step == max_iters:
                 break
+            if budget is not None and elapsed[-1] >= budget:
+                stop_reason = "time_budget"
+                break
             loss.backward()
             if (
                 parameters.grad is None
@@ -316,6 +332,10 @@ class Planner:
         )
         result.loss_history = history
         result.hard_lower_history = hard_history
+        result.smooth_lower_history = smooth_history
+        result.elapsed_history = elapsed
+        result.stop_reason = stop_reason
+        result.evaluations = len(candidates)
         result.selected_iteration = result_iteration
         result.initial_hard_lower = initial.hard_interval[0]
         result.initial_smooth_lower = initial.smooth_lower

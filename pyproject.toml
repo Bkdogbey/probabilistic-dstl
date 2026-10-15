@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
+  "cma",
   "matplotlib",
   "numpy",
   "Pillow",
@@ -36,6 +37,9 @@ include = ["baselines*", "experiments*", "models*", "pdstl*", "planning*", "visu
 "share/probabilistic-dstl/configs" = ["configs/*.yaml"]
 "share/probabilistic-dstl/configs/scenarios/lane" = [
   "configs/scenarios/lane/*.yaml",
+]
+"share/probabilistic-dstl/configs/scenarios/pickup_delivery" = [
+  "configs/scenarios/pickup_delivery/*.yaml",
 ]
 "share/probabilistic-dstl/configs/scenarios/reach_avoid" = [
   "configs/scenarios/reach_avoid/*.yaml",
