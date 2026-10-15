@@ -116,3 +116,6 @@ data/*
 
 # Generated figures, animations and results from src/main.py
 outputs/
+
+# Generated radio parameter and logging caches
+cache/
