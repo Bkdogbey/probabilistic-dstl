@@ -6,7 +6,8 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, is_dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -16,11 +17,23 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "src"))  # the pdSTL core (models, planning, ...)
 
 
+FAN_SETTINGS = (0, 6, 12, 18)  # old experiment: off plus three active settings
+
+
+def fan_setting(value):
+    """Numeric physical setting; 'off' is readable in older trial metadata."""
+    setting = 0 if value == "off" else int(value)
+    if setting not in FAN_SETTINGS:
+        raise ValueError(f"fan must be one of {FAN_SETTINGS}")
+    return setting
+
+
 @dataclass(frozen=True)
 class Box:
     x: tuple[float, float]
     y: tuple[float, float]
     name: str = ""
+    height: float = 0.0  # obstacles only
 
     def grown(self, margin):
         return Box(
@@ -36,46 +49,48 @@ class Box:
 
 @dataclass(frozen=True)
 class Flight:
-    connect_timeout: float
-    takeoff_speed: float
-    transit_speed: float
-    transit_z: float
-    land_speed: float
-    home_tolerance: float
-    start_tolerance: float
-    start_speed: float
-    start_window: float
-    start_timeout: float
-    settle: float
-    hold_end: float
-    stale_s: float
-    max_lateness_s: float
-    geofence_margin: float
-    position_spread: float
-    position_timeout: float
+    connect_timeout: float = 10.0
+    takeoff_speed: float = 0.3
+    transit_speed: float = 0.3
+    land_speed: float = 0.15
+    placement_tolerance: float = 0.15  # physical placement before takeoff
+    start_tolerance: float = 0.05
+    start_altitude_tolerance: float = 0.05
+    start_speed: float = 0.10
+    start_window: float = 1.0
+    start_timeout: float = 15.0
+    stale_s: float = 0.5
+    max_lateness_s: float = 0.05  # first send of each trajectory step
+    geofence_margin: float = 0.10
+    position_spread: float = 0.05
+    position_timeout: float = 15.0
+
+
+# Routine defaults live here; config.yml contains arena measurements and the
+# settings changed between experiments. Existing full configs still work.
+DEFAULTS = {
+    "stream_hz": 20,
+    "fan_position": None,
+    "fan_direction": None,
+    "model": {"holdout_every": 3, "bootstrap": 1000, "seed": 0},
+    "planner": {
+        "w_phi": 1.0, "w_u": 1e-3, "w_du": 1e-2, "lr": 0.05,
+        "max_iters": 400, "alpha": 0.90,
+    },
+    "mean_model": {"w_rho": 10.0, "beta": 50.0, "min_robustness": 0.0},
+}  # fmt: skip
 
 
 PLAN_FIELDS = (
     "workspace", "obstacles", "start", "goal", "airframe_radius", "reference",
-    "altitude", "duration", "dt", "stream_hz", "u_max", "excitation",
+    "altitude", "duration", "dt", "stream_hz", "u_max", "a_max",
     "planner", "mean_model",
 )  # fmt: skip
 
 
 def _digest(value):
-    text = json.dumps(asdict_any(value), sort_keys=True)
+    text = json.dumps(value, sort_keys=True, default=asdict)
     return hashlib.sha256(text.encode()).hexdigest()[:12]
-
-
-def asdict_any(value):
-    """json-ready form of dataclasses, tuples and containers of them."""
-    if is_dataclass(value):
-        return asdict(value)
-    if isinstance(value, dict):
-        return {k: asdict_any(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [asdict_any(v) for v in value]
-    return value
 
 
 @dataclass(frozen=True)
@@ -89,19 +104,20 @@ class Config:
     obstacles: tuple[Box, ...]
     start: tuple[float, float]
     goal: Box
-    reference: dict
+    reference: str
     duration: float
     dt: float
     stream_hz: int
     u_max: float
-    fans: dict
+    a_max: float
     fan_position: list | None
     fan_direction: list | None
-    excitation: dict
     flight: Flight
     model: dict
     planner: dict
     mean_model: dict
+    model_report: str | None = None
+    fan: int = 0
 
     @property
     def steps(self):
@@ -123,25 +139,77 @@ class Config:
         """Only what defines a plan; flight tuning and fan settings may change."""
         return _digest({name: getattr(self, name) for name in PLAN_FIELDS})
 
+    @property
+    def execution_hash(self):
+        """Only geometry, altitude, timing and physical command limits."""
+        fields = (
+            "workspace",
+            "obstacles",
+            "airframe_radius",
+            "altitude",
+            "dt",
+            "stream_hz",
+            "u_max",
+            "a_max",
+        )
+        return _digest({name: getattr(self, name) for name in fields})
+
+    def for_plan(self, plan):
+        """The saved trajectory owns its start, altitude and command timing."""
+        cfg = replace(
+            self,
+            start=tuple(plan["start"]),
+            altitude=plan["altitude"],
+            dt=plan["dt"],
+            duration=len(plan["velocities"]) * plan["dt"],
+        )
+        if abs(cfg.repeats - cfg.stream_hz * cfg.dt) > 1e-9:
+            raise ValueError(
+                "trajectory dt * stream_hz must be a whole number"
+            )
+        return cfg
+
     def ready_for_data(self, fan):
-        """Why identification/evaluation flights may not fly yet, or None."""
+        """Why recorded data is excluded from fitting/evaluation, or None."""
         if not self.measured:
             return "config.yml has measured: false"
-        if self.fans.get(fan) is None:
-            return f"fan setting {fan!r} is not chosen"
-        if fan != "off" and None in (self.fan_position, self.fan_direction):
-            return "fan position/direction are not measured"
+        fan_setting(fan)
         return None
 
 
-def load(path=HERE / "config.yml"):
+def load(path=HERE / "config.yml", *, trajectory_source=None):
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found. Create it from the template, then edit it:\n"
             f"  cd {HERE} && cp config.example.yml {path.name}"
         )
-    raw = yaml.safe_load(path.read_text())
+    raw = {**deepcopy(DEFAULTS), **yaml.safe_load(path.read_text())}
+    # Ignore probe sequences left in older configs.
+    raw.pop("excitation", None)
+    raw["fan"] = fan_setting(raw.get("fan", 0))
+    if not isinstance(raw["reference"], str):
+        raise TypeError(
+            "reference must name the supplied trajectory file, e.g. reference: plans/reference.json"
+        )
+    reference = Path(raw["reference"])
+    raw["reference"] = str((path.parent / reference).resolve())
+    # Timing/pose are read from the frozen file, not duplicated in YAML.
+    from trajectory import read_plan
+
+    supplied = read_plan(trajectory_source or raw["reference"])
+    raw.update(
+        start=tuple(supplied["start"]),
+        dt=supplied["dt"],
+        altitude=supplied["altitude"],
+        duration=len(supplied["velocities"]) * supplied["dt"],
+    )
+    if raw.get("model_report"):
+        raw["model_report"] = str(
+            (path.parent / raw["model_report"]).resolve()
+        )
+    for name in ("model", "planner", "mean_model"):
+        raw[name] = {**DEFAULTS[name], **(raw[name] or {})}
     cfg = Config(
         **{
             **raw,
@@ -149,11 +217,9 @@ def load(path=HERE / "config.yml"):
             "obstacles": tuple(Box(**box) for box in raw["obstacles"]),
             "start": tuple(raw["start"]),
             "goal": Box(**raw["goal"], name="goal"),
-            "flight": Flight(**raw["flight"]),
+            "flight": Flight(**(raw.get("flight") or {})),
         }
     )
-    if abs(cfg.steps * cfg.dt - cfg.duration) > 1e-9:
-        raise ValueError("duration must be a whole number of dt steps")
     if abs(cfg.repeats - cfg.stream_hz * cfg.dt) > 1e-9:
         raise ValueError("stream_hz * dt must be a whole number")
     return cfg

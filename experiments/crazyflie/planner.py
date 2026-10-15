@@ -1,150 +1,43 @@
-"""Task geometry, deterministic commands, and mean_model / pdstl plans.
+"""Offline mean-model and pdSTL planning, initialized from a frozen path."""
 
-A plan is a world-frame velocity sequence, one command per `dt`, plus the
-provenance needed to trust it. The same `Task` geometry scores plans and,
-later, the recorded flights.
-"""
-
-from __future__ import annotations
-
-import json
 import math
 from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 import torch
-from config import HERE, git_commit
+from config import git_commit
+from geometry import check_feasible, nominal_path
+from trajectory import condition_name, file_hash
 
-# isort: split  (config puts the pdSTL core in src/ on sys.path)
 from baselines.det_stl import from_pdstl
-from models.rollouts import (
-    create_gaussian_belief_trajectory,
-    gaussian_rollout,
-)
-from planning.environment import Environment, inside, safety_event
+from models.rollouts import BeliefRollout, create_gaussian_belief_trajectory
+from planning.environment import inside, safety_event
 from planning.planner import Planner
 
-PLANS = HERE / "plans"
-CONDITIONS = ("deterministic", "mean_model", "pdstl")
 
+def _rollout(model):
+    """Gaussian belief rollout under the model's speed and acceleration limits."""
 
-def _box_distance(xy, box):
-    """Signed distance from points [..., 2] to a box: > 0 outside."""
-    lo, hi = np.array([box.x[0], box.y[0]]), np.array([box.x[1], box.y[1]])
-    d = np.maximum(lo - xy, xy - hi)
-    outside = np.linalg.norm(np.maximum(d, 0.0), axis=-1)
-    return np.where(d.max(-1) > 0, outside, d.max(-1))
-
-
-class Task:
-    """Stay in the workspace, avoid obstacles, end inside the goal.
-
-    Obstacles grow and the workspace shrinks by the airframe radius, so
-    every check is on the drone's centre. The goal is required only at the
-    final step H, so starting inside it never counts as completion.
-    """
-
-    def __init__(self, cfg):
-        r = cfg.airframe_radius
-        self.workspace = cfg.workspace.grown(-r)
-        self.obstacles = [box.grown(r) for box in cfg.obstacles]
-        self.goal = cfg.goal
-        self.env = Environment()
-        self.env.set_bounds(self.workspace.x, self.workspace.y)
-        for box in self.obstacles:
-            self.env.add_obstacle(box.x, box.y, name=box.name)
-        self.env.set_goal(
-            self.goal.x, self.goal.y, interval=[cfg.steps] * 2, name="goal"
-        )
-        self.spec = self.env.get_specification(cfg.steps)
-
-    def clearance(self, xy):
-        """Airframe clearance [m] of positions [..., 2]; < 0 is a violation."""
-        xy = np.asarray(xy, dtype=float)
-        walls = -_box_distance(xy, self.workspace)
-        return np.min(
-            [walls, *(_box_distance(xy, box) for box in self.obstacles)],
-            axis=0,
+    def rollout(params):
+        controls = model.controls(params)
+        mean, cov = model.predict(controls)
+        return BeliefRollout(
+            create_gaussian_belief_trajectory(mean, cov),
+            {
+                "applied_controls": controls,
+                "mean_trace": mean,
+                "cov_trace": cov,
+            },
         )
 
-    def requirements(self, path, final):
-        """Each requirement on a path [N, 2] ending at `final` [2]: met or not."""
-        met = {
-            "workspace": bool(
-                (-_box_distance(path, self.workspace) >= 0).all()
-            )
-        }
-        for box in self.obstacles:
-            met[box.name] = bool((_box_distance(path, box) >= 0).all())
-        met["goal"] = bool(_box_distance(np.asarray(final), self.goal) <= 0)
-        return met
-
-
-# Deterministic commands
-
-
-def reference_velocities(cfg):
-    """Constant speed along start -> waypoints -> goal centre, then zero."""
-    points = np.array(
-        [cfg.start, *cfg.reference["waypoints"], cfg.goal.centre]
-    )
-    ends = np.concatenate(
-        [[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
-    )
-    speed = cfg.reference["speed"]
-    if ends[-1] / speed > cfg.duration:
-        raise ValueError("reference does not fit in the mission duration")
-    s = np.minimum(speed * cfg.dt * np.arange(cfg.steps + 1), ends[-1])
-    path = np.stack([np.interp(s, ends, points[:, i]) for i in (0, 1)], 1)
-    return np.diff(path, axis=0) / cfg.dt
-
-
-def excitation_velocities(cfg, name):
-    """Piecewise-constant [vx, vy, seconds] segments at dt."""
-    segments = cfg.excitation["sequences"][name]
-    return np.array(
-        [
-            [vx, vy]
-            for vx, vy, sec in segments
-            for _ in range(round(sec / cfg.dt))
-        ],
-        dtype=float,
-    )
-
-
-def nominal_path(cfg, start, velocities):
-    """Positions at the streaming rate if the drone tracked v exactly."""
-    v = np.repeat(np.asarray(velocities), cfg.repeats, axis=0)
-    steps = np.cumsum(v / cfg.stream_hz, axis=0)
-    return np.vstack([start, np.asarray(start) + steps])
-
-
-def check_feasible(cfg, task, start, velocities, mean=None, mission=True):
-    """Physical feasibility shared by every condition; problems, or []."""
-    v = np.asarray(velocities)
-    problems = []
-    if np.abs(v).max() > cfg.u_max + 1e-9:
-        problems.append(f"command above u_max = {cfg.u_max} m/s")
-    for label, path in (
-        ("nominal path", nominal_path(cfg, start, v)),
-        ("predicted mean", mean),
-    ):
-        if path is not None and task.clearance(path).min() < 0:
-            problems.append(f"{label} leaves the free space")
-    if mission and len(v) != cfg.steps:
-        problems.append(f"{len(v)} steps, mission needs {cfg.steps}")
-    return problems
-
-
-# Model-based plans
+    return rollout
 
 
 def plan_pdstl(cfg, task, model, init):
     """Maximize the pdSTL lower bound with the core Planner."""
     planner = Planner(model, cfg.steps, cfg.planner)
     result = planner.optimize_window(
-        gaussian_rollout(model, *model.initial),
+        _rollout(model),
         spec=task.spec,
         init_guess=torch.as_tensor(init, dtype=torch.float32),
     )
@@ -158,8 +51,8 @@ def plan_pdstl(cfg, task, model, init):
 def plan_mean(cfg, task, model, init):
     """Maximize STL robustness of the predicted mean, with matched budget.
 
-    Same tanh control bound, Adam step size, iteration count and control
-    cost as `plan_pdstl`; only the task score differs. Setting the
+    Same speed and acceleration limits, Adam step size, iteration count and
+    control cost as `plan_pdstl`; only the task score differs. Setting the
     covariance to zero would not do: pdSTL probabilities are then 0 or 1
     and carry no gradient.
     """
@@ -169,7 +62,7 @@ def plan_mean(cfg, task, model, init):
     optimizer = torch.optim.Adam([params], lr=planner.cfg["lr"])
     best, best_controls = -math.inf, None
     for step in range(planner.cfg["max_iters"] + 1):
-        controls = model.bound_control(params)
+        controls = model.controls(params)
         mean = model.predict(controls)[0].unsqueeze(0)
         with torch.no_grad():
             hard = robustness.robustness(mean, beta=None).item()
@@ -207,9 +100,6 @@ def prediction(task, model, controls):
     }
 
 
-# Plan files
-
-
 def make_plan(
     cfg,
     condition,
@@ -225,10 +115,10 @@ def make_plan(
     """A self-describing plan record (not yet saved)."""
     pred = None if model is None else prediction(task, model, velocities)
     mean = None if pred is None else np.asarray(pred["mean"])[:, :2]
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return {
         "id": f"{condition}_{name}_{stamp}",
-        "condition": condition,
+        "condition": condition_name(condition),
         "name": name,
         "fan": fan,
         "dt": cfg.dt,
@@ -236,61 +126,18 @@ def make_plan(
         "start": list(start),
         "velocities": np.asarray(velocities).tolist(),
         "config_hash": cfg.plan_hash,
+        "execution_hash": cfg.execution_hash,
         "model_id": None if model is None else model.report_id,
         "model_hash": None if model is None else model.report_hash,
         "prediction": pred,
         "score": score,
+        "min_clearance": float(
+            task.clearance(nominal_path(cfg, start, velocities)).min()
+        ),
         "problems": check_feasible(
             cfg, task, start, velocities, mean, mission
         ),
         "created": stamp,
         "git_commit": git_commit(),
+        "reference_hash": file_hash(cfg.reference),
     }
-
-
-def save_plan(plan):
-    PLANS.mkdir(exist_ok=True)
-    path = PLANS / f"{plan['id']}.json"
-    if path.exists():
-        raise FileExistsError(path)
-    path.write_text(json.dumps(plan, indent=1))
-    return path
-
-
-def find_plan(ref, cfg, condition, name):
-    """The plan to fly: a path or id if given, else the newest for this config.
-
-    None when no saved plan matches (the caller makes one or says so).
-
-    `name` is the sequence (deterministic) or "fan-<fan>" (model plans).
-    """
-    if ref is None:
-        for path in sorted(
-            PLANS.glob(f"{condition}_{name}_*.json"), reverse=True
-        ):
-            if json.loads(path.read_text())["config_hash"] == cfg.plan_hash:
-                return path
-        return None
-    path = Path(ref)
-    if not path.exists():
-        path = PLANS / f"{Path(ref).stem}.json"
-    if not path.exists():
-        raise SystemExit(f"no plan {ref!r} (looked in {PLANS})")
-    return path
-
-
-def load_plan(path, cfg):
-    """A saved plan, refused if the config changed or it is not flyable."""
-    plan = json.loads(Path(path).read_text())
-    if plan["config_hash"] != cfg.plan_hash:
-        raise ValueError(
-            f"plan {plan['id']} was made with a different task/path "
-            f"({plan['config_hash']}, now {cfg.plan_hash}); re-plan"
-        )
-    if plan["problems"]:
-        raise ValueError(
-            f"plan {plan['id']} is infeasible: {plan['problems']}"
-        )
-    if plan["score"] is not None and not plan["score"]["accepted"]:
-        raise ValueError(f"plan {plan['id']} missed its score threshold")
-    return plan

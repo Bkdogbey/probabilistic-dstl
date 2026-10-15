@@ -15,10 +15,9 @@ def cfg():
     base = config.load(config.HERE / "config.example.yml")
     return replace(
         base,
+        measured=True,  # synthetic test geometry, not a hardware measurement
         flight=replace(
             base.flight,
-            settle=0.1,
-            hold_end=0.2,
             takeoff_speed=1.0,
             transit_speed=1.0,
             land_speed=1.0,

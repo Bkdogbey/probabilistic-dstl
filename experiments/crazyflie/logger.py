@@ -10,10 +10,12 @@ from __future__ import annotations
 import csv
 import json
 import threading
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 import numpy as np
-from config import HERE
+from config import HERE, fan_setting, git_commit
+from trajectory import file_hash
 
 LOGS = HERE / "logs"
 STATE = ["t_host", "device_ms", "x", "y", "z", "vx", "vy", "yaw"]
@@ -35,8 +37,15 @@ CLOCK_WRAP = 1 << 24  # cflib log timestamps are a 24-bit ms counter
 
 class TrialLog:
     def __init__(self, metadata, root=LOGS):
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.id = f"{stamp}_{metadata['condition']}_{metadata['purpose']}"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        fan_tag = (
+            f"_fan{fan_setting(metadata['fan']):02d}"
+            if "fan" in metadata
+            else ""
+        )
+        self.id = (
+            f"{stamp}_{metadata['condition']}{fan_tag}_{metadata['purpose']}"
+        )
         self.dir = root / self.id
         self.dir.mkdir(parents=True)
         self.meta = {
@@ -49,6 +58,52 @@ class TrialLog:
         self.states, self.commands, self.events = [], [], []
         self._lock = threading.Lock()
         self._write_meta()
+
+    @classmethod
+    def for_flight(
+        cls,
+        cfg,
+        plan,
+        path,
+        *,
+        purpose,
+        fan,
+        dry_run=False,
+        note="",
+        root=LOGS,
+    ):
+        """All provenance is assembled once, before the ROS component starts."""
+        return cls(
+            {
+                "purpose": purpose,
+                "condition": plan["condition"],
+                "plan_id": plan["id"],
+                "plan_path": str(path.resolve()),
+                "plan_hash": file_hash(path),
+                "model_id": plan["model_id"],
+                "model_hash": plan.get("model_hash"),
+                "fan": fan_setting(fan),
+                "fan_position": cfg.fan_position,
+                "fan_direction": cfg.fan_direction,
+                "dry_run": dry_run,
+                "note": note,
+                "dt": cfg.dt,
+                "steps": len(plan["velocities"]),
+                "repeats": cfg.repeats,
+                "stream_hz": cfg.stream_hz,
+                "timing_policy": "trajectory_step_deadline",
+                "altitude": cfg.altitude,
+                "altitude_tolerance": cfg.altitude_tolerance,
+                "altitude_average_s": 0.25,
+                "config_hash": cfg.hash,
+                "plan_config_hash": cfg.plan_hash,
+                "execution_hash": cfg.execution_hash,
+                "data_readiness": cfg.ready_for_data(fan),
+                "config": asdict(cfg),
+                "git_commit": git_commit(),
+            },
+            root=root,
+        )
 
     def state(self, row):
         with self._lock:
@@ -71,6 +126,10 @@ class TrialLog:
     def mission_start(self, t0, state):
         self.meta["mission_t0"] = t0
         self.meta["start_state"] = [float(v) for v in state]
+
+    def mission_end(self, timestamp):
+        """The execution boundary, before any return or cleanup command."""
+        self.meta["mission_t_end"] = timestamp
 
     def finish(self, outcome, reason=None, kind=None, phase=None):
         """Write every file; returns the final metadata."""
@@ -145,7 +204,7 @@ def aligned_states(trial):
 
     Step k starts when command k was due: mission_t0 + k * dt. Only steps
     whose commands were all sent and whose end is covered by state data
-    are returned; hold commands after the mission (step -1) are ignored.
+    are returned.
     """
     meta, cmd, s = trial["meta"], trial["commands"], trial["state"]
     mission = cmd["step"] >= 0
@@ -157,7 +216,7 @@ def aligned_states(trial):
     n = int(np.cumprod(counts == meta["repeats"]).sum())
     t = state_times(s)
     grid = meta["mission_t0"] + meta["dt"] * np.arange(n + 1)
-    grid = grid[grid <= t[-1]]
+    grid = grid[grid <= min(t[-1], meta.get("mission_t_end", t[-1]))]
     states = np.stack(
         [np.interp(grid, t, s[c]) for c in ("x", "y", "vx", "vy")], 1
     )

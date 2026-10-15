@@ -1,85 +1,27 @@
-# Crazyflie pdSTL experiment. Metres, seconds, m/s; world frame (Lighthouse).
-#
-# Template: copy to config.yml (ignored by git) and edit that copy:
-#   cp config.example.yml config.yml
-#
-# Placeholder geometry (RA-L arena). Measure the altitude, airframe, obstacles
-# and fan, enter them here, then set `measured: true`. Identification and
-# evaluation flights refuse to fly until then.
+# Crazyflie experiment: metres, seconds, m/s; world frame (Lighthouse).
+# Enter actual measurements before setting measured: true.
 measured: false
-
 radio_uri: radio://0/85/2M/E7E7E7E85
-altitude: 0.25
-altitude_tolerance: 0.15     # abort outside altitude ± this
-airframe_radius: 0.07        # grows obstacles and shrinks the workspace
 
+altitude_tolerance: 0.20  # mission limit on the 0.25 s mean height
+airframe_radius: 0.07
 workspace: {x: [-0.5, 1.5], y: [-2.3, 0.5]}
 obstacles:
-  - {name: obs_1, x: [0.5, 0.8175], y: [-1.38335, -1.11665]}
-  - {name: obs_2, x: [0.1547, 0.3453], y: [-0.6651, -0.5]}
-  - {name: obs_3, x: [0.7508, 1.0429], y: [-0.8128, -0.6096]}
-start: [1.0, -2.0]
+  - {name: obs_1, x: [0.5, 0.8175], y: [-1.38335, -1.11665], height: 0.4064}
+  - {name: obs_2, x: [0.1547, 0.3453], y: [-0.6651, -0.5], height: 0.5143}
+  - {name: obs_3, x: [0.7508, 1.0429], y: [-0.8128, -0.6096], height: 0.4191}
 goal: {x: [0.85, 1.15], y: [-0.15, 0.15]}
 
-# Fixed reference: constant speed along start -> waypoints -> goal centre,
-# then zero velocity until the end of the mission. Freeze before evaluation.
-reference:
-  waypoints: [[0.1, -1.4], [0.5, -0.85], [0.55, -0.3]]
-  speed: 0.20
+# Supplied commands own the start, altitude and timing.
+reference: plans/reference.json
+u_max: 0.30
+a_max: 0.30
+model_report: null  # set to the report printed by `python run.py fit`
 
-duration: 18.0     # mission length
-dt: 0.2            # planning / model interval
-stream_hz: 20      # command streaming and state logging rate
-u_max: 0.40        # per-axis velocity command limit
+# Set the physical fan manually; this setting labels the flight.
+fan: 0  # 0 = off; active settings: 6, 12, 18
+fan_position: null
+fan_direction: null
 
-fans:              # numeric fan setting per condition; null = not yet chosen
-  "off": 0         # quoted: bare `off` is a YAML boolean
-  "low": null      # choose a repeatable, measured low setting
-  "high": null
-fan_position: null   # [x, y, z] of the fan
-fan_direction: null  # unit vector [x, y] of its airflow
-
-# Short open-space identification sequences: [vx, vy, seconds] segments.
-excitation:
-  start: [0.0, -1.9]
-  sequences:
-    steps_x: [[0.3, 0, 2], [0, 0, 1], [-0.3, 0, 2], [0, 0, 1], [0.15, 0, 2], [0, 0, 1]]
-    steps_y: [[0, 0.3, 2], [0, 0, 1], [0, -0.3, 2], [0, 0, 1], [0, 0.15, 2], [0, 0, 1]]
-    diagonal: [[0.2, 0.2, 2], [0, 0, 1], [-0.2, -0.2, 2], [0, 0, 1]]
-
-flight:
-  connect_timeout: 10.0
-  takeoff_speed: 0.3
-  transit_speed: 0.3
-  transit_z: 0.65          # crossing height when not placed at the start
-  land_speed: 0.15
-  home_tolerance: 0.15     # placed this close to the start: no high transit
-  start_tolerance: 0.05    # start gate: position error
-  start_speed: 0.10        # start gate: mean speed (the estimate is noisy)
-  start_window: 1.0        # start gate: averaged over the last 1 s
-  start_timeout: 15.0
-  settle: 1.5
-  hold_end: 1.0            # zero velocity after the last command
-  stale_s: 0.25            # freshest state must be younger than this
-  max_lateness_s: 0.05     # a later command aborts instead of being sent
-  geofence_margin: 0.10    # abort beyond the raw workspace by this much
-  position_spread: 0.05    # preflight x/y estimate stability
-  position_timeout: 15.0
-
-model:
-  holdout_every: 3   # within each fan, every 3rd identification flight is held out
-  bootstrap: 1000
-  seed: 0
-
-planner:           # core Planner settings (configs/planning.yaml keys)
-  w_phi: 1.0
-  w_u: 1.0e-3
-  w_du: 1.0e-2
-  lr: 0.05
-  max_iters: 400
-  alpha: 0.90      # pdstl plans must reach this hard lower bound
-
-mean_model:        # deterministic robustness on the mean, same budget
-  w_rho: 10.0
-  beta: 50.0       # STLCG log-sum-exp smoothing
-  min_robustness: 0.0
+# Routine defaults, including the 5 cm start-height tolerance, are in config.py.
+# Override only what is needed, e.g. flight: {start_speed: 0.10}.
