@@ -50,6 +50,7 @@ class IterationRecord:
     hard_interval: tuple[float, float] | None
     beta: float
     control_cost: float = 0.0
+    elapsed: float = 0.0  # optimizer seconds since the first step
 
 
 @dataclass
@@ -67,8 +68,9 @@ class Planner:
     rollout(v) maps unconstrained parameters v to a BeliefRollout. The planner
     ascends the smooth lower bound (plus small control regularizers) for
     max_iters steps and returns the iterate with the highest exact lower
-    robustness. Alpha is used only to report whether that iterate meets the
-    requested threshold.
+    robustness (`select_by: pdstl`), or the final iterate without in-loop
+    exact scoring (`select_by: last`). Alpha is used only to report whether
+    that iterate meets the requested threshold.
     """
 
     def __init__(self, dynamics, horizon, config=None):
@@ -91,6 +93,8 @@ class Planner:
         beta = self.cfg["margin_beta"]
         if beta is not None and (not math.isfinite(beta) or beta <= 0):
             raise ValueError("margin_beta must be finite and positive or null")
+        if self.cfg["select_by"] not in ("pdstl", "last"):
+            raise ValueError("select_by must be 'pdstl' or 'last'")
 
     @property
     def control_dim(self):
@@ -236,9 +240,11 @@ class Planner:
         (at beta_end) are kept as `initial_hard_lower` / `initial_smooth_lower`.
         Alpha only determines the reported threshold status.
         on_iteration(iteration, record) observes every `callback_every`-th
-        iterate and the last one.
+        iterate and the last one. With w_phi = 0 the smooth pdSTL bound is
+        not computed, and `planning_time` covers only the optimizer loop.
         """
         max_iters = self.cfg["max_iters"]
+        score_exact = self.cfg["select_by"] == "pdstl"
         auxiliary = self._auxiliary(spec, auxiliary_robustness)
         parameters = self._init_controls(init_guess)
         initial = self._evaluate(
@@ -257,27 +263,36 @@ class Planner:
             beta = self._beta(min(step, max_iters - 1))
             optimizer.zero_grad()
             prediction = rollout(parameters)
-            lower = spec.smooth_lower(prediction.belief_trajectory, beta)
             controls = self._applied_controls(prediction, parameters)
+            lower = (
+                spec.smooth_lower(prediction.belief_trajectory, beta)
+                if self.cfg["w_phi"]
+                else controls.new_zeros(())
+            )
             loss = self._objective(
                 controls, lower, self._margin_penalty(prediction, auxiliary)
             )
             if not torch.isfinite(loss):
                 raise ValueError("planning loss is not finite")
-            with torch.no_grad():
-                interval = spec.probability_interval(
-                    prediction.belief_trajectory
-                )
+            interval = None
+            if score_exact:
+                with torch.no_grad():
+                    interval = tuple(
+                        spec.probability_interval(
+                            prediction.belief_trajectory
+                        ).tolist()
+                    )
+                hard_history.append(interval[0])
             record = IterationRecord(
                 controls.detach().clone(),
                 loss.item(),
-                lower.item(),
-                tuple(interval.tolist()),
+                lower.item() if self.cfg["w_phi"] else math.nan,
+                interval,
                 beta,
                 self._control_cost(controls).item(),
+                perf_counter() - started,
             )
             candidates.append((iteration, record))
-            hard_history.append(record.hard_interval[0])
             if iteration >= 0:
                 history.append(record.loss)
                 observe = on_iteration is not None and (
@@ -294,7 +309,7 @@ class Planner:
                         iteration,
                         record.loss,
                         record.smooth_lower,
-                        record.hard_interval[0],
+                        interval[0] if interval else math.nan,
                     )
             if step == max_iters:
                 break
@@ -307,7 +322,12 @@ class Planner:
                     "rollout must supply finite gradients to controls"
                 )
             optimizer.step()
-        result_iteration, selected = self._select_candidate(candidates)
+        planning_time = perf_counter() - started
+        result_iteration, selected = (
+            self._select_candidate(candidates)
+            if score_exact
+            else candidates[-1]
+        )
         result = self.evaluate_controls(
             rollout,
             selected.controls,
@@ -319,7 +339,7 @@ class Planner:
         result.selected_iteration = result_iteration
         result.initial_hard_lower = initial.hard_interval[0]
         result.initial_smooth_lower = initial.smooth_lower
-        result.planning_time = perf_counter() - started
+        result.planning_time = planning_time
         return result
 
     @staticmethod
