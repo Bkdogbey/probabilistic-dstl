@@ -176,6 +176,66 @@ def test_stlcg_selects_by_final_mean_robustness(monkeypatch):
     assert logs[exp._key(best)][-1][1] == 4.0
 
 
+@pytest.mark.parametrize("winner", ["slot", "top"])
+def test_pdstl_selects_the_higher_scoring_refinement(
+    tmp_path, monkeypatch, winner
+):
+    cfg = load_config(exp.CONFIG)
+    monkeypatch.setattr(exp, "OUTPUTS", tmp_path)
+    monkeypatch.setattr(exp, "CASES", [("R2", "medium")])
+    monkeypatch.setattr(exp, "build_environment", lambda cfg: None)
+    monkeypatch.setattr(
+        exp, "build_specs", lambda env, cfg: {"R2": (None, {})}
+    )
+    monkeypatch.setattr(exp, "_score_log", lambda *args, **kwargs: [])
+    calls = []
+
+    def run_start(cfg, env, spec, method, start, noise="none", **kwargs):
+        controls = torch.full((cfg["H"], 2), 0.1 if start == "slot" else 0.2)
+        if method == "stlcg":
+            score = controls[0, 0].item()
+            seconds = 2.0 if start == "slot" else 3.0
+        else:
+            torch.testing.assert_close(kwargs["init_guess"], controls)
+            assert kwargs["stlcg_time"] == 5.0
+            score = 0.9 if start == winner else 0.4
+            seconds = 7.0 if start == "slot" else 11.0
+        calls.append((method, start))
+        row = {
+            "spec": spec[0],
+            "noise": noise,
+            "method": method,
+            "start": start,
+            "solver_status": "completed",
+            "own_score": score,
+            "final_score": score,
+            "planning_time": seconds,
+            "stlcg_time": kwargs.get("stlcg_time", seconds),
+            "refine_time": seconds if method == "pdstl" else 0.0,
+        }
+        return row, controls, [(-1, 0.0, controls), (0, seconds, controls)]
+
+    monkeypatch.setattr(exp, "run_start", run_start)
+    exp.runs(cfg)
+    rows = exp._read("runs.csv")
+    assert calls == [
+        ("stlcg", "slot"),
+        ("stlcg", "top"),
+        ("pdstl", "slot"),
+        ("pdstl", "top"),
+    ]
+    selected = exp.selected_runs()
+    assert selected[("R2", "medium", "stlcg")]["start"] == "top"
+    best = selected[("R2", "medium", "pdstl")]
+    assert best["start"] == winner
+    assert float(best["final_score"]) == max(
+        float(r["final_score"]) for r in rows if r["method"] == "pdstl"
+    )
+    assert float(best["stlcg_time"]) == 5.0
+    assert float(best["refine_time"]) == 18.0
+    assert float(best["planning_time"]) == 23.0
+
+
 @pytest.mark.slow
 def test_every_step_runs_end_to_end(tmp_path, monkeypatch):
     cfg = load_config(exp.CONFIG)
@@ -187,33 +247,56 @@ def test_every_step_runs_end_to_end(tmp_path, monkeypatch):
     for step in ("pilot", "runs", "monte-carlo", "paper"):
         exp.STEPS[step](cfg)
     runs = exp._read("runs.csv")
-    assert len(runs) == 11
+    assert len(runs) == 16
     assert sum(r["method"] == "stlcg" for r in runs) == 6
-    assert sum(r["method"] == "pdstl" for r in runs) == 5
+    assert sum(r["method"] == "pdstl" for r in runs) == 10
     assert sum(r["selected"] == "True" for r in runs) == 8
     checked = exp._read("monte_carlo.csv")
     assert len(checked) == 10
-    scores = {
-        (r["spec"], r["noise"], r["method"]): float(r["hard_score"])
-        for r in checked
-    }
     convergence = exp._read("convergence.csv")
     selected = exp.selected_runs()
     for (spec, noise, method), run in selected.items():
         if method != "pdstl":
             continue
         base = selected[(spec, noise, "stlcg")]
-        assert run["start"] == base["start"]
+        candidates = [
+            r
+            for r in runs
+            if r["spec"] == spec
+            and r["noise"] == noise
+            and r["method"] == method
+        ]
+        assert len(candidates) == 2
+        assert float(run["final_score"]) == max(
+            float(r["final_score"]) for r in candidates
+        )
+        source = next(
+            r
+            for r in reversed(convergence)
+            if r["spec"] == spec
+            and r["noise"] == noise
+            and r["method"] == "stlcg"
+            and r["start"] == run["start"]
+        )
         assert float(run["initial_score"]) == pytest.approx(
-            scores[(spec, noise, "stlcg")]
+            float(source["score"])
         )
         assert float(run["planning_time"]) == pytest.approx(
             float(run["stlcg_time"]) + float(run["refine_time"])
         )
         initial = next(r for r in convergence if exp._key(r) == exp._key(run))
-        assert float(initial["time_s"]) == float(base["planning_time"])
+        assert float(initial["time_s"]) >= float(base["planning_time"])
         assert float(initial["score"]) == pytest.approx(
             float(run["initial_score"])
         )
+        final = next(
+            r for r in reversed(convergence) if exp._key(r) == exp._key(run)
+        )
+        assert float(final["time_s"]) == float(run["planning_time"])
     assert (tmp_path / "figure1.pdf").exists()
     assert "Optimizer wall time" in (tmp_path / "table1.tex").read_text()
+    assert "both refinements" in (tmp_path / "table1.tex").read_text()
+    assert "\\% (slot)" in (tmp_path / "table1.tex").read_text()
+    for row in exp._read("table1.csv"):
+        assert row["STLCG route"] in ("slot", "top")
+        assert row["pdSTL route"] in ("slot", "top")

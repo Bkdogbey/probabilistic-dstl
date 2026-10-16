@@ -1,7 +1,7 @@
 """2D inspection: pdSTL vs deterministic STLCG on specs R1-R3.
 
-STLCG selects a mean plan from two seeds once per spec. pdSTL refines its
-selected controls at each noise level.
+STLCG plans from two seeds once per spec and selects by mean robustness.
+pdSTL refines both STLCG plans at each noise level and selects by exact score.
 
 The map and settings come from configs/scenarios/inspection_2d.yaml. Run one
 step at a time on CPU:
@@ -41,7 +41,7 @@ OUTPUTS = RESULTS_DIR / "inspection_2d"
 INSPECT = ("P1", "P2")
 # Named parts, in the order a failed rollout is classified.
 PARTS = ("safety", "ordering", "inspection", "deadline")
-# Five refinements/evaluations of each method's selected plans.
+# Five evaluation cases; pdSTL refines both STLCG seed plans in each case.
 CASES = [("R1", "medium"), ("R2", "medium"), ("R3", "medium")] + [
     ("R3", "low"),
     ("R3", "high"),
@@ -260,7 +260,9 @@ def _write(rows, name):
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     with open(OUTPUTS / name, "w", newline="", encoding="utf-8") as file:
         fields = dict.fromkeys(key for row in rows for key in row)
-        writer = csv.DictWriter(file, fieldnames=list(fields))
+        writer = csv.DictWriter(
+            file, fieldnames=list(fields), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(rows)
     print(f"wrote {OUTPUTS / name}", flush=True)
@@ -369,7 +371,7 @@ def run_start(
     Args:
         spec: (name, formula).
         planner: Optional planner overrides (the lr pilot).
-        init_guess: Selected STLCG controls, required for pdSTL.
+        init_guess: One STLCG seed plan's controls, required for pdSTL.
         stlcg_time: Total optimizer time to select the STLCG plan.
 
     Returns:
@@ -381,7 +383,7 @@ def run_start(
         _, guess = route_seed(env, cfg, s.dyn, start)
     else:
         if init_guess is None:
-            raise ValueError("pdSTL requires STLCG's selected controls")
+            raise ValueError("pdSTL requires a STLCG seed plan's controls")
         s = problem(cfg, method, planner, q_std=noise_level(cfg, noise))
         guess = init_guess
     log = [(-1, 0.0, guess)]
@@ -519,7 +521,7 @@ def pilot(cfg):
 
 
 def runs(cfg):
-    """Six STLCG seed runs, followed by five pdSTL refinements."""
+    """Six STLCG seed runs, then ten refinements selected by exact pdSTL."""
     env = build_environment(cfg)
     specs = build_specs(env, cfg)
     rows, convergence, plans, bases = [], [], {}, {}
@@ -527,7 +529,9 @@ def runs(cfg):
         group, controls, logs = stlcg_plan(cfg, env, (name, formula))
         rows += group
         plans.update({k: u for k, u in controls.items() if u is not None})
-        bases[name] = next(r for r in group if r["selected"])
+        if any(r["solver_status"] != "completed" for r in group):
+            raise RuntimeError(f"{name}: both STLCG seed plans are required")
+        bases[name] = group
         for row in group:
             for spec, noise in CASES:
                 if spec == name:
@@ -535,31 +539,51 @@ def runs(cfg):
                         cfg, row, formula, logs[_key(row)], noise=noise
                     )
     for name, noise in CASES:
-        base = bases[name]
-        row, controls, log = run_start(
-            cfg,
-            env,
-            (name, specs[name][0]),
-            "pdstl",
-            base["start"],
-            noise,
-            init_guess=plans[_key(base)],
-            stlcg_time=base["stlcg_time"],
-        )
-        row["selected"] = controls is not None
-        print(row, flush=True)
-        rows.append(row)
-        if controls is not None:
-            plans[_key(row)] = controls
-        convergence += _score_log(
-            cfg, row, specs[name][0], log, time_offset=base["stlcg_time"]
-        )
+        stlcg_time = next(r for r in bases[name] if r["selected"])[
+            "stlcg_time"
+        ]
+        group, logs, refine_time = [], {}, 0.0
+        for base in bases[name]:
+            row, controls, log = run_start(
+                cfg,
+                env,
+                (name, specs[name][0]),
+                "pdstl",
+                base["start"],
+                noise,
+                init_guess=plans[_key(base)],
+                stlcg_time=stlcg_time,
+            )
+            group.append(row)
+            logs[_key(row)] = [
+                (i, t + stlcg_time + refine_time, u) for i, t, u in log
+            ]
+            refine_time += row.get("refine_time", log[-1][1])
+            if controls is not None:
+                plans[_key(row)] = controls
+        done = [r for r in group if r["solver_status"] == "completed"]
+        best = max(done, key=lambda r: r["own_score"], default=None)
+        if best is not None:
+            best.update(
+                refine_time=refine_time, planning_time=stlcg_time + refine_time
+            )
+            key = _key(best)
+            logs[key].append(
+                (logs[key][-1][0], best["planning_time"], plans[key])
+            )
+        for row in group:
+            row["selected"] = row is best
+            print(row, flush=True)
+            convergence += _score_log(
+                cfg, row, specs[name][0], logs[_key(row)]
+            )
+        rows += group
     _write(rows, "runs.csv")
     _write(convergence, "convergence.csv")
     torch.save(plans, OUTPUTS / "plans.pt")
 
 
-def _score_log(cfg, row, formula, log, *, noise=None, time_offset=0.0):
+def _score_log(cfg, row, formula, log, *, noise=None):
     """Hard pdSTL scores at evaluation noise, outside optimizer timing."""
     noise = noise or row["noise"]
     s = problem(cfg, q_std=noise_level(cfg, noise))
@@ -569,7 +593,7 @@ def _score_log(cfg, row, formula, log, *, noise=None, time_offset=0.0):
         {
             **keys,
             "iteration": iteration,
-            "time_s": seconds + time_offset,
+            "time_s": seconds,
             "score": s.planner.evaluate_controls(
                 s.rollout, controls, spec=formula
             ).hard_interval[0],
@@ -664,8 +688,11 @@ def _read(name):
 METHODS = {"stlcg": ("STLCG", "#D55E00"), "pdstl": ("pdSTL", "#0072B2")}
 CLASS_COLORS = ("#E69F00", "#56B4E9", "#009E73", "#999999")
 TIMING = (
-    "Optimizer wall time on CPU, excluding diagnostic pdSTL scoring. "
-    "STLCG includes both seeds; pdSTL includes STLCG plus refinement."
+    "Optimizer wall time on CPU, excluding diagnostic pdSTL scoring.",
+    (
+        "STLCG includes both seed runs; pdSTL includes both STLCG seed runs "
+        "and both refinements."
+    ),
 )
 FONTS = {
     "font.size": 8,
@@ -693,7 +720,7 @@ def paper(cfg):
 
 
 def figure_1(cfg, selected):
-    """(a) R3 paths across noise; (b) STLCG followed by pdSTL refinement."""
+    """(a) Selected R2 paths at medium noise; (b) cumulative planning time."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Ellipse
 
@@ -713,23 +740,17 @@ def figure_1(cfg, selected):
     _draw_environment(ax, env)
     ax.tick_params(labelsize=FONTS["xtick.labelsize"])
     paths = []
-    curves = [("stlcg", "medium", "-", "STLCG")] + [
-        ("pdstl", noise, style, f"pdSTL {noise}")
-        for noise, style in (("low", ":"), ("medium", "-"), ("high", "--"))
-    ]
-    for method, noise, style, label in curves:
-        color = METHODS[method][1]
-        run = selected[("R3", noise, method)]
-        mean, cov = _belief(cfg, plans[_key(run)], noise)
+    for method, (label, color) in METHODS.items():
+        run = selected[("R2", "medium", method)]
+        mean, cov = _belief(cfg, plans[_key(run)], "medium")
         paths += ax.plot(
             *mean[:, :2].T,
             color=color,
-            linestyle=style,
             linewidth=1.4,
             zorder=8,
-            label=label,
+            label=f"{label} ({_route(run)})",
         )
-        if (method, noise) != ("pdstl", "medium"):
+        if method != "pdstl":
             continue
         for k in range(0, len(mean), cfg["paper"]["ellipse_every"]):
             width, height, angle = _ellipse_parameters(cov[k], 0.95)
@@ -746,6 +767,7 @@ def figure_1(cfg, selected):
                 )
             )
     ax.legend(handles=paths, loc="upper left", framealpha=0.9)
+    ax.set_title("R2, medium noise")
     ax.text(0.02, 0.02, "(a)", transform=ax.transAxes)
     for row, spec in enumerate(("R1", "R2", "R3")):
         panel = fig.add_subplot(grid[row, 1])
@@ -810,8 +832,13 @@ def failure_bars(checked):
     _finish(fig, OUTPUTS / "failure_classes.pdf", show=False)
 
 
+def _route(run):
+    """Route traversed by the final mean path, rather than its seed label."""
+    return "slot" if run["slot_traversed"] == "True" else "top"
+
+
 def table(selected, checked, cases, name, by_noise=False):
-    """CSV and booktabs LaTeX: score / time / success [CI] per method."""
+    """CSV and booktabs LaTeX: score / time / success (route) [CI]."""
     rows = []
     for spec, noise in cases:
         row = {"spec": spec, "noise": noise}
@@ -823,6 +850,7 @@ def table(selected, checked, cases, name, by_noise=False):
             row[f"{label} score"] = float(mc["hard_score"])
             row[f"{label} time_s"] = float(run["planning_time"])
             row[f"{label} success"] = float(mc["empirical_success_rate"])
+            row[f"{label} route"] = _route(run)
             row[f"{label} ci"] = (float(mc["ci_low"]), float(mc["ci_high"]))
         rows.append(row)
     _write(rows, f"{name}.csv")
@@ -849,17 +877,21 @@ def table(selected, checked, cases, name, by_noise=False):
             cells += [
                 f"{row[f'{label} score']:.3f}",
                 f"{row[f'{label} time_s']:.1f}",
-                f"{row[f'{label} success']:.3f} [{low:.3f}, {high:.3f}]",
+                (
+                    f"{100 * row[f'{label} success']:.1f}\\% "
+                    f"({row[f'{label} route']}) [{100 * low:.1f}, {100 * high:.1f}]"
+                ),
             ]
         lines.append(" & ".join(cells) + r" \\")
+    lines.append(r"\bottomrule")
     lines += [
-        r"\bottomrule",
         (
             rf"\multicolumn{{{1 + 3 * len(labels)}}}{{l}}"
-            rf"{{\footnotesize\textsuperscript{{*}}{TIMING}}} \\"
-        ),
-        r"\end{tabular}",
+            rf"{{\footnotesize\textsuperscript{{*}}{line}}} \\"
+        )
+        for line in TIMING
     ]
+    lines.append(r"\end{tabular}")
     (OUTPUTS / f"{name}.tex").write_text("\n".join(lines) + "\n")
     print(f"wrote {OUTPUTS / name}.tex", flush=True)
 

@@ -1,0 +1,12 @@
+\begin{tabular}{lcccccc}
+\toprule
+ & \multicolumn{3}{c}{STLCG} & \multicolumn{3}{c}{pdSTL} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Spec & score & time\textsuperscript{*} [s] & success [95\% CI] & score & time\textsuperscript{*} [s] & success [95\% CI] \\
+\midrule
+R3 low & 1.000 & 30.1 & 100.0\% (slot) [99.9, 100.0] & 1.000 & 83.7 & 100.0\% (slot) [99.9, 100.0] \\
+R3 high & 0.586 & 30.1 & 88.6\% (slot) [87.7, 89.5] & 0.643 & 83.3 & 90.6\% (slot) [89.7, 91.4] \\
+\bottomrule
+\multicolumn{7}{l}{\footnotesize\textsuperscript{*}Optimizer wall time on CPU, excluding diagnostic pdSTL scoring.} \\
+\multicolumn{7}{l}{\footnotesize\textsuperscript{*}STLCG includes both seed runs; pdSTL includes both STLCG seed runs and both refinements.} \\
+\end{tabular}

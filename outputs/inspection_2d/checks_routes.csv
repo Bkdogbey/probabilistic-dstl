@@ -1,0 +1,4 @@
+route,grid_m,path_m,ref_dwell,seed_dwell,seed_safe,seed_R3
+slot,13.384062043356588,12.807407978537713,26,27,True,True
+top,17.32964645562815,16.071200905999554,23,25,False,False
+over_rack,20.69949493661165,19.34769762280394,24,-1,False,False
