@@ -1,6 +1,7 @@
 """2D inspection: map, specs R1-R3 and their parts on noise-free paths."""
 
 import pytest
+import torch
 
 from experiments import inspection_2d as exp
 from utils import load_config
@@ -93,3 +94,20 @@ def test_slot_route_seed_holds_in_p1_and_satisfies_r3():
     mean = exp._mean(s, controls).rollout.aux["mean_trace"][0]
     assert exp.longest_stay(env, mean, "P1") > cfg["dwell"]
     assert exp.satisfied(r3, mean)
+
+
+def test_failure_class_is_the_first_failing_part():
+    flags = {
+        "safety": torch.tensor([True, True, False, True]),
+        "ordering": torch.tensor([True, False, False, True]),
+        "deadline": torch.tensor([True, False, True, True]),
+    }
+    classes = exp.failure_classes(flags)
+    assert classes.tolist() == ["", "ordering", "safety", ""]
+
+
+def test_slot_traversal_is_read_from_the_mean_path():
+    cfg = load_config(exp.CONFIG)
+    env = exp.build_environment(cfg)
+    assert exp.slot_traversed(env, _path(GOOD, cfg["H"]))
+    assert not exp.slot_traversed(env, _path([(START, 1), (C, 1)], 3))

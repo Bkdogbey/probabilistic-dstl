@@ -9,12 +9,18 @@ step at a time on CPU:
 import argparse
 import csv
 from functools import reduce
+from itertools import groupby
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from baselines.det_stl import from_pdstl
 from experiments.reach_avoid import tracking_controls
-from models.rollouts import create_gaussian_belief_trajectory
+from models.rollouts import (
+    create_gaussian_belief_trajectory,
+    sample_trajectories,
+)
 from pdstl.operators import Always, Eventually, Or, Until
 from planning.environment import (
     Environment,
@@ -23,16 +29,23 @@ from planning.environment import (
     inside,
     safety_event,
 )
-from planning.runners import RESULTS_DIR, setup_problem
+from planning.runners import RESULTS_DIR, monte_carlo, setup_problem
 from utils import load_config
 
 CONFIG = "configs/scenarios/inspection_2d.yaml"
 OUTPUTS = RESULTS_DIR / "inspection_2d"
 INSPECT = ("P1", "P2")
+# Named parts, in the order a failed rollout is classified.
+PARTS = ("safety", "ordering", "inspection", "deadline")
+# The 20 starts: every spec at medium noise, and R3 at low and high.
+CASES = [("R1", "medium"), ("R2", "medium"), ("R3", "medium")] + [
+    ("R3", "low"),
+    ("R3", "high"),
+]
 
 
 def build_environment(cfg):
-    """Workspace, racks, targets P1, P2, C and goal D; the start must be safe."""
+    """Racks, targets P1, P2, C and goal D; the start must be safe."""
     env = Environment()
     env.set_bounds(**cfg["bounds"])
     for obstacle in cfg["obstacles"]:
@@ -215,11 +228,10 @@ def first_inside(env, positions, name):
     return int(hits[0])
 
 
-def problem(cfg, method="pdstl", **overrides):
-    """setup_problem for one method's planner settings and noise."""
-    return setup_problem(
-        {**cfg, **overrides, "planner": cfg["methods"][method]}
-    )
+def problem(cfg, method="pdstl", planner=None, **overrides):
+    """setup_problem with one method's planner settings (plus `planner`)."""
+    settings = {**cfg["methods"][method], **(planner or {})}
+    return setup_problem({**cfg, **overrides, "planner": settings})
 
 
 def _mean(s, controls):
@@ -229,7 +241,8 @@ def _mean(s, controls):
 def _write(rows, name):
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     with open(OUTPUTS / name, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        fields = dict.fromkeys(key for row in rows for key in row)
+        writer = csv.DictWriter(file, fieldnames=list(fields))
         writer.writeheader()
         writer.writerows(rows)
     print(f"wrote {OUTPUTS / name}", flush=True)
@@ -258,7 +271,7 @@ def checks(cfg):
     s.spec = r3
     rows = []
     for name, route in cfg["routes"].items():
-        grid_m, corners, _ = prescribed_route(env, cfg, route["stops"])
+        grid_m, _, _ = prescribed_route(env, cfg, route["stops"])
         reference, controls = route_seed(env, cfg, s.dyn, name)
         mean = _mean(s, controls).rollout.aux["mean_trace"][0, :, :2]
         target = next(stop for stop in route["stops"] if stop in INSPECT)
@@ -325,7 +338,224 @@ def checks(cfg):
     _write(noise, "checks_noise.csv")
 
 
-STEPS = {"checks": checks}
+# Steps 3-4: planning runs
+
+
+def noise_level(cfg, noise):
+    """q_std of a named noise level, once Ben has set it."""
+    q_std = cfg["noise"][noise]
+    if q_std is None:
+        raise ValueError(f"set noise.{noise} in {CONFIG} first")
+    return q_std
+
+
+def run_start(cfg, env, spec, method, start, noise, planner=None):
+    """Plan one start and describe it.
+
+    Args:
+        spec: (name, formula).
+        planner: Optional planner overrides (the lr pilot).
+
+    Returns:
+        (row, controls or None, [(iteration, seconds, controls), ...]).
+    """
+    name, formula = spec
+    s = problem(cfg, method, planner, q_std=noise_level(cfg, noise))
+    _, guess = route_seed(env, cfg, s.dyn, start)
+    log = [(-1, 0.0, guess)]
+
+    def observe(iteration, record):
+        if record.elapsed > cfg["time_limit"]:
+            raise TimeoutError
+        log.append((iteration, record.elapsed, record.controls))
+
+    row = {"spec": name, "noise": noise, "method": method, "start": start}
+    try:
+        result = s.planner.optimize_window(
+            s.rollout,
+            spec=formula,
+            init_guess=guess,
+            on_iteration=observe,
+            callback_every=cfg["log_every"],
+        )
+    except TimeoutError:
+        return {**row, "solver_status": "timeout"}, None, log
+    except (RuntimeError, ValueError) as error:
+        return (
+            {**row, "solver_status": "error", "error": str(error)},
+            None,
+            log,
+        )
+    mean = result.rollout.aux["mean_trace"][0]
+    pickup = [p for p in INSPECT if longest_stay(env, mean, p) > cfg["dwell"]]
+    row.update(
+        solver_status="completed",
+        mean_satisfies_spec=bool(satisfied(formula, mean)),
+        pickup=pickup[0] if pickup else "neither",
+        slot_traversed=slot_traversed(env, mean),
+        planning_time=result.planning_time,
+        control_effort=float(result.controls.square().sum() * cfg["dt"]),
+        initial_score=result.initial_hard_lower,
+        final_score=result.hard_interval[0],
+        own_score=own_score(method, formula, result),
+    )
+    return row, result.controls, log
+
+
+def own_score(method, formula, result):
+    """Each method's selection criterion: hard pdSTL or mean robustness."""
+    if method == "pdstl":
+        return result.hard_interval[0]
+    mean = result.rollout.aux["mean_trace"]
+    return from_pdstl(formula).robustness(mean, beta=None).item()
+
+
+def slot_traversed(env, positions):
+    """Whether a sample lies in the gap between the two racks."""
+    lower, upper = env.by_role("obstacle")
+    x, y = np.asarray(positions)[:, :2].T
+    return bool(
+        np.any(
+            (lower.xmin <= x)
+            & (x <= lower.xmax)
+            & (lower.ymax < y)
+            & (y < upper.ymin)
+        )
+    )
+
+
+def pilot(cfg):
+    """Each method's lr on R2 at medium noise, from both starts."""
+    env = build_environment(cfg)
+    spec = ("R2", build_specs(env, cfg)["R2"][0])
+    rows = []
+    for method in cfg["methods"]:
+        for lr in cfg["lr_grid"]:
+            for start in cfg["starts"]:
+                row, _, _ = run_start(
+                    cfg, env, spec, method, start, "medium", {"lr": lr}
+                )
+                rows.append({"lr": lr, **row})
+                print(row, flush=True)
+    _write(rows, "lr_pilot.csv")
+    for method, group in groupby(rows, key=lambda row: row["method"]):
+        best = max(group, key=lambda row: row.get("own_score", -np.inf))
+        print(f"{method}: best lr {best['lr']} ({best['start']})")
+
+
+def runs(cfg):
+    """All 20 starts; marks each method's better start per spec and noise."""
+    env = build_environment(cfg)
+    specs = build_specs(env, cfg)
+    rows, convergence, plans = [], [], {}
+    for name, noise in CASES:
+        for method in cfg["methods"]:
+            group = []
+            for start in cfg["starts"]:
+                spec = (name, specs[name][0])
+                row, controls, log = run_start(
+                    cfg, env, spec, method, start, noise
+                )
+                print(row, flush=True)
+                group.append(row)
+                if controls is not None:
+                    plans[_key(row)] = controls
+                convergence += _score_log(cfg, row, specs[name][0], log)
+            done = [r for r in group if r["solver_status"] == "completed"]
+            best = max(done, key=lambda r: r["own_score"], default=None)
+            for row in group:
+                row["selected"] = row is best
+            rows += group
+    _write(rows, "runs.csv")
+    _write(convergence, "convergence.csv")
+    torch.save(plans, OUTPUTS / "plans.pt")
+
+
+def _score_log(cfg, row, formula, log):
+    """Hard pdSTL score of logged iterates, after the run (not timed)."""
+    s = problem(cfg, q_std=noise_level(cfg, row["noise"]))
+    keys = {k: row[k] for k in ("spec", "noise", "method", "start")}
+    return [
+        {
+            **keys,
+            "iteration": iteration,
+            "time_s": seconds,
+            "score": s.planner.evaluate_controls(
+                s.rollout, controls, spec=formula
+            ).hard_interval[0],
+        }
+        for iteration, seconds, controls in log
+    ]
+
+
+def _key(row):
+    return "/".join(row[k] for k in ("spec", "noise", "method", "start"))
+
+
+# Step 5: Monte Carlo
+
+
+def validate(cfg):
+    """Monte Carlo of every selected plan, with failure flags and classes."""
+    env = build_environment(cfg)
+    specs = build_specs(env, cfg)
+    plans = torch.load(OUTPUTS / "plans.pt")
+    samples = cfg["monte_carlo"]["samples"]
+    rows = []
+    for run in _read("runs.csv"):
+        if run["selected"] != "True":
+            continue
+        formula, parts = specs[run["spec"]]
+        s = problem(cfg, q_std=noise_level(cfg, run["noise"]))
+        s.spec = formula
+        controls = plans[_key(run)]
+        rate, lower, upper = monte_carlo(
+            s, SimpleNamespace(controls=controls), **cfg["monte_carlo"]
+        )
+        flags = failure_flags(s, controls, parts, **cfg["monte_carlo"])
+        classes = failure_classes(flags)
+        if (classes != "").sum() != samples - round(rate * samples):
+            raise RuntimeError(f"{_key(run)}: parts disagree with the spec")
+        row = {k: run[k] for k in ("spec", "noise", "method", "start")}
+        row.update(empirical_success_rate=rate, ci_low=lower, ci_high=upper)
+        for part in PARTS:  # fixed columns; blank where a part is absent
+            held = flags.get(part)
+            row[f"fail_{part}"] = (
+                "" if held is None else 1 - held.float().mean().item()
+            )
+            row[f"class_{part}"] = (
+                "" if held is None else float((classes == part).mean())
+            )
+        print(row, flush=True)
+        rows.append(row)
+    _write(rows, "monte_carlo.csv")
+
+
+def failure_flags(s, controls, parts, samples, seed):
+    """Whether each part holds on each rollout of runners.monte_carlo."""
+    generator = torch.Generator(device=s.dyn.device).manual_seed(seed)
+    paths = sample_trajectories(s.dyn, *s.state, controls, samples, generator)
+    return {name: satisfied(part, paths) for name, part in parts.items()}
+
+
+def failure_classes(flags):
+    """The first failing part of each rollout, in `flags` order; "" if none."""
+    failed = ~torch.stack(list(flags.values()), dim=1)
+    first = torch.where(failed.any(1), failed.int().argmax(1) + 1, 0)
+    return np.array(["", *flags])[first.cpu().numpy()]
+
+
+def _read(name):
+    with open(OUTPUTS / name, newline="", encoding="utf-8") as file:
+        return list(csv.DictReader(file))
+
+
+STEPS = {
+    "checks": checks,
+    "pilot": pilot,
+    "runs": runs,
+    "monte-carlo": validate,
+}
 
 
 def main():

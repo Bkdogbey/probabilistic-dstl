@@ -35,9 +35,16 @@ routes:
   over_rack: {stops: [[4.0, 6.3], P1, C, D], narrow: [4.0, 6.3]}
 starts: [slot, top]  # the two seeds every method plans from
 
+# Same limits and max_iters for both; lr is frozen after the R2 pilot.
+# STLCG: pdSTL off, an unreachable hinge target keeps the smoothed mean
+# robustness always active, and the final iterate is returned.
 methods:
   pdstl: {lr: 0.01, max_iters: 300}
   stlcg:
     {lr: 0.01, max_iters: 300, w_phi: 0.0, w_margin: 1.0,
-     margin_target: 10.0, margin_beta: 10.0}
-monte_carlo: {samples: 5000, seed: 2026}
+     margin_target: 10.0, margin_beta: 10.0, select_by: last}
+lr_grid: [0.001, 0.003, 0.01]  # lr 0.01 drifts the end out of D on step 1
+time_limit: 1800  # optimizer seconds per start
+log_every: 10     # iterations between convergence-log entries
+monte_carlo: {samples: 5000, seed: 2026}  # planning uses no random draws
+paper: {ellipse_every: 8}
