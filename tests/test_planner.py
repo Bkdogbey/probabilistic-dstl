@@ -539,3 +539,31 @@ def test_alpha_status_states_whether_the_lower_robustness_meets_alpha():
     planner, rollout, spec = problem(max_iters=1)
     result = planner.optimize_window(rollout, spec=spec)
     assert result.alpha_status() == "no α requested"
+
+
+def test_select_last_returns_the_final_iterate_without_exact_scoring():
+    planner, rollout, spec = problem(
+        max_iters=5, select_by="last", w_phi=0.0, w_margin=1.0
+    )
+    calls = []
+    exact = spec.probability_interval
+    spec.probability_interval = lambda *a, **k: (
+        calls.append(1) or exact(*a, **k)
+    )
+    records = []
+    result = planner.optimize_window(
+        rollout, spec=spec, on_iteration=lambda _, r: records.append(r)
+    )
+    assert len(calls) == 2  # only the initial and the returned plan
+    assert result.selected_iteration == 4
+    torch.testing.assert_close(result.controls, records[-1].controls)
+    assert all(r.hard_interval is None for r in records)
+    assert result.hard_lower_history == []
+    elapsed = [r.elapsed for r in records]
+    assert elapsed == sorted(elapsed)
+    assert 0 < elapsed[-1] <= result.planning_time
+
+
+def test_select_by_must_be_known():
+    with pytest.raises(ValueError, match="select_by"):
+        problem(select_by="best")
