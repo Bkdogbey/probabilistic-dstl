@@ -1,0 +1,11 @@
+\begin{tabular}{lcccccc}
+\toprule
+Spec & \shortstack{STLCG success\\mean (min--max)} & \shortstack{pdSTL success\\mean (min--max)} & \shortstack{Paired difference\\mean [pp]} & \shortstack{pdSTL\\higher / tie / lower} & \shortstack{Slot share\\STLCG / pdSTL} & \shortstack{Time, mean\textsuperscript{*} [s]\\STLCG / pdSTL} \\
+\midrule
+R1 & 96.6\% (94.3--98.3) & 99.3\% (98.3--99.8) & +2.7 & 15 / 5 / 0 & 0\% / 100\% & 9.3 / 26.7 \\
+R2 & 95.9\% (93.6--98.8) & 98.2\% (95.9--99.7) & +2.3 & 12 / 8 / 0 & 0\% / 100\% & 18.9 / 56.5 \\
+R3 & 92.9\% (77.7--99.5) & 98.7\% (96.6--99.9) & +5.8 & 8 / 12 / 0 & 70\% / 100\% & 28.2 / 80.3 \\
+\bottomrule
+\multicolumn{7}{l}{\footnotesize\textsuperscript{*}Optimizer wall time on CPU, excluding diagnostic pdSTL scoring.} \\
+\multicolumn{7}{l}{\footnotesize\textsuperscript{*}STLCG includes both seed runs; pdSTL includes both STLCG seed runs and both refinements.} \\
+\end{tabular}

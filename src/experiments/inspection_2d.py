@@ -11,6 +11,7 @@ step at a time on CPU:
 
 import argparse
 import csv
+from copy import deepcopy
 from functools import reduce
 from itertools import pairwise
 from types import SimpleNamespace
@@ -256,15 +257,19 @@ def _mean(s, controls):
     return s.planner.evaluate_controls(s.rollout, controls, spec=s.spec)
 
 
-def _write(rows, name):
+def _write(rows, name, *, atomic=False):
     OUTPUTS.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUTS / name, "w", newline="", encoding="utf-8") as file:
+    target = OUTPUTS / name
+    path = target.with_suffix(target.suffix + ".tmp") if atomic else target
+    with open(path, "w", newline="", encoding="utf-8") as file:
         fields = dict.fromkeys(key for row in rows for key in row)
         writer = csv.DictWriter(
             file, fieldnames=list(fields), lineterminator="\n"
         )
         writer.writeheader()
         writer.writerows(rows)
+    if atomic:
+        path.replace(target)
     print(f"wrote {OUTPUTS / name}", flush=True)
 
 
@@ -683,6 +688,280 @@ def _read(name):
         return list(csv.DictReader(file))
 
 
+# Perturbed instances (independent of the base-map runs)
+
+
+def draw_instance(cfg, rng):
+    """One uniform geometry draw; leave sizes and all planner settings fixed."""
+    result = deepcopy(cfg)
+    settings = cfg["instances"]
+    for axis in (0, 1):
+        result["x0_mean"][axis] += float(
+            rng.uniform(-settings["start_xy"], settings["start_xy"])
+        )
+    for box in result["regions"].values():
+        for axis in ("x_range", "y_range"):
+            shift = float(
+                rng.uniform(
+                    -settings["region_shift"], settings["region_shift"]
+                )
+            )
+            box[axis] = [edge + shift for edge in box[axis]]
+    lower, upper = result["obstacles"]
+    centre = (lower["y_range"][1] + upper["y_range"][0]) / 2
+    width = float(rng.uniform(*settings["slot_width"]))
+    centre += float(
+        rng.uniform(-settings["slot_centre"], settings["slot_centre"])
+    )
+    lower["y_range"][1] = centre - width / 2
+    upper["y_range"][0] = centre + width / 2
+    for point in (
+        result["routes"]["slot"]["stops"][0],
+        result["routes"]["slot"]["narrow"],
+    ):
+        point[1] = centre
+    return result
+
+
+def valid_geometry(cfg):
+    """All target rectangles lie inside the bounds and clear of the racks."""
+    axes = ("x_range", "y_range")
+    for box in cfg["regions"].values():
+        if any(
+            box[axis][0] < cfg["bounds"][axis][0]
+            or box[axis][1] > cfg["bounds"][axis][1]
+            for axis in axes
+        ):
+            return False
+        for rack in cfg["obstacles"]:
+            if all(
+                box[axis][0] <= rack[axis][1] and rack[axis][0] <= box[axis][1]
+                for axis in axes
+            ):
+                return False
+    return True
+
+
+def nominal_instance(cfg):
+    """The existing noise-free R3 check must succeed from both route seeds."""
+    try:
+        env = build_environment(cfg)
+        formula = build_specs(env, cfg)["R3"][0]
+        nominal = stlcg_plan(cfg, env, ("R3", formula))
+    except (RuntimeError, ValueError):
+        return None
+    if all(
+        r["solver_status"] == "completed" and r["mean_satisfies_spec"]
+        for r in nominal[0]
+    ):
+        return nominal
+    return None
+
+
+def instance_parameters(index, cfg, rejected):
+    """Human-readable geometry sufficient to reproduce a saved instance."""
+    lower, upper = cfg["obstacles"]
+    row = {
+        "instance": index,
+        "rejections": rejected,
+        "x0_x": cfg["x0_mean"][0],
+        "x0_y": cfg["x0_mean"][1],
+        "slot_width": upper["y_range"][0] - lower["y_range"][1],
+        "slot_centre": (upper["y_range"][0] + lower["y_range"][1]) / 2,
+        "mc_samples": cfg["instances"]["monte_carlo"]["samples"],
+        "mc_seed": cfg["instances"]["monte_carlo"]["seed"] + index,
+    }
+    for name, box in cfg["regions"].items():
+        for axis in ("x", "y"):
+            row[f"{name}_{axis}"] = sum(box[f"{axis}_range"]) / 2
+    return row
+
+
+def generate_instances(cfg, saved=()):
+    """Yield (index, config, rejections, nominal plans), replaying saved draws.
+
+    One RNG includes rejected draws. Saved rejection counts let resume advance
+    that same stream without rerunning nominal checks on accepted geometries.
+    Instance 0 consumes no random draws and must pass the gate unchanged.
+    """
+    rng = np.random.default_rng(cfg["instances"]["seed"])
+    accepted = {int(row["instance"]): row for row in saved}
+    if len(accepted) != len(saved):
+        raise ValueError("duplicate instance parameters")
+    for index in range(cfg["instances"]["count"]):
+        previous = accepted.get(index)
+        attempts = (
+            int(previous["rejections"]) + 1
+            if previous
+            else (1 if index == 0 else cfg["instances"]["max_tries"])
+        )
+        for rejected in range(attempts):
+            candidate = (
+                deepcopy(cfg) if index == 0 else draw_instance(cfg, rng)
+            )
+            if previous:
+                if rejected != attempts - 1:
+                    continue
+                parameters = instance_parameters(index, candidate, rejected)
+                if any(
+                    str(value) != str(previous[key])
+                    for key, value in parameters.items()
+                ):
+                    raise ValueError(
+                        f"instance {index}: saved parameters differ from config"
+                    )
+                nominal = None
+            else:
+                if not valid_geometry(candidate):
+                    continue
+                print(
+                    f"Instance {index}: nominal gate, attempt {rejected + 1}",
+                    flush=True,
+                )
+                nominal = nominal_instance(candidate)
+                if nominal is None:
+                    continue
+            yield index, candidate, rejected, nominal
+            break
+        else:
+            raise RuntimeError(
+                f"instance {index}: no valid map in {attempts} attempts"
+            )
+
+
+def instance_pairs(rows):
+    """Index method rows by (instance, spec); reject duplicate results."""
+    pairs = {}
+    for row in rows:
+        key = (int(row["instance"]), row["spec"])
+        group = pairs.setdefault(key, {})
+        method = row["method"]
+        if method not in METHODS or method in group:
+            raise ValueError(f"{key}: invalid or duplicate method {method}")
+        group[method] = row
+    return pairs
+
+
+def instance_case(cfg, index, name, nominal=None):
+    """Same two-seed search/selection and timing as runs, at medium noise."""
+    env = build_environment(cfg)
+    formula, parts = build_specs(env, cfg)[name]
+    group, plans, _ = nominal or stlcg_plan(cfg, env, (name, formula))
+    if any(r["solver_status"] != "completed" for r in group):
+        raise RuntimeError(
+            f"instance {index}/{name}: both STLCG plans are required"
+        )
+    baseline = next(r for r in group if r["selected"])
+    stlcg_time = baseline["stlcg_time"]
+    refinements, controls, refine_time = [], {}, 0.0
+    for base in group:
+        row, plan, _ = run_start(
+            cfg,
+            env,
+            (name, formula),
+            "pdstl",
+            base["start"],
+            "medium",
+            init_guess=plans[_key(base)],
+            stlcg_time=stlcg_time,
+        )
+        if row["solver_status"] != "completed":
+            raise RuntimeError(
+                f"instance {index}/{name}/{base['start']}: refinement failed"
+            )
+        refinements.append(row)
+        controls[_key(row)] = plan
+        refine_time += row["refine_time"]
+    best = max(refinements, key=lambda r: r["own_score"])
+    best["planning_time"] = stlcg_time + refine_time
+    selected = [
+        (baseline, plans[_key(baseline)]),
+        (best, controls[_key(best)]),
+    ]
+    mc = {**cfg["instances"]["monte_carlo"]}
+    mc["seed"] += index
+    s = problem(cfg, q_std=noise_level(cfg, "medium"))
+    s.spec = formula
+    rows = []
+    for run, plan in selected:
+        rate, low, high = monte_carlo(s, SimpleNamespace(controls=plan), **mc)
+        classes = failure_classes(failure_flags(s, plan, parts, **mc))
+        if (classes != "").sum() != mc["samples"] - round(
+            rate * mc["samples"]
+        ):
+            raise RuntimeError(
+                f"instance {index}/{name}: parts disagree with the spec"
+            )
+        rows.append(
+            {
+                "instance": index,
+                "spec": name,
+                "method": run["method"],
+                "route": "slot" if run["slot_traversed"] else "top",
+                "exact_score": _mean(s, plan).hard_interval[0],
+                "success_rate": rate,
+                "ci_low": low,
+                "ci_high": high,
+                **{
+                    f"class_{p}": float((classes == p).mean())
+                    if p in parts
+                    else ""
+                    for p in PARTS
+                },
+                "planning_time": run["planning_time"],
+            }
+        )
+    return rows
+
+
+def instances(cfg):
+    """Checkpoint accepted maps and complete method pairs; resume missing cases."""
+    parameters = (
+        _read("instances.csv") if (OUTPUTS / "instances.csv").exists() else []
+    )
+    rows = (
+        _read("instance_runs.csv")
+        if (OUTPUTS / "instance_runs.csv").exists()
+        else []
+    )
+    pairs = instance_pairs(rows)
+    known = {int(r["instance"]) for r in parameters}
+    if any(index not in known for index, _ in pairs):
+        raise ValueError("instance results have no saved geometry")
+    for index, candidate, rejected, nominal in generate_instances(
+        cfg, parameters
+    ):
+        if index not in known:
+            parameters.append(instance_parameters(index, candidate, rejected))
+            _write(parameters, "instances.csv", atomic=True)
+        for name in ("R1", "R2", "R3"):
+            if set(pairs.get((index, name), {})) == set(METHODS):
+                print(f"Instance {index}/{name}: already complete", flush=True)
+                continue
+            print(
+                f"Instance {index}/{name}: planning and Monte Carlo",
+                flush=True,
+            )
+            result = instance_case(
+                candidate, index, name, nominal if name == "R3" else None
+            )
+            rows = [
+                r
+                for r in rows
+                if (int(r["instance"]), r["spec"]) != (index, name)
+            ]
+            rows += result
+            _write(rows, "instance_runs.csv", atomic=True)
+            print(
+                f"Instance {index}/{name}: "
+                + "; ".join(
+                    f"{r['method']} {r['route']} success={r['success_rate']:.3f}"
+                    for r in result
+                ),
+                flush=True,
+            )
+
+
 # Paper outputs: read the saved results only
 
 METHODS = {"stlcg": ("STLCG", "#D55E00"), "pdstl": ("pdSTL", "#0072B2")}
@@ -715,8 +994,162 @@ def paper(cfg):
     with plt.rc_context(FONTS):
         figure_1(cfg, selected)
         failure_bars(checked)
+        if (OUTPUTS / "instance_runs.csv").exists():
+            instance_paper(cfg)
     table(selected, checked, CASES[:3], "table1")
     table(selected, checked, CASES[3:], "table_s1", by_noise=True)
+
+
+def instance_paper(cfg):
+    """Paired summaries and scatter plots, requiring all configured instances."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    from visualization.figures import _finish
+
+    pairs = instance_pairs(_read("instance_runs.csv"))
+    expected = {
+        (i, spec)
+        for i in range(cfg["instances"]["count"])
+        for spec in ("R1", "R2", "R3")
+    }
+    if set(pairs) != expected or any(
+        set(p) != set(METHODS) for p in pairs.values()
+    ):
+        raise ValueError(
+            "instance paper outputs require complete paired results"
+        )
+    summaries = []
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(7.16, 3.0),
+        sharex=True,
+        sharey=True,
+        layout="constrained",
+    )
+    lower = max(
+        0.0,
+        min(
+            float(r["success_rate"])
+            for p in pairs.values()
+            for r in p.values()
+        )
+        - 0.02,
+    )
+    for ax, spec in zip(axes, ("R1", "R2", "R3")):
+        groups = [pairs[(i, spec)] for i in range(cfg["instances"]["count"])]
+        row = {"spec": spec}
+        for method in METHODS:
+            success = [float(p[method]["success_rate"]) for p in groups]
+            row.update(
+                {
+                    f"{method}_success_mean": float(np.mean(success)),
+                    f"{method}_success_min": min(success),
+                    f"{method}_success_max": max(success),
+                    f"{method}_slot_share": float(
+                        np.mean([p[method]["route"] == "slot" for p in groups])
+                    ),
+                    f"{method}_time_s": float(
+                        np.mean(
+                            [float(p[method]["planning_time"]) for p in groups]
+                        )
+                    ),
+                }
+            )
+        differences, higher, ties, lower_count = [], 0, 0, 0
+        for p in groups:
+            st, pd = p["stlcg"], p["pdstl"]
+            difference = float(pd["success_rate"]) - float(st["success_rate"])
+            differences.append(difference)
+            overlap = float(pd["ci_low"]) <= float(st["ci_high"]) and float(
+                st["ci_low"]
+            ) <= float(pd["ci_high"])
+            if overlap:
+                ties += 1
+            elif difference > 0:
+                higher += 1
+            else:
+                lower_count += 1
+        row.update(
+            paired_difference_mean=float(np.mean(differences)),
+            pdstl_higher=higher,
+            tie=ties,
+            pdstl_lower=lower_count,
+        )
+        summaries.append(row)
+        for same, color, label in (
+            (True, "#009E73", "same route"),
+            (False, "#CC79A7", "different routes"),
+        ):
+            points = [
+                p
+                for p in groups
+                if (p["stlcg"]["route"] == p["pdstl"]["route"]) == same
+            ]
+            ax.scatter(
+                [float(p["stlcg"]["success_rate"]) for p in points],
+                [float(p["pdstl"]["success_rate"]) for p in points],
+                s=18,
+                color=color,
+                alpha=0.7,
+                label=label,
+                zorder=3,
+            )
+        ax.plot([lower, 1], [lower, 1], "--", color="0.5", linewidth=0.8)
+        ax.set(
+            title=spec,
+            xlabel="STLCG success",
+            xlim=(lower, 1.005),
+            ylim=(lower, 1.005),
+            aspect="equal",
+        )
+        ax.xaxis.set_major_formatter(PercentFormatter(1, decimals=0))
+        ax.yaxis.set_major_formatter(PercentFormatter(1, decimals=0))
+        ax.grid(alpha=0.2, linewidth=0.5)
+    axes[0].set_ylabel("pdSTL success")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="outside lower center", ncol=2, frameon=False
+    )
+    _finish(fig, OUTPUTS / "instances.pdf", show=False)
+    _write(summaries, "table_instances.csv")
+    lines = [
+        r"\begin{tabular}{lcccccc}",
+        r"\toprule",
+        (
+            r"Spec & \shortstack{STLCG success\\mean (min--max)}"
+            r" & \shortstack{pdSTL success\\mean (min--max)}"
+            r" & \shortstack{Paired difference\\mean [pp]}"
+            r" & \shortstack{pdSTL\\higher / tie / lower}"
+            r" & \shortstack{Slot share\\STLCG / pdSTL}"
+            r" & \shortstack{Time, mean\textsuperscript{*} [s]\\STLCG / pdSTL} \\"
+        ),
+        r"\midrule",
+    ]
+    for row in summaries:
+        cells = [row["spec"]]
+        for method in METHODS:
+            cells.append(
+                f"{100 * row[f'{method}_success_mean']:.1f}\\% "
+                f"({100 * row[f'{method}_success_min']:.1f}--"
+                f"{100 * row[f'{method}_success_max']:.1f})"
+            )
+        cells += [
+            f"{100 * row['paired_difference_mean']:+.1f}",
+            f"{row['pdstl_higher']} / {row['tie']} / {row['pdstl_lower']}",
+            f"{100 * row['stlcg_slot_share']:.0f}\\% / {100 * row['pdstl_slot_share']:.0f}\\%",
+            f"{row['stlcg_time_s']:.1f} / {row['pdstl_time_s']:.1f}",
+        ]
+        lines.append(" & ".join(cells) + r" \\")
+    lines.append(r"\bottomrule")
+    lines += [
+        rf"\multicolumn{{7}}{{l}}{{\footnotesize\textsuperscript{{*}}{line}}} \\"
+        for line in TIMING
+    ]
+    lines.append(r"\end{tabular}")
+    (OUTPUTS / "table_instances.tex").write_text("\n".join(lines) + "\n")
+    return summaries
 
 
 def figure_1(cfg, selected):
@@ -903,6 +1336,7 @@ STEPS = {
     "runs": runs,
     "monte-carlo": validate,
     "paper": paper,
+    "instances": instances,
 }
 
 
