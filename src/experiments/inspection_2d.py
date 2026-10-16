@@ -1,15 +1,18 @@
 """2D inspection: pdSTL vs deterministic STLCG on specs R1-R3.
 
+STLCG selects a mean plan from two seeds once per spec. pdSTL refines its
+selected controls at each noise level.
+
 The map and settings come from configs/scenarios/inspection_2d.yaml. Run one
 step at a time on CPU:
 
-    PDSTL_DEVICE=cpu python -m experiments.inspection_2d checks
+    PDSTL_DEVICE=cpu python -m experiments.inspection_2d check
 """
 
 import argparse
 import csv
 from functools import reduce
-from itertools import groupby
+from itertools import pairwise
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,6 +32,7 @@ from planning.environment import (
     inside,
     safety_event,
 )
+from planning.planner import Planner
 from planning.runners import RESULTS_DIR, monte_carlo, setup_problem
 from utils import load_config
 
@@ -37,7 +41,7 @@ OUTPUTS = RESULTS_DIR / "inspection_2d"
 INSPECT = ("P1", "P2")
 # Named parts, in the order a failed rollout is classified.
 PARTS = ("safety", "ordering", "inspection", "deadline")
-# The 20 starts: every spec at medium noise, and R3 at low and high.
+# Five refinements/evaluations of each method's selected plans.
 CASES = [("R1", "medium"), ("R2", "medium"), ("R3", "medium")] + [
     ("R3", "low"),
     ("R3", "high"),
@@ -157,7 +161,7 @@ def prescribed_route(env, cfg, stops):
     ]
     cells = [grid.cell(point) for point in points]
     length, corners, ends = 0.0, [], []
-    for a, b in zip(cells, cells[1:]):
+    for a, b in pairwise(cells):
         distance, parent = grid.search(a)
         length += distance[b] * grid.step  # Dijkstra counts cells
         corners += grid.shortcut(grid.trace(parent, a, b))
@@ -228,10 +232,24 @@ def first_inside(env, positions, name):
     return int(hits[0])
 
 
+class InspectionPlanner(Planner):
+    """Preserve supplied controls, including near-saturated STLCG controls."""
+
+    def _init_controls(self, init_guess):
+        if init_guess is None:
+            return super()._init_controls(init_guess)
+        parameters = self._control_parameters(
+            init_guess, margin=torch.finfo(self.dyn.B.dtype).eps
+        )
+        return torch.nn.Parameter(parameters.detach().clone())
+
+
 def problem(cfg, method="pdstl", planner=None, **overrides):
     """setup_problem with one method's planner settings (plus `planner`)."""
     settings = {**cfg["methods"][method], **(planner or {})}
-    return setup_problem({**cfg, **overrides, "planner": settings})
+    s = setup_problem({**cfg, **overrides, "planner": settings})
+    s.planner = InspectionPlanner(s.dyn, cfg["H"], settings)
+    return s
 
 
 def _mean(s, controls):
@@ -291,27 +309,12 @@ def checks(cfg):
     print("\nRoutes (dwell in steps, needs >= {})".format(cfg["dwell"]))
     _print(rows)
 
-    nominal = []
-    for name in cfg["starts"]:
-        s.init_guess = route_seed(env, cfg, s.dyn, name)[1]
-        result = s.planner.optimize_window(
-            s.rollout, spec=r3, init_guess=s.init_guess
-        )
-        mean = result.rollout.aux["mean_trace"][0, :, :2]
-        nominal.append(
-            {
-                "start": name,
-                "initial": result.initial_hard_lower,
-                "final": result.hard_interval[0],
-                "mean_R3": bool(satisfied(r3, mean)),
-                "time_s": result.planning_time,
-            }
-        )
-    print("\nNominal pdSTL on R3 (near-zero noise)")
+    nominal, _, _ = stlcg_plan(cfg, env, ("R3", r3))
+    print("\nNominal STLCG on R3 (no noise)")
     _print(nominal)
 
     noise = []
-    for q_std in cfg["noise_candidates"]:
+    for q_std in cfg["noise"].values():
         # Open loop, the covariance does not depend on the controls.
         noisy = problem(cfg, q_std=q_std)
         cov = noisy.dyn(torch.zeros(cfg["H"], 2), *noisy.state)[1][0]
@@ -342,26 +345,45 @@ def checks(cfg):
 
 
 def noise_level(cfg, noise):
-    """q_std of a named noise level, once Ben has set it."""
+    """q_std of a named noise level."""
     q_std = cfg["noise"][noise]
     if q_std is None:
         raise ValueError(f"set noise.{noise} in {CONFIG} first")
     return q_std
 
 
-def run_start(cfg, env, spec, method, start, noise, planner=None):
+def run_start(
+    cfg,
+    env,
+    spec,
+    method,
+    start,
+    noise="none",
+    planner=None,
+    *,
+    init_guess=None,
+    stlcg_time=0.0,
+):
     """Plan one start and describe it.
 
     Args:
         spec: (name, formula).
         planner: Optional planner overrides (the lr pilot).
+        init_guess: Selected STLCG controls, required for pdSTL.
+        stlcg_time: Total optimizer time to select the STLCG plan.
 
     Returns:
         (row, controls or None, [(iteration, seconds, controls), ...]).
     """
     name, formula = spec
-    s = problem(cfg, method, planner, q_std=noise_level(cfg, noise))
-    _, guess = route_seed(env, cfg, s.dyn, start)
+    if method == "stlcg":
+        s = problem(cfg, method, planner, q_std=0.0, x0_cov_scale=0.0)
+        _, guess = route_seed(env, cfg, s.dyn, start)
+    else:
+        if init_guess is None:
+            raise ValueError("pdSTL requires STLCG's selected controls")
+        s = problem(cfg, method, planner, q_std=noise_level(cfg, noise))
+        guess = init_guess
     log = [(-1, 0.0, guess)]
 
     def observe(iteration, record):
@@ -393,11 +415,17 @@ def run_start(cfg, env, spec, method, start, noise, planner=None):
         mean_satisfies_spec=bool(satisfied(formula, mean)),
         pickup=pickup[0] if pickup else "neither",
         slot_traversed=slot_traversed(env, mean),
-        planning_time=result.planning_time,
+        stlcg_time=(result.planning_time if method == "stlcg" else stlcg_time),
+        refine_time=(result.planning_time if method == "pdstl" else 0.0),
+        planning_time=stlcg_time + result.planning_time,
         control_effort=float(result.controls.square().sum() * cfg["dt"]),
         initial_score=result.initial_hard_lower,
         final_score=result.hard_interval[0],
         own_score=own_score(method, formula, result),
+    )
+    # The best pdSTL iterate may precede the last optimizer iterate.
+    log.append(
+        (result.selected_iteration, result.planning_time, result.controls)
     )
     return row, result.controls, log
 
@@ -424,68 +452,145 @@ def slot_traversed(env, positions):
     )
 
 
+def stlcg_plan(cfg, env, spec, planner=None):
+    """Run both noise-free seeds and select by final hard mean robustness."""
+    group, plans, logs = [], {}, {}
+    elapsed = 0.0
+    for start in cfg["starts"]:
+        row, controls, log = run_start(
+            cfg, env, spec, "stlcg", start, planner=planner
+        )
+        print(row, flush=True)
+        group.append(row)
+        plans[_key(row)] = controls
+        logs[_key(row)] = [(i, t + elapsed, u) for i, t, u in log]
+        elapsed += row.get("planning_time", log[-1][1])
+    done = [r for r in group if r["solver_status"] == "completed"]
+    if not done:
+        raise RuntimeError(f"{spec[0]}: neither STLCG seed completed")
+    best = max(done, key=lambda r: r["own_score"])
+    for row in group:
+        row["selected"] = row is best
+    # Selection costs both seed runs, even when the first seed wins.
+    best.update(stlcg_time=elapsed, planning_time=elapsed)
+    key = _key(best)
+    logs[key].append((logs[key][-1][0], elapsed, plans[key]))
+    return group, plans, logs
+
+
 def pilot(cfg):
-    """Each method's lr on R2 at medium noise, from both starts."""
+    """Tune STLCG on noise-free R2, then pdSTL on its plan at medium noise."""
     env = build_environment(cfg)
     spec = ("R2", build_specs(env, cfg)["R2"][0])
-    rows = []
-    for method in cfg["methods"]:
-        for lr in cfg["lr_grid"]:
-            for start in cfg["starts"]:
-                row, _, _ = run_start(
-                    cfg, env, spec, method, start, "medium", {"lr": lr}
-                )
-                rows.append({"lr": lr, **row})
-                print(row, flush=True)
+    rows, candidates = [], []
+    for lr in cfg["lr_grid"]:
+        group, plans, _ = stlcg_plan(cfg, env, spec, {"lr": lr})
+        rows += [{"lr": lr, **row} for row in group]
+        best = next(r for r in group if r["selected"])
+        candidates.append((lr, best, plans[_key(best)]))
+    stlcg_lr, base, controls = max(
+        candidates, key=lambda candidate: candidate[1]["own_score"]
+    )
+    for lr in cfg["lr_grid"]:
+        row, _, _ = run_start(
+            cfg,
+            env,
+            spec,
+            "pdstl",
+            base["start"],
+            "medium",
+            {"lr": lr},
+            init_guess=controls,
+            stlcg_time=base["stlcg_time"],
+        )
+        rows.append({"lr": lr, **row})
+        print(row, flush=True)
     _write(rows, "lr_pilot.csv")
-    for method, group in groupby(rows, key=lambda row: row["method"]):
-        best = max(group, key=lambda row: row.get("own_score", -np.inf))
-        print(f"{method}: best lr {best['lr']} ({best['start']})")
+    refinements = [
+        r
+        for r in rows
+        if r["method"] == "pdstl" and r["solver_status"] == "completed"
+    ]
+    if not refinements:
+        raise RuntimeError("no pdSTL pilot refinement completed")
+    pdstl_lr = max(refinements, key=lambda r: r["own_score"])["lr"]
+    print(f"Freeze in YAML: stlcg.lr={stlcg_lr}, pdstl.lr={pdstl_lr}")
+    return {"stlcg": stlcg_lr, "pdstl": pdstl_lr}
 
 
 def runs(cfg):
-    """All 20 starts; marks each method's better start per spec and noise."""
+    """Six STLCG seed runs, followed by five pdSTL refinements."""
     env = build_environment(cfg)
     specs = build_specs(env, cfg)
-    rows, convergence, plans = [], [], {}
+    rows, convergence, plans, bases = [], [], {}, {}
+    for name, (formula, _) in specs.items():
+        group, controls, logs = stlcg_plan(cfg, env, (name, formula))
+        rows += group
+        plans.update({k: u for k, u in controls.items() if u is not None})
+        bases[name] = next(r for r in group if r["selected"])
+        for row in group:
+            for spec, noise in CASES:
+                if spec == name:
+                    convergence += _score_log(
+                        cfg, row, formula, logs[_key(row)], noise=noise
+                    )
     for name, noise in CASES:
-        for method in cfg["methods"]:
-            group = []
-            for start in cfg["starts"]:
-                spec = (name, specs[name][0])
-                row, controls, log = run_start(
-                    cfg, env, spec, method, start, noise
-                )
-                print(row, flush=True)
-                group.append(row)
-                if controls is not None:
-                    plans[_key(row)] = controls
-                convergence += _score_log(cfg, row, specs[name][0], log)
-            done = [r for r in group if r["solver_status"] == "completed"]
-            best = max(done, key=lambda r: r["own_score"], default=None)
-            for row in group:
-                row["selected"] = row is best
-            rows += group
+        base = bases[name]
+        row, controls, log = run_start(
+            cfg,
+            env,
+            (name, specs[name][0]),
+            "pdstl",
+            base["start"],
+            noise,
+            init_guess=plans[_key(base)],
+            stlcg_time=base["stlcg_time"],
+        )
+        row["selected"] = controls is not None
+        print(row, flush=True)
+        rows.append(row)
+        if controls is not None:
+            plans[_key(row)] = controls
+        convergence += _score_log(
+            cfg, row, specs[name][0], log, time_offset=base["stlcg_time"]
+        )
     _write(rows, "runs.csv")
     _write(convergence, "convergence.csv")
     torch.save(plans, OUTPUTS / "plans.pt")
 
 
-def _score_log(cfg, row, formula, log):
-    """Hard pdSTL score of logged iterates, after the run (not timed)."""
-    s = problem(cfg, q_std=noise_level(cfg, row["noise"]))
+def _score_log(cfg, row, formula, log, *, noise=None, time_offset=0.0):
+    """Hard pdSTL scores at evaluation noise, outside optimizer timing."""
+    noise = noise or row["noise"]
+    s = problem(cfg, q_std=noise_level(cfg, noise))
     keys = {k: row[k] for k in ("spec", "noise", "method", "start")}
+    keys["noise"] = noise
     return [
         {
             **keys,
             "iteration": iteration,
-            "time_s": seconds,
+            "time_s": seconds + time_offset,
             "score": s.planner.evaluate_controls(
                 s.rollout, controls, spec=formula
             ).hard_interval[0],
         }
         for iteration, seconds, controls in log
     ]
+
+
+def selected_runs():
+    """Reuse each selected STLCG plan at all of its evaluation noise levels."""
+    selected = {}
+    for row in _read("runs.csv"):
+        if row["selected"] != "True":
+            continue
+        if row["method"] == "stlcg":
+            for spec, noise in CASES:
+                if spec == row["spec"]:
+                    selected[(spec, noise, "stlcg")] = row
+        else:
+            selected[(row["spec"], row["noise"], "pdstl")] = row
+    return selected
 
 
 def _key(row):
@@ -502,11 +607,9 @@ def validate(cfg):
     plans = torch.load(OUTPUTS / "plans.pt")
     samples = cfg["monte_carlo"]["samples"]
     rows = []
-    for run in _read("runs.csv"):
-        if run["selected"] != "True":
-            continue
-        formula, parts = specs[run["spec"]]
-        s = problem(cfg, q_std=noise_level(cfg, run["noise"]))
+    for (name, noise, method), run in selected_runs().items():
+        formula, parts = specs[name]
+        s = problem(cfg, q_std=noise_level(cfg, noise))
         s.spec = formula
         controls = plans[_key(run)]
         rate, lower, upper = monte_carlo(
@@ -517,7 +620,13 @@ def validate(cfg):
         if (classes != "").sum() != samples - round(rate * samples):
             raise RuntimeError(f"{_key(run)}: parts disagree with the spec")
         row = {k: run[k] for k in ("spec", "noise", "method", "start")}
-        row.update(empirical_success_rate=rate, ci_low=lower, ci_high=upper)
+        row.update(
+            noise=noise,
+            hard_score=_mean(s, controls).hard_interval[0],
+            empirical_success_rate=rate,
+            ci_low=lower,
+            ci_high=upper,
+        )
         for part in PARTS:  # fixed columns; blank where a part is absent
             held = flags.get(part)
             row[f"fail_{part}"] = (
@@ -554,7 +663,10 @@ def _read(name):
 
 METHODS = {"stlcg": ("STLCG", "#D55E00"), "pdstl": ("pdSTL", "#0072B2")}
 CLASS_COLORS = ("#E69F00", "#56B4E9", "#009E73", "#999999")
-TIMING = "Optimizer wall time on CPU, excluding diagnostic pdSTL scoring."
+TIMING = (
+    "Optimizer wall time on CPU, excluding diagnostic pdSTL scoring. "
+    "STLCG includes both seeds; pdSTL includes STLCG plus refinement."
+)
 FONTS = {
     "font.size": 8,
     "axes.labelsize": 8,
@@ -568,11 +680,7 @@ def paper(cfg):
     """Figure 1, Table 1 and the supplement from the saved CSVs and plans."""
     import matplotlib.pyplot as plt
 
-    selected = {
-        (r["spec"], r["noise"], r["method"]): r
-        for r in _read("runs.csv")
-        if r["selected"] == "True"
-    }
+    selected = selected_runs()
     checked = {
         (r["spec"], r["noise"], r["method"]): r
         for r in _read("monte_carlo.csv")
@@ -585,7 +693,7 @@ def paper(cfg):
 
 
 def figure_1(cfg, selected):
-    """(a) Map with each method's R3 plan; (b) score against own time."""
+    """(a) R3 paths across noise; (b) STLCG followed by pdSTL refinement."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Ellipse
 
@@ -605,16 +713,24 @@ def figure_1(cfg, selected):
     _draw_environment(ax, env)
     ax.tick_params(labelsize=FONTS["xtick.labelsize"])
     paths = []
-    for method, (label, color) in METHODS.items():
-        run = selected[("R3", "medium", method)]
-        mean, cov = _belief(cfg, plans[_key(run)], "medium")
+    curves = [("stlcg", "medium", "-", "STLCG")] + [
+        ("pdstl", noise, style, f"pdSTL {noise}")
+        for noise, style in (("low", ":"), ("medium", "-"), ("high", "--"))
+    ]
+    for method, noise, style, label in curves:
+        color = METHODS[method][1]
+        run = selected[("R3", noise, method)]
+        mean, cov = _belief(cfg, plans[_key(run)], noise)
         paths += ax.plot(
             *mean[:, :2].T,
             color=color,
+            linestyle=style,
             linewidth=1.4,
             zorder=8,
-            label=f"{label} via {run['pickup']}",
+            label=label,
         )
+        if (method, noise) != ("pdstl", "medium"):
+            continue
         for k in range(0, len(mean), cfg["paper"]["ellipse_every"]):
             width, height, angle = _ellipse_parameters(cov[k], 0.95)
             ax.add_patch(
@@ -635,10 +751,11 @@ def figure_1(cfg, selected):
         panel = fig.add_subplot(grid[row, 1])
         for method, (label, color) in METHODS.items():
             run = selected[(spec, "medium", method)]
+            key = _key({**run, "noise": "medium"})
             points = [
                 (float(r["time_s"]), float(r["score"]))
                 for r in convergence
-                if _key(r) == _key(run)
+                if _key(r) == key
             ]
             panel.plot(*zip(*points), color=color, linewidth=1.2, label=label)
         panel.set(ylim=(-0.03, 1.03), ylabel=RHO_LOWER)
@@ -646,7 +763,7 @@ def figure_1(cfg, selected):
         panel.grid(alpha=0.2, linewidth=0.5)
         if row < 2:
             panel.tick_params(labelbottom=False)
-    panel.set_xlabel("optimizer time [s]")
+    panel.set_xlabel("cumulative optimizer time [s]")
     panel.text(0.02, 0.08, "(b)", transform=panel.transAxes)
     _finish(fig, OUTPUTS / "figure1.pdf", show=False)
 
@@ -703,7 +820,7 @@ def table(selected, checked, cases, name, by_noise=False):
                 selected[(spec, noise, method)],
                 checked[(spec, noise, method)],
             )
-            row[f"{label} score"] = float(run["final_score"])
+            row[f"{label} score"] = float(mc["hard_score"])
             row[f"{label} time_s"] = float(run["planning_time"])
             row[f"{label} success"] = float(mc["empirical_success_rate"])
             row[f"{label} ci"] = (float(mc["ci_low"]), float(mc["ci_high"]))
@@ -737,8 +854,10 @@ def table(selected, checked, cases, name, by_noise=False):
         lines.append(" & ".join(cells) + r" \\")
     lines += [
         r"\bottomrule",
-        rf"\multicolumn{{{1 + 3 * len(labels)}}}{{l}}"
-        rf"{{\footnotesize\textsuperscript{{*}}{TIMING}}} \\",
+        (
+            rf"\multicolumn{{{1 + 3 * len(labels)}}}{{l}}"
+            rf"{{\footnotesize\textsuperscript{{*}}{TIMING}}} \\"
+        ),
         r"\end{tabular}",
     ]
     (OUTPUTS / f"{name}.tex").write_text("\n".join(lines) + "\n")
@@ -746,6 +865,7 @@ def table(selected, checked, cases, name, by_noise=False):
 
 
 STEPS = {
+    "check": checks,
     "checks": checks,
     "pilot": pilot,
     "runs": runs,

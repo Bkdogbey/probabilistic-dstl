@@ -10,9 +10,8 @@ dwell: 10       # steps inside P1 or P2 (2 s)
 deadline: 75    # T_d for reaching D
 x0_mean: [1.0, 1.0, 0.0, 0.0]
 x0_cov_scale: [1.0e-4, 1.0e-4, 0.0, 0.0]  # sigma = 1 cm
-q_std: null     # set from `noise` once the levels are chosen
-noise: {low: null, medium: null, high: null}
-noise_candidates: [0.001, 0.002, 0.005, 0.01]
+q_std: null     # set from `noise` for refinement and evaluation
+noise: {low: 0.002, medium: 0.004, high: 0.006}
 # Near-zero noise for the feasibility check. At q_std 1e-4 / variance 1e-8
 # the pdSTL gradient has NaN entries (Gaussian tail in float32).
 nominal: {q_std: 3.0e-4, x0_cov_scale: [1.0e-7, 1.0e-7, 0.0, 0.0]}
@@ -33,18 +32,19 @@ routes:
   slot: {stops: [[4.0, 1.5], P1, C, D], narrow: [4.0, 1.5]}
   top: {stops: [P2, C, D], narrow: [4.0, 6.1]}
   over_rack: {stops: [[4.0, 6.3], P1, C, D], narrow: [4.0, 6.3]}
-starts: [slot, top]  # the two seeds every method plans from
+starts: [slot, top]  # STLCG selects one plan; pdSTL refines that plan
 
-# Same limits and max_iters for both; lr is frozen after the R2 pilot.
+# R2 pilot: freeze lr=0.01 for both (STLCG noise-free; pdSTL medium noise).
+# Same time limit and max_iters for both methods.
 # STLCG: pdSTL off, an unreachable hinge target keeps the smoothed mean
 # robustness always active, and the final iterate is returned.
 methods:
-  pdstl: {lr: 0.01, max_iters: 300}
+  pdstl: {lr: 0.01, max_iters: 300, select_by: pdstl}
   stlcg:
     {lr: 0.01, max_iters: 300, w_phi: 0.0, w_margin: 1.0,
      margin_target: 10.0, margin_beta: 10.0, select_by: last}
-lr_grid: [0.001, 0.003, 0.01]  # lr 0.01 drifts the end out of D on step 1
-time_limit: 1800  # optimizer seconds per start
+lr_grid: [0.001, 0.003, 0.01]
+time_limit: 600  # optimizer seconds per seed or refinement
 log_every: 10     # iterations between convergence-log entries
 monte_carlo: {samples: 5000, seed: 2026}  # planning uses no random draws
 paper: {ellipse_every: 8}
