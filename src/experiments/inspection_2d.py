@@ -550,11 +550,207 @@ def _read(name):
         return list(csv.DictReader(file))
 
 
+# Paper outputs: read the saved results only
+
+METHODS = {"stlcg": ("STLCG", "#D55E00"), "pdstl": ("pdSTL", "#0072B2")}
+CLASS_COLORS = ("#E69F00", "#56B4E9", "#009E73", "#999999")
+TIMING = "Optimizer wall time on CPU, excluding diagnostic pdSTL scoring."
+FONTS = {
+    "font.size": 8,
+    "axes.labelsize": 8,
+    "legend.fontsize": 7,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+}
+
+
+def paper(cfg):
+    """Figure 1, Table 1 and the supplement from the saved CSVs and plans."""
+    import matplotlib.pyplot as plt
+
+    selected = {
+        (r["spec"], r["noise"], r["method"]): r
+        for r in _read("runs.csv")
+        if r["selected"] == "True"
+    }
+    checked = {
+        (r["spec"], r["noise"], r["method"]): r
+        for r in _read("monte_carlo.csv")
+    }
+    with plt.rc_context(FONTS):
+        figure_1(cfg, selected)
+        failure_bars(checked)
+    table(selected, checked, CASES[:3], "table1")
+    table(selected, checked, CASES[3:], "table_s1", by_noise=True)
+
+
+def figure_1(cfg, selected):
+    """(a) Map with each method's R3 plan; (b) score against own time."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
+
+    from visualization.figures import (
+        RHO_LOWER,
+        _draw_environment,
+        _ellipse_parameters,
+        _finish,
+    )
+
+    env = build_environment(cfg)
+    plans = torch.load(OUTPUTS / "plans.pt")
+    convergence = _read("convergence.csv")
+    fig = plt.figure(figsize=(7.16, 3.0), layout="constrained")
+    grid = fig.add_gridspec(3, 2, width_ratios=(1.0, 1.3))
+    ax = fig.add_subplot(grid[:, 0])
+    _draw_environment(ax, env)
+    ax.tick_params(labelsize=FONTS["xtick.labelsize"])
+    paths = []
+    for method, (label, color) in METHODS.items():
+        run = selected[("R3", "medium", method)]
+        mean, cov = _belief(cfg, plans[_key(run)], "medium")
+        paths += ax.plot(
+            *mean[:, :2].T,
+            color=color,
+            linewidth=1.4,
+            zorder=8,
+            label=f"{label} via {run['pickup']}",
+        )
+        for k in range(0, len(mean), cfg["paper"]["ellipse_every"]):
+            width, height, angle = _ellipse_parameters(cov[k], 0.95)
+            ax.add_patch(
+                Ellipse(
+                    mean[k, :2],
+                    width,
+                    height,
+                    angle=angle,
+                    color=color,
+                    alpha=0.18,
+                    linewidth=0,
+                    zorder=7,
+                )
+            )
+    ax.legend(handles=paths, loc="upper left", framealpha=0.9)
+    ax.text(0.02, 0.02, "(a)", transform=ax.transAxes)
+    for row, spec in enumerate(("R1", "R2", "R3")):
+        panel = fig.add_subplot(grid[row, 1])
+        for method, (label, color) in METHODS.items():
+            run = selected[(spec, "medium", method)]
+            points = [
+                (float(r["time_s"]), float(r["score"]))
+                for r in convergence
+                if _key(r) == _key(run)
+            ]
+            panel.plot(*zip(*points), color=color, linewidth=1.2, label=label)
+        panel.set(ylim=(-0.03, 1.03), ylabel=RHO_LOWER)
+        panel.text(0.98, 0.08, spec, transform=panel.transAxes, ha="right")
+        panel.grid(alpha=0.2, linewidth=0.5)
+        if row < 2:
+            panel.tick_params(labelbottom=False)
+    panel.set_xlabel("optimizer time [s]")
+    panel.text(0.02, 0.08, "(b)", transform=panel.transAxes)
+    _finish(fig, OUTPUTS / "figure1.pdf", show=False)
+
+
+def _belief(cfg, controls, noise):
+    """Mean and covariance traces of open-loop controls."""
+    s = problem(cfg, q_std=noise_level(cfg, noise))
+    mean, cov = s.state
+    means, covs = [mean], [cov]
+    for control in controls:
+        mean, cov = s.dyn.step(mean, cov, control)
+        means.append(mean)
+        covs.append(cov)
+    return torch.stack(means).numpy(), torch.stack(covs).numpy()
+
+
+def failure_bars(checked):
+    """Stacked failure classes of R3 per noise level and method."""
+    import matplotlib.pyplot as plt
+
+    from visualization.figures import _finish
+
+    fig, ax = plt.subplots(figsize=(3.5, 2.0), layout="constrained")
+    bars = [
+        (noise, method)
+        for noise in ("low", "medium", "high")
+        for method in METHODS
+    ]
+    bottom = np.zeros(len(bars))
+    for part, color in zip(PARTS, CLASS_COLORS):
+        height = np.array(
+            [float(checked[("R3", *bar)][f"class_{part}"]) for bar in bars]
+        )
+        ax.bar(
+            range(len(bars)), height, bottom=bottom, color=color, label=part
+        )
+        bottom += height
+    ax.set_xticks(
+        range(len(bars)),
+        [f"{METHODS[m][0]}\n{noise}" for noise, m in bars],
+    )
+    ax.set(ylabel="failed rollouts [fraction]", ylim=(0, 1))
+    ax.legend(ncol=2, frameon=False)
+    _finish(fig, OUTPUTS / "failure_classes.pdf", show=False)
+
+
+def table(selected, checked, cases, name, by_noise=False):
+    """CSV and booktabs LaTeX: score / time / success [CI] per method."""
+    rows = []
+    for spec, noise in cases:
+        row = {"spec": spec, "noise": noise}
+        for method, (label, _) in METHODS.items():
+            run, mc = (
+                selected[(spec, noise, method)],
+                checked[(spec, noise, method)],
+            )
+            row[f"{label} score"] = float(run["final_score"])
+            row[f"{label} time_s"] = float(run["planning_time"])
+            row[f"{label} success"] = float(mc["empirical_success_rate"])
+            row[f"{label} ci"] = (float(mc["ci_low"]), float(mc["ci_high"]))
+        rows.append(row)
+    _write(rows, f"{name}.csv")
+    labels = [label for label, _ in METHODS.values()]
+    lines = [
+        r"\begin{tabular}{l" + "ccc" * len(labels) + "}",
+        r"\toprule",
+        " & ".join(["", *(rf"\multicolumn{{3}}{{c}}{{{m}}}" for m in labels)])
+        + r" \\",
+        "".join(
+            rf"\cmidrule(lr){{{2 + 3 * k}-{4 + 3 * k}}}"
+            for k in range(len(labels))
+        ),
+        "Spec"
+        + r" & score & time\textsuperscript{*} [s] & success [95\% CI]"
+        * len(labels)
+        + r" \\",
+        r"\midrule",
+    ]
+    for row in rows:
+        cells = [f"{row['spec']} {row['noise']}" if by_noise else row["spec"]]
+        for label in labels:
+            low, high = row[f"{label} ci"]
+            cells += [
+                f"{row[f'{label} score']:.3f}",
+                f"{row[f'{label} time_s']:.1f}",
+                f"{row[f'{label} success']:.3f} [{low:.3f}, {high:.3f}]",
+            ]
+        lines.append(" & ".join(cells) + r" \\")
+    lines += [
+        r"\bottomrule",
+        rf"\multicolumn{{{1 + 3 * len(labels)}}}{{l}}"
+        rf"{{\footnotesize\textsuperscript{{*}}{TIMING}}} \\",
+        r"\end{tabular}",
+    ]
+    (OUTPUTS / f"{name}.tex").write_text("\n".join(lines) + "\n")
+    print(f"wrote {OUTPUTS / name}.tex", flush=True)
+
+
 STEPS = {
     "checks": checks,
     "pilot": pilot,
     "runs": runs,
     "monte-carlo": validate,
+    "paper": paper,
 }
 
 

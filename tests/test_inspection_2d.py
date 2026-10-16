@@ -111,3 +111,22 @@ def test_slot_traversal_is_read_from_the_mean_path():
     env = exp.build_environment(cfg)
     assert exp.slot_traversed(env, _path(GOOD, cfg["H"]))
     assert not exp.slot_traversed(env, _path([(START, 1), (C, 1)], 3))
+
+
+@pytest.mark.slow
+def test_every_step_runs_end_to_end(tmp_path, monkeypatch):
+    cfg = load_config(exp.CONFIG)
+    cfg["noise"] = {"low": 0.001, "medium": 0.002, "high": 0.005}
+    for method in cfg["methods"].values():
+        method["max_iters"] = 2
+    cfg.update(lr_grid=[0.001], log_every=1)
+    cfg["monte_carlo"]["samples"] = 100
+    monkeypatch.setattr(exp, "OUTPUTS", tmp_path)
+    for step in ("pilot", "runs", "monte-carlo", "paper"):
+        exp.STEPS[step](cfg)
+    runs = exp._read("runs.csv")
+    assert len(runs) == 20
+    assert sum(r["selected"] == "True" for r in runs) == 10
+    assert len(exp._read("monte_carlo.csv")) == 10
+    assert (tmp_path / "figure1.pdf").exists()
+    assert "Optimizer wall time" in (tmp_path / "table1.tex").read_text()
