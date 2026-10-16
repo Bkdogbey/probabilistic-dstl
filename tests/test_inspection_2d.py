@@ -76,3 +76,20 @@ def test_unsafe_start_raises():
     cfg["x0_mean"] = [4.0, 3.0, 0.0, 0.0]
     with pytest.raises(ValueError, match="not safe"):
         exp.build_environment(cfg)
+
+
+def test_slot_route_seed_holds_in_p1_and_satisfies_r3():
+    cfg = load_config(exp.CONFIG)
+    env = exp.build_environment(cfg)
+    r3 = exp.build_specs(env, cfg)["R3"][0]
+    length, _, _ = exp.prescribed_route(env, cfg, ["P1"])
+    slot, _, _ = exp.prescribed_route(env, cfg, cfg["routes"]["slot"]["stops"])
+    assert 5.0 < length < slot
+    s = exp.problem(cfg, **cfg["nominal"])
+    reference, controls = exp.route_seed(env, cfg, s.dyn, "slot")
+    assert reference.shape == (cfg["H"] + 1, 2)
+    assert controls.abs().max() <= s.dyn.u_max
+    s.spec = r3
+    mean = exp._mean(s, controls).rollout.aux["mean_trace"][0]
+    assert exp.longest_stay(env, mean, "P1") > cfg["dwell"]
+    assert exp.satisfied(r3, mean)
