@@ -102,6 +102,12 @@ def straight_line_guess(cfg, dyn, waypoints, kp=4.0, kd=4.0):
         [H, 2] controls within u_max.
     """
     reference = _straight_line_reference(cfg, waypoints, dyn.B.dtype)
+    return tracking_controls(cfg, dyn, reference, kp, kd)
+
+
+def tracking_controls(cfg, dyn, reference, kp=4.0, kd=4.0):
+    """Controls whose mean path tracks an [H+1, 2] position reference."""
+    reference = torch.as_tensor(reference, dtype=dyn.B.dtype)
     velocity = (reference[1:] - reference[:-1]) / cfg["dt"]
     if isinstance(dyn, SingleIntegrator):
         return velocity.clamp(-dyn.u_max, dyn.u_max).to(dyn.device)
