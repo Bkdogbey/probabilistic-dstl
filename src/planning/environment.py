@@ -1,468 +1,694 @@
-import math
+"""Rectangular geometry, the reach-avoid task, and lane construction."""
+
+import heapq
+from dataclasses import dataclass
+from functools import cache, reduce
+from itertools import permutations, product
+from math import ceil, floor, hypot, isfinite
 
 import numpy as np
 
-import torch
+from pdstl.operators import Always, And, Eventually, Or
+from pdstl.predicates import (
+    AxisInterval,
+    HalfSpace,
+    InsideRectangle,
+    LessThan,
+    OutsideRectangle,
+    RelativeAxisInterval,
+)
 
-from pdstl.operators import Always, And, Eventually, STL_Formula
+ROLES = ("workspace", "goal", "obstacle", "target")
 
 
-def extract_trajectory_stats(belief_trajectory, diagonal_only=True):
-    """Stack mean and covariance tensors from a belief trajectory.
+@dataclass
+class RectangleRegion:
+    """An axis-aligned rectangle with a name and a role."""
 
-    Parameters
-    ----------
-    belief_trajectory : list of TorchGaussianBelief
-    diagonal_only : bool
-        If True, extract only the diagonal of full covariance matrices,
-        returning var of shape [Batch, Time, Dim].
-        If False, stack full covariance matrices as-is.
+    name: str
+    role: str
+    xmin: float
+    xmax: float
+    ymin: float
+    ymax: float
 
-    Returns
-    -------
-    mu  : Tensor [Batch, Time, Dim]
-    var : Tensor [Batch, Time, Dim] (diagonal_only=True)
-          or [Batch, Time, Dim] / [Batch, Time, Dim, Dim] (diagonal_only=False)
-    """
-    means, vars_ = [], []
-    for belief in belief_trajectory:
-        means.append(belief.mean_full)
-        if diagonal_only and belief.var_full.ndim > 2:
-            vars_.append(torch.diagonal(belief.var_full, dim1=-2, dim2=-1))
-        else:
-            vars_.append(belief.var_full)
-    return torch.stack(means, dim=1), torch.stack(vars_, dim=1)
+    def __post_init__(self):
+        if self.role not in ROLES:
+            raise ValueError(
+                f"region {self.name!r}: role must be one of {list(ROLES)}"
+            )
+        if not (self.xmin < self.xmax and self.ymin < self.ymax):
+            raise ValueError(
+                f"region {self.name!r}: needs min < max on both axes"
+            )
+
+    @property
+    def x(self):
+        return (self.xmin, self.xmax)
+
+    @property
+    def y(self):
+        return (self.ymin, self.ymax)
+
+    @property
+    def centre(self):
+        return [(self.xmin + self.xmax) / 2, (self.ymin + self.ymax) / 2]
 
 
 class Environment:
-    """
-    Defines the workspace, obstacles, and goal regions.
-    Generates the probabilistic STL specification based on the optimization problem PDF.
+    """Workspace bounds, obstacles, a goal and visit regions.
+
+    `goal` is (interval, names) and `visits` is [(interval, dwell, names)];
+    several names are alternatives, any one of which satisfies the task.
     """
 
-    def __init__(self, device="cpu"):
-        self.obstacles = []
-        self.circle_obstacles = []
-        self.moving_obstacles = []
-        self.visit_regions = []
-        self.lane_markings = []
+    def __init__(self):
+        self.regions = {}
         self.goal = None
-        self.bounds = None
-        self.device = device
-        self.road = None
-        self.lane_change = None
-        self.success = None
-        self.label = ""
-        self.plot_xlim = None
-        self.robot_dims = None
-
-    def add_obstacle(self, x_range, y_range):
-        """
-        Adds an axis-aligned rectangular obstacle O_i = [x_min, x_max] x [y_min, y_max].
-        """
-        self.obstacles.append(
-            {
-                "x": x_range,  # (min, max)
-                "y": y_range,  # (min, max)
-            }
-        )
-
-    def add_circle_obstacle(self, center, radius):
-        """
-        Adds a circular obstacle defined by center [x, y] and radius r.
-        """
-        self.circle_obstacles.append({"center": center, "radius": radius})
-
-    def add_moving_obstacle(self, x_traj, y_traj, width, height):
-        """
-        Adds a moving rectangular obstacle.
-        x_traj, y_traj: Tensors or lists of center positions over time [T+1]
-        """
-        self.moving_obstacles.append(
-            {"x_traj": x_traj, "y_traj": y_traj, "width": width, "height": height}
-        )
-
-    def add_lane_marking(self, x_range, y_pos, style="dashed", color="white"):
-        """
-        Adds a visual lane marking (line).
-        """
-        self.lane_markings.append(
-            {"x": x_range, "y": y_pos, "style": style, "color": color}
-        )
-
-    def add_visit_region(self, x_range, y_range):
-        """
-        Adds a rectangular region that must be visited at some point.
-        """
-        self.visit_regions.append({"x": x_range, "y": y_range})
-
-    def set_goal(self, x_range, y_range):
-        """
-        Sets the goal region G = [x_g_min, x_g_max] x [y_g_min, y_g_max].
-        """
-        self.goal = {"x": x_range, "y": y_range}
+        self.visits = []
 
     def set_bounds(self, x_range, y_range):
-        """
-        Sets hard workspace boundaries. The trajectory must always stay inside.
-        """
-        self.bounds = {"x": x_range, "y": y_range}
+        """The workspace the trajectory must always stay inside."""
+        self._add("bounds", "workspace", x_range, y_range)
 
-    def draw_on_ax(self, ax, **kwargs):
-        # Deferred import keeps environment.py free of matplotlib at module load time.
-        from visualization.planning import draw_env_on_ax
+    def add_obstacle(self, x_range, y_range, name=None):
+        """A rectangle the trajectory must always stay out of."""
+        count = len(self.by_role("obstacle"))
+        self._add(
+            name or f"obstacle {count + 1}", "obstacle", x_range, y_range
+        )
 
-        draw_env_on_ax(ax, self, **kwargs)
-
-    def configure_lane_change(
-        self,
-        *,
-        road,
-        obstacle,
-        goal,
-        success,
-        horizon,
-        total_steps,
-        dt,
-        label="",
-        plot_xlim=None,
-        robot_dims=None,
+    def set_goal(
+        self, x_range=None, y_range=None, any_of=None, interval=None, name=None
     ):
-        """Configure a lane-change problem description from scenario values."""
-        self.road = dict(road)
-        self.success = dict(success)
-        self.label = label
-        self.plot_xlim = plot_xlim
-        self.robot_dims = tuple(robot_dims) if robot_dims is not None else None
+        """A region to reach within `interval`, or one of `any_of`."""
+        names = self._alternatives("goal", name, x_range, y_range, any_of)
+        self.goal = (interval, names)
 
-        marking_x = road["marking_x_range"]
-        self.add_lane_marking(
-            x_range=marking_x, y_pos=road["lane_divider"], style="dashed"
+    def add_visit_region(
+        self,
+        x_range=None,
+        y_range=None,
+        any_of=None,
+        dwell=0,
+        interval=None,
+        name=None,
+    ):
+        """A region to enter within `interval` and stay in for `dwell` steps."""
+        label = f"visit {len(self.visits) + 1}"
+        names = self._alternatives(label, name, x_range, y_range, any_of)
+        self.visits.append((interval, int(dwell), names))
+
+    def _alternatives(self, label, name, x_range, y_range, any_of):
+        role = "goal" if label == "goal" else "target"
+        if any_of is None:
+            return [self._add(name or label, role, x_range, y_range).name]
+        return [
+            self._add(
+                box.get("name", f"{label} {chr(ord('a') + k)}"),
+                role,
+                box["x_range"],
+                box["y_range"],
+            ).name
+            for k, box in enumerate(any_of)
+        ]
+
+    def _add(self, name, role, x_range, y_range):
+        (xmin, xmax), (ymin, ymax) = x_range, y_range
+        return self.add_region(
+            RectangleRegion(
+                name, role, float(xmin), float(xmax), float(ymin), float(ymax)
+            )
         )
-        self.add_lane_marking(x_range=marking_x, y_pos=road["y_min"], style="solid")
-        self.add_lane_marking(x_range=marking_x, y_pos=road["y_max"], style="solid")
-        self.set_goal(**goal)
 
-        total_points = total_steps + horizon + 10
-        times = np.arange(total_points) * dt
-        obs_x = obstacle["x0"] + obstacle["speed"] * times
-        obs_y = np.ones_like(times) * obstacle["y"]
+    def add_region(self, region):
+        if region.name in self.regions:
+            raise ValueError(f"region {region.name!r} already exists")
+        self.regions[region.name] = region
+        return region
 
-        self.lane_change = {
-            "obstacle": dict(obstacle),
-            "horizon": horizon,
-            "total_steps": total_steps,
-            "dt": dt,
-            "obs_x_global": obs_x,
-            "obs_y_global": obs_y,
-        }
-        self.add_moving_obstacle(
-            obs_x[: total_steps + 1],
-            obs_y[: total_steps + 1],
-            width=obstacle["width"],
-            height=obstacle["height"],
-        )
-
-    def make_local_lane_change_window(self, step, curr_mean, cfg):
-        """Build the local planning Environment for one lane-change MPC step."""
-        if self.road is None or self.lane_change is None:
+    def region(self, name):
+        try:
+            return self.regions[name]
+        except KeyError:
             raise ValueError(
-                "Lane-change local windows require configure_lane_change()."
+                f"no region named {name!r}; have {sorted(self.regions)}"
+            ) from None
+
+    def by_role(self, role):
+        """Every region with this role, in the order they were added."""
+        return [
+            region for region in self.regions.values() if region.role == role
+        ]
+
+    def single_region(self, role):
+        regions = self.by_role(role)
+        if len(regions) != 1:
+            raise ValueError(f"environment needs exactly one {role!r} region")
+        return regions[0]
+
+    def get_specification(self, horizon):
+        """The pdSTL task over prediction steps 0..horizon."""
+        if not isinstance(horizon, int) or horizon < 1:
+            raise ValueError(
+                f"horizon must be a positive integer, got {horizon!r}"
             )
+        return self._specification(horizon)
 
-        horizon = self.lane_change["horizon"]
-        obstacle = self.lane_change["obstacle"]
-        obs_x = self.lane_change["obs_x_global"]
-        obs_y = self.lane_change["obs_y_global"]
-        road = self.road
+    def _specification(self, horizon):
+        return reach_avoid_specification(self, horizon)
 
-        curr_x = curr_mean.detach().cpu().numpy()[0]
-        goal_lookahead = cfg["mpc_goal_lookahead"]
-        goal_width = cfg["mpc_goal_window_width"]
-        goal_y_inset = cfg["goal_y_inset"]
-        lane_margin = cfg["lane_boundary_margin"]
 
-        env_local = Environment(device=self.device)
-        env_local.set_goal(
-            x_range=[curr_x + goal_lookahead, curr_x + goal_lookahead + goal_width],
-            y_range=[
-                self.goal["y"][0] + goal_y_inset,
-                self.goal["y"][1] - goal_y_inset,
-            ],
-        )
+# Reach-avoid task
 
-        y_min_bound = road["y_min"] + lane_margin
-        if curr_mean[1] > road["lane_divider"] - lane_margin:
-            y_min_bound = road["lane_divider"]
-        env_local.set_bounds(
-            x_range=cfg["mpc_local_x_range"],
-            y_range=[y_min_bound, road["y_max"]],
-        )
 
-        idx_end = step + horizon + 1
-        if idx_end <= len(obs_x):
-            sl_x = obs_x[step:idx_end]
-            sl_y = obs_y[step:idx_end]
-        else:
-            pad = idx_end - len(obs_x)
-            sl_x = np.concatenate([obs_x[step:], np.full(pad, obs_x[-1])])
-            sl_y = np.concatenate([obs_y[step:], np.full(pad, obs_y[-1])])
-        env_local.add_moving_obstacle(
-            sl_x,
-            sl_y,
-            width=obstacle["width"],
-            height=obstacle["height"],
-        )
-        return env_local
+def inside(region):
+    return InsideRectangle(region.x, region.y, name=region.name)
 
-    def moving_obstacle_position(self, step):
-        """Return the first lane-change moving obstacle center at a global step."""
-        if self.lane_change is None:
-            return None
-        obs_x = self.lane_change["obs_x_global"]
-        obs_y = self.lane_change["obs_y_global"]
-        idx = min(step, len(obs_x) - 1)
-        return np.array([obs_x[idx], obs_y[idx]])
 
-    def clip_moving_obstacles(self, num_points):
-        """Trim moving obstacle trajectories to match an executed trajectory length."""
-        for obs in self.moving_obstacles:
-            obs["x_traj"] = obs["x_traj"][:num_points]
-            obs["y_traj"] = obs["y_traj"][:num_points]
+def outside(region):
+    return OutsideRectangle(region.x, region.y, name=f"¬{region.name}")
 
-    def get_predicates(self):
-        """ """
-        preds = {"obstacles": [], "visit": [], "goal": None}
 
-        if self.goal:
-            preds["goal"] = RectangularGoalPredicate(self.goal)
+def safety_event(environment):
+    """Inside the workspace and outside every obstacle."""
+    return reduce(
+        And,
+        [
+            inside(environment.single_region("workspace")),
+            *map(outside, environment.by_role("obstacle")),
+        ],
+    )
 
-        for region in self.visit_regions:
-            preds["visit"].append(RectangularGoalPredicate(region))
 
-        if self.obstacles or self.circle_obstacles or self.moving_obstacles:
-            obs_preds = [RectangularObstaclePredicate(obs) for obs in self.obstacles]
-            obs_preds.extend(
-                [
-                    CircularObstaclePredicate(obs, device=self.device)
-                    for obs in self.circle_obstacles
-                ]
+def reach_avoid_specification(environment, horizon):
+    """Stay safe, reach the goal, and dwell in each visit region.
+
+    Args:
+        environment: Environment with bounds, a goal and visit regions.
+        horizon: Last prediction step H; step 0 is the known initial belief.
+
+    Returns:
+        G[1,H] safe & F[goal interval] goal
+        & F[visit interval] G[0,dwell] visit, for every visit region.
+    """
+    if environment.goal is None:
+        raise ValueError("reach-avoid needs a goal")
+    interval, names = environment.goal
+    parts = [
+        Always(safety_event(environment), [1, horizon]),
+        Eventually(_any(environment, names, 0), _window(interval, horizon, 0)),
+    ]
+    for interval, dwell, names in environment.visits:
+        parts.append(
+            Eventually(
+                _any(environment, names, dwell),
+                _window(interval, horizon, dwell),
             )
-            obs_preds.extend(
-                [
-                    MovingRectangularObstaclePredicate(obs, device=self.device)
-                    for obs in self.moving_obstacles
-                ]
+        )
+    return reduce(And, parts)
+
+
+def _any(environment, names, dwell):
+    """Inside one of the named regions for `dwell` more steps."""
+    stays = [
+        Always(inside(environment.region(name)), [0, dwell])
+        if dwell
+        else inside(environment.region(name))
+        for name in names
+    ]
+    return reduce(Or, stays)
+
+
+def _window(interval, horizon, dwell):
+    """The requested window, defaulting to [1, H - dwell]."""
+    start, end = interval or (1, horizon - dwell)
+    if not 0 <= start <= end <= horizon - dwell:
+        raise ValueError(
+            f"interval {[start, end]} with dwell {dwell} must fit in [0, {horizon}]"
+        )
+    return [start, end]
+
+
+def build_reach_avoid_environment(config):
+    """Build the reach-avoid environment from a scenario config.
+
+    Args:
+        config: Mapping with `bounds`, `goal`, and optional `obstacles` and
+            `visit_regions`; see configs/scenarios/reach_avoid/.
+
+    Returns:
+        The Environment.
+    """
+    environment = Environment()
+    environment.set_bounds(**config["bounds"])
+    for obstacle in config.get("obstacles") or []:
+        environment.add_obstacle(**obstacle)
+    environment.set_goal(**config["goal"])
+    for visit in config.get("visit_regions") or []:
+        environment.add_visit_region(**visit)
+    return environment
+
+
+# Shortest collision-free route: where the optimizer starts
+
+_NEIGHBOURS = [(i, j) for i in (-1, 0, 1) for j in (-1, 0, 1) if i or j]
+
+
+def shortest_route(environment, start, clearance=0.05, resolution=0.05):
+    """Shortest collision-free route from start through the task regions.
+
+    Only a nominal start for the optimizer: `clearance` keeps it off the
+    obstacles, and pdSTL adds any uncertainty-aware separation. The route
+    visits the centre of the goal (or one of its alternatives) and of every
+    visit region, in any order; the shortest combination wins.
+
+    Args:
+        environment: Reach-avoid Environment.
+        start: [x, y] start position.
+        clearance: Distance kept from obstacles and the workspace edge.
+        resolution: Grid cell size of the search.
+
+    Returns:
+        [[x, y], ...] corner points after the start.
+    """
+    grid = _FreeGrid(environment, clearance, resolution)
+    search = cache(grid.search)
+    groups = [
+        [environment.region(name) for name in names]
+        for names in [environment.goal[1]]
+        + [names for _, _, names in environment.visits]
+    ]
+    stops = [
+        [grid.cell(start)] + [grid.cell(region.centre) for region in order]
+        for choice in product(*groups)
+        for order in permutations(choice)
+    ]
+
+    def length(cells):
+        return sum(search(a)[0][b] for a, b in zip(cells, cells[1:]))
+
+    best = min(stops, key=length)
+    if not isfinite(length(best)):
+        raise ValueError(
+            f"no route keeps {clearance} m from every obstacle; "
+            "lower route.clearance or move the obstacles"
+        )
+    route = []
+    for a, b in zip(best, best[1:]):
+        route += grid.shortcut(grid.trace(search(a)[1], a, b))
+    return route
+
+
+def _grown(x, y, region, margin):
+    return (
+        (x >= region.xmin - margin)
+        & (x <= region.xmax + margin)
+        & (y >= region.ymin - margin)
+        & (y <= region.ymax + margin)
+    )
+
+
+class _FreeGrid:
+    """Workspace cells that keep `clearance` from obstacles and the edge."""
+
+    def __init__(self, environment, clearance, resolution):
+        workspace = environment.single_region("workspace")
+        self.step = resolution
+        self.xs = np.arange(workspace.xmin, workspace.xmax, self.step)
+        self.ys = np.arange(workspace.ymin, workspace.ymax, self.step)
+        x, y = np.meshgrid(self.xs, self.ys, indexing="ij")
+        self.free = _grown(x, y, workspace, -clearance)
+        for obstacle in environment.by_role("obstacle"):
+            self.free &= ~_grown(x, y, obstacle, clearance)
+
+    def point(self, cell):
+        return np.array([self.xs[cell[0]], self.ys[cell[1]]])
+
+    def cell(self, point):
+        """The free cell nearest to a point."""
+        i, j = np.nonzero(self.free)
+        k = np.argmin(
+            (self.xs[i] - point[0]) ** 2 + (self.ys[j] - point[1]) ** 2
+        )
+        return int(i[k]), int(j[k])
+
+    def search(self, source):
+        """Dijkstra from one cell: distances to every cell, and parents."""
+        distance = np.full(self.free.shape, np.inf)
+        distance[source] = 0.0
+        parent, queue = {}, [(0.0, source)]
+        while queue:
+            d, (i, j) = heapq.heappop(queue)
+            if d > distance[i, j]:
+                continue
+            for di, dj in _NEIGHBOURS:
+                neighbour = (i + di, j + dj)
+                cost = d + hypot(di, dj)
+                if self._open(neighbour) and cost < distance[neighbour]:
+                    distance[neighbour], parent[neighbour] = cost, (i, j)
+                    heapq.heappush(queue, (cost, neighbour))
+        return distance, parent
+
+    def _open(self, cell):
+        (i, j), (nx, ny) = cell, self.free.shape
+        return 0 <= i < nx and 0 <= j < ny and self.free[i, j]
+
+    def trace(self, parent, source, target):
+        cells = [target]
+        while cells[-1] != source:
+            cells.append(parent[cells[-1]])
+        return cells[::-1]
+
+    def shortcut(self, cells):
+        """Keep only the corners: skip every cell a straight line can."""
+        points = [self.point(cell) for cell in cells]
+        corners, k = [], 0
+        while k < len(points) - 1:
+            m = len(points) - 1
+            while m > k + 1 and not self._visible(points[k], points[m]):
+                m -= 1
+            corners.append(points[m].tolist())
+            k = m
+        return corners
+
+    def _visible(self, p, q):
+        samples = np.linspace(p, q, int(np.linalg.norm(q - p) / self.step) + 2)
+        i = np.rint((samples[:, 0] - self.xs[0]) / self.step).astype(int)
+        j = np.rint((samples[:, 1] - self.ys[0]) / self.step).astype(int)
+        return bool(self.free[i, j].all())
+
+
+# Lane-change construction
+
+
+class LaneMergeEnvironment(Environment):
+    """An Environment that also carries the road description this scenario needs."""
+
+    def __init__(self, metadata=None):
+        super().__init__()
+        self.metadata = dict(metadata or {})
+
+    def _specification(self, horizon):
+        return lane_merge_specification(self, horizon)
+
+
+def lane_merge_specification(environment, horizon):
+    """Road and three relative collision checks, then timed target dwell."""
+    return lane_subformulas(environment, horizon)["overall"]
+
+
+def lane_subformulas(environment, horizon):
+    metadata = environment.metadata
+    task = metadata["task"]
+    step = metadata.get("step", 0)
+    streak = metadata.get("streak", 0)
+    road_atom = lane_road_predicate(metadata)
+    safety = {}
+    for vehicle in metadata["traffic"]:
+        name = vehicle["name"]
+        longitudinal, lateral = lane_collision_extents(metadata, vehicle)
+        longitudinal = RelativeAxisInterval(
+            name, -longitudinal, longitudinal, 0
+        )
+        lateral = RelativeAxisInterval(name, -lateral, lateral, 1)
+        safety[name] = ~(longitudinal & lateral)
+    safe_atom = reduce(And, [road_atom, *safety.values()])
+    all_safe = Always(safe_atom, [0, horizon])
+    target = AxisInterval(
+        task["target_center"] - task["target_tolerance"],
+        task["target_center"] + task["target_tolerance"],
+        dim=1,
+        name="Target lane occupancy",
+    )
+    speed = task["settle_lateral_speed"]
+    settled = AxisInterval(-speed, speed, dim=3, name="Lateral speed settled")
+    dwell = task["dwell_steps"]  # number of elapsed transitions
+    absolute_start, absolute_end = task["start_end_steps"]
+    credit = lane_dwell_credit(metadata, step, streak)
+
+    def stay_from(start):
+        """Remain in the target lane with settled lateral speed afterwards."""
+        return Always(target & settled, [start, horizon])
+
+    if metadata.get("completed"):
+        # Dwell is done: no timing or ramp-end check, just stay and settle.
+        stay = stay_from(0)
+        return {
+            "road": road_atom,
+            **{
+                f"safety_{name}": predicate
+                for name, predicate in safety.items()
+            },
+            "safe": all_safe,
+            "complete": stay,
+            "stay": stay,
+            "overall": all_safe & stay,
+        }
+
+    def completion_from_start(start, duration):
+        finish = start + duration
+        formula = Always(target, [start, finish])
+        ramp = metadata.get("ramp")
+        if ramp is not None:
+            front_limit = ramp["end_x"] - metadata["ego_vehicle"]["width"] / 2
+            before_end = LessThan(
+                front_limit, dim=0, name="Front before ramp end"
             )
-            preds["obstacles"] = obs_preds
+            formula = formula & Always(before_end, [finish, finish])
+        return formula, finish
 
-        return preds
-
-    def get_specification(self, T, t_goal_start=0, t_constraints_start=1):
-        """
-        Generates the STL formula: phi = (Always Safe) & (Eventually Goal)
-
-        """
-        preds = self.get_predicates()
-        specs = []
-
-        # 1. Goal Specification (Liveness)
-        if preds["goal"]:
-            specs.append(Eventually(preds["goal"], interval=[t_goal_start, T]))
-
-        # 2. Visit Regions (Liveness)
-        for visit_pred in preds["visit"]:
-            specs.append(Eventually(visit_pred, interval=[0, T]))
-
-        # 3. Obstacle Specification (Safety)
-        if preds["obstacles"]:
-            obs_preds = preds["obstacles"]
-            current_safe_formula = obs_preds[0]
-            for i in range(1, len(obs_preds)):
-                current_safe_formula = And(current_safe_formula, obs_preds[i])
-            phi_safety = Always(current_safe_formula, interval=[t_constraints_start, T])
-            specs.append(phi_safety)
-
-        # 4. Workspace Boundary (Always stay inside)
-        if self.bounds is not None:
-            bounds_pred = RectangularGoalPredicate(self.bounds)
-            specs.append(Always(bounds_pred, interval=[t_constraints_start, T]))
-
-        if not specs:
-            raise ValueError("No constraints defined in environment.")
-
-        # 5. Combined Specification
-        combined_spec = specs[0]
-        for i in range(1, len(specs)):
-            combined_spec = And(combined_spec, specs[i])
-
-        return combined_spec
+    if credit:
+        remaining = dwell - (credit - 1)
+        candidates = [completion_from_start(0, remaining)]
+    else:
+        start = max(0, absolute_start - step)
+        latest_start = absolute_end - dwell - step
+        if latest_start < start:
+            raise ValueError("lane task has no remaining feasible dwell start")
+        candidates = [
+            completion_from_start(candidate, dwell)
+            for candidate in range(start, latest_start + 1)
+        ]
+    completion = reduce(Or, [formula for formula, _finish in candidates])
+    stay = reduce(Or, [stay_from(finish) for _formula, finish in candidates])
+    # Safety covers the whole window, not just up to the dwell finish, so
+    # the plan cannot drift off the road or into traffic after completing.
+    overall = all_safe & reduce(
+        Or,
+        [formula & stay_from(finish) for formula, finish in candidates],
+    )
+    return {
+        "road": road_atom,
+        **{f"safety_{name}": predicate for name, predicate in safety.items()},
+        "safe": all_safe,
+        "complete": completion,
+        "stay": stay,
+        "overall": overall,
+    }
 
 
-# =============================================================================
-# PROBABILISTIC PREDICATES
-# =============================================================================
-
-
-def normal_cdf(value, mean, var):
-    """
-    Computes P(X <= value) for X ~ N(mean, var).
-    Standard Normal CDF Phi(z) where z = (value - mean) / sigma
-    """
-    std = torch.sqrt(var + 1e-6)  # Add epsilon for stability
-    z = (value - mean) / std
-    return 0.5 * (1 + torch.erf(z / math.sqrt(2)))
-
-
-class RectangularGoalPredicate(STL_Formula):
-    """
-    Implements PDF Eq (9):
-    P_goal(t) = min( P(x >= x_min), P(x <= x_max), P(y >= y_min), P(y <= y_max) )
-    """
-
-    def __init__(self, region):
-        super().__init__()
-        self.x_min, self.x_max = region["x"]
-        self.y_min, self.y_max = region["y"]
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        # **kwargs forwarded by the STL_Formula interface (see pdstl/operators.py)
-        mu, var = extract_trajectory_stats(belief_trajectory)
-
-        mu_x, mu_y = mu[..., 0], mu[..., 1]
-        var_x, var_y = var[..., 0], var[..., 1]
-
-        # 2. Compute Probabilities for intervals (assuming independence)
-        # P(x_min <= x <= x_max) = CDF(x_max) - CDF(x_min)
-        p_x = normal_cdf(self.x_max, mu_x, var_x) - normal_cdf(self.x_min, mu_x, var_x)
-
-        # P(y_min <= y <= y_max) = CDF(y_max) - CDF(y_min)
-        p_y = normal_cdf(self.y_max, mu_y, var_y) - normal_cdf(self.y_min, mu_y, var_y)
-
-        # 3. Combine using Product (Independence)
-        # This is more accurate for a rectangular region than min()
-        p_goal = torch.clamp(p_x * p_y, min=0.0, max=1.0)
-
-        # 4. Format Output for Operators
-        # Since we calculated exact probabilities (surrogates), Lower = Upper
-        return torch.stack([p_goal, p_goal], dim=-1)
-
-
-class RectangularObstaclePredicate(STL_Formula):
-    """
-    Implements PDF Eq (10):
-    P_safe(t) = max( P(x <= x_min), P(x >= x_max), P(y <= y_min), P(y >= y_max) )
-    (Safe if Left OR Right OR Below OR Above)
-    """
-
-    def __init__(self, region):
-        super().__init__()
-        self.x_min, self.x_max = region["x"]
-        self.y_min, self.y_max = region["y"]
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        mu, var = extract_trajectory_stats(belief_trajectory)
-
-        mu_x, mu_y = mu[..., 0], mu[..., 1]
-        var_x, var_y = var[..., 0], var[..., 1]
-
-        # 2. Compute Probabilities for being OUTSIDE
-        # P(x <= x_min) (Left of Obs)
-        p_left = normal_cdf(self.x_min, mu_x, var_x)
-
-        # P(x >= x_max) (Right of Obs)
-        p_right = 1.0 - normal_cdf(self.x_max, mu_x, var_x)
-
-        # P(y <= y_min) (Below Obs)
-        p_below = normal_cdf(self.y_min, mu_y, var_y)
-
-        # P(y >= y_max) (Above Obs)
-        p_above = 1.0 - normal_cdf(self.y_max, mu_y, var_y)
-
-        # 3. Combine using Max (Union)
-        # Safe if ANY of these are true
-        stacked_probs = torch.stack([p_left, p_right, p_below, p_above], dim=0)
-        p_safe, _ = torch.max(stacked_probs, dim=0)
-
-        # 4. Format Output
-        return torch.stack([p_safe, p_safe], dim=-1)
-
-
-class CircularObstaclePredicate(STL_Formula):
-    """
-    Implements probabilistic safety for a circular obstacle.
-    P_safe(t) = P( ||x(t) - center|| > radius )
-    Approximated using projected variance along the radial vector.
-    """
-
-    def __init__(self, circle_def, device="cpu"):
-        super().__init__()
-        self.center = torch.tensor(
-            circle_def["center"], device=device, dtype=torch.float32
+def lane_road_predicate(metadata):
+    """Contain the complete axis-aligned ego footprint inside the road."""
+    road = metadata["road"]
+    ramp = metadata.get("ramp")
+    ego = metadata["ego_vehicle"]
+    half_width = ego["width"] / 2
+    half_height = ego["height"] / 2
+    if ramp is None:
+        return AxisInterval(
+            road["y_min"] + half_height,
+            road["y_max"] - half_height,
+            dim=1,
+            name="Road containment",
         )
-        self.radius = circle_def["radius"]
+    start, end = ramp["start_x"], ramp["end_x"]
+    slope = (road["lane_divider"] - road["y_min"]) / (end - start)
+    outer = AxisInterval(
+        road["y_min"] + half_height,
+        road["y_max"] - half_height,
+        dim=1,
+        name="Road outer bounds",
+    )
+    after_taper = AxisInterval(
+        road["lane_divider"] + half_height,
+        road["y_max"] - half_height,
+        dim=1,
+        name="Main lane",
+    )
+    above_taper = HalfSpace(
+        (slope, -1.0, 0.0, 0.0),
+        slope * start - road["y_min"] - half_height - slope * half_width,
+        name="Above ramp edge",
+    )
+    return outer & (after_taper | above_taper)
 
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        mu, sigma_stack = extract_trajectory_stats(
-            belief_trajectory, diagonal_only=False
+
+def lane_collision_extents(metadata, vehicle):
+    """Combined footprint half-extents plus the configured safety margins."""
+    ego = metadata["ego_vehicle"]
+    margin = metadata["safety_margin"]
+    return (
+        (ego["width"] + vehicle["width"]) / 2 + margin["longitudinal"],
+        (ego["height"] + vehicle["height"]) / 2 + margin["lateral"],
+    )
+
+
+def lane_has_collision(environment, ego_position, traffic_positions):
+    """Return true when any traffic safety envelope overlaps the ego."""
+    for vehicle, position in zip(
+        environment.metadata["traffic"], traffic_positions
+    ):
+        longitudinal, lateral = lane_collision_extents(
+            environment.metadata, vehicle
         )
-
-        # Distance vector from center
-        diff = mu - self.center
-        dist = torch.norm(diff, dim=-1)  # [Batch, Time]
-
-        # Normalized direction vector
-        dir_vec = diff / (dist.unsqueeze(-1) + 1e-6)  # [Batch, Time, Dim]
-
-        # Projected Variance along the radial direction
-        if sigma_stack.ndim == 3:  # Diagonal Covariance [Batch, Time, Dim]
-            sigma_proj = torch.sum(dir_vec**2 * sigma_stack, dim=-1)
-        else:  # Full Covariance [Batch, Time, Dim, Dim]
-            # v^T * Sigma * v
-            sigma_proj = torch.einsum("bti,btij,btj->bt", dir_vec, sigma_stack, dir_vec)
-
-        # P(safe) = P(actual_dist > radius) ~= 1 - CDF(radius | N(dist, sigma_proj))
-        p_safe = 1.0 - normal_cdf(self.radius, dist, sigma_proj)
-
-        return torch.stack([p_safe, p_safe], dim=-1)
+        if (
+            abs(float(position[0]) - float(ego_position[0])) <= longitudinal
+            and abs(float(position[1]) - float(ego_position[1])) <= lateral
+        ):
+            return True
+    return False
 
 
-class MovingRectangularObstaclePredicate(STL_Formula):
+def lane_contains_footprint(environment, x, y):
+    """Physical road containment for every corner of the ego footprint."""
+    metadata = environment.metadata
+    road = metadata["road"]
+    ego = metadata["ego_vehicle"]
+    half_width, half_height = ego["width"] / 2, ego["height"] / 2
+    if not (
+        road["y_min"] <= y - half_height and y + half_height <= road["y_max"]
+    ):
+        return False
+    ramp = metadata.get("ramp")
+    if ramp is None or y - half_height >= road["lane_divider"]:
+        return True
+    slope = (road["lane_divider"] - road["y_min"]) / (
+        ramp["end_x"] - ramp["start_x"]
+    )
+    front = min(max(x + half_width, ramp["start_x"]), ramp["end_x"])
+    lower = road["y_min"] + slope * (front - ramp["start_x"])
+    return y - half_height >= lower
+
+
+def lane_target_contains(metadata, mean):
+    task = metadata["task"]
+    return (
+        task["target_center"] - task["target_tolerance"]
+        <= float(mean[1])
+        <= task["target_center"] + task["target_tolerance"]
+    )
+
+
+def lane_dwell_credit(metadata, step, streak):
+    """Number of consecutive in-window target samples available at this step."""
+    start, _ = metadata["task"]["start_end_steps"]
+    if not streak or step < start:
+        return 0
+    return min(streak, step - start + 1)
+
+
+def lane_goal_reached(environment, mean, step, streak):
+    """The sampled counterpart of the lane completion formula."""
+    metadata = environment.metadata
+    task = metadata["task"]
+    start, end = task["start_end_steps"]
+    dwell = task["dwell_steps"]
+    if not (start + dwell <= step <= end and streak >= dwell + 1):
+        return False
+    ramp = metadata.get("ramp")
+    return ramp is None or (
+        float(mean[0]) + metadata["ego_vehicle"]["width"] / 2 <= ramp["end_x"]
+    )
+
+
+def lane_deadline_missed(environment, mean, step, streak):
+    """Return true once no valid dwell can still finish by the deadline."""
+    metadata = environment.metadata
+    task = metadata["task"]
+    start, end = task["start_end_steps"]
+    credit = lane_dwell_credit(metadata, step, streak)
+    remaining = (
+        task["dwell_steps"] - (credit - 1) if credit else task["dwell_steps"]
+    )
+    earliest_finish = (
+        step + remaining if credit else max(step, start) + remaining
+    )
+    ramp = metadata.get("ramp")
+    past_ramp = ramp is not None and (
+        float(mean[0]) + metadata["ego_vehicle"]["width"] / 2 > ramp["end_x"]
+    )
+    return earliest_finish > end or step >= end or past_ramp
+
+
+def _lane_rectangle(name, role, block):
+    (xmin, xmax), (ymin, ymax) = block["x_range"], block["y_range"]
+    return RectangleRegion(
+        name=name,
+        role=role,
+        xmin=float(xmin),
+        xmax=float(xmax),
+        ymin=float(ymin),
+        ymax=float(ymax),
+    )
+
+
+def build_lane_merge_environment(config, device="cpu"):
+    """Road, target lane, and three constant-velocity traffic beliefs."""
+    road = config["road"]
+    ramp = config.get("ramp")
+    if ramp is not None and not ramp["start_x"] < ramp["end_x"]:
+        raise ValueError("ramp needs start_x < end_x")
+    traffic = config["traffic"]
+    if len(traffic) != 3 or len({car["name"] for car in traffic}) != 3:
+        raise ValueError("lane traffic needs three uniquely named vehicles")
+    task = dict(config["task"])
+    dt = config["dt"]
+    task["dwell_steps"] = ceil(task["dwell_seconds"] / dt)
+    task["settle_steps"] = ceil(task.get("settle_seconds", 1.0) / dt)
+    task.setdefault("settle_lateral_speed", 0.3)
+    task["start_end_steps"] = (
+        ceil(task["start_window_seconds"][0] / dt),
+        floor(task["start_window_seconds"][1] / dt),
+    )
+    start, end = task["start_end_steps"]
+    if start < 0 or end < start + task["dwell_steps"] or config["H"] < end:
+        raise ValueError(
+            "lane horizon must cover the completion window and dwell time"
+        )
+    environment = LaneMergeEnvironment(
+        metadata={
+            "road": dict(road),
+            "ramp": dict(ramp) if ramp is not None else None,
+            "traffic": traffic,
+            "ego_vehicle": dict(config["ego_vehicle"]),
+            "safety_margin": dict(
+                config.get(
+                    "safety_margin",
+                    {"longitudinal": 0.5, "lateral": 0.2},
+                )
+            ),
+            "task": task,
+            "dt": dt,
+            "device": device,
+        },
+    )
+    environment.add_region(_lane_rectangle("goal", "goal", config["goal"]))
+    return environment
+
+
+def lane_local_window(environment, step, streak=0, completed=False):
+    """Give a planning window its absolute time and observed dwell progress.
+
+    `completed` switches to the post-dwell task: stay in lane and settle.
     """
-    Probabilistic safety for a moving rectangular obstacle.
-    """
-
-    def __init__(self, obs_def, device="cpu"):
-        super().__init__()
-        # Trajectories are expected to be tensors of shape [T+1]
-        self.x_traj = torch.as_tensor(
-            obs_def["x_traj"], device=device, dtype=torch.float32
-        )
-        self.y_traj = torch.as_tensor(
-            obs_def["y_traj"], device=device, dtype=torch.float32
-        )
-        self.width = obs_def["width"]
-        self.height = obs_def["height"]
-
-    def robustness_trace(self, belief_trajectory, **kwargs):
-        mu, var = extract_trajectory_stats(belief_trajectory)
-
-        mu_x, mu_y = mu[..., 0], mu[..., 1]
-        var_x, var_y = var[..., 0], var[..., 1]
-
-        # Expand obstacle bounds over time
-        x_min = self.x_traj - self.width / 2.0
-        x_max = self.x_traj + self.width / 2.0
-        y_min = self.y_traj - self.height / 2.0
-        y_max = self.y_traj + self.height / 2.0
-
-        # Compute Probabilities (Safe if Outside)
-        p_left = normal_cdf(x_min, mu_x, var_x)
-        p_right = 1.0 - normal_cdf(x_max, mu_x, var_x)
-        p_below = normal_cdf(y_min, mu_y, var_y)
-        p_above = 1.0 - normal_cdf(y_max, mu_y, var_y)
-
-        stacked_probs = torch.stack([p_left, p_right, p_below, p_above], dim=0)
-        p_safe, _ = torch.max(stacked_probs, dim=0)
-
-        return torch.stack([p_safe, p_safe], dim=-1)
+    window = LaneMergeEnvironment(
+        metadata={
+            **environment.metadata,
+            "step": step,
+            "streak": streak,
+            "completed": completed,
+        }
+    )
+    window.regions = environment.regions
+    return window

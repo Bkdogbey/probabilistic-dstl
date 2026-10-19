@@ -1,113 +1,65 @@
-import numpy as np
 import torch
-from pdstl.base import Belief
+import torch.nn as nn
 
 
-def normal_cdf(z):
-    """Cumulative distribution function for standard normal distribution"""
-    return 0.5 * (1 + torch.erf(z / torch.sqrt(torch.tensor(2.0))))
+class Dynamics(nn.Module):
+    """Linear dynamics x' = A x + B u + W, W ~ N(0, Q); subclasses set A, B, Q."""
+
+    def __init__(self, dt, u_max, device="cpu"):
+        super().__init__()
+        self.dt = dt
+        self.u_max = u_max
+        self.device = device
+
+    def bound_control(self, v):
+        """Map an unconstrained parameter to a control in [-u_max, u_max]."""
+        return self.u_max * torch.tanh(v)
+
+    def step(self, x, P, u):
+        """Predicted mean and covariance after one step."""
+        return self.A @ x + self.B @ u, self.A @ P @ self.A.t() + self.Q
+
+    def sample_step(self, x, P, u):
+        """Simulated step: sampled next state and predicted covariance."""
+        x_next, P_next = self.step(x, P, u)
+        noise = torch.distributions.MultivariateNormal(
+            torch.zeros_like(x_next), self.Q
+        ).sample()
+        return x_next + noise, P_next
+
+    def forward(self, v_sequence, x0_mean, x0_cov):
+        """Roll out v [T, m] from (x0_mean, x0_cov); returns mean [1,T+1,D], cov [1,T+1,D,D]."""
+        means, covs = [x0_mean], [x0_cov]
+        for v in v_sequence:
+            mean, cov = self.step(means[-1], covs[-1], self.bound_control(v))
+            means.append(mean)
+            covs.append(cov)
+        return torch.stack(means).unsqueeze(0), torch.stack(covs).unsqueeze(0)
 
 
-def constant_input(t):
-    """Control input function u(t)."""
-    return -0.5
+class SingleIntegrator(Dynamics):
+    """Velocity control in R^D: A = I, B = dt I, Q = q_std^2 I."""
+
+    def __init__(
+        self, dt=0.2, u_max=1.0, q_std=0.05, device="cpu", state_dim=2
+    ):
+        super().__init__(dt, u_max, device)
+        eye = torch.eye(state_dim, device=device)
+        self.register_buffer("A", eye.clone())
+        self.register_buffer("B", dt * eye)
+        self.register_buffer("Q", q_std**2 * eye)
 
 
-def sinusoidial_input(t):
-    """A sinusoidal control input function u(t)."""
-    return 15 * np.sin(1 * np.pi * t)
+class DoubleIntegrator(Dynamics):
+    """Acceleration control. State [px, py, vx, vy], control [ax, ay]."""
 
-
-def noisy_stock_input(t):
-    """A noisy stock price-like input function u(t)."""
-    np.random.seed(int(t * 100) % 10000)
-    drift = 0.01 * t
-    noise = 50.0 * np.random.randn()
-    jitter = 0.2 * np.random.randn()
-    return drift + noise + jitter
-
-
-def piecewise_input(t):
-    """
-    Piecewise constant input for STL verification.
-    """
-    if t < 2:
-        return 0.0
-    elif t < 4:
-        return 20.0
-    elif t < 6:
-        return -25.0
-    elif t < 8:
-        return 30.0
-    else:
-        return -5.0
-
-
-def linear_system(a, b, g, q, mu, P, t, control_func=constant_input):
-    """Propagate the belief state (mu, P) through one time step."""
-    mean_trace = np.zeros(len(t))
-    var_trace = np.zeros(len(t))
-
-    mean_trace[0] = mu
-    var_trace[0] = P
-    Q = g**2 + q  # combined process noise covariance
-    for i in range(1, len(t)):
-        dt = t[i] - t[i - 1]
-        u = control_func(t[i - 1])  # control input at time t[i-1]
-
-        Phi = np.exp(a * dt)
-        int_u = dt * b * u  # integral of b*u from t[i-1] to t[i]
-        mean_trace[i] = Phi * mean_trace[i - 1] + int_u
-
-        # Variance update
-        var_trace[i] = (Phi**2) * var_trace[i - 1] + Q * dt
-    return mean_trace, var_trace
-
-
-def piecewise_signal(n_steps=7):
-    """
-    Discrete piecewise constant signal for STL verification.
-    """
-    t = np.arange(n_steps, dtype=float)
-
-    default_values = [
-        (45, 4),
-        (55, 4),
-        (60, 4),
-        (48, 4),
-        (42, 9),
-        (58, 4),
-        (52, 4),
-    ]
-
-    mean_trace = np.array([s[0] for s in default_values], dtype=float)
-    var_trace = np.array([s[1] for s in default_values], dtype=float)
-
-    return t, mean_trace, var_trace
-
-
-class GaussianBelief(Belief):
-    def __init__(self, mean, var, confidence_level=2.0):
-        self.mean = mean
-        self.var = var
-        self.confidence_level = confidence_level
-
-    def value(self):
-        """Return mean (representative state)"""
-        return self.mean
-
-    def lower_bound(self):
-        """Conservative lower bound: μ - k*σ"""
-        std = torch.sqrt(self.var)
-        return self.mean - self.confidence_level * std
-
-    def upper_bound(self):
-        """Conservative upper bound: μ + k*σ"""
-        std = torch.sqrt(self.var)
-        return self.mean + self.confidence_level * std
-
-    def probability_of(self, residual):
-        """Probability that residual >= 0"""
-        std = torch.sqrt(self.var)
-        z = residual / (std)
-        return normal_cdf(z)
+    def __init__(self, dt=0.2, u_max=1.0, q_std=0.02, device="cpu"):
+        super().__init__(dt, u_max, device)
+        A = torch.eye(4, device=device)
+        A[0, 2] = A[1, 3] = dt
+        B = torch.zeros(4, 2, device=device)
+        B[0, 0] = B[1, 1] = 0.5 * dt**2
+        B[2, 0] = B[3, 1] = dt
+        self.register_buffer("A", A)
+        self.register_buffer("B", B)
+        self.register_buffer("Q", q_std**2 * torch.eye(4, device=device))

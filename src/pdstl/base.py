@@ -1,36 +1,29 @@
+"""Belief contract and trajectory containers: Belief.probability_bounds(event) -> [B, 2]."""
+
 from abc import ABC, abstractmethod
+
+import torch
+
+_ATOL = 1e-6  # round-off allowed outside [0, 1]
 
 
 class Belief(ABC):
-    """
-    Abstract base class for any belief representation.
-    Users must implement:
-        - value() -> representative range of state (tensor)
-        - prob_from_residual(residual) -> probability (tensor)
-    """
+    """Abstract event-probability contract for any uncertainty model."""
 
     @abstractmethod
+    def probability_bounds(self, predicate):
+        """[B, 2] lower/upper probability of the event; ValueError if unsupported."""
+
     def value(self):
-        """
-        Return a representative range of state x(t)
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def probability_of(self, residual):
-        """
-        Return P(residual >= 0)
-        """
-        raise NotImplementedError
+        """Representative state [B, D]."""
+        raise NotImplementedError(f"{type(self).__name__} has no value()")
 
 
 class BeliefTrajectory:
-    """
-    Offline belief trajectory with list of beliefs
-    """
+    """Ordered per-step beliefs from any concrete ``Belief`` subclass."""
 
     def __init__(self, beliefs):
-        self.beliefs = beliefs
+        self.beliefs = list(beliefs)
 
     def __getitem__(self, t):
         return self.beliefs[t]
@@ -38,33 +31,29 @@ class BeliefTrajectory:
     def __len__(self):
         return len(self.beliefs)
 
-    def suffix(self, t):
-        return BeliefTrajectory(self.beliefs[t:])
-
-
-class OnlineBeliefTrajectory:
-    """
-    Online/streaming belief trajectory
-    Allows incremental updates as new beliefs arrive
-    """
-
-    def __init__(self):
-        self.beliefs = []
-
-    def append(self, belief):
-        self.beliefs.append(belief)
-
-    def __getitem__(self, t):
-        return self.beliefs[t]
+    def __iter__(self):
+        return iter(self.beliefs)
 
     def suffix(self, t):
-        return OnlineBeliefTrajectory.from_list(self.beliefs[t:])
+        return type(self)(self.beliefs[t:])
 
-    @classmethod
-    def from_list(cls, lst):
-        obj = cls()
-        obj.beliefs = lst
-        return obj
 
-    def __len__(self):
-        return len(self.beliefs)
+def check_probability_bounds(trace, predicate=None):
+    """Raise (never clamp) on non-finite, unordered, or out-of-[0, 1] bounds."""
+    who = "predicate"
+    if predicate is not None:
+        who = getattr(predicate, "name", None) or type(predicate).__name__
+
+    lower, upper = trace[..., 0], trace[..., 1]
+    bad = (
+        ~torch.isfinite(trace).all(dim=-1)
+        | (lower > upper + _ATOL)
+        | (trace < -_ATOL).any(dim=-1)
+        | (trace > 1.0 + _ATOL).any(dim=-1)
+    )  # [B, T]
+
+    if bool(bad.any()):
+        t = int(bad.any(dim=0).nonzero()[0])
+        raise ValueError(
+            f"{who}: malformed probability bounds at step {t}: {trace[:, t].tolist()}"
+        )

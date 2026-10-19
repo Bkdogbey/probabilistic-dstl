@@ -1,318 +1,121 @@
-import os
+"""Glue shared by every experiment: set up, solve, validate, and save."""
 
-import numpy as np
+from pathlib import Path
+from types import SimpleNamespace
+
 import torch
+from scipy.stats import beta
 
-from planning import log_utils
-from planning.dynamics import DoubleIntegrator, SingleIntegrator
-from planning.environment import Environment
-from planning.planner import Planner
-from utils import get_device, load_config
-from visualization.animation import animate_results
-from visualization.live_plots import (
-    make_lane_change_live_callback,
-    make_mpc_live_callback,
+from models.dynamics import DoubleIntegrator, SingleIntegrator
+from models.rollouts import (
+    create_gaussian_belief_trajectory,
+    gaussian_rollout,
+    sample_trajectories,
 )
-from visualization.planning import visualize_lane_change, visualize_results
+from planning.planner import Planner
+from utils import get_device
 
-RESULTS_DIR = "saved_data"
-if not os.path.exists(RESULTS_DIR):
-    os.makedirs(RESULTS_DIR)
-
-
-def load_scenario_config(cfg_path):
-    cfg = load_config(cfg_path)
-    planner_cfg = {**load_config("configs/planning.yaml"), **cfg.get("planner", {})}
-    return cfg, planner_cfg
-
-
-def build_environment(cfg, device):
-    env = Environment(device=device)
-    if "road" in cfg and "obstacle" in cfg:
-        env.configure_lane_change(
-            road=cfg["road"],
-            obstacle=cfg["obstacle"],
-            goal=cfg["goal"],
-            success=cfg["success"],
-            horizon=cfg["H"],
-            total_steps=cfg["T_SIM"],
-            dt=cfg["dt"],
-            label=cfg.get("label", ""),
-            plot_xlim=cfg.get("plot_xlim"),
-            robot_dims=cfg.get("robot_dims"),
-        )
-        return env
-
-    if "goal" in cfg:
-        env.set_goal(**cfg["goal"])
-    if "bounds" in cfg:
-        env.set_bounds(**cfg["bounds"])
-    for vr in cfg.get("visit_regions", []):
-        env.add_visit_region(**vr)
-    for obs in cfg.get("obstacles", []):
-        if obs["type"] == "circle":
-            env.add_circle_obstacle(center=obs["center"], radius=obs["radius"])
-        else:
-            env.add_obstacle(x_range=obs["x_range"], y_range=obs["y_range"])
-    return env
-
-
-def build_initial_belief(cfg, device):
-    x0_mean = torch.tensor(cfg["x0_mean"], device=device)
-    x0_cov = torch.eye(len(cfg["x0_mean"]), device=device) * cfg["x0_cov_scale"]
-    return x0_mean, x0_cov
+RESULTS_DIR = Path(__file__).resolve().parents[2] / "outputs"
 
 
 def build_dynamics(cfg, device):
-    kind = cfg.get("dynamics", "single_integrator")
-    if kind == "double_integrator":
-        return DoubleIntegrator(
-            dt=cfg["dt"],
-            u_max=cfg["u_max"],
-            q_std=cfg["q_std"],
-            device=device,
-        )
-    return SingleIntegrator(
-        dt=cfg["dt"], u_max=cfg["u_max"], q_std=cfg["q_std"], device=device
+    common = {key: cfg[key] for key in ("dt", "u_max", "q_std")}
+    if cfg.get("dynamics", "single_integrator") == "double_integrator":
+        return DoubleIntegrator(**common, device=device)
+    return SingleIntegrator(**common, device=device)
+
+
+def build_initial_belief(cfg, device):
+    """Gaussian x0: `x0_cov_scale` is one variance or one per state."""
+    mean = torch.tensor(cfg["x0_mean"], device=device, dtype=torch.float32)
+    variance = torch.as_tensor(
+        cfg["x0_cov_scale"], device=device, dtype=torch.float32
+    )
+    return mean, torch.diag(variance.expand(len(mean)))
+
+
+def setup_problem(cfg, *, device=None):
+    """Dynamics, initial belief, planner, and Gaussian rollout of a config."""
+    device = get_device() if device is None else device
+    dyn = build_dynamics(cfg, device)
+    state = build_initial_belief(cfg, device)
+    return SimpleNamespace(
+        cfg=cfg,
+        dyn=dyn,
+        state=state,
+        planner=Planner(dyn, cfg["H"], cfg.get("planner", {})),
+        rollout=gaussian_rollout(dyn, *state),
+        init_guess=None,
     )
 
 
-def check_collision(mean_trace, env, r_robot=1.0, moving_obs_dist=2.25):
-    traj = mean_trace.squeeze()  # [T, 2]
-    if traj.ndim == 1:
-        traj = traj.unsqueeze(0)
-    T = traj.shape[0]
+def solve(s, *, label, verbose=False, on_iteration=None, callback_every=1):
+    """Optimize one open-loop plan and print its lower robustness.
 
-    is_safe = True
-    min_sep = float("inf")
+    Args:
+        s: Problem from setup_problem, with `spec` and `init_guess` set.
+        label: Name printed with the result.
+        verbose: Log optimizer progress.
+        on_iteration, callback_every: Optional observer of sampled iterates.
 
-    for t in range(T):
-        ego_pos = traj[t].cpu().numpy()
-
-        for obs in env.obstacles:
-            x_min, x_max = obs["x"]
-            y_min, y_max = obs["y"]
-            if (x_min - r_robot <= ego_pos[0] <= x_max + r_robot) and (
-                y_min - r_robot <= ego_pos[1] <= y_max + r_robot
-            ):
-                log_utils.log_collision_event(t, "Static obstacle", f"ego={ego_pos}")
-                is_safe = False
-
-        for obs in env.moving_obstacles:
-            xt, yt = obs["x_traj"], obs["y_traj"]
-            if t < len(xt):
-                ox = xt[t].item() if isinstance(xt, torch.Tensor) else xt[t]
-                oy = yt[t].item() if isinstance(yt, torch.Tensor) else yt[t]
-                dist = np.linalg.norm(ego_pos[:2] - np.array([ox, oy]))
-                min_sep = min(min_sep, dist)
-                if dist < moving_obs_dist:
-                    log_utils.log_collision_event(
-                        t, "Moving obstacle", f"dist={dist:.2f}"
-                    )
-                    is_safe = False
-
-    log_utils.log_safety(is_safe, min_sep)
-
-
-def _scenario_result_path(cfg, load_from):
-    if load_from is not None:
-        return load_from
-    if "save_file" not in cfg:
-        return None
-    return os.path.join(RESULTS_DIR, cfg["save_file"])
-
-
-def _normalise_result(data):
-    result = dict(data)
-    if "loss_trace" not in result and "history" in result:
-        result["loss_trace"] = result["history"]
-    if "history" not in result and "loss_trace" in result:
-        result["history"] = result["loss_trace"]
-    result.setdefault("p_sat_trace", [result.get("best_p", 0.0)])
-    result.setdefault("all_plans", [])
-    result.setdefault(
-        "best_p", max(result["p_sat_trace"]) if result["p_sat_trace"] else 0.0
+    Returns:
+        The PlanResult with the highest exact lower robustness.
+    """
+    result = s.planner.optimize_window(
+        s.rollout,
+        spec=s.spec,
+        init_guess=s.init_guess,
+        verbose=verbose,
+        on_iteration=on_iteration,
+        callback_every=callback_every,
     )
-    result.setdefault("mode", "loaded")
-    result.setdefault("stopped_reason", None)
+    print(
+        f"{label}: rho_lower {result.initial_hard_lower:.3f} -> "
+        f"{result.hard_interval[0]:.3f} (smooth "
+        f"{result.initial_smooth_lower:.3f} -> {result.smooth_lower:.3f}); "
+        f"{result.alpha_status()}",
+        flush=True,
+    )
     return result
 
 
-def _load_or_solve(
-    cfg,
-    planner_cfg,
-    env,
-    *,
-    horizon,
-    load_from=None,
-    force_run=False,
-    make_callback=None,
-):
-    result_path = _scenario_result_path(cfg, load_from)
-    if not force_run and result_path and os.path.exists(result_path):
-        log_utils.log_load(result_path)
-        return _normalise_result(
-            torch.load(result_path, map_location=env.device, weights_only=False)
-        )
+def monte_carlo(s, result, samples=5000, seed=0):
+    """Fraction of sampled trajectories that satisfy the spec.
 
-    step_callback = make_callback(env) if make_callback is not None else None
-    dynamics = build_dynamics(cfg, env.device)
-    planner = Planner(dynamics, env, horizon, config=planner_cfg)
-    x0_mean, x0_cov = build_initial_belief(cfg, env.device)
-    result = planner.solve(x0_mean, x0_cov, step_callback=step_callback)
+    Samples the stochastic dynamics under the plan's controls and scores each
+    trajectory with the same pdSTL spec: with zero variance every atom is
+    0 or 1, so the Fréchet operators reduce to Boolean logic.
 
-    if result_path:
-        torch.save(result, result_path)
-        log_utils.log_save(result_path)
-    return result
+    Args:
+        s: Problem with `spec`.
+        result: PlanResult whose controls are executed open loop.
+        samples, seed: Number of trajectories and random seed.
 
-
-def _clip_env_to_result(env, result):
-    if env.moving_obstacles and "mean_trace" in result:
-        env.clip_moving_obstacles(result["mean_trace"].shape[1])
-
-
-def run_single_shot(max_iterations=1000, load_from=None, force_run=False):
-    device = get_device()
-    log_utils.log_device(device)
-
-    cfg, planner_cfg = load_scenario_config("configs/scenarios/single_shot.yaml")
-
-    T = cfg["T"]
-
-    env = build_environment(cfg, device)
-    planner_cfg["max_iters"] = max_iterations
-
-    log_utils._log.info("Starting single-shot optimisation...")
-    result = _load_or_solve(
-        cfg, planner_cfg, env, horizon=T, load_from=load_from, force_run=force_run
+    Returns:
+        (rate, lower, upper): the rate and its 95% Clopper-Pearson interval.
+    """
+    generator = torch.Generator(device=s.dyn.device).manual_seed(seed)
+    paths = sample_trajectories(
+        s.dyn, *s.state, result.controls, samples, generator
     )
-    log_utils._log.info(f"Done. Final P(Sat): {result['best_p']:.4f}")
-
-    visualize_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        result["u_trace"],
-        env,
-        result["loss_trace"],
+    beliefs = create_gaussian_belief_trajectory(paths, torch.zeros_like(paths))
+    hits = int(s.spec(beliefs)[:, 0, 0].sum())
+    lower = beta.ppf(0.025, hits, samples - hits + 1) if hits else 0.0
+    upper = (
+        beta.ppf(0.975, hits + 1, samples - hits) if hits < samples else 1.0
     )
-
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        env,
-        filename=anim["filename"],
-        step=anim["step"],
-        title=anim["title"],
-        bounds=anim["bounds"],
-    )
+    return hits / samples, float(lower), float(upper)
 
 
-def run_mpc(load_from=None, force_run=False):
-    device = get_device()
-    log_utils.log_device(device)
-
-    cfg, planner_cfg = load_scenario_config("configs/scenarios/mpc.yaml")
-
-    H = cfg["H"]
-    planner_cfg = {**planner_cfg, "MAX_STEPS": cfg["MAX_STEPS"]}
-
-    env = build_environment(cfg, device)
-
-    log_utils._log.info(f"Starting MPC execution (horizon={H})...")
-    result = _load_or_solve(
-        cfg,
-        planner_cfg,
-        env,
-        horizon=H,
-        load_from=load_from,
-        force_run=force_run,
-        make_callback=make_mpc_live_callback,
-    )
-
-    visualize_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        result["u_trace"],
-        env,
-        history=result["loss_trace"],
-        p_sat_trace=result["p_sat_trace"],
-    )
-
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        env,
-        filename=anim["filename"],
-        plan_traces=result["all_plans"],
-        step=anim["step"],
-        title=anim["title"],
-        bounds=anim.get("bounds"),
-    )
+def output_path(stem, suffix):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    return RESULTS_DIR / f"{stem}{suffix}"
 
 
-def _run_lane_change_scenario(cfg_path):
-    device = get_device()
-    log_utils.log_device(device)
-
-    cfg, planner_cfg = load_scenario_config(cfg_path)
-    label = cfg.get("label", "")
-
-    H = cfg["H"]
-    dt = cfg["dt"]
-
-    log_utils.log_scenario_start(label)
-
-    env = build_environment(cfg, device)
-    planner_cfg = {**planner_cfg, "T_SIM": cfg["T_SIM"], "mpc_mode": "lane_change"}
-    result = _load_or_solve(
-        cfg,
-        planner_cfg,
-        env,
-        horizon=H,
-        load_from=None,
-        force_run=True,
-        make_callback=make_lane_change_live_callback,
-    )
-    _clip_env_to_result(env, result)
-
-    check_collision(
-        result["mean_trace"],
-        env,
-        r_robot=planner_cfg["r_robot"],
-        moving_obs_dist=planner_cfg["moving_obs_dist"],
-    )
-
-    visualize_lane_change(
-        result["mean_trace"],
-        result["cov_trace"],
-        result["u_trace"],
-        env,
-        p_sat_trace=result["p_sat_trace"],
-        dt=dt,
-        robot_dims=env.robot_dims,
-        xlim=env.plot_xlim,
-    )
-
-    anim = cfg["animation"]
-    animate_results(
-        result["mean_trace"],
-        result["cov_trace"],
-        env,
-        filename=anim["filename"],
-        plan_traces=result["all_plans"],
-        step=anim["step"],
-        robot_dims=env.robot_dims,
-        title=anim["title"],
-        bounds=anim.get("bounds"),
-    )
+def save_result(result, stem, save):
+    if save:
+        torch.save(result, output_path(stem, ".pt"))
 
 
-def run_lane_change():
-    _run_lane_change_scenario("configs/scenarios/lane_change.yaml")
-
-
-def run_lane_change_aggressive():
-    _run_lane_change_scenario("configs/scenarios/lane_change_aggressive.yaml")
+def control_unit(dyn):
+    return "m/s²" if isinstance(dyn, DoubleIntegrator) else "m/s"

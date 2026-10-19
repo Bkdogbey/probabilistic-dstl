@@ -113,5 +113,7 @@ ENV/
 
 # Data folder
 data/*
-report/*
 
+# Generated figures, animations and results from src/main.py
+outputs/
+report/*
