@@ -32,7 +32,8 @@ def test_dry_flight_uploads_before_arming_flies_once_and_lands_in_place(
     assert meta["outcome"] == "completed" and meta["landing"] == "landed"
     calls = drone.calls
     assert (
-        calls.index("write_data_sync")
+        calls.index("param stabilizer.controller=2")
+        < calls.index("write_data_sync")
         < calls.index("define_trajectory")
         < calls.index("arm")
     )

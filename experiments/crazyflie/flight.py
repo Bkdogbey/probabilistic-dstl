@@ -310,6 +310,8 @@ def fly(drone, feed, plan, cfg, log, stop, status):
     start = np.array([*plan["start"], cfg.altitude])
 
     log.set_phase("upload")
+    # Mellinger uses the curve's velocity and acceleration as feedforward.
+    drone.cf.param.set_value("stabilizer.controller", str(f.controller))
     upload(drone, plan, log)
 
     log.set_phase("takeoff")

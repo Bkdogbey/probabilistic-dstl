@@ -62,6 +62,7 @@ class Flight:
     geofence_margin: float = 0.10
     position_spread: float = 0.05
     position_timeout: float = 15.0
+    controller: int = 2  # onboard controller: 1 = PID, 2 = Mellinger
 
 
 # Routine defaults live here; config.yml contains arena measurements and the

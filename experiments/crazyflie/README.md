@@ -20,8 +20,10 @@ some step.
 
 1. **Positioning.** The Kalman filter is reset and the position estimate
    must settle. The drone can sit anywhere in the workspace.
-2. **Upload, on the ground.** The pieces are written to trajectory memory
-   and defined, before arming. If the upload fails, nothing takes off.
+2. **Upload, on the ground.** The onboard controller is set
+   (`flight.controller`: 2 = Mellinger, the default, which uses the curve's
+   velocity and acceleration; 1 = PID). The pieces are written to trajectory
+   memory and defined, before arming. If the upload fails, nothing takes off.
 3. **Takeoff** where it sits, a straight move to the start, then the
    **start gate** (averaged position, speed and height).
 4. **The onboard controller flies the curve.** The host only monitors it:
