@@ -1,127 +1,213 @@
 # Crazyflie experiment
 
-The deterministic condition replays the supplied `plans/reference.json`:
-90 world-frame velocity pairs, held for 0.2 seconds each and refreshed at
-20 Hz. The mission lasts 18 seconds. Fitting, planning and analysis run offline.
+The drone flies a minimum-snap curve that is uploaded to it. pdSTL (or the
+mean-model baseline) chooses the curve's **waypoints**. A degree-7
+minimum-snap polynomial with fixed segment times goes through them. The
+pieces are uploaded to the drone, and the onboard controller flies them
+(`start_trajectory`). The reference, `plans/reference.json`, has
+10 waypoints, 9 pieces of 2.0 s, and lasts 18 s.
 
-During the mission, horizontal velocity commands are rotated using measured yaw
-and sent through cflib. The onboard controller tracks velocity and height;
-there is no horizontal position-error correction toward the reference path.
+## How a flight works
 
-## Files
+1. **Positioning.** The Kalman filter is reset, and the drone must be within
+   15 cm of the start.
+2. **Upload, on the ground.** The pieces are written to trajectory memory
+   and defined, before arming. If the upload fails, nothing takes off.
+3. **Takeoff**, then a move to the start and the **start gate** (averaged
+   position, speed and height).
+4. **The onboard controller flies the curve.** The host only monitors it:
+   state freshness, the radio link, the geofence and a trailing 0.25 s
+   altitude mean.
+5. **Land in place.** Ctrl-C during the flight also lands.
 
-| File | Purpose |
-| --- | --- |
-| `run.py` | Command-line entry point: import, fly, fit, plan and analyze |
-| `flight.py` | One ROS Sugar mission using irobot and cflib; preflight, replay and landing |
-| `logger.py` | Trial records, onboard timestamps and time alignment |
-| `trajectory.py` | Read, validate and save frozen velocity commands |
-| `config.py`, `config.example.yml` | Defaults and the setup template; local measurements go in `config.yml` |
-| `tracking_model.py` | Fit response lag, gain, drift and covariance; validate on held-out flights |
-| `planner.py` | Offline mean-model and pdSTL planning |
-| `geometry.py` | Workspace, obstacles, goal and airframe-clearance checks |
-| `analysis.py` | Outcome summaries, plan previews and selected flight plots |
-| `simulator.py`, `tests/` | Hardware-free replay and regression checks |
+The host time of the `start_trajectory` call is not the firmware's start
+time. The drone also logs the setpoint it is tracking (`ctrltarget`), and
+the analysis fits the playback start `t_play` by matching that setpoint to
+the curve.
 
-## Run a flight
+## The model, in plain words
 
-Place the drone within 15 cm of the saved start and leave space to land at the
-endpoint. The flight takes off, reaches the start, settles, replays the saved
-commands and lands in place.
+drone position = curve + bias + a random error.
 
-```bash
-conda activate ros_env
-source ~/sugar_ws/install/setup.bash
-cd ~/Research/probabilistic-dstl/experiments/crazyflie
+Under the model, the spread of that error settles to a fixed (stationary)
+value instead of growing without limit. Per fan setting, on the 0.2 s grid:
 
-python run.py fly --fan 0
+```text
+e[k+1] = R e[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),   w ~ N(0, Q)
 ```
 
-Set the physical fan before running `fly`: **0** is off; **6, 12 and 18** are the
-active settings. `--fan` labels the record and selects the model condition; it
-does not operate the fan. Connecting does not arm the drone; arming follows
-preflight. Ctrl-C during flight requests landing and cleanup. After landing,
-press Ctrl-C to exit the idle ROS Sugar component.
+This is what the model **assumes**. The held-out and transfer checks show
+whether real flights behave this way. `Q` is an *effective* covariance: it
+also absorbs state-estimation error and model mismatch, so it is not pure
+fan noise. The model also assumes that, at a given fan setting, the error
+statistics are the same for every path, so a plan only moves the curve.
+The residual diagnostics test this.
 
-Inspect a recorded flight or rehearse without hardware:
+The simulator generates data from this same model. Simulated flights
+therefore test plumbing and parameter recovery only, never whether the
+model suits the hardware.
 
-```bash
-python run.py analyze --trial latest
-python run.py fly --fan 0 --dry-run
-```
+## Pipeline
 
-The configured reference is already registered. Use `--plan PATH` to select
-another saved plan. Use `import PATH` only to register a new supplied trajectory
-after its offline geometry and command-limit checks. The supplied reference
-is never optimized or replaced during flight.
+Run these from this directory. Copy `config.example.yml` to `config.yml`
+for a new checkout.
 
-## Experiment pipeline
-
-1. Enter measured geometry and airframe radius in `config.yml`, then set
-   `measured: true`. For a new checkout, copy `config.example.yml` to `config.yml`.
-2. Collect identification flights at fan settings 0, 6, 12 and 18, keeping the
-   reference, obstacle layout and fan placement fixed:
+1. **Measure the geometry.** Enter the obstacles and the airframe radius in
+   `config.yml`, then set `measured: true`.
+2. **First hardware step:** one slow fan-off pilot flight.
 
    ```bash
-   python run.py fly --purpose identification --fan 0
+   python run.py fly --fan 0 --purpose pilot
+   python run.py analyze --trial latest
    ```
 
-3. Fit the response and uncertainty model:
+   Before any identification flights, check the alignment (the offset of
+   `t_play` and whether it was identifiable), the `ctrltarget`-vs-`r(t)`
+   residual (well under 1 cm), and the time-aligned and cross-track errors.
+3. **Identification flights** of the reference at fan settings 0, 6, 12
+   and 18. It is also worth recording a second, slower variant of the
+   reference, so the model is not fitted to one path. Make one with
+   `import`, see below.
+
+   ```bash
+   python run.py fly --purpose identification --fan 6
+   ```
+
+4. **Fit.**
 
    ```bash
    python run.py fit
    ```
 
-   The JSON report in `reports/` contains prediction errors, coverage and
-   residual checks. Every third eligible flight is held out. Set `model_report`
-   in `config.yml` to the fitted report before planning.
-4. Generate and inspect the model-based plans offline for each fan:
+   Every third flight per fan is held out. In the report (`reports/`),
+   check:
+   - coverage near 39 / 86 / 95 %;
+   - `flights_by_step`: flights that aborted early drop out of later
+     steps;
+   - the signed-velocity, acceleration and fan-position diagnostics;
+   - the stationary spread per fan;
+   - the transfer results, when a second path was flown.
+
+   Set `model_report` in `config.yml` to the report.
+5. **Plan** both conditions per fan:
 
    ```bash
-   python run.py plan --condition mean_model --fan 0 --output plans/mean_fan0.json
-   python run.py plan --condition pdstl --fan 0 --output plans/pdstl_fan0.json
+   python run.py plan --condition mean_model --fan 6 --output plans/mean_fan6.json
+   python run.py plan --condition pdstl --fan 6 --output plans/pdstl_fan6.json
    ```
 
-5. Freeze the reference, fitted model and model-based plans, then collect
-   evaluation flights with a fixed run count and balanced condition order:
+   Report how much the plans differ: waypoint distance, min clearance and
+   exact scores. This is a **diagnostic, not a gate**. Similar plans can
+   mean the uncertainty is too small to change the decision, the task is
+   easy, or the bound or the optimizer is uninformative. Investigate which
+   one it is, and report it.
+6. **Evaluation flights**, in a balanced order with a fixed count:
 
    ```bash
-   python run.py fly --purpose evaluation --fan 0
-   python run.py fly --plan plans/mean_fan0.json --purpose evaluation --fan 0
-   python run.py fly --plan plans/pdstl_fan0.json --purpose evaluation --fan 0
-   python run.py analyze
+   python run.py fly --purpose evaluation --fan 6
+   python run.py fly --plan plans/mean_fan6.json --purpose evaluation --fan 6
+   python run.py fly --plan plans/pdstl_fan6.json --purpose evaluation --fan 6
    ```
 
-The default purpose is `pilot`. Pilots, dry runs and unmeasured trials are
-excluded from fitting. Evaluation data is not used to refit the model.
-Use `--note` to record unusual events.
+7. **Analyze.** `python run.py analyze` writes the summary tables to
+   `results/`. Success rates (with Clopper–Pearson intervals) are kept
+   apart from the model scores. Held-out coverage per condition tests
+   whether the model transfers to the optimized paths.
 
-## Records and outputs
+**Flight counts.** Two fit flights per fan is the software minimum, not
+enough calibration. Plan for at least `model.min_flights_warning` (8) per
+fan before trusting a fit.
 
-Each attempt saves `state.csv`, `commands.csv` and `metadata.json` in `logs/`.
-Mission scoring ends before landing; historical return legs are also excluded.
-A command timestamp records acceptance by cflib, not aircraft acknowledgement.
-Landing status records completion of landing commands, without touchdown detection.
+Set the physical fan before running `fly`: **0** is off; **6, 12 and 18**
+are the active settings. `--fan` labels the record; it does not operate the
+fan. Pilots, dry runs and unmeasured trials are never fitted. Evaluation
+data never refits the model.
 
-The flight checks state freshness, link, workspace, altitude and command timing.
-Each new trajectory step has a 50 ms lateness limit. Repeated refreshes may
-recover within one trajectory interval, without shifting the schedule or
-extending the mission. Altitude checks use a trailing 0.25-second mean.
+## Which flights the fit uses
 
-Plots are limited to plan previews and a selected flight's XY path and height.
-Batch analysis writes summary tables in `results/`; fitting writes numerical
-validation results in its JSON report. Empirical task-success rates and their
-95% intervals are reported separately from model-based planning scores.
-Recorded data and generated outputs stay local and are ignored by Git.
+Identification flights that completed are used, and so are flights that
+aborted on a `TaskViolation` (up to the abort): dropping large deviations
+would understate the noise. Data faults, errors and interruptions are
+excluded.
+
+## Planning
+
+The planner moves the waypoints `w_1..w_M`. The start `w_0` and the segment
+durations are fixed (the reference's), and the reference waypoints are the
+initial guess. Both conditions use the same Adam loop, iteration count,
+learning-rate sweep and penalties. Only the task score differs:
+
+| Condition | Smooth score (optimized) | Exact score (stored) | Threshold |
+| --- | --- | --- | --- |
+| `pdstl` | `spec.smooth_lower`, core geometric beta schedule | pdSTL lower bound | `planner.alpha` |
+| `mean_model` | smooth STL robustness of the predicted mean | hard robustness | `mean_model.min_robustness` |
+
+A probability and a robustness are on different scales, so the weights
+are set as follows and recorded in each plan's `objective`:
+
+- `w_lim` (speed and acceleration norm limits) is zero inside the limits,
+  so it only acts on infeasible iterates.
+- `w_snap` is set per condition, so that at the reference the snap term's
+  gradient is `snap_fraction` (1%) of the task score's gradient.
+- The learning rate is picked per condition from `lr_grid`, with
+  `sweep_iters` iterations for each value. Both conditions get the same
+  sweep budget.
+
+Each iterate, and the reference itself, is rounded to the uploaded float32
+rows, checked densely and scored exactly on those rows. The best feasible
+candidate is kept. Ties go to the higher smooth score, then the lower
+penalty, then the earlier iterate. A plan stores three separate results:
+
+- `feasible` and its `problems`;
+- `exact_score`;
+- `threshold_met`.
+
+`fly` refuses infeasible plans. A feasible plan that misses its threshold
+flies only with `--allow-below-threshold`.
+
+**Scope.** The pdSTL score is evaluated on the 0.2 s grid. Between grid
+points, only the dense geometric check covers the path. That check samples
+at 100 Hz plus every piece boundary, so it is not a proof of clearance
+between samples.
+
+## Other commands
+
+```bash
+python run.py fly --fan 0 --dry-run                     # simulated drone
+python run.py import waypoints.csv --segment 2.0 --output plans/slow.json
+python run.py export plans/reference.json --csv /tmp/reference.csv
+```
+
+`import` reads `x,y` rows; the first row is the start. It takes one
+`--segment` duration or one value per segment with `--durations`, and it
+never replaces an existing file. `export` writes the
+[uav_trajectories](https://github.com/whoenig/uav_trajectories) CSV format.
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `run.py` | Command line: import, export, fly, fit, plan and analyze |
+| `minsnap.py` | Min-snap solve, evaluation, float32 rows and CSV |
+| `trajectory.py` | Plan records: build, check, read, load and import |
+| `flight.py` | Upload, takeoff, start gate, mission monitor, landing |
+| `logger.py` | Trial records, onboard timestamps and playback alignment |
+| `tracking_model.py` | Error model: fit, diagnostics and held-out validation |
+| `planner.py` | Offline waypoint planning for both conditions |
+| `geometry.py` | Workspace, obstacles, goal and sampled feasibility checks |
+| `analysis.py` | Outcome summaries, plan previews and flight checks |
+| `simulator.py`, `tests/` | Hardware-free drone and regression checks |
+
+Each attempt saves `state.csv`, `target.csv` and `metadata.json` in
+`logs/`. The metadata also holds the uploaded rows and the alignment
+results. Mission scoring ends before landing.
 
 ## Installation and checks
 
-One-time installation, if needed, from this directory:
-`pip install -e "../..[crazyflie]"` and
-`pip install -e ~/Research/irobot --no-deps`. ROS Sugar must also be available
-in the sourced ROS environment.
-
-From the repository root:
+One-time installation, from this directory: `pip install -e "../..[crazyflie]"`
+and `pip install -e ~/Research/irobot --no-deps`. ROS Sugar must also be
+available in the sourced ROS environment. Tests need neither cflib nor
+hardware. From the repository root:
 
 ```bash
 python -m pytest experiments/crazyflie/tests -q
