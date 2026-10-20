@@ -69,8 +69,6 @@ class Flight:
 DEFAULTS = {
     "log_hz": 20,
     "clearance_margin": 0.01,
-    "fan_position": None,
-    "fan_direction": None,
     "model": {
         "holdout_every": 3, "bootstrap": 1000, "seed": 0,
         "min_flights_warning": 8,
@@ -114,8 +112,6 @@ class Config:
     v_max: float
     a_max: float
     clearance_margin: float
-    fan_position: list | None
-    fan_direction: list | None
     flight: Flight
     model: dict
     planner: dict

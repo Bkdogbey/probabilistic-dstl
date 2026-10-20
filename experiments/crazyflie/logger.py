@@ -81,8 +81,6 @@ class TrialLog:
                 "model_id": plan["model_id"],
                 "model_hash": plan.get("model_hash"),
                 "fan": fan_setting(fan),
-                "fan_position": cfg.fan_position,
-                "fan_direction": cfg.fan_direction,
                 "dry_run": dry_run,
                 "note": note,
                 "dt": cfg.dt,

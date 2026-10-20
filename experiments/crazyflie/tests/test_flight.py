@@ -233,7 +233,7 @@ def test_one_altitude_spike_is_ignored_but_a_sustained_error_is_not(cfg):
         return flight.mean_altitude(feed, cfg, feed.snapshot(1.0))
 
     tol = cfg.altitude_tolerance
-    spike = run(lambda k: 0.6 if k == 59 else cfg.altitude)
+    spike = run(lambda k: cfg.altitude + (0.35 if k == 59 else 0.0))
     assert abs(spike - cfg.altitude) < tol  # one bad reading: no abort
     high = run(lambda k: cfg.altitude + 2 * tol)
     assert abs(high - cfg.altitude) > tol  # sustained: abort
@@ -290,20 +290,21 @@ def test_start_gate_rejects_recent_motion_hidden_by_the_long_mean(
 
 
 @pytest.mark.parametrize(
-    "heights, expected",
+    "offsets, expected",
     [
-        ([0.05] * 21, False),
-        ([0.25] * 21, True),
-        ([0.32] * 16 + [0.04] * 5, False),  # full mean hides recent descent
-        ([0.22] * 16 + [0.35] * 5, False),  # full mean hides recent climb
+        ([-0.20] * 21, False),
+        ([0.0] * 21, True),
+        ([0.07] * 16 + [-0.21] * 5, False),  # full mean hides recent descent
+        ([-0.03] * 16 + [0.10] * 5, False),  # full mean hides recent climb
     ],
 )
 def test_start_gate_requires_both_height_windows_at_the_target(
-    cfg, heights, expected
+    cfg, offsets, expected
 ):
     now = [0.0]
     feed = quiet_feed(now)
-    for k, z in enumerate(heights):
+    for k, offset in enumerate(offsets):
+        z = cfg.altitude + offset
         now[0] = k / cfg.log_hz
         feed.on_state(
             k * 50, dict(zip(STATE_VARS, [*cfg.start, z, 0.0, 0.0, 0.0]))

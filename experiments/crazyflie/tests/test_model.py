@@ -13,7 +13,7 @@ import pytest
 import tracking_model
 from logger import align_playback, aligned_states
 from simulator import TICKS, per_tick
-from trajectory import file_hash, reference_plan
+from trajectory import reference_plan
 
 TRUE = {
     "rho": np.array([0.7, 0.85]),
@@ -32,15 +32,8 @@ def errors(rng, steps, p=TRUE):
     return np.array(e)
 
 
-def synthetic_flights(cfg, count, rng, steps=90):
-    """Flights of the reference with errors drawn from TRUE."""
-    rows = np.asarray(reference_plan(cfg)["coefficients"])
-    t = minsnap.grid_times(rows, cfg.dt)[: steps + 1]
-    reference = {
-        "r": minsnap.evaluate(rows, t)[:, :2],
-        "v": minsnap.evaluate(rows, t, 1)[:, :2],
-        "a": minsnap.evaluate(rows, t, 2)[:, :2],
-    }
+def synthetic_flights(count, rng, steps=90):
+    """Identification flights with errors drawn from TRUE."""
     flights = []
     for i in range(count):
         meta = {
@@ -49,17 +42,14 @@ def synthetic_flights(cfg, count, rng, steps=90):
             "mission_outcome": "completed",
             "fan": 0,
             "trial_id": f"t{i:02d}",
-            "plan_id": "reference",
-            "plan_hash": file_hash(cfg.reference),
         }
-        data = {**reference, "e": errors(rng, steps)}
-        flights.append({"meta": meta, "data": data})
+        flights.append({"meta": meta, "errors": errors(rng, steps)})
     return flights
 
 
 @pytest.fixture
 def synthetic(monkeypatch):
-    monkeypatch.setattr(tracking_model, "flight_data", lambda t: t["data"])
+    monkeypatch.setattr(tracking_model, "flight_errors", lambda t: t["errors"])
 
 
 def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
@@ -67,7 +57,7 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
 ):
     cfg = replace(cfg, model={**cfg.model, "bootstrap": 50})
     report = tracking_model.fit(
-        cfg, synthetic_flights(cfg, 60, np.random.default_rng(0))
+        cfg, synthetic_flights(60, np.random.default_rng(0))
     )
     fan = report["fans"]["0"]
     assert fan["fit_flights"] == 40 and len(fan["held_out_trials"]) == 20
@@ -80,8 +70,7 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
     lo, hi = np.array(fan["intervals"]["rho"])
     assert (lo <= fan["rho"]).all() and (fan["rho"] <= hi).all()
     assert fan["b_poorly_determined"] == [False, False]
-    assert set(fan["diagnostics"]["x"]) == {"vx", "vy", "ax", "ay", "constant"}
-    assert report["warnings"] == [] and report["transfer"] == {}
+    assert report["warnings"] == []
     validation = report["validation"]["0"]
     assert validation["flights_by_step"] == [20] * 91
     for (name, (estimate, *_)), nominal in zip(
@@ -93,14 +82,12 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
 def test_few_flights_warn_and_a_single_flight_is_refused(cfg, synthetic):
     cfg = replace(cfg, model={**cfg.model, "bootstrap": 5})
     report = tracking_model.fit(
-        cfg, synthetic_flights(cfg, 3, np.random.default_rng(1))
+        cfg, synthetic_flights(3, np.random.default_rng(1))
     )
     assert report["fans"]["0"]["fit_flights"] == 2
     assert "2 fit flights" in report["warnings"][0]
     with pytest.raises(ValueError, match="at least two"):
-        tracking_model.fit(
-            cfg, synthetic_flights(cfg, 1, np.random.default_rng(1))
-        )
+        tracking_model.fit(cfg, synthetic_flights(1, np.random.default_rng(1)))
 
 
 def test_clipped_rho_refits_the_intercept_and_the_residuals():
@@ -185,8 +172,9 @@ def test_task_violations_count_up_to_the_abort_and_faults_do_not(cfg):
 
 def test_alignment_recovers_a_shifted_playback_start(cfg):
     rows = np.asarray(reference_plan(cfg)["coefficients"])
+    duration = minsnap.total_duration(rows)
     t_cmd, t_play = 100.0, 100.137
-    t = np.arange(99.0, 118.3, 0.05)
+    t = np.arange(99.0, t_cmd + duration + 0.3, 0.05)
     delay = np.random.default_rng(0).uniform(0.0, 0.01, len(t))
     delay[0] = 0.0
     xyz = minsnap.evaluate(rows, t - t_play).astype(np.float32)
@@ -199,8 +187,8 @@ def test_alignment_recovers_a_shifted_playback_start(cfg):
     meta = {
         "coefficients": rows,
         "t_cmd_after": t_cmd,
-        "duration": 18.0,
-        "mission_t_end": t_cmd + 18.25,
+        "duration": duration,
+        "mission_t_end": t_cmd + duration + 0.25,
     }
     result = align_playback(meta, None, target)
     assert result["alignment"] == "ctrltarget" and result["identifiable"]

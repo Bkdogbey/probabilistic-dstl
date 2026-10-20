@@ -128,7 +128,7 @@ def describe(plan, path):
     accel = np.linalg.norm(minsnap.evaluate(rows, t, 2)[:, :2], axis=1)
     return (
         f"  {len(rows)} pieces, duration {minsnap.total_duration(rows):.1f} s, "
-        f"altitude {plan['altitude']} m, start {plan['start']}\n"
+        f"altitude {plan['altitude']} m, start {np.round(plan['start'], 3).tolist()}\n"
         f"  max speed {speed.max():.3f} m/s, "
         f"max acceleration {accel.max():.3f} m/s^2, "
         f"min clearance {plan['min_clearance']:.3f} m\n"

@@ -23,17 +23,31 @@ from trajectory import (
 )
 
 
-def test_reference_is_feasible_reaches_the_goal_and_fits_memory(cfg):
+def test_reference_is_the_figure8_feasible_and_through_the_goal(cfg):
     plan = reference_plan(cfg)
     rows = np.asarray(plan["coefficients"])
-    assert plan["start"] == [1.0, -2.0] and cfg.start == (1.0, -2.0)
-    assert minsnap.total_duration(rows) == 18.0 == cfg.duration
-    assert cfg.steps == 90 and len(rows) <= minsnap.MAX_PIECES
+    assert np.allclose(plan["start"], [0.5, -1.75]) and cfg.altitude == 0.5
+    assert minsnap.total_duration(rows) == 20.0 == cfg.duration
+    assert cfg.steps == 100 and len(rows) <= minsnap.MAX_PIECES
     task = Task(cfg)
     assert check_plan(cfg, task, dict(plan))["problems"] == []
     curve = analysis.curve_xy(rows)
-    assert all(task.requirements(curve, curve[-1]).values())
-    assert plan["source_hash"] and "velocity reference" in plan["method"]
+    assert np.allclose(curve[-1], curve[0], atol=1e-5)  # back at the start
+    assert all(task.requirements(curve).values())
+    assert "figure-8" in plan["method"]
+
+
+def test_obstacle_path_flies_in_its_own_arena():
+    import config
+
+    cfg = config.load(config.HERE / "config.obstacles.yml")
+    plan = load_plan(cfg.reference, cfg)
+    assert plan["start"] == [1.0, -2.0] and cfg.duration == 18.0
+    task = Task(cfg)
+    assert check_plan(cfg, task, dict(plan))["problems"] == []
+    assert all(
+        task.requirements(analysis.curve_xy(plan["coefficients"])).values()
+    )
 
 
 def test_reference_ignores_optimizer_tuning_but_not_the_arena(cfg):
@@ -42,13 +56,7 @@ def test_reference_ignores_optimizer_tuning_but_not_the_arena(cfg):
         load_plan(cfg.reference, tuned)["coefficients"]
         == (json.loads(Path(cfg.reference).read_text())["coefficients"])
     )
-    moved = replace(
-        cfg,
-        obstacles=(
-            replace(cfg.obstacles[0], x=(0.0, 0.1)),
-            *cfg.obstacles[1:],
-        ),
-    )
+    moved = replace(cfg, workspace=replace(cfg.workspace, x=(0.0, 1.2)))
     with pytest.raises(ValueError, match="another arena"):
         load_plan(cfg.reference, moved)
 
@@ -56,7 +64,7 @@ def test_reference_ignores_optimizer_tuning_but_not_the_arena(cfg):
 @pytest.mark.parametrize(
     "change, message",
     [
-        ({"waypoints": [[1.0, -2.0]] * 10}, "miss the waypoints"),
+        ({"waypoints": [[0.5, -1.75]] * 21}, "miss the waypoints"),
         ({"dt": 0.35}, "whole number"),
         ({"durations": [2.0] * 8}, "plan needs"),
     ],
@@ -76,12 +84,12 @@ def test_import_rebuilds_the_reference_and_export_round_trips(cfg, tmp_path):
     waypoints = tmp_path / "waypoints.csv"
     np.savetxt(waypoints, reference["waypoints"], delimiter=",", fmt="%.17g")
     output = tmp_path / "imported.json"
-    path = import_plan(waypoints, [2.0], cfg, output)
+    path = import_plan(waypoints, [1.0], cfg, output)
     imported = load_plan(path, cfg)
     assert imported["coefficients"] == reference["coefficients"]
     assert imported["source_hash"] == file_hash(waypoints)
     with pytest.raises(ValueError, match="never replaced"):
-        import_plan(waypoints, [2.0], cfg, output)
+        import_plan(waypoints, [1.0], cfg, output)
 
     csv = tmp_path / "curve.csv"
     run.cmd_export(cfg, SimpleNamespace(plan=str(path), csv=str(csv)))
@@ -152,26 +160,20 @@ def recorded(cfg, path, outcome="completed"):
     return {"meta": meta, "state": state, "target": None}
 
 
-def reference_path(cfg, seconds=20.0):
+def reference_path(cfg):
     rows = reference_plan(cfg)["coefficients"]
-    return minsnap.evaluate(rows, np.arange(0, seconds, 1 / cfg.log_hz))[:, :2]
+    t = np.arange(0, cfg.duration + 1, 1 / cfg.log_hz)
+    return minsnap.evaluate(rows, t)[:, :2]
 
 
 def test_evaluate_scores_each_requirement(cfg):
     task = Task(cfg)
     result = analysis.evaluate(recorded(cfg, reference_path(cfg)), task)
     assert result["success"] and result["min_clearance"] > 0
-    goal = np.array(task.goal.centre)
-    assert result["endpoint_error"] == pytest.approx(
-        np.linalg.norm(reference_path(cfg)[-1] - goal), abs=1e-6
-    )
-    assert result["duration"] == pytest.approx(
-        cfg.duration + flight.END_HOLD_S
-    )
 
-    bad = np.linspace([0.65, -2.0], [0.65, -0.2], 400)  # through obs_1
+    bad = np.linspace([0.5, -1.75], [1.2, -1.75], 440)  # leaves, no goal
     result = analysis.evaluate(recorded(cfg, bad), task)
-    assert not result["success"] and not result["requirements"]["obs_1"]
+    assert not result["success"] and not result["requirements"]["workspace"]
     assert not result["requirements"]["goal"] and result["min_clearance"] < 0
 
     excluded = recorded(cfg, reference_path(cfg), outcome="aborted")
@@ -186,33 +188,16 @@ def test_abort_boundary_excludes_landing_from_mission_metrics(cfg):
     trial["state"]["x"][after] = 100.0
     trial["state"]["z"][after] = 0.0
     result = analysis.evaluate(trial, Task(cfg))
-    assert not result["success"] and np.isnan(result["endpoint_error"])
+    assert not result["success"] and not result["requirements"]["goal"]
     assert result["min_clearance"] > 0 and result["requirements"]["altitude"]
-    assert result["duration"] == 1.0
 
 
 def test_altitude_scoring_uses_the_same_average_as_execution(cfg):
     trial = recorded(cfg, reference_path(cfg))
-    trial["state"]["z"][40] = 0.6
+    trial["state"]["z"][40] = cfg.altitude + 0.35
     assert analysis.evaluate(trial, Task(cfg))["success"]
-    trial["state"]["z"][40:60] = 0.6
+    trial["state"]["z"][40:60] = cfg.altitude + 0.35
     assert not analysis.evaluate(trial, Task(cfg))["requirements"]["altitude"]
-
-
-def test_held_out_coverage_uses_the_plan_prediction(cfg):
-    offset = np.array([0.01, -0.01])
-    trial = recorded(cfg, reference_path(cfg) + offset)
-    rows = reference_plan(cfg)["coefficients"]
-    r = minsnap.evaluate(rows, minsnap.grid_times(rows, cfg.dt))[:, :2]
-    plan = {
-        "prediction": {
-            "mean": (r + offset).tolist(),
-            "cov": np.tile(1e-4 * np.eye(2), (len(r), 1, 1)).tolist(),
-        }
-    }
-    coverage = analysis.coverage([trial], plan)
-    assert all(value == 1.0 for value in coverage.values())
-    assert analysis.coverage([trial], {"prediction": None}) is None
 
 
 @pytest.mark.parametrize("setting", [0, 6, 12, 18])

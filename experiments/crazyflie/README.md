@@ -4,8 +4,18 @@ The drone flies a minimum-snap curve that is uploaded to it. pdSTL (or the
 mean-model baseline) chooses the curve's **waypoints**. A degree-7
 minimum-snap polynomial with fixed segment times goes through them. The
 pieces are uploaded to the drone, and the onboard controller flies them
-(`start_trajectory`). The reference, `plans/reference.json`, has
-10 waypoints, 9 pieces of 2.0 s, and lasts 18 s.
+(`start_trajectory`).
+
+Two paths are frozen in `plans/`:
+
+| Path | File | Arena | Shape |
+| --- | --- | --- | --- |
+| Figure-8 (the reference) | `reference.json` | `config.yml` (from `config.example.yml`): x [0, 1], y [−2, 0], no obstacles | Vertical lemniscate, centre (0.5, −1.0), 0.5 m wide, 1.5 m tall, 0.50 m altitude; from the bottom tip, past the goal at the top tip and back; 20 pieces of 1.0 s (20 s), max speed 0.245 m/s |
+| Obstacle path | `obstacles.json` | `config.obstacles.yml`: three boxes | From (1.0, −2.0) between the boxes into the goal at (1.0, 0.0); 9 pieces of 2.0 s (18 s), 0.25 m altitude |
+
+The task is: stay in the workspace, avoid obstacles, and reach the goal at
+some step. Fly the obstacle path with its own arena:
+`python run.py --config config.obstacles.yml fly --fan 0`.
 
 ## How a flight works
 
@@ -36,12 +46,12 @@ value instead of growing without limit. Per fan setting, on the 0.2 s grid:
 e[k+1] = R e[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),   w ~ N(0, Q)
 ```
 
-This is what the model **assumes**. The held-out and transfer checks show
+This is what the model **assumes**. The held-out coverage checks show
 whether real flights behave this way. `Q` is an *effective* covariance: it
 also absorbs state-estimation error and model mismatch, so it is not pure
 fan noise. The model also assumes that, at a given fan setting, the error
 statistics are the same for every path, so a plan only moves the curve.
-The residual diagnostics test this.
+Only flights of other paths can test this.
 
 The simulator generates data from this same model. Simulated flights
 therefore test plumbing and parameter recovery only, never whether the
@@ -52,8 +62,8 @@ model suits the hardware.
 Run these from this directory. Copy `config.example.yml` to `config.yml`
 for a new checkout.
 
-1. **Measure the geometry.** Enter the obstacles and the airframe radius in
-   `config.yml`, then set `measured: true`.
+1. **Measure the geometry.** Enter the workspace, any obstacles and the
+   airframe radius in `config.yml`, then set `measured: true`.
 2. **First hardware step:** one slow fan-off pilot flight.
 
    ```bash
@@ -65,9 +75,7 @@ for a new checkout.
    `t_play` and whether it was identifiable), the `ctrltarget`-vs-`r(t)`
    residual (well under 1 cm), and the time-aligned and cross-track errors.
 3. **Identification flights** of the reference at fan settings 0, 6, 12
-   and 18. It is also worth recording a second, slower variant of the
-   reference, so the model is not fitted to one path. Make one with
-   `import`, see below.
+   and 18.
 
    ```bash
    python run.py fly --purpose identification --fan 6
@@ -84,9 +92,8 @@ for a new checkout.
    - coverage near 39 / 86 / 95 %;
    - `flights_by_step`: flights that aborted early drop out of later
      steps;
-   - the signed-velocity, acceleration and fan-position diagnostics;
-   - the stationary spread per fan;
-   - the transfer results, when a second path was flown.
+   - the residual lag-1 correlation (near 0 if the model fits);
+   - the stationary spread per fan.
 
    Set `model_report` in `config.yml` to the report.
 5. **Plan** both conditions per fan:
@@ -109,10 +116,9 @@ for a new checkout.
    python run.py fly --plan plans/pdstl_fan6.json --purpose evaluation --fan 6
    ```
 
-7. **Analyze.** `python run.py analyze` writes the summary tables to
-   `results/`. Success rates (with Clopper–Pearson intervals) are kept
-   apart from the model scores. Held-out coverage per condition tests
-   whether the model transfers to the optimized paths.
+7. **Analyze.** `python run.py analyze` writes `results/summary.md`.
+   Success rates (with Clopper–Pearson intervals) are kept apart from the
+   model scores.
 
 **Flight counts.** Two fit flights per fan is the software minimum, not
 enough calibration. Plan for at least `model.min_flights_warning` (8) per
@@ -192,7 +198,7 @@ never replaces an existing file. `export` writes the
 | `trajectory.py` | Plan records: build, check, read, load and import |
 | `flight.py` | Upload, takeoff, start gate, mission monitor, landing |
 | `logger.py` | Trial records, onboard timestamps and playback alignment |
-| `tracking_model.py` | Error model: fit, diagnostics and held-out validation |
+| `tracking_model.py` | Error model: fit and held-out validation |
 | `planner.py` | Offline waypoint planning for both conditions |
 | `geometry.py` | Workspace, obstacles, goal and sampled feasibility checks |
 | `analysis.py` | Outcome summaries, plan previews and flight checks |

@@ -13,11 +13,11 @@ def _box_distance(xy, box):
 
 
 class Task:
-    """Stay in the workspace, avoid obstacles, end inside the goal.
+    """Stay in the workspace, avoid obstacles, reach the goal.
 
     Obstacles grow and the workspace shrinks by the airframe radius, so
-    every check is on the drone's centre. The goal is required only at the
-    final step H, so starting inside it never counts as completion.
+    every check is on the drone's centre. The goal must be reached at some
+    step 1..H (the figure-8 passes its top tip and returns to the start).
     """
 
     def __init__(self, cfg):
@@ -38,12 +38,7 @@ class Task:
             env.set_bounds(self.workspace.x, self.workspace.y)
             for box in self.obstacles:
                 env.add_obstacle(box.x, box.y, name=box.name)
-            env.set_goal(
-                self.goal.x,
-                self.goal.y,
-                interval=[self.steps] * 2,
-                name="goal",
-            )
+            env.set_goal(self.goal.x, self.goal.y, name="goal")
             self._env = env
         return self._env
 
@@ -60,8 +55,8 @@ class Task:
             axis=0,
         )
 
-    def requirements(self, path, final):
-        """Each requirement on a path [N, 2] ending at `final` [2]: met or not."""
+    def requirements(self, path):
+        """Each requirement on a path [N, 2] from its start: met or not."""
         met = {
             "workspace": bool(
                 (-_box_distance(path, self.workspace) >= 0).all()
@@ -69,7 +64,7 @@ class Task:
         }
         for box in self.obstacles:
             met[box.name] = bool((_box_distance(path, box) >= 0).all())
-        met["goal"] = bool(_box_distance(np.asarray(final), self.goal) <= 0)
+        met["goal"] = bool((_box_distance(path[1:], self.goal) <= 0).any())
         return met
 
 
