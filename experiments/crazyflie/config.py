@@ -62,7 +62,9 @@ class Flight:
     geofence_margin: float = 0.10
     position_spread: float = 0.05
     position_timeout: float = 15.0
-    controller: int = 2  # onboard controller: 1 = PID, 2 = Mellinger
+    # Onboard controller: 1 = PID; 2 = Mellinger (hovered 10 cm low on
+    # 2026-10-20: its thrust assumes a lighter drone than ours).
+    controller: int = 1
 
 
 # Routine defaults live here; config.yml contains arena measurements and the
