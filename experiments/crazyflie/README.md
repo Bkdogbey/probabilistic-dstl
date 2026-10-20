@@ -6,16 +6,15 @@ minimum-snap polynomial with fixed segment times goes through them. The
 pieces are uploaded to the drone, and the onboard controller flies them
 (`start_trajectory`).
 
-Two paths are frozen in `plans/`:
-
-| Path | File | Arena | Shape |
-| --- | --- | --- | --- |
-| Figure-8 (the reference) | `reference.json` | `config.yml` (from `config.example.yml`): x [0, 1], y [−2, 0], no obstacles | Vertical lemniscate, centre (0.5, −1.0), 0.5 m wide, 1.5 m tall, 0.50 m altitude; from the bottom tip, past the goal at the top tip and back; 20 pieces of 1.0 s (20 s), max speed 0.245 m/s |
-| Obstacle path | `obstacles.json` | `config.obstacles.yml`: three boxes | From (1.0, −2.0) between the boxes into the goal at (1.0, 0.0); 9 pieces of 2.0 s (18 s), 0.25 m altitude |
+The reference, `plans/reference.json`, is the **figure-8**: a vertical
+lemniscate centred at (0.5, −1.0), 0.5 m wide and 1.5 m tall, at 0.50 m
+altitude. It starts at the bottom tip, passes the goal at the top tip and
+returns: 20 pieces of 1.0 s (20 s), max speed 0.245 m/s. The arena is in
+`config.yml`: x [0, 1], y [−2, 0]. Obstacles are off for now (commented
+out in `config.example.yml`).
 
 The task is: stay in the workspace, avoid obstacles, and reach the goal at
-some step. Fly the obstacle path with its own arena:
-`python run.py --config config.obstacles.yml fly --fan 0`.
+some step.
 
 ## How a flight works
 

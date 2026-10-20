@@ -37,19 +37,6 @@ def test_reference_is_the_figure8_feasible_and_through_the_goal(cfg):
     assert "figure-8" in plan["method"]
 
 
-def test_obstacle_path_flies_in_its_own_arena():
-    import config
-
-    cfg = config.load(config.HERE / "config.obstacles.yml")
-    plan = load_plan(cfg.reference, cfg)
-    assert plan["start"] == [1.0, -2.0] and cfg.duration == 18.0
-    task = Task(cfg)
-    assert check_plan(cfg, task, dict(plan))["problems"] == []
-    assert all(
-        task.requirements(analysis.curve_xy(plan["coefficients"])).values()
-    )
-
-
 def test_reference_ignores_optimizer_tuning_but_not_the_arena(cfg):
     tuned = replace(cfg, planner={**cfg.planner, "max_iters": 3})
     assert (

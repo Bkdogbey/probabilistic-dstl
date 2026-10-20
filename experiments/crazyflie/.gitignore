@@ -4,9 +4,7 @@ logs/
 reports/
 results/
 
-# Keep the frozen paths and their previews in version control.
+# Keep the frozen reference and its preview in version control.
 plans/*
 !plans/reference.json
 !plans/reference.png
-!plans/obstacles.json
-!plans/obstacles.png
