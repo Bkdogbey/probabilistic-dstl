@@ -53,7 +53,6 @@ class Flight:
     takeoff_speed: float = 0.3
     transit_speed: float = 0.3
     land_speed: float = 0.15
-    placement_tolerance: float = 0.15  # physical placement before takeoff
     start_tolerance: float = 0.05
     start_altitude_tolerance: float = 0.05
     start_speed: float = 0.10

@@ -159,18 +159,17 @@ def test_failed_start_move_lands_and_disconnects(cfg, tmp_path, short_plan):
     assert "land" in drone.calls and drone.calls[-1] == "disconnect"
 
 
-def test_off_start_placement_is_rejected_before_upload(
+def test_drone_away_from_the_start_flies_there_before_the_mission(
     cfg, tmp_path, short_plan
 ):
-    drone = SimDrone((cfg.start[0] + 0.3, cfg.start[1], 0.0))
-    meta, _, drone = fly_sim(cfg, tmp_path, short_plan, drone)
-    assert meta["outcome"] == "aborted"
-    assert "place the drone" in meta["abort_reason"]
-    assert not any(
-        c in drone.calls
-        for c in ("write_data_sync", "arm", "takeoff", "go_to", "land")
-    )
-    assert drone.calls[-1] == "disconnect"
+    home = (cfg.start[0] - 0.5, cfg.start[1] + 0.3, 0.0)
+    meta, _, drone = fly_sim(cfg, tmp_path, short_plan, SimDrone(home))
+    assert meta["outcome"] == "completed"
+    assert np.allclose(meta["home"][:2], home[:2], atol=0.01)
+    calls = drone.calls
+    assert calls.index("takeoff") < calls.index("go_to")
+    assert calls.index("go_to") < calls.index("start_trajectory")
+    assert np.allclose(meta["start_state"][:2], cfg.start, atol=0.05)
 
 
 def test_connect_failure_still_records_the_attempt(cfg, tmp_path, short_plan):

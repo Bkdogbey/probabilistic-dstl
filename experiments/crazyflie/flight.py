@@ -303,14 +303,11 @@ def fly(drone, feed, plan, cfg, log, stop, status):
     """Nominal attempt; sets status['airborne'] once takeoff is sent."""
     f, hl = cfg.flight, drone.cf.high_level_commander
 
+    # The drone takes off where it sits and then flies to the start.
     log.set_phase("positioning")
     home = wait_for_positioning(drone, feed, cfg, stop)
+    log.meta["home"] = home.tolist()
     start = np.array([*plan["start"], cfg.altitude])
-    if np.linalg.norm(home[:2] - start[:2]) > f.placement_tolerance:
-        raise DataFault(
-            f"place the drone within {f.placement_tolerance:.2f} m "
-            f"of start {plan['start']} before takeoff"
-        )
 
     log.set_phase("upload")
     upload(drone, plan, log)
