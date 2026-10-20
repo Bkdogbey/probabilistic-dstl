@@ -60,7 +60,6 @@ class Flight:
     start_window: float = 1.0
     start_timeout: float = 15.0
     stale_s: float = 0.5
-    max_lateness_s: float = 0.05  # first send of each trajectory step
     geofence_margin: float = 0.10
     position_spread: float = 0.05
     position_timeout: float = 15.0
@@ -69,21 +68,26 @@ class Flight:
 # Routine defaults live here; config.yml contains arena measurements and the
 # settings changed between experiments. Existing full configs still work.
 DEFAULTS = {
-    "stream_hz": 20,
+    "log_hz": 20,
+    "clearance_margin": 0.01,
     "fan_position": None,
     "fan_direction": None,
-    "model": {"holdout_every": 3, "bootstrap": 1000, "seed": 0},
-    "planner": {
-        "w_phi": 1.0, "w_u": 1e-3, "w_du": 1e-2, "lr": 0.05,
-        "max_iters": 400, "alpha": 0.90,
+    "model": {
+        "holdout_every": 3, "bootstrap": 1000, "seed": 0,
+        "min_flights_warning": 8,
     },
-    "mean_model": {"w_rho": 10.0, "beta": 50.0, "min_robustness": 0.0},
+    "planner": {
+        "max_iters": 400, "alpha": 0.90, "w_lim": 100.0,
+        "snap_fraction": 0.01, "lr_grid": [0.003, 0.01, 0.03],
+        "sweep_iters": 100,
+    },
+    "mean_model": {"beta": 50.0, "min_robustness": 0.0},
 }  # fmt: skip
 
 
 PLAN_FIELDS = (
     "workspace", "obstacles", "start", "goal", "airframe_radius", "reference",
-    "altitude", "duration", "dt", "stream_hz", "u_max", "a_max",
+    "altitude", "duration", "dt", "v_max", "a_max", "clearance_margin",
     "planner", "mean_model",
 )  # fmt: skip
 
@@ -107,9 +111,10 @@ class Config:
     reference: str
     duration: float
     dt: float
-    stream_hz: int
-    u_max: float
+    log_hz: int
+    v_max: float
     a_max: float
+    clearance_margin: float
     fan_position: list | None
     fan_direction: list | None
     flight: Flight
@@ -125,11 +130,6 @@ class Config:
         return round(self.duration / self.dt)
 
     @property
-    def repeats(self):
-        """Streamed commands per planning step."""
-        return round(self.stream_hz * self.dt)
-
-    @property
     def hash(self):
         """Whole configuration; recorded with every trial."""
         return _digest(asdict(self))
@@ -141,33 +141,28 @@ class Config:
 
     @property
     def execution_hash(self):
-        """Only geometry, altitude, timing and physical command limits."""
+        """Only geometry, altitude, timing and the curve limits."""
         fields = (
             "workspace",
             "obstacles",
             "airframe_radius",
             "altitude",
             "dt",
-            "stream_hz",
-            "u_max",
+            "v_max",
             "a_max",
+            "clearance_margin",
         )
         return _digest({name: getattr(self, name) for name in fields})
 
     def for_plan(self, plan):
-        """The saved trajectory owns its start, altitude and command timing."""
-        cfg = replace(
+        """The saved trajectory owns its start, altitude and timing."""
+        return replace(
             self,
             start=tuple(plan["start"]),
             altitude=plan["altitude"],
             dt=plan["dt"],
-            duration=len(plan["velocities"]) * plan["dt"],
+            duration=float(sum(plan["durations"])),
         )
-        if abs(cfg.repeats - cfg.stream_hz * cfg.dt) > 1e-9:
-            raise ValueError(
-                "trajectory dt * stream_hz must be a whole number"
-            )
-        return cfg
 
     def ready_for_data(self, fan):
         """Why recorded data is excluded from fitting/evaluation, or None."""
@@ -177,7 +172,7 @@ class Config:
         return None
 
 
-def load(path=HERE / "config.yml", *, trajectory_source=None):
+def load(path=HERE / "config.yml"):
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(
@@ -185,8 +180,6 @@ def load(path=HERE / "config.yml", *, trajectory_source=None):
             f"  cd {HERE} && cp config.example.yml {path.name}"
         )
     raw = {**deepcopy(DEFAULTS), **yaml.safe_load(path.read_text())}
-    # Ignore probe sequences left in older configs.
-    raw.pop("excitation", None)
     raw["fan"] = fan_setting(raw.get("fan", 0))
     if not isinstance(raw["reference"], str):
         raise TypeError(
@@ -197,12 +190,12 @@ def load(path=HERE / "config.yml", *, trajectory_source=None):
     # Timing/pose are read from the frozen file, not duplicated in YAML.
     from trajectory import read_plan
 
-    supplied = read_plan(trajectory_source or raw["reference"])
+    supplied = read_plan(raw["reference"])
     raw.update(
         start=tuple(supplied["start"]),
         dt=supplied["dt"],
         altitude=supplied["altitude"],
-        duration=len(supplied["velocities"]) * supplied["dt"],
+        duration=float(sum(supplied["durations"])),
     )
     if raw.get("model_report"):
         raw["model_report"] = str(
@@ -210,7 +203,7 @@ def load(path=HERE / "config.yml", *, trajectory_source=None):
         )
     for name in ("model", "planner", "mean_model"):
         raw[name] = {**DEFAULTS[name], **(raw[name] or {})}
-    cfg = Config(
+    return Config(
         **{
             **raw,
             "workspace": Box(**raw["workspace"]),
@@ -220,9 +213,6 @@ def load(path=HERE / "config.yml", *, trajectory_source=None):
             "flight": Flight(**(raw.get("flight") or {})),
         }
     )
-    if abs(cfg.repeats - cfg.stream_hz * cfg.dt) > 1e-9:
-        raise ValueError("stream_hz * dt must be a whole number")
-    return cfg
 
 
 def git_commit():

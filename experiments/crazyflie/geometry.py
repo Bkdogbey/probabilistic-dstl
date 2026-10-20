@@ -1,5 +1,6 @@
 """Arena geometry and offline clearance checks; no optimizer dependencies."""
 
+import minsnap
 import numpy as np
 
 
@@ -72,30 +73,43 @@ class Task:
         return met
 
 
-def nominal_path(cfg, start, velocities):
-    """Positions at the streaming rate if the drone tracked v exactly."""
-    v = np.repeat(np.asarray(velocities), cfg.repeats, axis=0)
-    steps = np.cumsum(v / cfg.stream_hz, axis=0)
-    return np.vstack([start, np.asarray(start) + steps])
+def check_feasible(cfg, task, plan, mean=None):
+    """Execution checks of a plan's uploaded rows; problems, or [].
 
-
-def check_feasible(cfg, task, start, velocities, mean=None, mission=True):
-    """Physical feasibility shared by every condition; problems, or []."""
-    v = np.asarray(velocities)
-    problems = []
-    if np.abs(v).max() > cfg.u_max + 1e-4:
-        problems.append(f"command above u_max = {cfg.u_max} m/s")
-    accel = np.abs(np.diff(np.vstack([[0.0, 0.0], v]), axis=0)).max() / cfg.dt
-    if accel > cfg.a_max + 1e-4:
+    Sampled at minsnap.DENSE_HZ plus every piece boundary: these are sampled
+    checks, not a proof of clearance between samples. `mean` [H+1, 2] is
+    the predicted mean on the planning grid.
+    """
+    rows = np.asarray(plan["coefficients"], dtype=float)
+    problems = minsnap.problems(rows, plan["waypoints"])
+    if len(rows) > minsnap.MAX_PIECES:
         problems.append(
-            f"acceleration {accel:.2f} above a_max = {cfg.a_max} m/s^2"
+            f"{len(rows)} pieces, trajectory memory holds {minsnap.MAX_PIECES}"
         )
-    for label, path in (
-        ("nominal path", nominal_path(cfg, start, v)),
-        ("predicted mean", mean),
-    ):
-        if path is not None and task.clearance(path).min() < 0:
-            problems.append(f"{label} leaves the free space")
-    if mission and len(v) != cfg.steps:
-        problems.append(f"{len(v)} steps, mission needs {cfg.steps}")
+    t = minsnap.dense_times(rows)
+    speed = np.linalg.norm(minsnap.evaluate(rows, t, 1)[:, :2], axis=1).max()
+    if speed > cfg.v_max:
+        problems.append(f"speed {speed:.3f} above v_max = {cfg.v_max} m/s")
+    accel = np.linalg.norm(minsnap.evaluate(rows, t, 2)[:, :2], axis=1).max()
+    if accel > cfg.a_max:
+        problems.append(
+            f"acceleration {accel:.3f} above a_max = {cfg.a_max} m/s^2"
+        )
+    curve = minsnap.evaluate(rows, t)[:, :2]
+    for label, path in (("curve", curve), ("predicted mean", mean)):
+        if path is None:
+            continue
+        clearance = task.clearance(path).min()
+        if clearance < cfg.clearance_margin:
+            problems.append(
+                f"{label} clearance {clearance:.3f} m "
+                f"below {cfg.clearance_margin} m"
+            )
+    if np.linalg.norm(curve[0] - np.asarray(cfg.start)) > minsnap.WAYPOINT_TOL:
+        problems.append(f"curve does not start at {list(cfg.start)}")
+    duration = minsnap.total_duration(rows)
+    if abs(duration - cfg.duration) > 1e-6:
+        problems.append(
+            f"curve lasts {duration} s, mission needs {cfg.duration} s"
+        )
     return problems

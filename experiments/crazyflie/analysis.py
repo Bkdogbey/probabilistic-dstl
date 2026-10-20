@@ -2,6 +2,7 @@
 
 Empirical whole-flight success (with Clopper-Pearson intervals) is
 reported next to, never merged with, each plan's model-based score.
+Dry runs (simulated data) never enter the summary.
 """
 
 from __future__ import annotations
@@ -15,22 +16,20 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import minsnap
 import numpy as np
 from config import HERE, fan_setting
-from geometry import nominal_path
-from logger import state_times
-from matplotlib.patches import Rectangle
+from flight import MONITOR_S
+from logger import aligned_states, state_times
+from matplotlib.patches import Ellipse, Rectangle
 from scipy.stats import beta
+from tracking_model import COVERAGE, squared_distance
 from trajectory import PLANS, condition_name, file_hash
 
 RESULTS = HERE / "results"
-METRICS = [
-    "min_clearance",
-    "endpoint_error",
-    "path_length",
-    "effort",
-    "duration",
-]
+METRICS = ["min_clearance", "endpoint_error", "path_length", "duration"]
+ALIGNMENT_FLAG_M = 0.01  # max ctrltarget-vs-r residual worth investigating
+D2_95 = 5.991  # a 2-D Gaussian ellipse with d^2 <= 5.991 holds 95%
 
 
 def clopper_pearson(k, n):
@@ -39,25 +38,24 @@ def clopper_pearson(k, n):
     return float(lower), float(upper)
 
 
+def mission_window(meta):
+    """Host times (start, end) of the flown curve, ending before landing."""
+    start = meta.get("t_play", meta["mission_t0"])
+    horizon = start + meta["duration"]
+    return start, min(horizon, meta.get("mission_t_end", horizon))
+
+
 def mission_samples(trial):
-    """Mission positions only; the step-H endpoint exists only after completion."""
+    """Mission positions only; the endpoint exists only after completion."""
     meta, s = trial["meta"], trial["state"]
     t = state_times(s)
-    t0 = meta["mission_t0"]
-    horizon = t0 + meta["steps"] * meta["dt"]
-    completed = meta.get("mission_outcome", meta["outcome"]) == "completed"
-    t_end = min(horizon, meta.get("mission_t_end", horizon))
-    if not completed and "mission_t_end" not in meta:
-        # Legacy logs did not mark the abort boundary; stop after the last
-        # command's interval rather than including subsequent landing.
-        sent = trial["commands"]["t_sent"]
-        t_end = min(
-            t_end, sent[-1] + 1 / meta["stream_hz"] if len(sent) else t0
-        )
-    keep = (t >= t0) & (t <= t_end)
+    start, end = mission_window(meta)
+    horizon = start + meta["duration"]
+    keep = (t >= start) & (t <= end)
     xyz = np.stack([s["x"][keep], s["y"][keep], s["z"][keep]], 1)
     final = None
-    if completed and t[0] <= horizon <= t[-1] and t_end >= horizon:
+    completed = meta.get("mission_outcome", meta["outcome"]) == "completed"
+    if completed and t[0] <= horizon <= t[-1] and end >= horizon:
         final = np.array(
             [np.interp(horizon, t, s["x"]), np.interp(horizon, t, s["y"])]
         )
@@ -87,24 +85,18 @@ def evaluate(trial, task):
     met = task.requirements(
         xyz[:, :2], final if final is not None else [np.inf] * 2
     )
-    cmd = trial["commands"]
-    mission = cmd["step"] >= 0
-    period = 1.0 / meta["stream_hz"]
-    sent = cmd["t_sent"][mission]
-    # Match the flight monitor: trailing host-time means at command checks.
-    # Older logs without the averaging field retain their original scoring.
-    altitude = xyz[:, 2]
-    if window := meta.get("altitude_average_s"):
-        s = trial["state"]
-        checks = sent
-        altitude = np.array(
-            [
-                s["z"][
-                    (s["t_host"] >= tick - window) & (s["t_host"] <= tick)
-                ].mean()
-                for tick in checks
-            ]
-        )
+    # Match the flight monitor: trailing host-time means at its checks.
+    s, window = trial["state"], meta["altitude_average_s"]
+    t0 = meta["mission_t0"]
+    t_end = meta.get("mission_t_end", t0)
+    altitude = np.array(
+        [
+            s["z"][
+                (s["t_host"] >= tick - window) & (s["t_host"] <= tick)
+            ].mean()
+            for tick in np.arange(t0, t_end, MONITOR_S)
+        ]
+    )
     met["altitude"] = bool(
         len(altitude)
         and np.all(
@@ -121,16 +113,7 @@ def evaluate(trial, task):
         "path_length": float(
             np.linalg.norm(np.diff(xyz[:, :2], axis=0), axis=1).sum()
         ),
-        "effort": float(
-            np.sum(cmd["vx"][mission] ** 2 + cmd["vy"][mission] ** 2) * period
-        ),
-        "duration": float(
-            meta.get(
-                "mission_t_end",
-                sent[-1] + period if len(sent) else meta["mission_t0"],
-            )
-            - meta["mission_t0"]
-        ),
+        "duration": float(t_end - t0),
     }
 
 
@@ -144,6 +127,26 @@ def _plan(meta):
     ):
         return None
     return json.loads(path.read_text())
+
+
+def coverage(trials, plan):
+    """Held-out d^2 coverage of evaluation flights under the plan's prediction.
+
+    Tests whether the model transfers to the path actually flown; None for
+    a plan without a prediction.
+    """
+    if plan is None or plan.get("prediction") is None:
+        return None
+    mean = np.asarray(plan["prediction"]["mean"])
+    cov = np.asarray(plan["prediction"]["cov"])
+    d2 = []
+    for trial in trials:
+        p, _, _ = aligned_states(trial)
+        d2.append(squared_distance(p - mean[: len(p)], cov[: len(p)]))
+    if not d2:
+        return None
+    d2 = np.concatenate(d2)
+    return {name: float(np.mean(d2 <= th)) for name, th in COVERAGE.items()}
 
 
 def summarize(trials, task):
@@ -164,8 +167,8 @@ def summarize(trials, task):
         for r in counted:
             for name, ok in r["requirements"].items():
                 failures[name] += not ok
-        plan = _plan(group[0]["meta"])
-        score = (plan or {}).get("score") or {}
+        plan = _plan(group[0]["meta"]) or {}
+        flown = [t for t, r in zip(group, results) if "excluded" not in r]
         row = {
             "condition": condition,
             "fan": fan,
@@ -175,11 +178,9 @@ def summarize(trials, task):
             "ci95": clopper_pearson(k, n) if n else (np.nan, np.nan),
             "failures": dict(failures),
             "excluded": [r["excluded"] for r in results if "excluded" in r],
-            "returned": sum(
-                t["meta"].get("recovery") == "returned" for t in group
-            ),
-            "planned_pdstl_lower": score.get("pdstl_lower"),
-            "planned_mean_robustness": score.get("robustness"),
+            "planned_exact_score": plan.get("exact_score"),
+            "planned_threshold_met": plan.get("threshold_met"),
+            "held_out_coverage": coverage(flown, plan),
         }
         for name in METRICS:
             values = [r[name] for r in counted]
@@ -201,28 +202,29 @@ def _write_tables(rows):
         )
         writer.writeheader()
         writer.writerows(rows)
-    lines = [
-        (
-            "| condition | fan | success | 95% CI | min clearance [m] "
-            "| endpoint error [m] | planned pdSTL lower (model) | excluded |"
-        ),
-        "|" + "---|" * 8,
-    ]
+    header = (
+        "| condition | fan | success | 95% CI | min clearance [m] "
+        "| endpoint error [m] | planned exact score (model) "
+        "| held-out d2<=4 coverage (model, nominal 86.5%) | excluded |"
+    )
+    lines = [header, "|" + "---|" * 9]
     for r in rows:
 
         def spread(name, r=r):
-            return (
-                "-"
-                if r[name] is None
-                else f"{r[name][0]:.3f} ± {r[name][1]:.3f}"
-            )
+            if r[name] is None:
+                return "-"
+            return f"{r[name][0]:.3f} ± {r[name][1]:.3f}"
 
-        planned = r["planned_pdstl_lower"]
+        score = r["planned_exact_score"]
+        score = "-" if score is None else f"{score:.3f}"
+        cover = r["held_out_coverage"]
+        cover = "-" if cover is None else f"{cover['d2<=4 (86.5%)']:.2f}"
         lines.append(
-            f"| {r['condition']} | {r['fan']} | {r['successes']}/{r['flights']} "
+            f"| {r['condition']} | {r['fan']} "
+            f"| {r['successes']}/{r['flights']} "
             f"| [{r['ci95'][0]:.2f}, {r['ci95'][1]:.2f}] "
             f"| {spread('min_clearance')} | {spread('endpoint_error')} "
-            f"| {'-' if planned is None else f'{planned:.3f}'} | {len(r['excluded'])} |"
+            f"| {score} | {cover} | {len(r['excluded'])} |"
         )
     (RESULTS / "summary.md").write_text("\n".join(lines) + "\n")
 
@@ -248,78 +250,107 @@ def draw_task(ax, task, cfg=None):
     ax.set_ylabel("y [m]")
 
 
+def curve_xy(rows):
+    rows = np.asarray(rows, dtype=float)
+    return minsnap.evaluate(rows, minsnap.dense_times(rows))[:, :2]
+
+
 def plot_plan(plan, task, cfg, path):
-    """The integrated commands and fitted-model mean, when available."""
+    """The uploaded curve and, when available, the predicted belief."""
     fig, ax = plt.subplots(figsize=(5, 6))
     draw_task(ax, task, cfg)
-    nominal = nominal_path(cfg, plan["start"], plan["velocities"])
-    ax.plot(
-        nominal[:, 0],
-        nominal[:, 1],
-        "k--",
-        lw=1,
-        label="commanded (integrated)",
-    )
+    curve = curve_xy(plan["coefficients"])
+    ax.plot(curve[:, 0], curve[:, 1], "k--", lw=1, label="curve (uploaded)")
+    w = np.asarray(plan["waypoints"])
+    ax.plot(w[:, 0], w[:, 1], "k.", ms=4, label="waypoints")
     if plan["prediction"]:
         mean = np.array(plan["prediction"]["mean"])
+        cov = np.array(plan["prediction"]["cov"])
         ax.plot(mean[:, 0], mean[:, 1], "tab:blue", label="predicted mean")
+        every = round(1.0 / plan["dt"])  # one ellipse per second
+        for k in range(0, len(mean), every):
+            values, vectors = np.linalg.eigh(cov[k])
+            angle = np.degrees(np.arctan2(vectors[1, 1], vectors[0, 1]))
+            width, height = 2 * np.sqrt(D2_95 * values[::-1])
+            ax.add_patch(
+                Ellipse(
+                    mean[k], width, height, angle=angle,
+                    fill=False, ec="tab:blue", lw=0.6,
+                    label="95% region (d² = 5.991)" if k == 0 else None,
+                )
+            )  # fmt: skip
     ax.set_title(plan["id"], fontsize=8)
-    ax.legend()
+    ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
 
 
-def check_trial(trial, task, cfg):
-    """Inspect one attempt's timing, recorded state and mission outcome."""
-    meta, cmd, s = trial["meta"], trial["commands"], trial["state"]
-    print(
-        f"{meta['trial_id']}: {meta['outcome']}"
-        + (
-            f" ({meta['abort_kind']} in {meta['abort_phase']}: {meta['abort_reason']})"
-            if meta.get("abort_reason")
-            else ""
-        )
+def tracking_errors(trial):
+    """Time-aligned and cross-track errors [m] of the mission samples."""
+    meta, s = trial["meta"], trial["state"]
+    rows = np.asarray(meta["coefficients"], dtype=float)
+    t = state_times(s)
+    start, end = mission_window(meta)
+    keep = (t >= start) & (t <= end)
+    xy = np.stack([s["x"][keep], s["y"][keep]], 1)
+    aligned = np.linalg.norm(
+        xy - minsnap.evaluate(rows, t[keep] - start)[:, :2], axis=1
     )
-    if meta.get("recovery"):
-        error = meta.get("start_error")
-        print(
-            f"  recovery: {meta['recovery']}"
-            + (f", {error:.3f} m from the start" if error is not None else "")
+    curve = curve_xy(rows)
+    cross = np.linalg.norm(xy[:, None] - curve[None], axis=2).min(axis=1)
+    return xy, aligned, cross
+
+
+def rms(x):
+    return float(np.sqrt(np.mean(np.square(x))))
+
+
+def check_trial(trial, task, cfg):
+    """Inspect one attempt: alignment, tracking, state data and outcome."""
+    meta, s = trial["meta"], trial["state"]
+    line = f"{meta['trial_id']}: {meta['outcome']}"
+    if meta.get("abort_reason"):
+        line += (
+            f" ({meta['abort_kind']} in {meta['abort_phase']}: "
+            f"{meta['abort_reason']})"
         )
+    print(line)
     if meta.get("landing"):
-        print(
-            f"  landing: {meta['landing']}"
-            + (
-                f" ({meta['landing_error']})"
-                if meta.get("landing_error")
-                else ""
-            )
-        )
+        print(f"  landing: {meta['landing']}")
+        if meta.get("landing_error"):
+            print(f"  landing error: {meta['landing_error']}")
     if s is None or not len(s["t_host"]) or "mission_t0" not in meta:
         print("  no mission data")
         return None
-    period = 1.0 / meta["stream_hz"]
+    if meta.get("pieces"):
+        print(
+            f"  upload: {meta['pieces']} pieces, {meta['upload_bytes']} B, "
+            f"{1e3 * meta['upload_s']:.0f} ms"
+        )
+    offset = 1e3 * meta["t_play_offset"]
+    print(
+        f"  alignment: {meta['alignment']}, t_play - t_cmd_after "
+        f"= {offset:.1f} ms, identifiable: {meta['identifiable']}"
+    )
+    if meta.get("alignment_max") is not None:
+        print(
+            f"  ctrltarget vs r(t): rms {1e3 * meta['alignment_rms']:.2f} mm, "
+            f"max {1e3 * meta['alignment_max']:.2f} mm"
+        )
+        if meta["alignment_max"] > ALIGNMENT_FLAG_M:
+            print(
+                "  FLAG: reference-alignment discrepancy above 1 cm; "
+                "investigate upload, timing, sampling or alignment"
+            )
     gaps = np.diff(state_times(s))
-    if not len(cmd["k"]):
-        print("  no mission commands sent")
-        return None
-    # Derive this from timestamps for old logs too: their `lateness` was
-    # measured before checks/sending and could hide a blocked send.
-    delay = cmd["t_sent"] - meta["mission_t0"] - cmd["t_ref"]
+    period = 1.0 / meta["log_hz"]
+    missing = int(np.sum(np.round(gaps / period) - 1))
     print(
-        f"  commands: {len(cmd['k'])} sent, send-return delay mean {1e3 * delay.mean():.1f} ms, "
-        f"max {1e3 * delay.max():.1f} ms"
-    )
-    print(
-        f"  state: {len(gaps) + 1} packets, interval median {1e3 * np.median(gaps):.0f} ms, "
-        f"max gap {1e3 * gaps.max():.0f} ms, missing ≈ {int(np.sum(np.round(gaps / period) - 1))}"
-    )
-    print(
-        f"  host receive max gap {1e3 * np.diff(s['t_host']).max():.0f} ms"
-        if len(s["t_host"]) > 1
-        else "  host receive: one packet"
+        f"  state: {len(gaps) + 1} packets, interval median "
+        f"{1e3 * np.median(gaps):.0f} ms, max gap {1e3 * gaps.max():.0f} ms, "
+        f"missing ≈ {missing}"
     )
     print(
         f"  start state [x y z vx vy yaw]: {np.round(meta['start_state'], 3).tolist()}"
@@ -327,43 +358,29 @@ def check_trial(trial, task, cfg):
     print(
         f"  battery {meta.get('battery_start')} -> {meta.get('battery_end')} V"
     )
+    xy, aligned, cross = tracking_errors(trial)
+    if len(xy):
+        print(
+            f"  time-aligned tracking error: rms {1e3 * rms(aligned):.1f} mm, "
+            f"max {1e3 * aligned.max():.1f} mm"
+        )
+        print(
+            f"  cross-track error: rms {1e3 * rms(cross):.1f} mm, "
+            f"max {1e3 * cross.max():.1f} mm"
+        )
     result = evaluate(trial, task)
     if "excluded" not in result:
         print(
-            f"  requirements {result['requirements']}, min clearance {result['min_clearance']:.3f} m"
+            f"  requirements {result['requirements']}, "
+            f"min clearance {result['min_clearance']:.3f} m"
         )
 
-    t = state_times(s) - meta["mission_t0"]
+    t = state_times(s) - mission_window(meta)[0]
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
     draw_task(axes[0], task, cfg)
-    plan = _plan(meta)
-    if plan:
-        nominal = nominal_path(cfg, plan["start"], plan["velocities"])
-        axes[0].plot(
-            nominal[:, 0],
-            nominal[:, 1],
-            "k--",
-            lw=1,
-            label="commanded (integrated)",
-        )
-    mission_end = (
-        meta.get(
-            "mission_t_end", meta["mission_t0"] + meta["steps"] * meta["dt"]
-        )
-        - meta["mission_t0"]
-    )
-    during = (t >= 0) & (t <= mission_end)
-    after = t > mission_end
-    axes[0].plot(s["x"][during], s["y"][during], label="flown (mission)")
-    axes[0].plot(
-        s["x"][after],
-        s["y"][after],
-        ":",
-        c="tab:red",
-        label="return + landing"
-        if meta.get("start_error") is not None
-        else "landing",
-    )
+    curve = curve_xy(meta["coefficients"])
+    axes[0].plot(curve[:, 0], curve[:, 1], "k--", lw=1, label="curve")
+    axes[0].plot(xy[:, 0], xy[:, 1], label="flown (mission)")
     axes[0].legend()
     ax = axes[1]
     ax.plot(t, s["z"], label="measured z")
@@ -377,9 +394,9 @@ def check_trial(trial, task, cfg):
     ax.axhline(
         meta["altitude"], c="tab:green", ls="--", lw=1, label="setpoint"
     )
-    ax.axvline(mission_end, c="0.5", ls=":", label="mission end")
+    ax.axvline(meta["duration"], c="0.5", ls=":", label="curve end")
     ax.set_xlim(-1, t.max())
-    ax.set_xlabel("time from mission start [s]")
+    ax.set_xlabel("time from playback start [s]")
     ax.set_ylabel("z [m]")
     ax.legend()
     fig.tight_layout()

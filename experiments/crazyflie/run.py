@@ -1,10 +1,13 @@
-"""Crazyflie experiment: replay supplied commands, fit, plan and analyze.
+"""Crazyflie experiment: fly an uploaded min-snap curve, fit, plan, analyze.
 
 python run.py fly --fan 0
 python run.py analyze --trial latest
 python run.py fit
+python run.py plan --condition pdstl --fan 0 --output plans/pdstl_fan0.json
+python run.py export plans/reference.json --csv /tmp/reference.csv
 
-The configured reference is already registered. Use import only for a new file.
+The configured reference is already registered. Use import only for a new
+waypoint file.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import sys
 from pathlib import Path
 
 import config
+import minsnap
 import numpy as np
 from logger import TrialLog, all_trials, find_trial
 from trajectory import load_plan, read_plan, save_plan
@@ -33,25 +37,29 @@ def cmd_import(cfg, args):
     from geometry import Task
     from trajectory import import_plan
 
-    path = import_plan(args.path, cfg, args.output)
+    durations = args.durations or [args.segment]
+    path = import_plan(args.path, durations, cfg, args.output)
     plan = read_plan(path)
-    cfg = cfg.for_plan(plan)
+    flight_cfg = cfg.for_plan(plan)
     analysis.plot_plan(
-        plan,
-        Task(cfg),
-        cfg,
-        path.with_suffix(".png"),
+        plan, Task(flight_cfg), flight_cfg, path.with_suffix(".png")
     )
-    print(f"Imported unchanged commands: {path}")
+    print(f"Imported {len(plan['durations'])} pieces: {path}")
     return path
+
+
+def cmd_export(cfg, args):
+    plan = read_plan(args.plan)
+    minsnap.write_csv(args.csv, plan["coefficients"])
+    print(f"Wrote {len(plan['coefficients'])} pieces to {args.csv}")
 
 
 def cmd_plan(cfg, args):
     import analysis
     from geometry import Task
-    from planner import make_plan, plan_mean, plan_pdstl
+    from planner import plan
     from tracking_model import load_model
-    from trajectory import reference_velocities
+    from trajectory import reference_plan
 
     if (
         args.output
@@ -63,27 +71,25 @@ def cmd_plan(cfg, args):
     model_path = args.model or cfg.model_report
     if model_path is None:
         sys.exit(
-            "set model_report in config.yml or supply --model; no model is selected automatically"
+            "set model_report in config.yml or supply --model; "
+            "no model is selected automatically"
         )
     model = load_model(model_path, args.fan, cfg)
     task = Task(cfg)
-    optimize = plan_pdstl if args.condition == "pdstl" else plan_mean
-    controls, score = optimize(cfg, task, model, reference_velocities(cfg))
-    plan = make_plan(
-        cfg,
-        args.condition,
-        f"fan-{args.fan}",
-        cfg.start,
-        controls,
-        task,
-        args.fan,
-        model,
-        score,
+    record = plan(
+        cfg, task, model, reference_plan(cfg), args.condition, args.fan
     )
-    path = save_plan(plan, args.output)
-    analysis.plot_plan(plan, task, cfg, path.with_suffix(".png"))
+    path = save_plan(record, args.output)
+    analysis.plot_plan(record, task, cfg, path.with_suffix(".png"))
+    print(f"{path}")
+    print(f"  feasible: {record['feasible']} {record['problems'] or ''}")
     print(
-        f"{path}: clearance {plan['min_clearance']:.3f} m, score {score}, problems {plan['problems'] or 'none'}"
+        f"  exact score {record['exact_score']:.4f}, "
+        f"threshold {record['threshold']} met: {record['threshold_met']}"
+    )
+    print(
+        f"  min clearance {record['min_clearance']:.3f} m, largest waypoint "
+        f"move from the reference {record['waypoint_shift_max']:.3f} m"
     )
     return path
 
@@ -105,10 +111,29 @@ def select_plan(cfg, args):
         path = config.HERE / path
     if not path.exists():
         sys.exit(f"no trajectory {path}; select its saved file")
-    plan = load_plan(path, cfg)
+    try:
+        plan = load_plan(path, cfg, args.allow_below_threshold)
+    except ValueError as exc:
+        sys.exit(str(exc))
     if plan["fan"] is not None and plan["fan"] != args.fan:
         sys.exit(f"plan is for fan {plan['fan']!r}, not {args.fan!r}")
     return path, plan
+
+
+def describe(plan, path):
+    """What will be uploaded and flown."""
+    rows = np.asarray(plan["coefficients"])
+    t = minsnap.dense_times(rows)
+    speed = np.linalg.norm(minsnap.evaluate(rows, t, 1)[:, :2], axis=1)
+    accel = np.linalg.norm(minsnap.evaluate(rows, t, 2)[:, :2], axis=1)
+    return (
+        f"  {len(rows)} pieces, duration {minsnap.total_duration(rows):.1f} s, "
+        f"altitude {plan['altitude']} m, start {plan['start']}\n"
+        f"  max speed {speed.max():.3f} m/s, "
+        f"max acceleration {accel.max():.3f} m/s^2, "
+        f"min clearance {plan['min_clearance']:.3f} m\n"
+        f"  plan figure {path.with_suffix('.png')}"
+    )
 
 
 def cmd_fly(cfg, args):
@@ -121,16 +146,12 @@ def cmd_fly(cfg, args):
         print("\n".join(f"  - {line}" for line in missing))
         sys.exit("Nothing was flown or logged. Use --dry-run to simulate.")
 
-    v = np.asarray(plan["velocities"])
+    dry = " [DRY RUN]" if args.dry_run else ""
     print(
         f"{plan['id']} ({plan['condition']}), purpose {args.purpose}, "
-        f"fan {args.fan}"
-        + (" [DRY RUN]" if args.dry_run else "")
-        + f"\n  duration {len(v) * cfg.dt:.1f} s, altitude {cfg.altitude} m, "
-        f"start {plan['start']}, max speed {np.linalg.norm(v, axis=1).max():.2f} m/s, "
-        f"clearance {plan['min_clearance']:.3f} m"
-        f"\n  plan figure {path.with_suffix('.png')}"
+        f"fan {args.fan}{dry}"
     )
+    print(describe(plan, path))
     log = TrialLog.for_flight(
         cfg,
         plan,
@@ -157,22 +178,29 @@ def cmd_fit(cfg, args):
         report = fit(cfg, all_trials())
     except ValueError as exc:
         sys.exit(
-            f"cannot fit yet: {exc} (completed identification flights; dry runs do not count)"
+            f"cannot fit yet: {exc} (identification flights that completed "
+            "or aborted on a task violation; dry runs do not count)"
         )
     path = save_report(report)
-    print(
-        f"{report['id']}: tau {np.round(report['tau'], 3).tolist()} s, "
-        f"gain {np.round(report['gain'], 3).tolist()}\n  {path}"
-    )
-    for fan, v in report["validation"].items():
-        coverage = ", ".join(
-            f"{k}: {c[0]:.2f} [{c[1]:.2f}, {c[2]:.2f}]"
-            for k, c in v["coverage"].items()
-        )
+    print(f"{report['id']}: {path}")
+    for warning in report["warnings"]:
+        print(f"  warning: {warning}")
+    for fan, f in report["fans"].items():
         print(
-            f"  fan {fan}: {v['flights']} held out; final error "
-            f"{v['final_error'][0]:.3f} m; {coverage}"
+            f"  fan {fan}: {f['fit_flights']} fit flights, "
+            f"rho {np.round(f['rho'], 3).tolist()}, "
+            f"b {np.round(f['b'], 4).tolist()} m, "
+            f"stationary spread {np.round(f['stationary_spread'], 4).tolist()} m"
         )
+        if any(f["b_poorly_determined"]):
+            print("    b is poorly determined: rho is close to 1")
+        v = report["validation"].get(fan)
+        if v:
+            coverage = ", ".join(
+                f"{k}: {c[0]:.2f} [{c[1]:.2f}, {c[2]:.2f}]"
+                for k, c in v["coverage"].items()
+            )
+            print(f"    {v['flights']} held out; {coverage}")
 
 
 def cmd_analyze(cfg, args):
@@ -196,10 +224,16 @@ def main(argv=None):
     parser.add_argument("--config", default=config.HERE / "config.yml")
     sub = parser.add_subparsers(dest="action", required=True)
     imp = sub.add_parser(
-        "import", help="check a supplied trajectory once and freeze it"
+        "import", help="fit a curve through x,y waypoint rows and freeze it"
     )
-    imp.add_argument("path")
-    imp.add_argument("--output", help="default: configured reference file")
+    imp.add_argument("path", help="CSV of x,y rows, the first is the start")
+    times = imp.add_mutually_exclusive_group(required=True)
+    times.add_argument("--durations", type=float, nargs="+")
+    times.add_argument("--segment", type=float, help="one duration for all")
+    imp.add_argument("--output", required=True, help="new plan file")
+    exp = sub.add_parser("export", help="write a plan in uav_trajectories CSV")
+    exp.add_argument("plan")
+    exp.add_argument("--csv", required=True)
     p = sub.add_parser("plan", help="optimize a model-based plan offline")
     p.add_argument(
         "--condition", choices=("mean_model", "pdstl"), required=True
@@ -212,7 +246,7 @@ def main(argv=None):
     )
     p.add_argument("--model", help="default: configured model_report")
     p.add_argument("--output", help="optional saved plan filename")
-    f = sub.add_parser("fly", help="replay a saved velocity trajectory")
+    f = sub.add_parser("fly", help="upload and fly a saved curve")
     f.add_argument("--plan", help="saved file; default: configured reference")
     f.add_argument(
         "--purpose",
@@ -226,8 +260,9 @@ def main(argv=None):
         help="physical setting; default: fan in config.yml",
     )
     f.add_argument("--dry-run", action="store_true")
+    f.add_argument("--allow-below-threshold", action="store_true")
     f.add_argument("--note", default="")
-    sub.add_parser("fit", help="fit and validate the flight model offline")
+    sub.add_parser("fit", help="fit and validate the error model offline")
     a = sub.add_parser("analyze", help="score and plot recorded flights")
     a.add_argument(
         "--trial", help='trial id, a unique part of it, or "latest"'
@@ -236,17 +271,14 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
-        cfg = (
-            config.load(args.config, trajectory_source=args.path)
-            if args.action == "import"
-            else config.load(args.config)
-        )
+        cfg = config.load(args.config)
     except (FileNotFoundError, TypeError, ValueError) as exc:
         sys.exit(str(exc))
     if args.action in ("plan", "fly") and args.fan is None:
         args.fan = cfg.fan
     {
         "import": cmd_import,
+        "export": cmd_export,
         "plan": cmd_plan,
         "fly": cmd_fly,
         "fit": cmd_fit,

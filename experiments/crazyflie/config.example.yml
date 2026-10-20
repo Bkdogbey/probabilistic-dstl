@@ -12,10 +12,11 @@ obstacles:
   - {name: obs_3, x: [0.7508, 1.0429], y: [-0.8128, -0.6096], height: 0.4191}
 goal: {x: [0.85, 1.15], y: [-0.15, 0.15]}
 
-# Supplied commands own the start, altitude and timing.
+# The reference curve owns the start, altitude and timing.
 reference: plans/reference.json
-u_max: 0.30
-a_max: 0.30
+v_max: 0.30  # speed norm limit on the curve [m/s]
+a_max: 0.30  # acceleration norm limit on the curve [m/s^2]
+clearance_margin: 0.01  # sampled airframe clearance must stay above this [m]
 model_report: null  # set to the report printed by `python run.py fit`
 
 # Set the physical fan manually; this setting labels the flight.

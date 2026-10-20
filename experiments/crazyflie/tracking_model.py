@@ -1,43 +1,48 @@
-"""Tracking model s' = A s + B u + c_f + w, w ~ N(0, Q_f): fit, validate, load.
+"""Stable stochastic tracking-error model: fit, validate, load.
 
-State s = [px, py, vx, vy], control u = commanded world velocity. Each
-axis is a first-order velocity lag (time constant tau, gain g) under a
-zero-order hold, discretized exactly at dt, so position integrates the
-velocity consistently:
+The onboard controller flies the uploaded curve r(t). On the planning grid
+t_k = t_play + k dt the time-aligned tracking error e_k = p_k - r(t_k) is
+modelled, per fan setting, as
 
-    a  = exp(-dt / tau)
-    v' = a v + g (1 - a) u
-    p' = p + tau (1 - a) v + g (dt - tau (1 - a)) u
+    e[k+1] = R e[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),
+    w ~ N(0, Q) (full 2x2),   e[0] ~ N(m0, P0).
 
-tau and g are shared across fan settings; the bias c_f, residual
-covariance Q_f and initial belief are per fan.
+This is an empirical error model, not a physical model of the drone. Q is
+the effective innovation covariance: it also absorbs state-estimation error
+and model mismatch, so it does not isolate the physical fan noise. With
+every |rho| < 1 the covariance approaches the stationary P_inf, which
+solves P_inf = R P_inf R^T + Q. A Gaussian error still has unbounded
+support. Whether real flights behave this way is what the held-out and
+transfer checks test.
+
+Assumption: at a given fan setting the error statistics are the same for
+every candidate path, so a plan only moves r. This is a strong assumption.
+The residual diagnostics (signed reference velocity, acceleration and
+position relative to the fan) check it; they are reported, never fitted.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import minsnap
 import numpy as np
 import torch
 from config import HERE, fan_setting
 from logger import aligned_states
-from scipy.optimize import least_squares, minimize
+from trajectory import file_hash
 
 # isort: split  (config puts the pdSTL core in src/ on sys.path)
 from models.beliefs import interval_probability
-from models.dynamics import Dynamics
 
 REPORTS = HERE / "reports"
-MIN_VELOCITY_VARIANCE = (
-    1e-8  # (1e-4 m/s)^2 per step: never a degenerate covariance
-)
-START_COV = torch.diag(
-    torch.tensor([1e-4, 1e-4, 0.05**2, 0.05**2])
-)  # measured start: ~1 cm, at rest
+RHO_RANGE = (0.0, 0.999)
+RHO_NEAR_ONE = 0.95  # above this, b = c / (1 - rho) is poorly determined
+P0_FLOOR = 0.01**2  # m^2, on the initial variances
 COVERAGE = {
     "d2<=1 (39.3%)": 1.0,
     "d2<=4 (86.5%)": 4.0,
@@ -45,273 +50,289 @@ COVERAGE = {
 }
 
 
-def response_matrices(dt, tau, gain):
-    A, B = np.eye(4), np.zeros((4, 2))
-    for i in (0, 1):
-        a = math.exp(-dt / tau[i])
-        A[i, 2 + i], A[2 + i, 2 + i] = tau[i] * (1 - a), a
-        B[i, i] = gain[i] * (dt - tau[i] * (1 - a))
-        B[2 + i, i] = gain[i] * (1 - a)
-    return A, B
-
-
-class TrackingModel(Dynamics):
-    """Linear Gaussian tracking model with a constant bias c."""
+class TrackingModel:
+    """The error model of one fan setting; beliefs are r + m_k, P_k."""
 
     def __init__(
-        self,
-        dt,
-        tau,
-        gain,
-        c,
-        Q,
-        initial,
-        u_max,
-        a_max,
-        report_id=None,
-        report_hash=None,
+        self, dt, rho, b, Q, m0, P0, report_id=None, report_hash=None
     ):
-        super().__init__(dt, u_max)
-        self.a_max = a_max
-        A, B = response_matrices(dt, tau, gain)
+        def tensor(x):
+            return torch.as_tensor(np.asarray(x, float), dtype=torch.float64)
 
-        def f32(x):
-            return torch.as_tensor(np.asarray(x), dtype=torch.float32)
-
-        for name, value in {"A": A, "B": B, "c": c, "Q": Q}.items():
-            self.register_buffer(name, f32(value))
-        self.initial = (f32(initial[0]), f32(initial[1]))
+        self.dt = dt
+        self.rho, self.b, self.Q = tensor(rho), tensor(b), tensor(Q)
+        self.m0, self.P0 = tensor(m0), tensor(P0)
         self.report_id, self.report_hash = report_id, report_hash
 
-    def controls(self, params):
-        """Physical controls [T, 2] from unconstrained parameters.
-
-        Speed is bounded by u_max (tanh) and the change per step by
-        a_max * dt, starting from rest. A sequence already within both
-        limits maps to itself, so planners can re-evaluate their output.
-        """
-        step = self.a_max * self.dt
-        u, out = torch.zeros_like(params[0]), []
-        for target in self.bound_control(params):
-            u = u + torch.clamp(target - u, -step, step)
-            out.append(u)
-        return torch.stack(out)
-
-    def step(self, x, P, u):
-        return self.A @ x + self.B @ u + self.c, self.A @ P @ self.A.T + self.Q
-
-    def predict(self, controls, mean0=None, cov0=None):
-        """Mean [N+1, 4] and covariance [N+1, 4, 4] under physical controls."""
-        mean = (
-            self.initial[0]
-            if mean0 is None
-            else torch.as_tensor(mean0, dtype=torch.float32)
-        )
-        cov = (
-            self.initial[1]
-            if cov0 is None
-            else torch.as_tensor(cov0, dtype=torch.float32)
-        )
-        means, covs = [mean], [cov]
-        for u in torch.as_tensor(controls, dtype=torch.float32):
-            mean, cov = self.step(mean, cov, u)
-            means.append(mean)
-            covs.append(cov)
+    def error_moments(self, steps):
+        """Error mean m_k [steps+1, 2] and covariance P_k [steps+1, 2, 2]."""
+        R = torch.diag(self.rho)
+        m, P = self.m0, self.P0
+        means, covs = [m], [P]
+        for _ in range(steps):
+            m = self.rho * m + (1 - self.rho) * self.b
+            P = R @ P @ R.T + self.Q
+            means.append(m)
+            covs.append(P)
         return torch.stack(means), torch.stack(covs)
 
+    def predict(self, reference):
+        """Belief mean r_k + m_k [N, 2] and covariance P_k for r [N, 2]."""
+        reference = torch.as_tensor(reference, dtype=torch.float64)
+        m, P = self.error_moments(len(reference) - 1)
+        return reference + m, P
 
-# Fitting
+    def stationary_cov(self):
+        """P_inf = R P_inf R^T + Q; elementwise for diagonal R."""
+        return self.Q / (1 - torch.outer(self.rho, self.rho))
+
+
+# Which flights count
+
+
+def usable(trial):
+    """Identification flights that completed or aborted on a task violation.
+
+    Task-violation aborts count up to the abort: dropping large deviations
+    would understate the noise. Data faults, errors and interruptions do not.
+    """
+    meta = trial["meta"]
+    mission = meta.get("mission_outcome")
+    return (
+        meta["purpose"] == "identification"
+        and not meta.get("dry_run")
+        and not meta.get("data_readiness")
+        and (
+            mission == "completed"
+            or (
+                mission == "aborted"
+                and meta.get("abort_kind") == "TaskViolation"
+            )
+        )
+    )
+
+
+def by_fan(trials):
+    groups = defaultdict(list)
+    for t in trials:
+        if usable(t):
+            groups[str(fan_setting(t["meta"]["fan"]))].append(t)
+    return dict(sorted(groups.items(), key=lambda item: int(item[0])))
 
 
 def split(trials, holdout_every):
-    """Identification flights per fan, in time order: (fit, held_out)."""
+    """Usable flights per fan, in time order: (fit, held_out)."""
     fit, held = {}, {}
-    usable = [
-        t
-        for t in trials
-        if t["meta"]["purpose"] == "identification"
-        and not t["meta"].get("dry_run")
-        and not t["meta"].get("data_readiness")
-        and t["meta"]["outcome"] == "completed"
-    ]
-    for fan in sorted(
-        {str(fan_setting(t["meta"]["fan"])) for t in usable}, key=int
-    ):
-        ordered = [
-            t for t in usable if str(fan_setting(t["meta"]["fan"])) == fan
-        ]
+    for fan, ordered in by_fan(trials).items():
         held[fan] = ordered[holdout_every - 1 :: holdout_every]
         fit[fan] = [t for t in ordered if t not in held[fan]]
     return fit, held
 
 
-def _response(dt, tau, gain, drift, u, p0):
-    """Positions [N, 2] of the velocity-lag model driven by u [N, 2] from rest.
+def flight_data(trial):
+    """Error e, reference r and its velocity and acceleration on the grid."""
+    _, r, e = aligned_states(trial)
+    rows = np.asarray(trial["meta"]["coefficients"], dtype=float)
+    t = trial["meta"]["dt"] * np.arange(len(e))
+    return {
+        "e": e,
+        "r": r,
+        "v": minsnap.evaluate(rows, t, 1)[:, :2],
+        "a": minsnap.evaluate(rows, t, 2)[:, :2],
+    }
 
-    `drift` is a steady velocity offset [m/s]. This is `response_matrices`
-    rolled out, written per axis so it can be fitted quickly.
+
+# Fitting
+
+
+def fit_errors(errors):
+    """rho, b, Q, m0, P0 from the errors [N_i, 2] of whole flights.
+
+    Per axis, e[k+1] is regressed on [e[k], 1]. A slope outside RHO_RANGE
+    is clipped and the intercept refitted with rho fixed, so b and Q
+    describe the model actually used for prediction.
     """
-    tau, gain, drift = map(np.asarray, (tau, gain, drift))
-    a = np.exp(-dt / tau)
-    lag = tau * (1 - a)
-    v, p, out = np.zeros(2), np.asarray(p0, float), []
-    for uk in u:
-        p = p + lag * v + gain * (dt - lag) * uk + (dt - lag) * drift
-        v = a * v + gain * (1 - a) * uk + (1 - a) * drift
-        out.append(p)
-    return np.array(out)
+    x = np.concatenate([e[:-1] for e in errors])
+    y = np.concatenate([e[1:] for e in errors])
+    rho, intercept, clipped = np.zeros(2), np.zeros(2), [False, False]
+    for i in (0, 1):
+        slope, c = np.polyfit(x[:, i], y[:, i], 1)
+        if not RHO_RANGE[0] <= slope <= RHO_RANGE[1]:
+            slope = float(np.clip(slope, *RHO_RANGE))
+            c = np.mean(y[:, i] - slope * x[:, i])
+            clipped[i] = True
+        rho[i], intercept[i] = slope, c
+    residual = y - rho * x - intercept
+    starts = np.array([e[0] for e in errors])
+    P0 = np.cov(starts.T)
+    P0[np.diag_indices(2)] = np.maximum(np.diag(P0), P0_FLOOR)
+    return {
+        "rho": rho,
+        "b": intercept / (1 - rho),
+        "Q": np.cov(residual.T),
+        "m0": starts.mean(0),
+        "P0": P0,
+        "clipped": clipped,
+    }
 
 
-def _fit_response(cfg, data):
-    """tau, gain (shared) and per-fan drift, by matching measured positions.
+def residuals(params, e):
+    rho, b = np.asarray(params["rho"]), np.asarray(params["b"])
+    return e[1:] - rho * e[:-1] - (1 - rho) * b
 
-    The onboard velocity estimate is too noisy (about 0.15 m/s) to regress
-    on, so the model is simulated from rest over each whole flight and its
-    positions are matched to the measured ones (robust least squares).
+
+def _resample(items, rng):
+    return [items[i] for i in rng.integers(len(items), size=len(items))]
+
+
+def _parameter_intervals(errors, samples, rng):
+    """95% intervals of rho, b and Q, resampling whole flights."""
+    draws = [fit_errors(_resample(errors, rng)) for _ in range(samples)]
+    return {
+        key: np.percentile(
+            [d[key] for d in draws], [2.5, 97.5], axis=0
+        ).tolist()
+        for key in ("rho", "b", "Q")
+    }
+
+
+def _features(cfg, d):
+    """Regressors at step k: signed reference velocity, acceleration, fan."""
+    names = ["vx", "vy", "ax", "ay"]
+    columns = [d["v"][:-1], d["a"][:-1]]
+    if cfg.fan_position is not None and cfg.fan_direction is not None:
+        u = np.asarray(cfg.fan_direction, float)[:2]
+        u = u / np.linalg.norm(u)
+        relative = d["r"][:-1] - np.asarray(cfg.fan_position, float)[:2]
+        columns.append(np.stack([relative @ u, relative @ [-u[1], u[0]]], 1))
+        names += ["fan_along", "fan_across"]
+    columns.append(np.ones((len(d["e"]) - 1, 1)))
+    return np.column_stack(columns), names + ["constant"]
+
+
+def diagnostics(cfg, params, flights, samples, rng):
+    """One-step residuals per axis regressed on the reference; report only.
+
+    A delay delta gives e ~ -delta * r_dot, which changes sign with
+    direction, so the velocity regressors are signed.
     """
-    fans = sorted(data, key=int)
 
-    def unpack(theta):
-        return (
-            theta[:2],
-            theta[2:4],
-            {f: theta[4 + 2 * j : 6 + 2 * j] for j, f in enumerate(fans)},
-        )
+    def coefficients(fs):
+        X = np.vstack([_features(cfg, d)[0] for d in fs])
+        y = np.vstack([residuals(params, d["e"]) for d in fs])
+        return np.linalg.lstsq(X, y, rcond=None)[0]
 
-    def residuals(theta):
-        tau, gain, drift = unpack(theta)
-        return np.concatenate(
-            [
-                (
-                    _response(cfg.dt, tau, gain, drift[f], u, s[0, :2])
-                    - s[1:, :2]
-                ).ravel()
-                for f in fans
-                for s, u in data[f]
-            ]
-        )
-
-    k = 2 * len(fans)
-    fitted = least_squares(
-        residuals,
-        x0=[0.5, 0.5, 1.0, 1.0] + [0.0] * k,
-        bounds=(
-            [0.05] * 2 + [0.3] * 2 + [-0.3] * k,
-            [3.0] * 2 + [1.7] * 2 + [0.3] * k,
-        ),
-        loss="soft_l1",
-        f_scale=0.05,
+    names = _features(cfg, flights[0])[1]
+    estimate = coefficients(flights)
+    draws = np.array(
+        [coefficients(_resample(flights, rng)) for _ in range(samples)]
     )
-    return unpack(fitted.x)
+    low, high = np.percentile(draws, [2.5, 97.5], axis=0)
+    return {
+        axis: {
+            name: [estimate[j, i], low[j, i], high[j, i]]
+            for j, name in enumerate(names)
+        }
+        for i, axis in enumerate(("x", "y"))
+    }
 
 
-def _velocity_noise(dt, tau, errors, v0_var=0.05**2):
-    """Per-step velocity process variance of one axis, by maximum likelihood.
-
-    `errors` is a list of measured-minus-simulated position traces. The
-    position variance is propagated through the model and an unknown
-    measurement variance is added, so measurement noise is not absorbed
-    into the process noise.
-    """
-    a = math.exp(-dt / tau)
-    A = np.array([[1.0, tau * (1 - a)], [0.0, a]])
-    # Supplied trajectories may have different horizons. Pool
-    # only observations that exist at each step, without padding residuals.
-    by_step = [
-        np.array([e[k] for e in errors if k < len(e)])
-        for k in range(max(map(len, errors)))
-    ]
-
-    def nll(log_params):
-        q, r = np.exp(log_params)
-        P, total = np.diag([0.0, v0_var]), 0.0
-        for observed in by_step:
-            P = A @ P @ A.T + np.diag([1e-6, q])
-            var = P[0, 0] + r
-            total += np.sum(np.log(var) + observed**2 / var)
-        return total
-
-    best = minimize(nll, np.log([1e-4, 1e-4]), method="Nelder-Mead")
-    return float(max(np.exp(best.x[0]), MIN_VELOCITY_VARIANCE))
+def make_model(dt, params, report_id=None, report_hash=None):
+    return TrackingModel(
+        dt,
+        params["rho"],
+        params["b"],
+        params["Q"],
+        params["m0"],
+        params["P0"],
+        report_id,
+        report_hash,
+    )
 
 
 def fit(cfg, trials):
-    """Fit tau, g (shared) and drift c_f, Q_f, initial belief (per fan); validate."""
+    """Fit the error model per fan, then validate it on held-out flights."""
     from geometry import Task
 
     fit_trials, held = split(trials, cfg.model["holdout_every"])
     data = {
-        fan: [aligned_states(t) for t in ts] for fan, ts in fit_trials.items()
+        fan: [flight_data(t) for t in ts] for fan, ts in fit_trials.items()
     }
-    fans = sorted(data, key=int)
-    if not fans or min(len(d) for d in data.values()) < 2:
+    if not data or min(len(d) for d in data.values()) < 2:
         raise ValueError("need at least two fitting flights per fan")
-
-    tau, gain, drift = _fit_response(cfg, data)
-    a = np.exp(-cfg.dt / tau)
-    lag = tau * (1 - a)
-    report = {
-        "dt": cfg.dt,
-        "tau": tau.tolist(),
-        "gain": gain.tolist(),
-        "config_hash": cfg.hash,
-        "fans": {},
-    }
-    for fan in fans:
-        errors = [
-            s[1:, :2] - _response(cfg.dt, tau, gain, drift[fan], u, s[0, :2])
-            for s, u in data[fan]
-        ]
-        q = [
-            _velocity_noise(cfg.dt, tau[i], [e[:, i] for e in errors])
-            for i in (0, 1)
-        ]
-        # The belief the planner starts from: flights that begin at the start.
-        starts = np.array(
-            [
-                s[0, :2]
-                for s, _ in data[fan]
-                if np.linalg.norm(s[0, :2] - cfg.start) < 0.3
-            ]
-        )
-        var = (
-            np.maximum(starts.var(axis=0), 0.01**2)
-            if len(starts) > 1
-            else np.full(2, 0.01**2)
-        )
+    samples, rng = (
+        cfg.model["bootstrap"],
+        np.random.default_rng(cfg.model["seed"]),
+    )
+    report = {"dt": cfg.dt, "config_hash": cfg.hash, "fans": {}}
+    warnings = []
+    for fan, flights in data.items():
+        params = fit_errors([d["e"] for d in flights])
+        if len(flights) < cfg.model["min_flights_warning"]:
+            warnings.append(
+                f"fan {fan}: {len(flights)} fit flights; plan for at least "
+                f"{cfg.model['min_flights_warning']} before trusting the fit"
+            )
         report["fans"][fan] = {
-            "drift": drift[fan].tolist(),
-            "c": np.concatenate(
-                [(cfg.dt - lag) * drift[fan], (1 - a) * drift[fan]]
-            ).tolist(),
-            "Q": np.diag([1e-6, 1e-6, *q]).tolist(),
-            "initial_mean": [*starts.mean(axis=0), 0.0, 0.0]
-            if len(starts)
-            else [*cfg.start, 0.0, 0.0],
-            "initial_cov": np.diag([*var, 0.05**2, 0.05**2]).tolist(),
+            **{k: np.asarray(v).tolist() for k, v in params.items()},
+            "fit_flights": len(flights),
             "fit_trials": [t["meta"]["trial_id"] for t in fit_trials[fan]],
             "held_out_trials": [t["meta"]["trial_id"] for t in held[fan]],
         }
-    params = json.dumps(report, sort_keys=True)
-    report["hash"] = hashlib.sha256(params.encode()).hexdigest()[:12]
+    text = json.dumps(report, sort_keys=True)
+    report["hash"] = hashlib.sha256(text.encode()).hexdigest()[:12]
     report["id"] = "model_" + datetime.now(timezone.utc).strftime(
         "%Y%m%dT%H%M%SZ"
     )
+    report["warnings"] = warnings
 
-    rng = np.random.default_rng(cfg.model["seed"])
     task = Task(cfg)
-    report["validation"] = {
-        fan: validate(
-            model_from(report, fan, cfg),
-            [aligned_states(t) for t in held[fan]],
-            task,
-            cfg.model["bootstrap"],
-            rng,
+    report["validation"] = {}
+    for fan, flights in data.items():
+        entry = report["fans"][fan]
+        model = model_from(report, fan, cfg)
+        entry["intervals"] = _parameter_intervals(
+            [d["e"] for d in flights], samples, rng
         )
-        for fan in fans
-        if held[fan]
-    }
+        entry["b_poorly_determined"] = [
+            bool(r > RHO_NEAR_ONE) for r in entry["rho"]
+        ]
+        entry["stationary_spread"] = np.sqrt(
+            np.linalg.eigvalsh(model.stationary_cov().numpy())
+        ).tolist()
+        entry["diagnostics"] = diagnostics(cfg, entry, flights, samples, rng)
+        if held[fan]:
+            report["validation"][fan] = validate(
+                model, [flight_data(t) for t in held[fan]], task, samples, rng
+            )
+    report["transfer"] = transfer(cfg, trials, task, samples, rng)
     return report
+
+
+def transfer(cfg, trials, task, samples, rng):
+    """Fit on the configured reference's flights, validate on other paths.
+
+    Reported separately from the same-path held-out results.
+    """
+    reference = file_hash(cfg.reference)
+    out = {}
+    for fan, flights in by_fan(trials).items():
+        own = [t for t in flights if t["meta"].get("plan_hash") == reference]
+        others = defaultdict(list)
+        for t in flights:
+            if t["meta"].get("plan_hash") != reference:
+                others[t["meta"]["plan_id"]].append(t)
+        if len(own) < 2 or not others:
+            continue
+        params = fit_errors([flight_data(t)["e"] for t in own])
+        model = make_model(cfg.dt, params)
+        out[fan] = {
+            plan_id: validate(
+                model, [flight_data(t) for t in group], task, samples, rng
+            )
+            for plan_id, group in others.items()
+        }
+    return out
 
 
 def save_report(report):
@@ -322,24 +343,11 @@ def save_report(report):
 
 
 def model_from(report, fan, cfg):
-    # JSON object keys are strings; older fan-off reports used the key 'off'.
     key = str(fan_setting(fan))
-    f = report["fans"].get(
-        key, report["fans"].get("off") if key == "0" else None
-    )
-    if f is None:
+    if key not in report["fans"]:
         raise ValueError(f"model {report['id']} has no fan {fan!r}")
-    return TrackingModel(
-        report["dt"],
-        report["tau"],
-        report["gain"],
-        f["c"],
-        f["Q"],
-        (f["initial_mean"], f["initial_cov"]),
-        cfg.u_max,
-        cfg.a_max,
-        report["id"],
-        report["hash"],
+    return make_model(
+        report["dt"], report["fans"][key], report["id"], report["hash"]
     )
 
 
@@ -356,61 +364,50 @@ def load_model(path, fan, cfg):
 def _bootstrap(per_flight, statistic, samples, rng):
     """Estimate and 95% interval, resampling whole flights."""
     value = statistic(per_flight)
-    draws = [
-        statistic(
-            [
-                per_flight[i]
-                for i in rng.integers(len(per_flight), size=len(per_flight))
-            ]
-        )
-        for _ in range(samples)
-    ]
+    draws = [statistic(_resample(per_flight, rng)) for _ in range(samples)]
     return [float(value), *map(float, np.percentile(draws, [2.5, 97.5]))]
 
 
-WINDOW = 5  # plan steps (1 s) per residual: long enough to rise above position noise
+def squared_distance(deviation, cov):
+    """d^2 = x^T P^-1 x per step, for x [N, 2] and P [N, 2, 2]."""
+    return np.einsum("ki,kij,kj->k", deviation, np.linalg.inv(cov), deviation)
 
 
-def _flight_checks(model, s, u, task):
-    """Per-flight arrays used by every validation statistic.
-
-    The prediction starts at the flight's measured position (at rest, as the
-    start gate ensures) with the initial uncertainty, like a plan's does.
-    Residuals are the increments of the open-loop position error over
-    WINDOW steps. The measured velocity is too noisy to be a regressor.
-    """
-    mean0 = [*s[0, :2], 0.0, 0.0]
-    with torch.no_grad():
-        mean, cov = (x.numpy() for x in model.predict(u, mean0, START_COV))
-    err = s[:, :2] - mean[:, :2]
-    inv = np.linalg.inv(cov[1:, :2, :2])
-    d2 = np.einsum("ki,kij,kj->k", err[1:], inv, err[1:])
-    residual = np.diff(err[::WINDOW], axis=0)
+def _flight_checks(model, d, task):
+    """Per-flight arrays used by every validation statistic."""
+    e = d["e"]
+    m, P = (x.numpy() for x in model.error_moments(len(e) - 1))
+    mean, measured = d["r"] + m, d["r"] + e
     probs, hits = [], []
     for box in [task.workspace, *task.obstacles, task.goal]:
         for axis, (lo, hi) in enumerate((box.x, box.y)):
             p = interval_probability(
                 lo,
                 hi,
-                torch.tensor(mean[1:, axis]),
-                torch.tensor(cov[1:, axis, axis]),
+                torch.tensor(mean[:, axis]),
+                torch.tensor(P[:, axis, axis]),
             )
             probs.append(p.numpy())
-            hits.append((lo <= s[1:, axis]) & (s[1:, axis] <= hi))
+            hits.append((lo <= measured[:, axis]) & (measured[:, axis] <= hi))
     return {
-        "error": np.linalg.norm(err, axis=1),
-        "spread": np.sqrt(np.trace(cov[:, :2, :2], axis1=1, axis2=2)),
-        "d2": d2,
-        "residual": residual,
-        "residual_xy": s[WINDOW::WINDOW, :2][: len(residual)],
+        "error": np.linalg.norm(e, axis=1),
+        "spread": np.sqrt(np.trace(P, axis1=1, axis2=2)),
+        "d2": squared_distance(e - m, P),
+        "residual": residuals(
+            {"rho": model.rho.numpy(), "b": model.b.numpy()}, e
+        ),
         "p": np.concatenate(probs),
         "hit": np.concatenate(hits),
     }
 
 
 def validate(model, flights, task, samples, rng):
-    """Held-out checks: horizon error, spread, residuals, coverage, calibration."""
-    checks = [_flight_checks(model, s, u, task) for s, u in flights]
+    """Held-out checks: coverage, calibration, Brier score and residuals.
+
+    Flights aborted early drop out of later steps: `flights_by_step` says
+    how many flights each step's statistics describe.
+    """
+    checks = [_flight_checks(model, d, task) for d in flights]
 
     def pooled(fs, key):
         return np.concatenate([f[key] for f in fs])
@@ -431,10 +428,6 @@ def validate(model, flights, task, samples, rng):
     lag1 = sum((r[:-1] * r[1:]).sum(0) for r in centred) / sum(
         (r**2).sum(0) for r in centred
     )
-    thirds = [np.array_split(f["residual"], 3) for f in checks]
-    centre = np.array(task.workspace.centre)
-    xy = pooled(checks, "residual_xy")
-    quadrant = 2 * (xy[:, 0] > centre[0]) + (xy[:, 1] > centre[1])
     p, hit = pooled(checks, "p"), pooled(checks, "hit")
     bins = np.minimum((p * 10).astype(int), 9)
     return {
@@ -451,16 +444,9 @@ def validate(model, flights, task, samples, rng):
             name: interval(lambda fs, th=th: np.mean(pooled(fs, "d2") <= th))
             for name, th in COVERAGE.items()
         },
-        "residual_window_s": WINDOW * model.dt,
         "residual_bias": residual.mean(0).tolist(),
+        "residual_std": residual.std(0).tolist(),
         "residual_lag1_corr": lag1.tolist(),
-        "residual_std_by_time": [
-            np.vstack([t[i] for t in thirds]).std(0).tolist() for i in range(3)
-        ],
-        "residual_std_by_quadrant": {
-            int(q): residual[quadrant == q].std(0).tolist()
-            for q in np.unique(quadrant)
-        },
         "calibration": [  # [mean predicted, observed frequency, count] per bin
             [
                 float(p[bins == b].mean()),

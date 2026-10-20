@@ -1,8 +1,11 @@
-"""Trial records: commands.csv, state.csv and metadata.json per attempt.
+"""Trial records: state.csv, target.csv and metadata.json per attempt.
 
 Rows are kept in memory while flying (callbacks never touch the disk) and
 written by `finish`, which `flight.run_flight` always calls. metadata.json
 is written at creation too, so an attempt that never flies is recorded.
+
+`target.csv` holds the onboard controller's setpoint (`ctrltarget`). It is
+used to fit when playback of the uploaded curve really started.
 """
 
 from __future__ import annotations
@@ -13,26 +16,18 @@ import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+import minsnap
 import numpy as np
 from config import HERE, fan_setting, git_commit
 from trajectory import file_hash
 
 LOGS = HERE / "logs"
 STATE = ["t_host", "device_ms", "x", "y", "z", "vx", "vy", "yaw"]
-COMMANDS = [
-    "k",
-    "step",
-    "t_ref",
-    "t_sent",
-    "lateness",
-    "vx",
-    "vy",
-    "yaw",
-    "vx_body",
-    "vy_body",
-    "z",
-]
+TARGET = ["t_host", "device_ms", "tx", "ty", "tz"]
 CLOCK_WRAP = 1 << 24  # cflib log timestamps are a 24-bit ms counter
+ALIGN_SEARCH_S = 0.5  # t_play is searched within this of t_cmd_after
+ALIGN_STEP_S = 0.001
+ALIGN_SE_MAX = 0.02  # s; a larger standard error is not identifiable
 
 
 class TrialLog:
@@ -55,7 +50,7 @@ class TrialLog:
             "outcome": "started",
         }
         self.phase = "connect"
-        self.states, self.commands, self.events = [], [], []
+        self.states, self.targets, self.events = [], [], []
         self._lock = threading.Lock()
         self._write_meta()
 
@@ -72,7 +67,10 @@ class TrialLog:
         note="",
         root=LOGS,
     ):
-        """All provenance is assembled once, before the ROS component starts."""
+        """All provenance is assembled once, before the ROS component starts.
+
+        The plan's rows are copied in, so a trial carries its own curve.
+        """
         return cls(
             {
                 "purpose": purpose,
@@ -88,10 +86,10 @@ class TrialLog:
                 "dry_run": dry_run,
                 "note": note,
                 "dt": cfg.dt,
-                "steps": len(plan["velocities"]),
-                "repeats": cfg.repeats,
-                "stream_hz": cfg.stream_hz,
-                "timing_policy": "trajectory_step_deadline",
+                "duration": float(sum(plan["durations"])),
+                "durations": plan["durations"],
+                "coefficients": plan["coefficients"],
+                "log_hz": cfg.log_hz,
                 "altitude": cfg.altitude,
                 "altitude_tolerance": cfg.altitude_tolerance,
                 "altitude_average_s": 0.25,
@@ -109,9 +107,9 @@ class TrialLog:
         with self._lock:
             self.states.append(row)
 
-    def command(self, row):
+    def target(self, row):
         with self._lock:
-            self.commands.append(row)
+            self.targets.append(row)
 
     def battery(self, volts):
         self.meta.setdefault("battery_start", volts)
@@ -124,6 +122,7 @@ class TrialLog:
         self.phase = phase
 
     def mission_start(self, t0, state):
+        """t0 is the host time after start_trajectory; it schedules monitoring."""
         self.meta["mission_t0"] = t0
         self.meta["start_state"] = [float(v) for v in state]
 
@@ -132,7 +131,7 @@ class TrialLog:
         self.meta["mission_t_end"] = timestamp
 
     def finish(self, outcome, reason=None, kind=None, phase=None):
-        """Write every file; returns the final metadata."""
+        """Fit the playback start, write every file; returns the metadata."""
         self.meta.update(
             outcome=outcome,
             abort_reason=reason,
@@ -142,8 +141,12 @@ class TrialLog:
             finished=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         )
         with self._lock:
+            state = _columns(STATE, self.states)
+            target = _columns(TARGET, self.targets)
             _write_csv(self.dir / "state.csv", STATE, self.states)
-            _write_csv(self.dir / "commands.csv", COMMANDS, self.commands)
+            _write_csv(self.dir / "target.csv", TARGET, self.targets)
+        if "t_cmd_after" in self.meta and "coefficients" in self.meta:
+            self.meta.update(align_playback(self.meta, state, target))
         self._write_meta()
         return self.meta
 
@@ -151,6 +154,11 @@ class TrialLog:
         (self.dir / "metadata.json").write_text(
             json.dumps(self.meta, indent=1, default=str)
         )
+
+
+def _columns(names, rows):
+    data = np.array(rows, dtype=float).reshape(-1, len(names))
+    return {name: data[:, i] for i, name in enumerate(names)}
 
 
 def _write_csv(path, columns, rows):
@@ -163,16 +171,15 @@ def _write_csv(path, columns, rows):
 def _read_csv(path):
     with open(path) as f:
         rows = list(csv.reader(f))
-    data = np.array(rows[1:], dtype=float).reshape(-1, len(rows[0]))
-    return {name: data[:, i] for i, name in enumerate(rows[0])}
+    return _columns(rows[0], rows[1:])
 
 
 def load_trial(directory):
-    """{'meta', 'state', 'commands'}; columns are numpy arrays."""
+    """{'meta', 'state', 'target'}; columns are numpy arrays."""
     meta = json.loads((directory / "metadata.json").read_text())
-    files = {n: directory / f"{n}.csv" for n in ("state", "commands")}
     trial = {"meta": meta, "dir": directory}
-    for name, path in files.items():
+    for name in ("state", "target"):
+        path = directory / f"{name}.csv"
         trial[name] = _read_csv(path) if path.exists() else None
     return trial
 
@@ -186,41 +193,117 @@ def all_trials(root=LOGS):
     ]
 
 
-def state_times(state):
-    """Onboard sample times on the host clock.
-
-    Device times are unwrapped, then shifted by the smallest observed
-    receive delay, so radio jitter does not blur the sample spacing.
-    """
-    ms = state["device_ms"].astype(np.int64)
+def _unwrap(device_ms):
+    ms = np.asarray(device_ms).astype(np.int64)
     steps = np.diff(ms)
     steps[steps < -CLOCK_WRAP // 2] += CLOCK_WRAP
-    device = (ms[0] + np.concatenate([[0], np.cumsum(steps)])) / 1000.0
-    return device + np.min(state["t_host"] - device)
+    return (ms[0] + np.concatenate([[0], np.cumsum(steps)])) / 1000.0
+
+
+def device_times(state, target=None):
+    """Onboard sample times of the state and target blocks on the host clock.
+
+    Both blocks are stamped by the same onboard clock. Device times are
+    unwrapped, then shifted by the smallest receive delay seen in either
+    block, so radio jitter does not blur the sample spacing. A missing or
+    empty block gives None.
+    """
+    blocks = [
+        b if b is not None and len(b["t_host"]) else None
+        for b in (state, target)
+    ]
+    device = [None if b is None else _unwrap(b["device_ms"]) for b in blocks]
+    offset = min(
+        np.min(b["t_host"] - d)
+        for b, d in zip(blocks, device)
+        if b is not None
+    )
+    return [None if d is None else d + offset for d in device]
+
+
+def state_times(state):
+    return device_times(state)[0]
+
+
+def align_playback(meta, state, target):
+    """Fit the playback start t_play from the logged setpoints.
+
+    Least squares over one offset: the logged ctrltarget xy against the
+    plan's r(t - t_play) over the whole mission. Before playback the setpoint
+    holds the start and afterwards the end, so r is clamped to [0, T]. The
+    curve starts at rest, so the opening seconds carry little timing
+    information; the curvature of the cost at its minimum gives a standard
+    error, and a large one falls back to the host command time.
+    """
+    t_cmd = meta["t_cmd_after"]
+    result = {
+        "t_play": t_cmd,
+        "alignment": "host_fallback",
+        "t_play_offset": 0.0,
+        "alignment_rms": None,
+        "alignment_max": None,
+        "alignment_curvature": None,
+        "alignment_se": None,
+        "identifiable": False,
+    }
+    if target is None or len(target["t_host"]) < 10:
+        return result
+    rows = np.asarray(meta["coefficients"], dtype=float)
+    t = device_times(state, target)[1]
+    end = meta.get("mission_t_end", t_cmd + meta["duration"])
+    keep = (t >= t_cmd - 1.0) & (t <= end)
+    t = t[keep]
+    xy = np.stack([target["tx"][keep], target["ty"][keep]], 1)
+    if len(t) < 10:
+        return result
+
+    def residual(t_play):
+        return xy - minsnap.evaluate(rows, t - t_play)[:, :2]
+
+    offsets = np.arange(-ALIGN_SEARCH_S, ALIGN_SEARCH_S + 1e-9, ALIGN_STEP_S)
+    cost = np.array([np.sum(residual(t_cmd + s) ** 2) for s in offsets])
+    best = int(np.argmin(cost))
+    if 0 < best < len(cost) - 1:
+        curvature = (
+            cost[best - 1] - 2 * cost[best] + cost[best + 1]
+        ) / ALIGN_STEP_S**2
+        variance = cost[best] / max(len(t) - 1, 1)
+        se = np.sqrt(2 * variance / curvature) if curvature > 0 else np.inf
+        result.update(
+            alignment_curvature=float(curvature), alignment_se=float(se)
+        )
+        if se <= ALIGN_SE_MAX:
+            result.update(
+                t_play=float(t_cmd + offsets[best]),
+                t_play_offset=float(offsets[best]),
+                alignment="ctrltarget",
+                identifiable=True,
+            )
+    distance = np.linalg.norm(residual(result["t_play"]), axis=1)
+    result.update(
+        alignment_rms=float(np.sqrt(np.mean(distance**2))),
+        alignment_max=float(distance.max()),
+    )
+    return result
 
 
 def aligned_states(trial):
-    """States [N+1, 4] (px, py, vx, vy) at each plan step and controls [N, 2].
+    """Measured xy, reference r(t_k) and tracking error e_k, each [N, 2].
 
-    Step k starts when command k was due: mission_t0 + k * dt. Only steps
-    whose commands were all sent and whose end is covered by state data
-    are returned.
+    Step k is at t_play + k * dt; r comes from the stored (uploaded)
+    coefficients and e_k = p_k - r(t_k). Only steps covered by state data,
+    up to the mission end, are returned.
     """
-    meta, cmd, s = trial["meta"], trial["commands"], trial["state"]
-    mission = cmd["step"] >= 0
-    first = mission & (cmd["k"] % meta["repeats"] == 0)
-    controls = np.stack([cmd["vx"][first], cmd["vy"][first]], 1)
-    counts = np.bincount(
-        cmd["step"][mission].astype(int), minlength=len(controls)
-    )
-    n = int(np.cumprod(counts == meta["repeats"]).sum())
-    t = state_times(s)
-    grid = meta["mission_t0"] + meta["dt"] * np.arange(n + 1)
-    grid = grid[grid <= min(t[-1], meta.get("mission_t_end", t[-1]))]
-    states = np.stack(
-        [np.interp(grid, t, s[c]) for c in ("x", "y", "vx", "vy")], 1
-    )
-    return states, controls[: len(grid) - 1]
+    meta, s = trial["meta"], trial["state"]
+    rows = np.asarray(meta["coefficients"], dtype=float)
+    t = device_times(s, trial.get("target"))[0]
+    tk = minsnap.grid_times(rows, meta["dt"])
+    grid = meta["t_play"] + tk
+    end = min(t[-1], meta.get("mission_t_end", t[-1]))
+    n = int(np.sum(grid <= end))
+    p = np.stack([np.interp(grid[:n], t, s[c]) for c in ("x", "y")], 1)
+    r = minsnap.evaluate(rows, tk[:n])[:, :2]
+    return p, r, p - r
 
 
 def find_trial(ref="latest", root=LOGS):

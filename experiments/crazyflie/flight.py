@@ -1,31 +1,35 @@
-"""One flight attempt: preflight, start gate, timed velocity commands, landing.
+"""One flight attempt: upload, takeoff, start gate, onboard curve, landing.
 
 `drone` is an irobot `CrazyflieBase` (radio link, arming) or a `SimDrone`.
-The high-level commander takes off, reaches the start and lands; the
-mission streams world-frame velocities as body-frame hover setpoints at
-`stream_hz`. Every safety decision uses a fresh state packet.
-
-Place the drone near the saved start before launching. Take off, reach the
-start, replay the commands, then land in place. Scoring ends before landing.
+The plan's polynomial pieces are uploaded on the ground, before arming.
+The high-level commander takes off, reaches the start, flies the uploaded
+curve (`start_trajectory`) and lands in place. The host only monitors the
+mission; every safety decision uses a fresh state packet.
 
 Abort kinds: `TaskViolation` (left the workspace or altitude band: a task
-failure) and `DataFault` (stale state, lost link, late command: not a task
+failure) and `DataFault` (stale state, lost link, failed upload: not a task
 outcome). Either one lands through the high-level commander.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from collections import deque
 
 import numpy as np
+from minsnap import MAX_PIECES, PIECE_BYTES
 
 logger = logging.getLogger(__name__)
 
 ALTITUDE_AVG_S = 0.25  # s of state averaged for the altitude limit
+MONITOR_S = 0.05  # mission check period
+# Monitoring continues this long after the curve ends, while the drone holds
+# its final setpoint, so the radio delay before playback starts cannot drop
+# the last plan step from the mission data.
+END_HOLD_S = 0.25
+TRAJ_ID = 1
 
 STATE_VARS = [
     "stateEstimate.x",
@@ -35,6 +39,7 @@ STATE_VARS = [
     "stateEstimate.vy",
     "stateEstimate.yaw",
 ]
+TARGET_VARS = ["ctrltarget.x", "ctrltarget.y", "ctrltarget.z"]
 
 
 class TaskViolation(RuntimeError):
@@ -42,17 +47,11 @@ class TaskViolation(RuntimeError):
 
 
 class DataFault(RuntimeError):
-    """Stale state, lost link, late command or a failed preflight check."""
+    """Stale state, lost link, failed upload or a failed preflight check."""
 
 
 class Interrupted(Exception):
     """Stop requested (Ctrl-C or ROS shutdown)."""
-
-
-def world_to_body(v, yaw_deg):
-    """Rotate a world-frame XY velocity into the body frame."""
-    c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
-    return c * v[0] + s * v[1], -s * v[0] + c * v[1]
 
 
 class StateFeed:
@@ -92,7 +91,7 @@ class StateFeed:
 
 
 def start_logging(cf, cfg, feed, log, make_config=None, *, state_logged=False):
-    """Battery logging; the simulator also supplies irobot's state block."""
+    """Battery and setpoint logging; the simulator also needs a state block."""
     if make_config is None:
         from cflib.crazyflie.log import LogConfig as make_config
     battery = make_config(name="battery", period_in_ms=1000)
@@ -100,9 +99,18 @@ def start_logging(cf, cfg, feed, log, make_config=None, *, state_logged=False):
     battery.data_received_cb.add_callback(
         lambda ts, data, _: log.battery(data["pm.vbat"])
     )
-    blocks = [battery]
+    # The setpoint the onboard controller is tracking, for time alignment.
+    target = make_config(name="target", period_in_ms=1000 // cfg.log_hz)
+    for name in TARGET_VARS:
+        target.add_variable(name, "float")
+    target.data_received_cb.add_callback(
+        lambda ts, data, _: log.target(
+            [feed.clock(), ts, *(data[name] for name in TARGET_VARS)]
+        )
+    )
+    blocks = [battery, target]
     if not state_logged:
-        state = make_config(name="state", period_in_ms=1000 // cfg.stream_hz)
+        state = make_config(name="state", period_in_ms=1000 // cfg.log_hz)
         for name in STATE_VARS:
             state.add_variable(name, "float")
         state.data_received_cb.add_callback(
@@ -141,14 +149,14 @@ def connect(cfg, feed):
         CrazyflieConfig(
             uri=cfg.radio_uri,
             connect_timeout=cfg.flight.connect_timeout,
-            log_rate_ms=1000 // cfg.stream_hz,
+            log_rate_ms=1000 // cfg.log_hz,
         )
     )
     if not drone.is_connected:
         drone.disconnect()
         raise DataFault(f"could not connect to {cfg.radio_uri}")
     # `connected` precedes parameter download completion. Let that traffic
-    # finish before preflight and before streaming time-critical commands.
+    # finish before preflight and the trajectory upload.
     try:
         deadline = time.monotonic() + cfg.flight.connect_timeout
         while not drone.cf.param.is_updated:
@@ -250,6 +258,47 @@ def at_start(feed, start, cfg):
     return True
 
 
+def upload(drone, plan, log):
+    """Write the plan's pieces to trajectory memory and define them.
+
+    Runs on the ground before arming. cflib imports stay lazy so tests run
+    without it; the simulator supplies its own Poly4D and memory type.
+    """
+    Poly4D = getattr(drone, "Poly4D", None)
+    memory_type = getattr(drone, "TYPE_TRAJ", None)
+    if Poly4D is None:
+        from cflib.crazyflie.mem import MemoryElement
+        from cflib.crazyflie.mem.trajectory_memory import Poly4D
+
+        memory_type = MemoryElement.TYPE_TRAJ
+    rows = np.asarray(plan["coefficients"], dtype=float)
+    mem = drone.cf.mem.get_mems(memory_type)[0]
+    capacity = mem.size // PIECE_BYTES
+    if len(rows) > capacity:
+        raise DataFault(
+            f"{len(rows)} pieces, trajectory memory holds {capacity}"
+        )
+    mem.trajectory = [
+        Poly4D(
+            float(row[0]),
+            Poly4D.Poly(row[1:9].tolist()),
+            Poly4D.Poly(row[9:17].tolist()),
+            Poly4D.Poly(row[17:25].tolist()),
+            Poly4D.Poly(row[25:33].tolist()),
+        )
+        for row in rows
+    ]
+    started = time.monotonic()
+    if not mem.write_data_sync():
+        raise DataFault("trajectory upload failed")
+    drone.cf.high_level_commander.define_trajectory(TRAJ_ID, 0, len(rows))
+    log.meta.update(
+        pieces=len(rows),
+        upload_bytes=PIECE_BYTES * len(rows),
+        upload_s=time.monotonic() - started,
+    )
+
+
 def fly(drone, feed, plan, cfg, log, stop, status):
     """Nominal attempt; sets status['airborne'] once takeoff is sent."""
     f, hl = cfg.flight, drone.cf.high_level_commander
@@ -262,6 +311,9 @@ def fly(drone, feed, plan, cfg, log, stop, status):
             f"place the drone within {f.placement_tolerance:.2f} m "
             f"of start {plan['start']} before takeoff"
         )
+
+    log.set_phase("upload")
+    upload(drone, plan, log)
 
     log.set_phase("takeoff")
     drone.arm()
@@ -284,8 +336,7 @@ def fly(drone, feed, plan, cfg, log, stop, status):
         _wait(stop, 0.05)
 
     log.set_phase("mission")
-    velocities = np.repeat(np.asarray(plan["velocities"]), cfg.repeats, axis=0)
-    send(drone, feed, cfg, log, stop, velocities)
+    mission(drone, feed, cfg, log, stop, sum(plan["durations"]))
 
     # Landing and disconnect belong to run_flight's single cleanup path.
 
@@ -296,52 +347,30 @@ def mean_altitude(feed, cfg, s):
     return float(np.mean(window[:, 2])) if window is not None else float(s[2])
 
 
-def send(drone, feed, cfg, log, stop, velocities):
-    """Replay world velocities on an absolute schedule, rotating into body axes.
+def mission(drone, feed, cfg, log, stop, duration):
+    """Start the uploaded curve, then monitor it until it ends.
 
-    New trajectory steps have a strict deadline. Refresh delays may recover
-    within one step, without shifting the schedule or extending the mission.
+    The host times around `start_trajectory` only schedule monitoring:
+    cflib sends a packet and returns, it does not confirm playback. The
+    analysis start time is fitted from the logged setpoints.
     """
-    f, period = cfg.flight, 1.0 / cfg.stream_hz
-    t0 = time.monotonic()
-    log.mission_start(t0, feed.snapshot(f.stale_s))
-    for k, v in enumerate(velocities):
-        due = t0 + k * period
-        limit = (
-            f.max_lateness_s
-            if k % cfg.repeats == 0
-            else min(cfg.dt, f.stale_s)
-        )
-        limit = min(limit, (len(velocities) - k) * period)
+    state = feed.snapshot(cfg.flight.stale_s)
+    log.meta["t_cmd_before"] = time.monotonic()
+    drone.cf.high_level_commander.start_trajectory(
+        TRAJ_ID,
+        time_scale=1.0,
+        relative_position=False,
+        relative_yaw=False,
+    )
+    t0 = log.meta["t_cmd_after"] = time.monotonic()
+    log.mission_start(t0, state)
+    end = t0 + duration + END_HOLD_S
+    while time.monotonic() < end:
         s = _check(drone, feed, cfg)
         z = mean_altitude(feed, cfg, s)
         if abs(z - cfg.altitude) > cfg.altitude_tolerance:
             raise TaskViolation(f"altitude {z:.2f} m")
-        body = world_to_body(v, s[5])
-        lateness = time.monotonic() - due
-        if lateness > limit:
-            raise DataFault(
-                f"command {k} late by {lateness:.3f} s before send"
-            )
-        drone.cf.commander.send_hover_setpoint(*body, 0.0, cfg.altitude)
-        sent = time.monotonic()
-        lateness = sent - due
-        log.command(
-            [
-                k,
-                k // cfg.repeats,
-                k * period,
-                sent,
-                lateness,
-                *v,
-                s[5],
-                *body,
-                cfg.altitude,
-            ]
-        )
-        if lateness > limit:
-            raise DataFault(f"command {k} send returned {lateness:.3f} s late")
-        _wait(stop, t0 + (k + 1) * period - time.monotonic())
+        _wait(stop, min(MONITOR_S, end - time.monotonic()))
     log.mission_end(time.monotonic())
 
 
@@ -398,6 +427,11 @@ def run_flight(cfg, plan, log, stop=None, connect_fn=None):
     feed = StateFeed(log)
     outcome, reason, kind = "error", None, "error"
     try:
+        if len(plan["coefficients"]) > MAX_PIECES:
+            raise DataFault(
+                f"{len(plan['coefficients'])} pieces, "
+                f"trajectory memory holds {MAX_PIECES}"
+            )
         drone = connect_fn(cfg) if connect_fn else connect(cfg, feed)
         blocks = start_logging(
             drone.cf,
