@@ -1,0 +1,10 @@
+# Recorded data and generated reports stay local.
+cache/
+logs/
+reports/
+results/
+
+# Keep the active reference and its preview in version control.
+plans/*
+!plans/reference.json
+!plans/reference.png
