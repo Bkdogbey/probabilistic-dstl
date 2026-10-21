@@ -567,3 +567,42 @@ def test_select_last_returns_the_final_iterate_without_exact_scoring():
 def test_select_by_must_be_known():
     with pytest.raises(ValueError, match="select_by"):
         problem(select_by="best")
+
+
+def test_score_threshold_penalizes_only_a_shortfall():
+    controls = torch.tensor([[0.1], [0.3], [0.2], [-0.2], [0.0]])
+    planner, _, _ = problem(w_phi=3.0, score_threshold=0.9)
+    effort = planner._control_cost(controls)
+    torch.testing.assert_close(
+        planner._objective(controls, torch.tensor(0.7)),
+        3 * 0.2 + effort,
+    )
+    for at_or_above in (0.9, 0.95):
+        torch.testing.assert_close(
+            planner._objective(controls, torch.tensor(at_or_above)), effort
+        )
+
+
+def test_score_threshold_must_be_a_probability():
+    for bad in (0.0, 1.5):
+        with pytest.raises(ValueError, match="score_threshold"):
+            problem(score_threshold=bad)
+
+
+def test_threshold_selection_takes_least_effort_among_iterates_meeting_it():
+    planner, _, _ = problem(score_threshold=0.9)
+
+    def candidate(lower, cost):
+        return SimpleNamespace(hard_interval=(lower, 1.0), control_cost=cost)
+
+    candidates = [
+        (-1, candidate(0.60, 0.1)),
+        (0, candidate(0.99, 2.0)),
+        (1, candidate(0.91, 1.0)),
+        (2, candidate(0.95, 1.5)),
+    ]
+    iteration, _ = planner._select_candidate(candidates, 0.9)
+    assert iteration == 1
+    # None meets it: the highest exact bound, as without a threshold.
+    iteration, _ = planner._select_candidate(candidates, 0.995)
+    assert iteration == 0

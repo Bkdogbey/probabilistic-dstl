@@ -95,6 +95,9 @@ class Planner:
             raise ValueError("margin_beta must be finite and positive or null")
         if self.cfg["select_by"] not in ("pdstl", "last"):
             raise ValueError("select_by must be 'pdstl' or 'last'")
+        threshold = self.cfg["score_threshold"]
+        if threshold is not None and not 0.0 < threshold <= 1.0:
+            raise ValueError("score_threshold must be in (0, 1] or null")
 
     @property
     def control_dim(self):
@@ -139,7 +142,24 @@ class Planner:
         )
 
     def _objective(self, controls, smooth_lower, margin_penalty=0.0):
-        loss = -self.cfg["w_phi"] * smooth_lower + self._control_cost(controls)
+        """Score term plus control cost (plus the optional STL hinge).
+
+        Without `score_threshold` the smooth lower bound is maximized. With
+        threshold alpha only a shortfall is penalized,
+        w_phi * max(0, alpha - smooth): reach alpha, then spend least effort.
+        """
+        threshold = self.cfg["score_threshold"]
+        if threshold is None:
+            score_term = -self.cfg["w_phi"] * smooth_lower
+        else:
+            shortfall = threshold - smooth_lower
+            shortfall = (
+                torch.clamp(shortfall, min=0.0)
+                if torch.is_tensor(shortfall)
+                else max(shortfall, 0.0)
+            )
+            score_term = self.cfg["w_phi"] * shortfall
+        loss = score_term + self._control_cost(controls)
         if self.cfg["w_margin"]:
             loss = loss + self.cfg["w_margin"] * margin_penalty
         return loss
@@ -324,7 +344,7 @@ class Planner:
             optimizer.step()
         planning_time = perf_counter() - started
         result_iteration, selected = (
-            self._select_candidate(candidates)
+            self._select_candidate(candidates, self.cfg["score_threshold"])
             if score_exact
             else candidates[-1]
         )
@@ -343,8 +363,16 @@ class Planner:
         return result
 
     @staticmethod
-    def _select_candidate(candidates):
-        """Highest exact lower bound; the later iterate wins a tie."""
+    def _select_candidate(candidates, threshold=None):
+        """Highest exact lower bound; the later iterate wins a tie.
+
+        With a threshold alpha: the least control cost among iterates whose
+        exact lower bound reaches alpha, else the highest bound.
+        """
+        if threshold is not None:
+            met = [c for c in candidates if c[1].hard_interval[0] >= threshold]
+            if met:
+                return min(reversed(met), key=lambda c: c[1].control_cost)
         return max(reversed(candidates), key=lambda c: c[1].hard_interval[0])
 
     @staticmethod

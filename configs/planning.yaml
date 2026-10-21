@@ -8,6 +8,7 @@ margin_beta: 10.0  # STLCG log-sum-exp smoothing; null: hard STL robustness
 lr: 0.05
 max_iters: 300
 select_by: pdstl  # best exact iterate; last: final iterate, no in-loop exact scoring
+score_threshold: null  # alpha: penalize w_phi * max(0, alpha - smooth) instead of maximizing
 smoothing:
   beta_start: 10.0
   beta_end: 200.0
