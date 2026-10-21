@@ -1,10 +1,11 @@
-"""Two-gap reach-avoid: does pdSTL put safety first as noise grows?
+"""Slit or around: does pdSTL put safety first as noise grows?
 
-Three blocks leave a narrow gap level with the start and goal (the short way)
-and a wide gap that needs a detour. STLCG requires a fixed margin on the mean
-path; pdSTL requires an exact score. Both then spend the least effort. Each
-method plans from both gaps, keeps one plan by its own rule, and the plan is
-executed open loop under noise (Monte Carlo, the same draws for every plan).
+A floor block and an upper block leave a narrow slit between them (the short
+way); above the upper block the room is open (a longer way around). STLCG
+requires a fixed margin on the mean path; pdSTL requires an exact score. Both
+then spend the least effort. Each method plans from both routes, keeps one
+plan by its own rule, and the plan is executed open loop under noise (Monte
+Carlo, the same draws for every plan).
 
 Steps (CPU):
 
@@ -68,16 +69,18 @@ def evaluation_problem(cfg, noise):
 
 
 def gap_used(cfg, mean):
-    """'narrow' or 'wide' from the mean path's height at the blocks.
+    """'slit' or 'around' from the mean path's height at the blocks.
 
-    The narrow gap is above the middle block, the wide gap below it.
+    The slit lies between the floor block and the upper block; the way
+    around passes above the upper block.
     """
-    mid = next(o for o in cfg["obstacles"] if o["name"] == "mid")
-    k = int(np.argmin(np.abs(mean[:, 0] - np.mean(mid["x_range"]))))
+    block = {o["name"]: o for o in cfg["obstacles"]}
+    floor, upper = block["floor"], block["upper"]
+    k = int(np.argmin(np.abs(mean[:, 0] - np.mean(upper["x_range"]))))
     y = float(mean[k, 1])
-    if y > mid["y_range"][1]:
-        return "narrow"
-    return "wide" if y < mid["y_range"][0] else "none"
+    if floor["y_range"][1] < y < upper["y_range"][0]:
+        return "slit"
+    return "around" if y > upper["y_range"][1] else "none"
 
 
 def effort(controls):
@@ -232,8 +235,8 @@ def _read(name):
 
 # Report: table and figure from the saved results
 
-LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL", "stlcg_m30": "STLCG, 30 cm"}
-COLORS = {"stlcg": "#D55E00", "pdstl": "#0072B2", "stlcg_m30": "#999999"}
+LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL", "stlcg_m20": "STLCG, 20 cm"}
+COLORS = {"stlcg": "#D55E00", "pdstl": "#0072B2", "stlcg_m20": "#999999"}
 
 
 def table(cfg):
@@ -285,7 +288,7 @@ def figure(cfg, methods=("stlcg", "pdstl")):
     picked = {(r["method"], r["noise"]): r for r in _read("selected.csv")}
     levels = list(cfg["noise"])
     fig, axes = plt.subplots(
-        1, len(levels), figsize=(4.2 * len(levels), 3.6), sharey=True
+        1, len(levels), figsize=(3.6 * len(levels), 3.9), sharey=True
     )
     for ax, noise in zip(axes, levels):
         for block in cfg["obstacles"]:
