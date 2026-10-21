@@ -7,7 +7,7 @@ pieces are uploaded to the drone, and the onboard controller flies them
 (`start_trajectory`).
 
 The reference, `plans/reference.json`, is the **figure-8**: a vertical
-lemniscate centred at (0.5, −1.0), 0.5 m wide and 1.5 m tall, at 0.50 m
+lemniscate centred at (0.5, −1.0), 0.5 m wide and 1.5 m tall, at 0.30 m
 altitude. It starts at the bottom tip, passes the goal at the top tip and
 returns: 20 pieces of 1.0 s (20 s), max speed 0.245 m/s. The arena is in
 `config.yml`: x [0, 1], y [−2, 0]. Obstacles are off for now (commented

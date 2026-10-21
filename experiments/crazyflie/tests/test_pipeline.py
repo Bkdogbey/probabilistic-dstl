@@ -26,7 +26,7 @@ from trajectory import (
 def test_reference_is_the_figure8_feasible_and_through_the_goal(cfg):
     plan = reference_plan(cfg)
     rows = np.asarray(plan["coefficients"])
-    assert np.allclose(plan["start"], [0.5, -1.75]) and cfg.altitude == 0.5
+    assert np.allclose(plan["start"], [0.5, -1.75]) and cfg.altitude == 0.3
     assert minsnap.total_duration(rows) == 20.0 == cfg.duration
     assert cfg.steps == 100 and len(rows) <= minsnap.MAX_PIECES
     task = Task(cfg)
