@@ -253,11 +253,11 @@ def table(cfg):
                 "pdstl_score": round(float(r["score_eval"]), 3),
                 "effort": round(float(r["effort"]), 1),
                 "clearance_p05_cm": round(100 * float(r["clearance_p05"]), 1),
-                "time_s": round(float(r["time_s"]), 1),
             }
         )
-    order = {n: i for i, n in enumerate(cfg["noise"])}
-    rows.sort(key=lambda r: (order[r["noise"]], r["method"]))
+    noise = {n: i for i, n in enumerate(cfg["noise"])}
+    method = {LABELS[m]: i for i, m in enumerate(cfg["methods"])}
+    rows.sort(key=lambda r: (noise[r["noise"]], method[r["method"]]))
     _write(rows, "table.csv")
     header = list(rows[0])
     lines = [
@@ -270,7 +270,12 @@ def table(cfg):
 
 
 def figure(cfg, methods=("stlcg", "pdstl")):
-    """Map at each noise level with each method's mean path and spread."""
+    """Map at each noise level with each method's mean path and spread.
+
+    The formula asks only to reach the goal, so each path is drawn up to its
+    arrival (closest approach to the goal centre); afterwards the plan is
+    free to drift.
+    """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Ellipse, Rectangle
 
@@ -293,6 +298,7 @@ def figure(cfg, methods=("stlcg", "pdstl")):
             )
         )
         ax.plot(*cfg["x0_mean"][:2], "ko", ms=4)
+        goal_centre = np.array([(gx0 + gx1) / 2, (gy0 + gy1) / 2])
         s = evaluation_problem(cfg, noise)
         for method in methods:
             controls = plans[f"{method}/{noise}"].to(s.dyn.device)
@@ -304,6 +310,8 @@ def figure(cfg, methods=("stlcg", "pdstl")):
                 covs.append(cov)
             mean = torch.stack(means).cpu().numpy()
             cov = torch.stack(covs).cpu().numpy()
+            arrival = int(np.argmin(np.hypot(*(mean[:, :2] - goal_centre).T)))
+            mean, cov = mean[: arrival + 1], cov[: arrival + 1]
             r = picked[(method, noise)]
             ax.plot(
                 *mean[:, :2].T,
@@ -311,8 +319,11 @@ def figure(cfg, methods=("stlcg", "pdstl")):
                 lw=1.6,
                 label=(f"{LABELS[method]}: {100 * float(r['success']):.1f}%"),
             )
-            for k in range(0, len(mean), cfg["figure"]["ellipse_every"]):
-                width, height, angle = _ellipse_parameters(cov[k], 0.95)
+            every = cfg["figure"]["ellipse_every"]
+            for k in [*range(0, arrival, every), arrival]:
+                width, height, angle = _ellipse_parameters(
+                    cov[k, :2, :2], 0.95
+                )
                 ax.add_patch(
                     Ellipse(
                         mean[k, :2],
@@ -332,7 +343,16 @@ def figure(cfg, methods=("stlcg", "pdstl")):
         )
         ax.legend(loc="lower right", fontsize=7)
         ax.grid(alpha=0.2)
-    fig.tight_layout()
+    fig.text(
+        0.5,
+        0.01,
+        "Mean paths up to arrival at the goal; 95% position ellipses every "
+        f"{every * cfg['dt']:g} s and at arrival. Legend: Monte Carlo "
+        "success.",
+        ha="center",
+        fontsize=8,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     for suffix in (".png", ".pdf"):
         fig.savefig(OUTPUTS / f"figure{suffix}", dpi=150)
     plt.close(fig)
