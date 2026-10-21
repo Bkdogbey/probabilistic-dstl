@@ -1,10 +1,7 @@
 noise,method,gap,success_pct,ci_pct,pdstl_score,effort,clearance_p05_cm
-low,STLCG,narrow,99.7,"[99.5, 99.8]",0.998,9.0,16.2
-low,pdSTL,narrow,96.4,"[95.8, 96.9]",0.964,7.4,16.3
-low,"STLCG, 30 cm",narrow,100.0,"[99.9, 100.0]",1.0,12.0,18.6
-medium,STLCG,narrow,86.8,"[85.9, 87.8]",0.913,9.0,0.0
-medium,pdSTL,narrow,99.1,"[98.8, 99.4]",0.984,8.3,7.7
-medium,"STLCG, 30 cm",narrow,94.3,"[93.6, 94.9]",0.956,12.0,2.6
-high,STLCG,narrow,46.7,"[45.3, 48.1]",0.42,9.0,0.0
-high,pdSTL,wide,95.8,"[95.2, 96.3]",0.961,20.5,13.1
-high,"STLCG, 30 cm",narrow,55.7,"[54.3, 57.1]",0.623,12.0,0.0
+low,STLCG,slit,100.0,"[99.9, 100.0]",0.999,25.3,8.6
+low,pdSTL,slit,99.9,"[99.7, 99.9]",0.998,16.4,4.8
+medium,STLCG,slit,97.4,"[96.9, 97.8]",0.928,25.3,4.8
+medium,pdSTL,slit,97.9,"[97.4, 98.2]",0.97,17.8,2.3
+high,STLCG,slit,86.4,"[85.4, 87.3]",0.715,25.3,0.9
+high,pdSTL,around,99.7,"[99.6, 99.9]",0.989,34.9,13.0

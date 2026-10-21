@@ -235,8 +235,8 @@ def _read(name):
 
 # Report: table and figure from the saved results
 
-LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL", "stlcg_m20": "STLCG, 20 cm"}
-COLORS = {"stlcg": "#D55E00", "pdstl": "#0072B2", "stlcg_m20": "#999999"}
+LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL"}
+COLORS = {"stlcg": "#D55E00", "pdstl": "#0072B2"}
 
 
 def table(cfg):
