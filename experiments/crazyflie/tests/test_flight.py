@@ -297,6 +297,7 @@ def test_start_gate_rejects_recent_motion_hidden_by_the_long_mean(
         ([0.0] * 21, True),
         ([0.07] * 16 + [-0.21] * 5, False),  # full mean hides recent descent
         ([-0.03] * 16 + [0.10] * 5, False),  # full mean hides recent climb
+        (list(np.linspace(-0.08, 0.08, 21)), False),  # climbing through
     ],
 )
 def test_start_gate_requires_both_height_windows_at_the_target(

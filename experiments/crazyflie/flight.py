@@ -236,10 +236,12 @@ def wait_for_positioning(drone, feed, cfg, stop, samples=10):
 
 
 def at_start(feed, start, cfg):
-    """Is the last `start_window` s, averaged, at the start and at rest?
+    """Is the last `start_window` s at the start, at rest and at height?
 
     The velocity estimate is noisy (0.2-0.3 m/s at rest), so a single sample
-    never passes; the window mean does.
+    never passes; the window mean does. Every height sample must be in
+    tolerance: the mean of a climb can sit at the target while the drone is
+    still rising.
     """
     f = cfg.flight
     height_tolerance = min(f.start_altitude_tolerance, cfg.altitude_tolerance)
@@ -252,7 +254,7 @@ def at_start(feed, start, cfg):
         if not (
             np.linalg.norm(mean[:2] - start[:2]) <= f.start_tolerance
             and np.linalg.norm(mean[3:5]) <= f.start_speed
-            and abs(mean[2] - cfg.altitude) <= height_tolerance
+            and np.abs(window[:, 2] - cfg.altitude).max() <= height_tolerance
         ):
             return False
     return True
