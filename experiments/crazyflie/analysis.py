@@ -18,7 +18,7 @@ import minsnap
 import numpy as np
 from config import HERE, fan_setting
 from flight import MONITOR_S
-from logger import state_times
+from logger import logged_time, playback_time, state_times
 from matplotlib.patches import Ellipse, Rectangle
 from scipy.stats import beta
 from trajectory import PLANS, condition_name, file_hash
@@ -36,8 +36,8 @@ def clopper_pearson(k, n):
 
 def mission_window(meta):
     """Host times (start, end) of the flown curve, ending before landing."""
-    start = meta.get("t_play", meta["mission_t0"])
-    horizon = start + meta["duration"]
+    meta = {"t_play": meta["mission_t0"], **meta}
+    start, horizon = logged_time(meta, [0.0, meta["duration"]])
     return start, min(horizon, meta.get("mission_t_end", horizon))
 
 
@@ -200,7 +200,7 @@ def tracking_errors(trial):
     start, end = mission_window(meta)
     keep = (t >= start) & (t <= end)
     xy = np.stack([s["x"][keep], s["y"][keep]], 1)
-    reference = minsnap.evaluate(rows, t[keep] - start)[:, :2]
+    reference = minsnap.evaluate(rows, playback_time(meta, t[keep]))[:, :2]
     aligned = np.linalg.norm(xy - reference, axis=1)
     curve = curve_xy(rows)
     cross = np.linalg.norm(xy[:, None] - curve[None], axis=2).min(axis=1)
@@ -228,6 +228,7 @@ def check_trial(trial, task, cfg):
     print(
         f"  alignment: {meta['alignment']}, t_play - t_cmd_after "
         f"= {1e3 * meta['t_play_offset']:.1f} ms, "
+        f"rate {meta.get('t_play_rate', 1.0):.4f}, "
         f"identifiable: {meta['identifiable']}"
     )
     if meta.get("alignment_max") is not None:
@@ -261,7 +262,10 @@ def check_trial(trial, task, cfg):
             f"min clearance {result['min_clearance']:.3f} m"
         )
 
+    # Height from takeoff to landing only: the estimator reset on the ground
+    # can spike by metres and would flatten the plot.
     t = state_times(s) - mission_window(meta)[0]
+    shown = (t >= -2.0) & (t <= meta["duration"] + 2.0)
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
     draw_task(axes[0], task, cfg)
     curve = curve_xy(meta["coefficients"])
@@ -269,7 +273,7 @@ def check_trial(trial, task, cfg):
     axes[0].plot(xy[:, 0], xy[:, 1], label="flown (mission)")
     axes[0].legend()
     ax = axes[1]
-    ax.plot(t, s["z"], label="measured z")
+    ax.plot(t[shown], s["z"][shown], label="measured z")
     tolerance = meta["altitude_tolerance"]
     ax.axhspan(
         meta["altitude"] - tolerance,
@@ -278,7 +282,8 @@ def check_trial(trial, task, cfg):
         alpha=0.15,
         label="allowed band",
     )
-    ax.axvline(meta["duration"], c="0.5", ls=":", label="curve end")
+    curve_end = meta["duration"] / meta.get("t_play_rate", 1.0)
+    ax.axvline(curve_end, c="0.5", ls=":", label="curve end")
     ax.set_xlabel("time from playback start [s]")
     ax.set_ylabel("z [m]")
     ax.legend()

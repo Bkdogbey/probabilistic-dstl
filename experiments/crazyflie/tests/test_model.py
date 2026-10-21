@@ -170,14 +170,14 @@ def test_task_violations_count_up_to_the_abort_and_faults_do_not(cfg):
     assert len(e) == 6  # t = 1.0, 1.2, ..., 2.0
 
 
-def test_alignment_recovers_a_shifted_playback_start(cfg):
+def test_alignment_recovers_a_shifted_and_slower_playback(cfg):
     rows = np.asarray(reference_plan(cfg)["coefficients"])
     duration = minsnap.total_duration(rows)
-    t_cmd, t_play = 100.0, 100.137
-    t = np.arange(99.0, t_cmd + duration + 0.3, 0.05)
+    t_cmd, t_play, rate = 100.0, 100.137, 0.99  # as seen on the drone
+    t = np.arange(99.0, t_cmd + duration / rate + 0.3, 0.05)
     delay = np.random.default_rng(0).uniform(0.0, 0.01, len(t))
     delay[0] = 0.0
-    xyz = minsnap.evaluate(rows, t - t_play).astype(np.float32)
+    xyz = minsnap.evaluate(rows, rate * (t - t_play)).astype(np.float32)
     target = {
         "t_host": t + delay,
         "device_ms": np.round(1000 * (t - 50.0)),
@@ -188,15 +188,16 @@ def test_alignment_recovers_a_shifted_playback_start(cfg):
         "coefficients": rows,
         "t_cmd_after": t_cmd,
         "duration": duration,
-        "mission_t_end": t_cmd + duration + 0.25,
+        "mission_t_end": t_cmd + duration / rate + 0.25,
     }
     result = align_playback(meta, None, target)
     assert result["alignment"] == "ctrltarget" and result["identifiable"]
     assert abs(result["t_play"] - t_play) <= 0.002
+    assert abs(result["t_play_rate"] - rate) <= 2e-4
     assert result["alignment_max"] < 1e-3
     fallback = align_playback(meta, None, None)
     assert fallback["alignment"] == "host_fallback"
-    assert fallback["t_play"] == t_cmd
+    assert fallback["t_play"] == t_cmd and fallback["t_play_rate"] == 1.0
 
 
 def test_model_prediction_approaches_the_stationary_covariance():

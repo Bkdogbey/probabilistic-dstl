@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import minsnap
 import numpy as np
 from config import HERE, fan_setting, git_commit
+from scipy.optimize import least_squares
 from trajectory import file_hash
 
 LOGS = HERE / "logs"
@@ -26,7 +27,6 @@ STATE = ["t_host", "device_ms", "x", "y", "z", "vx", "vy", "yaw"]
 TARGET = ["t_host", "device_ms", "tx", "ty", "tz"]
 CLOCK_WRAP = 1 << 24  # cflib log timestamps are a 24-bit ms counter
 ALIGN_SEARCH_S = 0.5  # t_play is searched within this of t_cmd_after
-ALIGN_STEP_S = 0.001
 ALIGN_SE_MAX = 0.02  # s; a larger standard error is not identifiable
 
 
@@ -224,23 +224,25 @@ def state_times(state):
 
 
 def align_playback(meta, state, target):
-    """Fit the playback start t_play from the logged setpoints.
+    """Fit when, and at what rate, the drone played the curve.
 
-    Least squares over one offset: the logged ctrltarget xy against the
-    plan's r(t - t_play) over the whole mission. Before playback the setpoint
-    holds the start and afterwards the end, so r is clamped to [0, T]. The
-    curve starts at rest, so the opening seconds carry little timing
-    information; the curvature of the cost at its minimum gives a standard
-    error, and a large one falls back to the host command time.
+    The logged ctrltarget xy is matched to the plan's r(tau), with playback
+    time tau = rate * (t - t_play) on the logged clock, over the whole
+    mission. The drone's playback clock and its log timestamps can differ
+    by about 1%, so the rate is fitted with the start. Before playback the
+    setpoint holds the start and afterwards the end, so r is clamped to
+    [0, T]. A coarse search over t_play starts a least-squares fit of both;
+    the fit's standard error of t_play decides identifiability, and an
+    unidentifiable fit falls back to the host command time.
     """
     t_cmd = meta["t_cmd_after"]
     result = {
         "t_play": t_cmd,
+        "t_play_rate": 1.0,
         "alignment": "host_fallback",
         "t_play_offset": 0.0,
         "alignment_rms": None,
         "alignment_max": None,
-        "alignment_curvature": None,
         "alignment_se": None,
         "identifiable": False,
     }
@@ -255,29 +257,32 @@ def align_playback(meta, state, target):
     if len(t) < 10:
         return result
 
-    def residual(t_play):
-        return xy - minsnap.evaluate(rows, t - t_play)[:, :2]
+    def residual(theta):
+        t_play, rate = theta
+        tau = rate * (t - t_play)
+        return (xy - minsnap.evaluate(rows, tau)[:, :2]).ravel()
 
-    offsets = np.arange(-ALIGN_SEARCH_S, ALIGN_SEARCH_S + 1e-9, ALIGN_STEP_S)
-    cost = np.array([np.sum(residual(t_cmd + s) ** 2) for s in offsets])
-    best = int(np.argmin(cost))
-    if 0 < best < len(cost) - 1:
-        curvature = (
-            cost[best - 1] - 2 * cost[best] + cost[best + 1]
-        ) / ALIGN_STEP_S**2
-        variance = cost[best] / max(len(t) - 1, 1)
-        se = np.sqrt(2 * variance / curvature) if curvature > 0 else np.inf
+    starts = t_cmd + np.arange(-ALIGN_SEARCH_S, ALIGN_SEARCH_S, 0.01)
+    start = min(starts, key=lambda t0: np.sum(residual((t0, 1.0)) ** 2))
+    fit = least_squares(residual, [start, 1.0], x_scale=[0.01, 0.001])
+    variance = np.sum(fit.fun**2) / max(len(fit.fun) - 2, 1)
+    try:
+        cov = variance * np.linalg.inv(fit.jac.T @ fit.jac)
+        se = float(np.sqrt(cov[0, 0]))
+    except np.linalg.LinAlgError:
+        se = float("inf")
+    result["alignment_se"] = se
+    if se <= ALIGN_SE_MAX:
+        t_play, rate = fit.x
         result.update(
-            alignment_curvature=float(curvature), alignment_se=float(se)
+            t_play=float(t_play),
+            t_play_rate=float(rate),
+            t_play_offset=float(t_play - t_cmd),
+            alignment="ctrltarget",
+            identifiable=True,
         )
-        if se <= ALIGN_SE_MAX:
-            result.update(
-                t_play=float(t_cmd + offsets[best]),
-                t_play_offset=float(offsets[best]),
-                alignment="ctrltarget",
-                identifiable=True,
-            )
-    distance = np.linalg.norm(residual(result["t_play"]), axis=1)
+    theta = (result["t_play"], result["t_play_rate"])
+    distance = np.linalg.norm(residual(theta).reshape(-1, 2), axis=1)
     result.update(
         alignment_rms=float(np.sqrt(np.mean(distance**2))),
         alignment_max=float(distance.max()),
@@ -285,18 +290,28 @@ def align_playback(meta, state, target):
     return result
 
 
+def playback_time(meta, t):
+    """Curve time of logged (host-clock) times t."""
+    return meta.get("t_play_rate", 1.0) * (np.asarray(t) - meta["t_play"])
+
+
+def logged_time(meta, tau):
+    """Logged (host-clock) time of curve time tau."""
+    return meta["t_play"] + np.asarray(tau) / meta.get("t_play_rate", 1.0)
+
+
 def aligned_states(trial):
     """Measured xy, reference r(t_k) and tracking error e_k, each [N, 2].
 
-    Step k is at t_play + k * dt; r comes from the stored (uploaded)
-    coefficients and e_k = p_k - r(t_k). Only steps covered by state data,
-    up to the mission end, are returned.
+    Step k is curve time k * dt, logged at logged_time(k * dt); r comes from
+    the stored (uploaded) coefficients and e_k = p_k - r(t_k). Only steps
+    covered by state data, up to the mission end, are returned.
     """
     meta, s = trial["meta"], trial["state"]
     rows = np.asarray(meta["coefficients"], dtype=float)
     t = device_times(s, trial.get("target"))[0]
     tk = minsnap.grid_times(rows, meta["dt"])
-    grid = meta["t_play"] + tk
+    grid = logged_time(meta, tk)
     end = min(t[-1], meta.get("mission_t_end", t[-1]))
     n = int(np.sum(grid <= end))
     p = np.stack([np.interp(grid[:n], t, s[c]) for c in ("x", "y")], 1)
