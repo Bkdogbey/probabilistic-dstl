@@ -41,6 +41,7 @@ speed_bounds: [-0.5, 25.0]
 accel_bounds:
   longitudinal: [-2.5, 2.5]
   lateral: [-2.0, 2.0]
+# Braking warm start: biased toward the yield branch.
 warm_start: {longitudinal: -2.0, lateral: 0.0, switch_step: 10}
 planner:
   w_u: 0.002

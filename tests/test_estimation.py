@@ -235,7 +235,7 @@ def test_executed_plots_use_truth_and_ellipses_use_beliefs():
     s = problem()
     result = lane.trial(s, max_steps=1)
     figures = plot_lane_merge(result, s.env, dt=s.cfg["dt"])
-    axis = figures["trajectory"][1]
+    axis = figures["combined"][1][0]
     executed = next(
         line for line in axis.lines if line.get_label() == "Executed"
     )

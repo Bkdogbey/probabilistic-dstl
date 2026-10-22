@@ -119,6 +119,7 @@ def _deterministic_lane_beliefs(env, ego, traffic):
 )
 def test_headway_activation_formula_and_truth(y, violated):
     cfg = load_config("configs/scenarios/lane/lane_headway.yaml")
+    cfg["task"]["headway"]["min_gap"] = 40.0
     env = build_lane_merge_environment(cfg)
     ego = torch.tensor([[[0.0, y, 0.0, 0.0]]]).expand(1, 2, 4).clone()
     traffic = torch.zeros(1, 2, 3, 4)

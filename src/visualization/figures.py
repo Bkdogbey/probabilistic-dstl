@@ -600,14 +600,21 @@ def _plot_execution(result, env, *, dt, save_path, show):
     _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
     ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
     if "yield" in env.regions:
+        # Show the final traffic too, so the reason for yielding is visible.
+        traffic = _np(_traffic_truth(result.states[-1]))[:, 0]
         ax_map.set_xlim(
-            right=max(ax_map.get_xlim()[1], env.region("yield").xmax + 2)
+            right=max(
+                ax_map.get_xlim()[1],
+                env.region("yield").xmax + 2,
+                traffic.max() + 4,
+            )
         )
     elapsed = dt * np.arange(len(means))
-    used = set()
+    labeled = None
     for second in range(int(np.floor(elapsed[-1])) + 1):
         index = int(np.argmin(np.abs(elapsed - second)))
-        if index not in used:
+        # Skip labels that would overlap while the ego is (nearly) stopped.
+        if labeled is None or abs(means[index, 0] - labeled) > 3.0:
             ax_map.annotate(
                 f"t={second} s",
                 means[index],
@@ -615,7 +622,7 @@ def _plot_execution(result, env, *, dt, save_path, show):
                 textcoords="offset points",
                 fontsize=8,
             )
-            used.add(index)
+            labeled = means[index, 0]
     reason = result.stopped_reason.replace("_", " ")
     ax_map.text(
         0.98,
@@ -668,7 +675,13 @@ def _plot_execution(result, env, *, dt, save_path, show):
     _mark_lane_task_window(ax_score, env, dt)
     ax_score.set(xlabel="executed time [s]", ylabel="robustness per window")
     _style(ax_score, probability=True)
-    _unique_legend(ax_score, loc="best")
+    if len(intervals):
+        # The smooth surrogate can be negative; keep it on the axis.
+        smooth = min(plan.smooth_lower for plan in result.window_plans)
+        ax_score.set_ylim(bottom=min(-0.03, smooth - 0.05))
+    _unique_legend(
+        ax_score, loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3
+    )
     controls = _np(result.applied_controls)
     for dimension in range(controls.shape[1]):
         ax_control.step(
