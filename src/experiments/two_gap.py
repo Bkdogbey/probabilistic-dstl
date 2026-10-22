@@ -32,6 +32,7 @@ from models.rollouts import (
 from planning.environment import build_reach_avoid_environment
 from planning.runners import RESULTS_DIR, setup_problem
 from utils import load_config
+from visualization.figures import COLORS, _ellipse_parameters
 
 CONFIG = "configs/scenarios/reach_avoid/two_gap.yaml"
 OUTPUTS = RESULTS_DIR / "two_gap"
@@ -236,14 +237,9 @@ def _read(name):
 # Report: table and figure from the saved results
 
 LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL"}
-# Paper style: red obstacles and green goal (as in Safaoui et al. and
-# Okamoto & Tsiotras); pdSTL blue; the deterministic baseline dark grey,
-# dashed, so the obstacles keep the only red.
-STYLE = {
-    "pdstl": {"color": "#0072B2", "ls": "-", "lw": 1.4},
-    "stlcg": {"color": "#3a3a3a", "ls": (0, (4, 2)), "lw": 1.1},
-}
-OBSTACLE, GOAL = "#C0392B", "#2E7D32"
+# The repo's figure palette (visualization.figures.COLORS): pdSTL in the
+# belief blue, the deterministic plan in the planned orange.
+METHOD_COLOR = {"pdstl": COLORS["mean"], "stlcg": COLORS["planned"]}
 
 
 def table(cfg):
@@ -301,17 +297,32 @@ def belief(cfg, controls, noise):
 
 
 def _draw_room(ax, cfg):
-    """Walls, red obstacles, green goal, start."""
+    """Walls, obstacles and goal in the repo's style; start marked S."""
     from matplotlib.patches import Rectangle
 
     (x0, x1), (y0, y1) = cfg["bounds"]["x_range"], cfg["bounds"]["y_range"]
     ax.add_patch(
-        Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.2, ec="k")
+        Rectangle(
+            (x0, y0),
+            x1 - x0,
+            y1 - y0,
+            fill=False,
+            ec=COLORS["workspace"],
+            lw=1.3,
+        )
     )
     for block in cfg["obstacles"]:
         (bx0, bx1), (by0, by1) = block["x_range"], block["y_range"]
         ax.add_patch(
-            Rectangle((bx0, by0), bx1 - bx0, by1 - by0, fc=OBSTACLE, ec="none")
+            Rectangle(
+                (bx0, by0),
+                bx1 - bx0,
+                by1 - by0,
+                fc=COLORS["obstacle"],
+                ec=COLORS["obstacle"],
+                alpha=0.45,
+                hatch="//",
+            )
         )
     (gx0, gx1), (gy0, gy1) = cfg["goal"]["x_range"], cfg["goal"]["y_range"]
     ax.add_patch(
@@ -319,134 +330,154 @@ def _draw_room(ax, cfg):
             (gx0, gy0),
             gx1 - gx0,
             gy1 - gy0,
-            fc=GOAL,
-            alpha=0.25,
-            ec=GOAL,
-            lw=0.8,
+            fc=COLORS["goal"],
+            ec=COLORS["goal"],
+            alpha=0.35,
         )
     )
-    ax.text(gx1 + 0.1, gy1 + 0.1, "G", fontsize=8, color=GOAL)
+    ax.text(
+        (gx0 + gx1) / 2,
+        gy1 + 0.15,
+        "G",
+        color=COLORS["goal"],
+        fontweight="bold",
+        ha="center",
+        va="bottom",
+    )
     sx, sy = cfg["x0_mean"][:2]
     ax.plot(sx, sy, "o", color="k", ms=3.5, zorder=5)
-    ax.text(sx + 0.15, sy + 0.25, "S", fontsize=8)
+    ax.text(sx, sy + 0.25, "S", fontweight="bold", ha="center", va="bottom")
 
 
 def _draw_plan(ax, mean, cov, method, every):
-    """Mean path and 95% position ellipses.
+    """Mean path; pdSTL also gets its 95% belief ellipses every `every`.
 
-    pdSTL: filled ellipses every `every` steps, the belief it plans with.
-    STLCG: dashed outlines at half that rate, the spread its noise-free plan
-    meets when executed under the same noise.
+    STLCG plans the noise-free mean, so it has no belief to draw; its
+    executed spread shows in its Monte Carlo success instead.
     """
     from matplotlib.patches import Ellipse
 
-    from visualization.figures import _ellipse_parameters
-
-    style = STYLE[method]
-    ax.plot(*mean.T, color=style["color"], ls=style["ls"], lw=style["lw"])
+    color = METHOD_COLOR[method]
+    ax.plot(*mean.T, color=color, lw=1.6, zorder=4)
     if method != "pdstl":
-        every *= 2  # sparser outlines keep the baseline readable
+        return
     for k in [*range(every, len(mean) - 1, every), len(mean) - 1]:
         width, height, angle = _ellipse_parameters(cov[k], 0.95)
-        filled = method == "pdstl"
         ax.add_patch(
             Ellipse(
                 mean[k],
                 width,
                 height,
                 angle=angle,
-                fc=style["color"] if filled else "none",
-                alpha=0.18 if filled else 0.9,
-                ec=style["color"],
-                lw=0.3 if filled else 0.5,
-                ls="-" if filled else (0, (2, 1.5)),
+                fc=color,
+                ec=color,
+                alpha=0.22,
+                lw=0.6,
+                zorder=3,
             )
         )
 
 
 def figure(cfg, methods=("stlcg", "pdstl")):
-    """One panel per noise level: both plans, their spread, MC success.
+    """One panel per noise level: both plans and their MC success.
 
-    Sized for a two-column IEEE figure (7.16 in); the explanation of the
-    marks belongs in the caption.
+    Sized for a two-column IEEE figure (7.16 in) with the panels filling
+    the width; the explanation of the marks belongs in the caption.
     """
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    plt.rcParams.update(
-        {"font.size": 8, "font.family": "serif", "mathtext.fontset": "cm"}
-    )
     plans = torch.load(OUTPUTS / "plans.pt")
     picked = {(r["method"], r["noise"]): r for r in _read("selected.csv")}
     levels = list(cfg["noise"])
     every = cfg["figure"]["ellipse_every"]
-    fig, axes = plt.subplots(
-        1, len(levels), figsize=(7.16, 2.75), sharex=True, sharey=True
-    )
-    for i, (ax, noise) in enumerate(zip(axes, levels)):
-        _draw_room(ax, cfg)
-        for method in methods:
-            mean, cov = belief(cfg, plans[f"{method}/{noise}"], noise)
-            _draw_plan(ax, mean, cov, method, every)
-        success = "\n".join(
-            f"{LABELS[m]}: {100 * float(picked[(m, noise)]['success']):.1f}%"
-            for m in reversed(methods)
+    with plt.rc_context({"font.size": 8}):
+        fig, axes = plt.subplots(
+            1,
+            len(levels),
+            figsize=(7.16, 2.95),
+            sharex=True,
+            sharey=True,
+            gridspec_kw={"wspace": 0.05},
         )
-        ax.text(0.3, 9.7, success, va="top", fontsize=7, linespacing=1.3)
-        ax.set_title(
-            f"({'abc'[i]}) {noise} noise, $q = {cfg['noise'][noise]:g}$",
-            fontsize=8,
+        for i, (ax, noise) in enumerate(zip(axes, levels)):
+            _draw_room(ax, cfg)
+            for method in methods:
+                mean, cov = belief(cfg, plans[f"{method}/{noise}"], noise)
+                _draw_plan(ax, mean, cov, method, every)
+            success = "\n".join(
+                f"{LABELS[m]}: "
+                f"{100 * float(picked[(m, noise)]['success']):.1f}%"
+                for m in reversed(methods)
+            )
+            ax.text(
+                0.25,
+                9.75,
+                success,
+                va="top",
+                fontsize=7.5,
+                linespacing=1.35,
+                bbox={"fc": "white", "ec": "none", "alpha": 0.8, "pad": 1.5},
+            )
+            ax.set_title(
+                f"({'abc'[i]}) {noise} noise, q = {cfg['noise'][noise]:g}",
+                fontsize=8,
+                pad=3,
+            )
+            ax.set(
+                xlim=cfg["bounds"]["x_range"],
+                ylim=cfg["bounds"]["y_range"],
+                aspect="equal",
+                xticks=range(0, 11, 2),
+                yticks=range(0, 11, 2),
+            )
+            ax.set_xlabel("x [m]", labelpad=1)
+            ax.grid(color=COLORS["workspace"], alpha=0.16, lw=0.6)
+            ax.set_axisbelow(True)
+            ax.tick_params(labelsize=7, length=2, pad=1.5)
+        axes[0].set_ylabel("y [m]", labelpad=1)
+        handles = [
+            Line2D([], [], color=METHOD_COLOR["pdstl"], lw=1.6, label="pdSTL"),
+            Patch(
+                fc=METHOD_COLOR["pdstl"],
+                ec=METHOD_COLOR["pdstl"],
+                alpha=0.3,
+                label="pdSTL 95% belief",
+            ),
+            Line2D([], [], color=METHOD_COLOR["stlcg"], lw=1.6, label="STLCG"),
+            Patch(
+                fc=COLORS["obstacle"],
+                ec=COLORS["obstacle"],
+                alpha=0.45,
+                hatch="//",
+                label="Obstacle",
+            ),
+            Patch(
+                fc=COLORS["goal"], ec=COLORS["goal"], alpha=0.35, label="Goal"
+            ),
+        ]
+        fig.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.0),
+            ncol=5,
+            fontsize=7.5,
+            frameon=False,
+            handlelength=2.0,
+            columnspacing=1.4,
+            borderaxespad=0.1,
         )
-        ax.set(
-            xlim=cfg["bounds"]["x_range"],
-            ylim=cfg["bounds"]["y_range"],
-            aspect="equal",
-            xticks=range(0, 11, 2),
-            yticks=range(0, 11, 2),
-        )
-        ax.set_xlabel("$x$ [m]")
-        ax.tick_params(length=2, pad=1.5)
-        for side in ax.spines.values():
-            side.set_visible(False)
-    axes[0].set_ylabel("$y$ [m]")
-    handles = [
-        Line2D([], [], **_line(STYLE["pdstl"]), label="pdSTL mean"),
-        Patch(
-            fc=STYLE["pdstl"]["color"],
-            alpha=0.3,
-            ec=STYLE["pdstl"]["color"],
-            label="pdSTL 95% ellipse",
-        ),
-        Line2D([], [], **_line(STYLE["stlcg"]), label="STLCG mean"),
-        Patch(
-            fc="none",
-            ec=STYLE["stlcg"]["color"],
-            ls=(0, (2, 1.5)),
-            label="STLCG 95% ellipse (executed)",
-        ),
-        Patch(fc=OBSTACLE, label="obstacle"),
-        Patch(fc=GOAL, alpha=0.3, ec=GOAL, label="goal"),
-    ]
-    fig.legend(
-        handles=handles,
-        loc="upper center",
-        ncol=6,
-        fontsize=7,
-        frameon=False,
-        handlelength=2.2,
-        columnspacing=1.2,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.92), w_pad=0.6)
-    for suffix in (".png", ".pdf"):
-        fig.savefig(OUTPUTS / f"figure{suffix}", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    plt.rcdefaults()
+        fig.subplots_adjust(left=0.05, right=0.998, bottom=0.1, top=0.88)
+        for suffix in (".png", ".pdf"):
+            fig.savefig(
+                OUTPUTS / f"figure{suffix}",
+                dpi=300,
+                bbox_inches="tight",
+                pad_inches=0.02,
+            )
+        plt.close(fig)
     print(f"wrote {OUTPUTS / 'figure.png'}", flush=True)
-
-
-def _line(style):
-    return {"color": style["color"], "ls": style["ls"], "lw": style["lw"]}
 
 
 def report(cfg):
