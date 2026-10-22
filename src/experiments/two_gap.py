@@ -397,7 +397,6 @@ def figure(cfg, methods=("stlcg", "pdstl")):
             1,
             len(levels),
             figsize=(7.16, 2.95),
-            sharex=True,
             sharey=True,
             gridspec_kw={"wspace": 0.05},
         )
@@ -429,7 +428,8 @@ def figure(cfg, methods=("stlcg", "pdstl")):
                 xlim=cfg["bounds"]["x_range"],
                 ylim=cfg["bounds"]["y_range"],
                 aspect="equal",
-                xticks=range(0, 11, 2),
+                # the last panel alone shows x = 10, so labels do not meet
+                xticks=range(0, 11 if i == len(levels) - 1 else 10, 2),
                 yticks=range(0, 11, 2),
             )
             ax.set_xlabel("x [m]", labelpad=1)

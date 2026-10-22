@@ -18,7 +18,7 @@ obstacles:
   - {name: upper, x_range: [4.0, 5.5], y_range: [3.3, 6.5]}
 goal: {x_range: [8.3, 9.3], y_range: [4.5, 5.5]}
 
-noise: {low: 0.001, medium: 0.005, high: 0.01}   # q_std per level
+noise: {low: 0.002, medium: 0.005, high: 0.0125}   # q_std per level (ratio 2.5)
 gaps:  # one start per route: waypoints after the start, ending at the goal
   slit: [[3.4, 3.15], [6.1, 3.15], [8.8, 5.0]]
   around: [[3.4, 7.5], [6.1, 7.5], [8.8, 5.0]]

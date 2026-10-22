@@ -81,7 +81,7 @@ def test_monte_carlo_draws_are_fixed_by_the_config_seed(cfg):
 
     def run(seed):
         small = {**cfg, "monte_carlo": {"samples": 200, "seed": seed}}
-        return two_gap.evaluate(small, controls, "high")
+        return two_gap.evaluate(small, controls, "medium")
 
     assert run(7) == run(7)  # every plan sees the same draws
     assert run(7)["clearance_median"] != run(8)["clearance_median"]
