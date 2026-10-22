@@ -37,4 +37,4 @@ methods:
               max_iters: 600, lr: 0.01, select_by: pdstl}
 
 monte_carlo: {samples: 5000, seed: 7}
-figure: {ellipse_every: 10}
+figure: {ellipse_every: 5}   # one 95% ellipse per second

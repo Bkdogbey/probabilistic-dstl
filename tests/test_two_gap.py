@@ -89,3 +89,19 @@ def test_monte_carlo_draws_are_fixed_by_the_config_seed(cfg):
 
 def test_effort_is_the_sum_of_squared_controls():
     assert two_gap.effort(torch.tensor([[1.0, 2.0], [0.0, 3.0]])) == 14.0
+
+
+def test_report_builds_table_and_figure_from_saved_results(
+    cfg, tmp_path, monkeypatch
+):
+    import shutil
+
+    saved = two_gap.OUTPUTS
+    if not (saved / "selected.csv").exists():
+        pytest.skip("no saved results; run `two_gap run` first")
+    for name in ("selected.csv", "plans.pt"):
+        shutil.copy(saved / name, tmp_path / name)
+    monkeypatch.setattr(two_gap, "OUTPUTS", tmp_path)
+    two_gap.report(cfg)
+    for name in ("table.csv", "table.md", "figure.png", "figure.pdf"):
+        assert (tmp_path / name).stat().st_size > 0

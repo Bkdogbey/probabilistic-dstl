@@ -236,7 +236,14 @@ def _read(name):
 # Report: table and figure from the saved results
 
 LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL"}
-COLORS = {"stlcg": "#D55E00", "pdstl": "#0072B2"}
+# Paper style: red obstacles and green goal (as in Safaoui et al. and
+# Okamoto & Tsiotras); pdSTL blue; the deterministic baseline dark grey,
+# dashed, so the obstacles keep the only red.
+STYLE = {
+    "pdstl": {"color": "#0072B2", "ls": "-", "lw": 1.4},
+    "stlcg": {"color": "#3a3a3a", "ls": (0, (4, 2)), "lw": 1.1},
+}
+OBSTACLE, GOAL = "#C0392B", "#2E7D32"
 
 
 def table(cfg):
@@ -272,94 +279,174 @@ def table(cfg):
     print(f"wrote {OUTPUTS / 'table.md'}", flush=True)
 
 
-def figure(cfg, methods=("stlcg", "pdstl")):
-    """Map at each noise level with each method's mean path and spread.
+def belief(cfg, controls, noise):
+    """Mean and covariance of the open-loop plan at one noise level.
 
-    The formula asks only to reach the goal, so each path is drawn up to its
-    arrival (closest approach to the goal centre); afterwards the plan is
-    free to drift.
+    Cut at arrival, the step closest to the goal centre: the formula asks
+    only to reach the goal, so the plan is free to drift afterwards.
     """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Ellipse, Rectangle
+    s = evaluation_problem(cfg, noise)
+    mean, cov = s.state
+    means, covs = [mean], [cov]
+    for control in controls.to(s.dyn.device):
+        mean, cov = s.dyn.step(mean, cov, control)
+        means.append(mean)
+        covs.append(cov)
+    mean = torch.stack(means).cpu().numpy()[:, :2]
+    cov = torch.stack(covs).cpu().numpy()[:, :2, :2]
+    (gx0, gx1), (gy0, gy1) = cfg["goal"]["x_range"], cfg["goal"]["y_range"]
+    centre = np.array([(gx0 + gx1) / 2, (gy0 + gy1) / 2])
+    arrival = int(np.argmin(np.linalg.norm(mean - centre, axis=1)))
+    return mean[: arrival + 1], cov[: arrival + 1]
+
+
+def _draw_room(ax, cfg):
+    """Walls, red obstacles, green goal, start."""
+    from matplotlib.patches import Rectangle
+
+    (x0, x1), (y0, y1) = cfg["bounds"]["x_range"], cfg["bounds"]["y_range"]
+    ax.add_patch(
+        Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, lw=1.2, ec="k")
+    )
+    for block in cfg["obstacles"]:
+        (bx0, bx1), (by0, by1) = block["x_range"], block["y_range"]
+        ax.add_patch(
+            Rectangle((bx0, by0), bx1 - bx0, by1 - by0, fc=OBSTACLE, ec="none")
+        )
+    (gx0, gx1), (gy0, gy1) = cfg["goal"]["x_range"], cfg["goal"]["y_range"]
+    ax.add_patch(
+        Rectangle(
+            (gx0, gy0),
+            gx1 - gx0,
+            gy1 - gy0,
+            fc=GOAL,
+            alpha=0.25,
+            ec=GOAL,
+            lw=0.8,
+        )
+    )
+    ax.text(gx1 + 0.1, gy1 + 0.1, "G", fontsize=8, color=GOAL)
+    sx, sy = cfg["x0_mean"][:2]
+    ax.plot(sx, sy, "o", color="k", ms=3.5, zorder=5)
+    ax.text(sx + 0.15, sy + 0.25, "S", fontsize=8)
+
+
+def _draw_plan(ax, mean, cov, method, every):
+    """Mean path and 95% position ellipses.
+
+    pdSTL: filled ellipses every `every` steps, the belief it plans with.
+    STLCG: dashed outlines at half that rate, the spread its noise-free plan
+    meets when executed under the same noise.
+    """
+    from matplotlib.patches import Ellipse
 
     from visualization.figures import _ellipse_parameters
 
+    style = STYLE[method]
+    ax.plot(*mean.T, color=style["color"], ls=style["ls"], lw=style["lw"])
+    if method != "pdstl":
+        every *= 2  # sparser outlines keep the baseline readable
+    for k in [*range(every, len(mean) - 1, every), len(mean) - 1]:
+        width, height, angle = _ellipse_parameters(cov[k], 0.95)
+        filled = method == "pdstl"
+        ax.add_patch(
+            Ellipse(
+                mean[k],
+                width,
+                height,
+                angle=angle,
+                fc=style["color"] if filled else "none",
+                alpha=0.18 if filled else 0.9,
+                ec=style["color"],
+                lw=0.3 if filled else 0.5,
+                ls="-" if filled else (0, (2, 1.5)),
+            )
+        )
+
+
+def figure(cfg, methods=("stlcg", "pdstl")):
+    """One panel per noise level: both plans, their spread, MC success.
+
+    Sized for a two-column IEEE figure (7.16 in); the explanation of the
+    marks belongs in the caption.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    plt.rcParams.update(
+        {"font.size": 8, "font.family": "serif", "mathtext.fontset": "cm"}
+    )
     plans = torch.load(OUTPUTS / "plans.pt")
     picked = {(r["method"], r["noise"]): r for r in _read("selected.csv")}
     levels = list(cfg["noise"])
+    every = cfg["figure"]["ellipse_every"]
     fig, axes = plt.subplots(
-        1, len(levels), figsize=(3.6 * len(levels), 3.9), sharey=True
+        1, len(levels), figsize=(7.16, 2.75), sharex=True, sharey=True
     )
-    for ax, noise in zip(axes, levels):
-        for block in cfg["obstacles"]:
-            (x0, x1), (y0, y1) = block["x_range"], block["y_range"]
-            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, color="0.6"))
-        (gx0, gx1), (gy0, gy1) = cfg["goal"]["x_range"], cfg["goal"]["y_range"]
-        ax.add_patch(
-            Rectangle(
-                (gx0, gy0), gx1 - gx0, gy1 - gy0, color="#2e7d32", alpha=0.3
-            )
-        )
-        ax.plot(*cfg["x0_mean"][:2], "ko", ms=4)
-        goal_centre = np.array([(gx0 + gx1) / 2, (gy0 + gy1) / 2])
-        s = evaluation_problem(cfg, noise)
+    for i, (ax, noise) in enumerate(zip(axes, levels)):
+        _draw_room(ax, cfg)
         for method in methods:
-            controls = plans[f"{method}/{noise}"].to(s.dyn.device)
-            mean, cov = s.state
-            means, covs = [mean], [cov]
-            for control in controls:
-                mean, cov = s.dyn.step(mean, cov, control)
-                means.append(mean)
-                covs.append(cov)
-            mean = torch.stack(means).cpu().numpy()
-            cov = torch.stack(covs).cpu().numpy()
-            arrival = int(np.argmin(np.hypot(*(mean[:, :2] - goal_centre).T)))
-            mean, cov = mean[: arrival + 1], cov[: arrival + 1]
-            r = picked[(method, noise)]
-            ax.plot(
-                *mean[:, :2].T,
-                color=COLORS[method],
-                lw=1.6,
-                label=(f"{LABELS[method]}: {100 * float(r['success']):.1f}%"),
-            )
-            every = cfg["figure"]["ellipse_every"]
-            for k in [*range(0, arrival, every), arrival]:
-                width, height, angle = _ellipse_parameters(
-                    cov[k, :2, :2], 0.95
-                )
-                ax.add_patch(
-                    Ellipse(
-                        mean[k, :2],
-                        width,
-                        height,
-                        angle=angle,
-                        color=COLORS[method],
-                        alpha=0.15,
-                        lw=0,
-                    )
-                )
+            mean, cov = belief(cfg, plans[f"{method}/{noise}"], noise)
+            _draw_plan(ax, mean, cov, method, every)
+        success = "\n".join(
+            f"{LABELS[m]}: {100 * float(picked[(m, noise)]['success']):.1f}%"
+            for m in reversed(methods)
+        )
+        ax.text(0.3, 9.7, success, va="top", fontsize=7, linespacing=1.3)
+        ax.set_title(
+            f"({'abc'[i]}) {noise} noise, $q = {cfg['noise'][noise]:g}$",
+            fontsize=8,
+        )
         ax.set(
             xlim=cfg["bounds"]["x_range"],
             ylim=cfg["bounds"]["y_range"],
             aspect="equal",
-            title=f"{noise} noise (q = {cfg['noise'][noise]})",
+            xticks=range(0, 11, 2),
+            yticks=range(0, 11, 2),
         )
-        ax.legend(loc="lower right", fontsize=7)
-        ax.grid(alpha=0.2)
-    fig.text(
-        0.5,
-        0.01,
-        "Mean paths up to arrival at the goal; 95% position ellipses every "
-        f"{every * cfg['dt']:g} s and at arrival. Legend: Monte Carlo "
-        "success.",
-        ha="center",
-        fontsize=8,
+        ax.set_xlabel("$x$ [m]")
+        ax.tick_params(length=2, pad=1.5)
+        for side in ax.spines.values():
+            side.set_visible(False)
+    axes[0].set_ylabel("$y$ [m]")
+    handles = [
+        Line2D([], [], **_line(STYLE["pdstl"]), label="pdSTL mean"),
+        Patch(
+            fc=STYLE["pdstl"]["color"],
+            alpha=0.3,
+            ec=STYLE["pdstl"]["color"],
+            label="pdSTL 95% ellipse",
+        ),
+        Line2D([], [], **_line(STYLE["stlcg"]), label="STLCG mean"),
+        Patch(
+            fc="none",
+            ec=STYLE["stlcg"]["color"],
+            ls=(0, (2, 1.5)),
+            label="STLCG 95% ellipse (executed)",
+        ),
+        Patch(fc=OBSTACLE, label="obstacle"),
+        Patch(fc=GOAL, alpha=0.3, ec=GOAL, label="goal"),
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=6,
+        fontsize=7,
+        frameon=False,
+        handlelength=2.2,
+        columnspacing=1.2,
     )
-    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.tight_layout(rect=(0, 0, 1, 0.92), w_pad=0.6)
     for suffix in (".png", ".pdf"):
-        fig.savefig(OUTPUTS / f"figure{suffix}", dpi=150)
+        fig.savefig(OUTPUTS / f"figure{suffix}", dpi=300, bbox_inches="tight")
     plt.close(fig)
+    plt.rcdefaults()
     print(f"wrote {OUTPUTS / 'figure.png'}", flush=True)
+
+
+def _line(style):
+    return {"color": style["color"], "ls": style["ls"], "lw": style["lw"]}
 
 
 def report(cfg):
