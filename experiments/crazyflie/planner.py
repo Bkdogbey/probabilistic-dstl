@@ -2,9 +2,9 @@
 
 Decision variables are the waypoints w_1..w_M (xy). w_0 is the start, and
 the segment durations are the reference's. Each iteration maps the
-waypoints to min-snap coefficients (c = K w), samples r(t_k) on the
-planning grid, builds the tracking-model belief (mean r + m_k, covariance
-P_k) and scores it.
+waypoints to min-snap coefficients (c = K w), samples the curve on the
+planning grid behind the model's delay, r(t_k - d), builds the
+tracking-model belief (mean r(t_k - d) + m_k, covariance P_k) and scores it.
 
 Both conditions run the same Adam loop, iteration count, learning-rate
 sweep and penalties; only the task score differs:
@@ -53,9 +53,12 @@ class Problem:
         self.start, self.init = waypoints[:1], waypoints[1:]
         rows = np.asarray(reference["coefficients"], dtype=float)
         self.times = minsnap.grid_times(rows, cfg.dt)
+        # The drone trails the curve by the model's delay; the curve holds
+        # its start before t = 0.
+        self.delayed = self.times - model.delay
         dense = minsnap.dense_times(rows)
         K = minsnap.solve_matrix(self.durations)
-        self.grid = minsnap.sample_matrix(self.durations, self.times) @ K
+        self.grid = minsnap.sample_matrix(self.durations, self.delayed) @ K
         self.vel = minsnap.sample_matrix(self.durations, dense, 1) @ K
         self.acc = minsnap.sample_matrix(self.durations, dense, 2) @ K
         self.snap = K.T @ minsnap.snap_matrix(self.durations) @ K
@@ -106,7 +109,7 @@ class Problem:
 
     def rows_mean(self, rows):
         """Predicted mean [H+1, 2] of uploaded rows."""
-        r = minsnap.evaluate(rows, self.times)[:, :2]
+        r = minsnap.evaluate(rows, self.delayed)[:, :2]
         return torch.as_tensor(r) + self.m
 
     def candidate(self, condition, free, iteration, w_snap):

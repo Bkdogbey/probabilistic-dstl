@@ -1,8 +1,10 @@
 """Stable stochastic tracking-error model: fit, validate, load.
 
-The onboard controller flies the uploaded curve r(t). On the planning grid
-t_k = t_play + k dt the time-aligned tracking error e_k = p_k - r(t_k) is
-modelled, per fan setting, as
+The onboard controller flies the uploaded curve r(t), and with PID it
+trails the curve by a steady delay (about 0.5 s). Per fan setting the
+delay d is fitted first, by least squares over the fit flights; on the
+planning grid t_k = t_play + k dt the tracking error behind the delayed
+curve, e_k = p_k - r(t_k - d), is then modelled as
 
     e[k+1] = R e[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),
     w ~ N(0, Q) (full 2x2),   e[0] ~ N(m0, P0).
@@ -28,6 +30,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import minsnap
 import numpy as np
 import torch
 from config import HERE, fan_setting
@@ -37,6 +40,7 @@ REPORTS = HERE / "reports"
 RHO_RANGE = (0.0, 0.999)
 RHO_NEAR_ONE = 0.95  # above this, b = c / (1 - rho) is poorly determined
 P0_FLOOR = 0.01**2  # m^2, on the initial variances
+DELAYS = np.arange(0.0, 1.0 + 1e-9, 0.01)  # s, searched for the delay
 COVERAGE = {
     "d2<=1 (39.3%)": 1.0,
     "d2<=4 (86.5%)": 4.0,
@@ -45,15 +49,27 @@ COVERAGE = {
 
 
 class TrackingModel:
-    """The error model of one fan setting; beliefs are r + m_k, P_k."""
+    """The error model of one fan setting.
+
+    Beliefs are r(t_k - delay) + m_k with covariance P_k.
+    """
 
     def __init__(
-        self, dt, rho, b, Q, m0, P0, report_id=None, report_hash=None
+        self,
+        dt,
+        rho,
+        b,
+        Q,
+        m0,
+        P0,
+        report_id=None,
+        report_hash=None,
+        delay=0.0,
     ):
         def tensor(x):
             return torch.as_tensor(np.asarray(x, float), dtype=torch.float64)
 
-        self.dt = dt
+        self.dt, self.delay = dt, float(delay)
         self.rho, self.b, self.Q = tensor(rho), tensor(b), tensor(Q)
         self.m0, self.P0 = tensor(m0), tensor(P0)
         self.report_id, self.report_hash = report_id, report_hash
@@ -71,7 +87,10 @@ class TrackingModel:
         return torch.stack(means), torch.stack(covs)
 
     def predict(self, reference):
-        """Belief mean r_k + m_k [N, 2] and covariance P_k for r [N, 2]."""
+        """Belief mean r_k + m_k [N, 2] and covariance P_k.
+
+        `reference` [N, 2] is the curve already sampled at t_k - delay.
+        """
         reference = torch.as_tensor(reference, dtype=torch.float64)
         m, P = self.error_moments(len(reference) - 1)
         return reference + m, P
@@ -123,9 +142,26 @@ def split(trials, holdout_every):
     return fit, held
 
 
-def flight_errors(trial):
-    """Time-aligned tracking errors e_k [N, 2] of one flight."""
-    return aligned_states(trial)[2]
+def flight_positions(trial):
+    """Measured xy on the planning grid and the flight's uploaded curve."""
+    p, _, _ = aligned_states(trial)
+    meta = trial["meta"]
+    return {"p": p, "rows": np.asarray(meta["coefficients"]), "dt": meta["dt"]}
+
+
+def errors_at(flight, delay):
+    """Tracking errors [N, 2] behind the curve delayed by `delay` s."""
+    t = flight["dt"] * np.arange(len(flight["p"])) - delay
+    return flight["p"] - minsnap.evaluate(flight["rows"], t)[:, :2]
+
+
+def fit_delay(flights):
+    """The delay [s] that minimizes the squared errors of all flights."""
+
+    def cost(delay):
+        return sum(np.sum(errors_at(f, delay) ** 2) for f in flights)
+
+    return float(min(DELAYS, key=cost))
 
 
 # Fitting
@@ -150,8 +186,10 @@ def fit_errors(errors):
         rho[i], intercept[i] = slope, c
     residual = y - rho * x - intercept
     starts = np.array([e[0] for e in errors])
-    P0 = np.cov(starts.T)
-    P0[np.diag_indices(2)] = np.maximum(np.diag(P0), P0_FLOOR)
+    # Floor the eigenvalues: with few flights the sample covariance is
+    # singular in some direction.
+    values, vectors = np.linalg.eigh(np.cov(starts.T))
+    P0 = vectors @ np.diag(np.maximum(values, P0_FLOOR)) @ vectors.T
     return {
         "rho": rho,
         "b": intercept / (1 - rho),
@@ -192,23 +230,27 @@ def make_model(dt, params, report_id=None, report_hash=None):
         params["P0"],
         report_id,
         report_hash,
+        params.get("delay", 0.0),
     )
 
 
 def fit(cfg, trials):
     """Fit the error model per fan, then validate it on held-out flights."""
     fit_trials, held = split(trials, cfg.model["holdout_every"])
-    data = {
-        fan: [flight_errors(t) for t in ts] for fan, ts in fit_trials.items()
+    flights = {
+        fan: [flight_positions(t) for t in ts]
+        for fan, ts in fit_trials.items()
     }
-    if not data or min(len(d) for d in data.values()) < 2:
+    if not flights or min(len(f) for f in flights.values()) < 2:
         raise ValueError("need at least two fitting flights per fan")
     samples = cfg.model["bootstrap"]
     rng = np.random.default_rng(cfg.model["seed"])
     report = {"dt": cfg.dt, "config_hash": cfg.hash, "fans": {}}
-    warnings = []
-    for fan, errors in data.items():
-        params = fit_errors(errors)
+    warnings, data = [], {}
+    for fan, fs in flights.items():
+        delay = fit_delay(fs)
+        errors = data[fan] = [errors_at(f, delay) for f in fs]
+        params = {**fit_errors(errors), "delay": delay}
         if len(errors) < cfg.model["min_flights_warning"]:
             warnings.append(
                 f"fan {fan}: {len(errors)} fit flights; plan for at least "
@@ -239,8 +281,11 @@ def fit(cfg, trials):
             np.linalg.eigvalsh(model.stationary_cov().numpy())
         ).tolist()
         if held[fan]:
+            held_errors = [
+                errors_at(flight_positions(t), model.delay) for t in held[fan]
+            ]
             report["validation"][fan] = validate(
-                model, [flight_errors(t) for t in held[fan]], samples, rng
+                model, held_errors, samples, rng
             )
     return report
 

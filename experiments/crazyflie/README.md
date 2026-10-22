@@ -40,7 +40,11 @@ the curve.
 
 ## The model, in plain words
 
-drone position = curve + bias + a random error.
+drone position = curve, delayed + bias + a random error.
+
+With the PID controller the drone trails the uploaded curve by a steady
+delay (about 0.5 s on our drone). The delay is fitted per fan first; the
+error is then measured behind the delayed curve, `e_k = p_k − r(t_k − d)`.
 
 Under the model, the spread of that error settles to a fixed (stationary)
 value instead of growing without limit. Per fan setting, on the 0.2 s grid:

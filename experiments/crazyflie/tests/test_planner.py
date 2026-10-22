@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import minsnap
 import numpy as np
 import planner
 import pytest
@@ -187,3 +188,16 @@ def test_planning_cannot_overwrite_the_frozen_reference(cfg):
     with pytest.raises(SystemExit, match="reference stays frozen"):
         run.cmd_plan(cfg, SimpleNamespace(output=cfg.reference))
     assert Path(cfg.reference).read_bytes() == before
+
+
+def test_prediction_trails_the_curve_by_the_model_delay(small, model):
+    model.delay = 0.5
+    reference = reference_plan(small)
+    problem = planner.Problem(small, Task(small), model, reference)
+    rows = np.asarray(reference["coefficients"])
+    behind = minsnap.evaluate(rows, problem.times - 0.5)[:, :2]
+    mean = problem.rows_mean(rows) - problem.m
+    assert np.allclose(mean.numpy(), behind)
+    free = torch.as_tensor(np.asarray(reference["waypoints"])[1:])
+    grid_mean = problem.grid @ problem.waypoints(free)
+    assert np.allclose(grid_mean.numpy(), behind, atol=1e-5)

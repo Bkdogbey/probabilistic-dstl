@@ -22,6 +22,7 @@ TRUE = {
     "m0": np.array([0.005, -0.003]),
     "P0": np.diag([2e-4, 1.5e-4]),
 }
+DELAY = 0.4  # s the synthetic drone trails the curve
 
 
 def errors(rng, steps, p=TRUE):
@@ -32,8 +33,11 @@ def errors(rng, steps, p=TRUE):
     return np.array(e)
 
 
-def synthetic_flights(count, rng, steps=90):
-    """Identification flights with errors drawn from TRUE."""
+def synthetic_flights(cfg, count, rng, steps=90):
+    """Flights of the reference, DELAY behind it, errors drawn from TRUE."""
+    rows = np.asarray(reference_plan(cfg)["coefficients"])
+    t = cfg.dt * np.arange(steps + 1) - DELAY
+    behind = minsnap.evaluate(rows, t)[:, :2]
     flights = []
     for i in range(count):
         meta = {
@@ -43,13 +47,17 @@ def synthetic_flights(count, rng, steps=90):
             "fan": 0,
             "trial_id": f"t{i:02d}",
         }
-        flights.append({"meta": meta, "errors": errors(rng, steps)})
+        p = behind + errors(rng, steps)
+        flight = {"p": p, "rows": rows, "dt": cfg.dt}
+        flights.append({"meta": meta, "flight": flight})
     return flights
 
 
 @pytest.fixture
 def synthetic(monkeypatch):
-    monkeypatch.setattr(tracking_model, "flight_errors", lambda t: t["errors"])
+    monkeypatch.setattr(
+        tracking_model, "flight_positions", lambda t: t["flight"]
+    )
 
 
 def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
@@ -57,11 +65,12 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
 ):
     cfg = replace(cfg, model={**cfg.model, "bootstrap": 50})
     report = tracking_model.fit(
-        cfg, synthetic_flights(60, np.random.default_rng(0))
+        cfg, synthetic_flights(cfg, 60, np.random.default_rng(0))
     )
     fan = report["fans"]["0"]
     assert fan["fit_flights"] == 40 and len(fan["held_out_trials"]) == 20
     assert not set(fan["held_out_trials"]) & set(fan["fit_trials"])
+    assert fan["delay"] == pytest.approx(DELAY, abs=0.011)
     assert np.allclose(fan["rho"], TRUE["rho"], atol=0.04)
     assert np.allclose(fan["b"], TRUE["b"], atol=0.004)
     assert np.allclose(fan["Q"], TRUE["Q"], atol=4e-6)
@@ -82,12 +91,14 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
 def test_few_flights_warn_and_a_single_flight_is_refused(cfg, synthetic):
     cfg = replace(cfg, model={**cfg.model, "bootstrap": 5})
     report = tracking_model.fit(
-        cfg, synthetic_flights(3, np.random.default_rng(1))
+        cfg, synthetic_flights(cfg, 3, np.random.default_rng(1))
     )
     assert report["fans"]["0"]["fit_flights"] == 2
     assert "2 fit flights" in report["warnings"][0]
     with pytest.raises(ValueError, match="at least two"):
-        tracking_model.fit(cfg, synthetic_flights(1, np.random.default_rng(1)))
+        tracking_model.fit(
+            cfg, synthetic_flights(cfg, 1, np.random.default_rng(1))
+        )
 
 
 def test_clipped_rho_refits_the_intercept_and_the_residuals():

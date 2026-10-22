@@ -188,6 +188,7 @@ def cmd_fit(cfg, args):
     for fan, f in report["fans"].items():
         print(
             f"  fan {fan}: {f['fit_flights']} fit flights, "
+            f"delay {f['delay']:.2f} s, "
             f"rho {np.round(f['rho'], 3).tolist()}, "
             f"b {np.round(f['b'], 4).tolist()} m, "
             f"stationary spread {np.round(f['stationary_spread'], 4).tolist()} m"
