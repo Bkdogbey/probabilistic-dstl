@@ -50,11 +50,13 @@ class Box:
 @dataclass(frozen=True)
 class Flight:
     connect_timeout: float = 10.0
-    takeoff_speed: float = 0.1  # m/s; faster climbs overshoot with PID
+    takeoff_speed: float = 0.3  # m/s; a slower climb did not reduce overshoot
     transit_speed: float = 0.3
     land_speed: float = 0.15
     start_tolerance: float = 0.05
-    start_altitude_tolerance: float = 0.05
+    # PID overshoots about 8 cm after takeoff and settles over ~6 s; 0.10
+    # starts the curve without waiting for that.
+    start_altitude_tolerance: float = 0.10
     start_speed: float = 0.10
     start_window: float = 1.0
     start_timeout: float = 15.0

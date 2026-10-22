@@ -75,12 +75,9 @@ def evaluate(trial, task):
     s, window = trial["state"], meta["altitude_average_s"]
     t0 = meta["mission_t0"]
     ticks = np.arange(t0, meta.get("mission_t_end", t0), MONITOR_S)
-    altitude = np.array(
-        [
-            s["z"][(s["t_host"] >= t - window) & (s["t_host"] <= t)].mean()
-            for t in ticks
-        ]
-    )
+    # A tick with no packet in its window is skipped, as in flight.
+    windows = [(s["t_host"] >= t - window) & (s["t_host"] <= t) for t in ticks]
+    altitude = np.array([s["z"][w].mean() for w in windows if w.any()])
     error = np.abs(altitude - meta["altitude"])
     met["altitude"] = bool(
         len(altitude) and np.all(error <= meta["altitude_tolerance"])
