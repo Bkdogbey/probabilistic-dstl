@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 ALTITUDE_AVG_S = 0.25  # s of state averaged for the altitude limit
 MONITOR_S = 0.05  # mission check period
+START_HEIGHT_DRIFT = 0.02  # m between the 0.25 s and 1 s mean heights
 # Monitoring continues this long after the curve ends, while the drone holds
 # its final setpoint, so the radio delay before playback starts cannot drop
 # the last plan step from the mission data.
@@ -246,6 +247,7 @@ def at_start(feed, start, cfg):
     f = cfg.flight
     height_tolerance = min(f.start_altitude_tolerance, cfg.altitude_tolerance)
     # An older average must not hide current motion at the handoff.
+    heights = []
     for seconds in (f.start_window, ALTITUDE_AVG_S):
         window = feed.window(seconds, f.stale_s)
         if window is None:
@@ -257,7 +259,10 @@ def at_start(feed, start, cfg):
             and np.abs(window[:, 2] - cfg.altitude).max() <= height_tolerance
         ):
             return False
-    return True
+        heights.append(mean[2])
+    # Not climbing or sinking: the recent mean height matches the longer one
+    # (about 5 cm/s); there is no vertical velocity in the state packets.
+    return abs(heights[1] - heights[0]) <= START_HEIGHT_DRIFT
 
 
 def upload(drone, plan, log):
