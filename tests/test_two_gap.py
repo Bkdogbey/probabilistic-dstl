@@ -5,15 +5,14 @@ import torch
 
 from experiments import two_gap
 from experiments.reach_avoid import straight_line_guess
-from utils import load_config
 
 
 @pytest.fixture(scope="module")
 def cfg():
-    return load_config(two_gap.CONFIG)
+    return two_gap.load()
 
 
-def test_config_loads_with_three_doubling_noise_levels(cfg):
+def test_config_loads_with_three_increasing_uncertainty_levels(cfg):
     assert cfg["dynamics"] == "double_integrator"
     assert list(cfg["noise"]) == ["low", "medium", "high"]
     levels = list(cfg["noise"].values())
@@ -105,3 +104,14 @@ def test_report_builds_table_and_figure_from_saved_results(
     two_gap.report(cfg)
     for name in ("table.csv", "table.md", "figure.png", "figure.pdf"):
         assert (tmp_path / name).stat().st_size > 0
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_noise_gives_the_stated_position_uncertainty(cfg, level):
+    after = cfg["uncertainty"]["after_s"]
+    sigma = cfg["uncertainty"]["position_std_m"][level]
+    s = two_gap.evaluation_problem(cfg, level)
+    mean, cov = s.state
+    for _ in range(round(after / cfg["dt"])):
+        mean, cov = s.dyn.step(mean, cov, torch.zeros(2))
+    assert cov[1, 1].sqrt().item() == pytest.approx(sigma, rel=1e-4)

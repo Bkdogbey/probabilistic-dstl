@@ -7,6 +7,10 @@ then spend the least effort. Each method plans from both routes, keeps one
 plan by its own rule, and the plan is executed open loop under noise (Monte
 Carlo, the same draws for every plan).
 
+Uncertainty levels are the robot's 1-sigma position uncertainty after a
+reference time of open-loop driving (config `uncertainty`); `load` turns each
+into the process noise q that produces it.
+
 Steps (CPU):
 
     PDSTL_DEVICE=cpu PYTHONPATH=src python -m experiments.two_gap run
@@ -30,12 +34,52 @@ from models.rollouts import (
     sample_trajectories,
 )
 from planning.environment import build_reach_avoid_environment
-from planning.runners import RESULTS_DIR, setup_problem
+from planning.runners import (
+    RESULTS_DIR,
+    build_dynamics,
+    build_initial_belief,
+    setup_problem,
+)
 from utils import load_config
 from visualization.figures import COLORS, _ellipse_parameters
 
 CONFIG = "configs/scenarios/reach_avoid/two_gap.yaml"
 OUTPUTS = RESULTS_DIR / "two_gap"
+
+
+def noise_for_uncertainty(cfg, sigma, time):
+    """Process noise q that gives position std `sigma` (m) after `time` (s).
+
+    Open loop the covariance does not depend on the controls:
+    P_n = A^n P_0 A^nT + q^2 S_n with S_n = sum_k A^k A^kT, so the
+    position variance is linear in q^2 and q follows in closed form.
+    """
+    dyn = build_dynamics({**cfg, "q_std": 0.0}, "cpu")
+    _, p0 = build_initial_belief(cfg, "cpu")
+    a = dyn.A.double()
+    start, unit = p0.double(), torch.zeros_like(a)
+    for _ in range(round(time / cfg["dt"])):
+        start = a @ start @ a.T
+        unit = a @ unit @ a.T + torch.eye(len(a), dtype=a.dtype)
+    variance0, per_q2 = float(start[1, 1]), float(unit[1, 1])
+    if sigma**2 <= variance0:
+        raise ValueError("target uncertainty is below the initial spread")
+    return ((sigma**2 - variance0) / per_q2) ** 0.5
+
+
+def load(path=CONFIG):
+    """Config with `noise` (q per level) set from `uncertainty`.
+
+    Levels are the robot's 1-sigma position uncertainty after a reference
+    time of open-loop driving: a property of the robot, not of the map.
+    """
+    cfg = load_config(path)
+    spec = cfg["uncertainty"]
+    cfg["noise"] = {
+        level: noise_for_uncertainty(cfg, sigma, spec["after_s"])
+        for level, sigma in spec["position_std_m"].items()
+    }
+    return cfg
 
 
 def problem(cfg, method, noise):
@@ -243,12 +287,17 @@ METHOD_COLOR = {"pdstl": COLORS["mean"], "stlcg": COLORS["planned"]}
 
 
 def table(cfg):
-    """One row per noise level and method; CSV and Markdown."""
+    """One row per uncertainty level and method; CSV and Markdown."""
+    uncertainty = cfg["uncertainty"]
     rows = []
     for r in _read("selected.csv"):
         rows.append(
             {
                 "noise": r["noise"],
+                "position_std_cm": round(
+                    100 * uncertainty["position_std_m"][r["noise"]]
+                ),
+                "q": round(cfg["noise"][r["noise"]], 4),
                 "method": LABELS[r["method"]],
                 "gap": r["gap"],
                 "success_pct": round(100 * float(r["success"]), 1),
@@ -392,6 +441,8 @@ def figure(cfg, methods=("stlcg", "pdstl")):
     picked = {(r["method"], r["noise"]): r for r in _read("selected.csv")}
     levels = list(cfg["noise"])
     every = cfg["figure"]["ellipse_every"]
+    sigma = cfg["uncertainty"]["position_std_m"]
+    after = cfg["uncertainty"]["after_s"]
     with plt.rc_context({"font.size": 8}):
         fig, axes = plt.subplots(
             1,
@@ -420,7 +471,8 @@ def figure(cfg, methods=("stlcg", "pdstl")):
                 bbox={"fc": "white", "ec": "none", "alpha": 0.8, "pad": 1.5},
             )
             ax.set_title(
-                f"({'abc'[i]}) {noise} noise, q = {cfg['noise'][noise]:g}",
+                f"({'abc'[i]}) {noise} uncertainty: "
+                f"{100 * sigma[noise]:.0f} cm after {after:g} s",
                 fontsize=8,
                 pad=3,
             )
@@ -494,7 +546,7 @@ def main():
     parser.add_argument("step", choices=STEPS)
     parser.add_argument("--config", default=CONFIG)
     args = parser.parse_args()
-    STEPS[args.step](load_config(args.config))
+    STEPS[args.step](load(args.config))
 
 
 if __name__ == "__main__":
