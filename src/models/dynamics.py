@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class Dynamics(nn.Module):
@@ -63,3 +63,26 @@ class DoubleIntegrator(Dynamics):
         self.register_buffer("A", A)
         self.register_buffer("B", B)
         self.register_buffer("Q", q_std**2 * torch.eye(4, device=device))
+
+
+class TrackedDoubleIntegrator(DoubleIntegrator):
+    """Double integrator that follows its plan with a PD tracker.
+
+    The plan is the feed-forward acceleration u_ff; the robot applies
+    u = u_ff - K (x - x_bar), with x_bar the planned (mean) state and
+    K = [kp I, kd I]. The mean follows the plan exactly, and the tracking
+    error covariance evolves with A_cl = A - B K, so it settles at a steady
+    size instead of growing with time. The feedback term is not saturated.
+    """
+
+    def __init__(
+        self, dt=0.2, u_max=1.0, q_std=0.02, kp=2.25, kd=3.0, device="cpu"
+    ):
+        super().__init__(dt, u_max, q_std, device)
+        eye = torch.eye(2, device=device)
+        self.register_buffer("K", torch.cat([kp * eye, kd * eye], dim=1))
+        self.register_buffer("A_cl", self.A - self.B @ self.K)
+
+    def step(self, x, P, u):
+        """Planned mean and closed-loop error covariance after one step."""
+        return self.A @ x + self.B @ u, self.A_cl @ P @ self.A_cl.t() + self.Q

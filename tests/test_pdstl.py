@@ -1202,3 +1202,22 @@ def test_half_space_gradient_reaches_gaussian_parameters():
     bounds = GaussianBelief(mean, factor @ factor.transpose(-1, -2))
     bounds.probability_bounds(event).sum().backward()
     assert mean.grad.abs().sum() > 0 and factor.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("interval", [(0, 10), (2, 7), (0, 0), (3, 3)])
+@pytest.mark.parametrize("beta", [None, 10.0, 200.0])
+def test_windowed_until_matches_the_reference_loop(interval, beta):
+    torch.manual_seed(0)
+    lower = torch.rand(3, 40)
+    phi = torch.stack([lower, lower + (1 - lower) * torch.rand(3, 40)], -1)
+    phi.requires_grad_()
+    lower = torch.rand(3, 40)
+    psi = torch.stack([lower, lower + (1 - lower) * 0.3], -1)
+    until = Until(None, None, list(interval))  # children unused here
+    a, b = interval
+    fast = until._windowed(phi, psi, a, b, 40 - b, beta)
+    slow = until._loop(phi, psi, a, b, 40 - b, beta)
+    torch.testing.assert_close(fast, slow, atol=1e-6, rtol=1e-5)
+    grad_fast = torch.autograd.grad(fast.sum(), phi, retain_graph=True)[0]
+    grad_slow = torch.autograd.grad(slow.sum(), phi)[0]
+    torch.testing.assert_close(grad_fast, grad_slow, atol=1e-4, rtol=1e-4)

@@ -327,3 +327,39 @@ def test_sampled_trajectories_match_the_predicted_belief():
     torch.testing.assert_close(
         torch.cov(paths[:, -1].T), covariance[0, -1], atol=5e-3, rtol=0
     )
+
+
+def test_tracked_double_integrator_covariance_settles():
+    from models.dynamics import TrackedDoubleIntegrator
+
+    dyn = TrackedDoubleIntegrator(dt=0.2, q_std=0.05)
+    controls = torch.zeros(150, 2)
+    _, cov = dyn(controls, torch.zeros(4), torch.zeros(4, 4))
+    spread = cov[0, :, 1, 1].sqrt()
+    # Settles: the last 50 steps agree, unlike the open-loop t^1.5 growth.
+    assert torch.allclose(spread[-50:], spread[-1], rtol=1e-4)
+    assert spread[-1] < 0.2
+
+
+def test_tracked_sampling_matches_the_predicted_belief():
+    from models.dynamics import TrackedDoubleIntegrator
+    from models.rollouts import sample_trajectories
+
+    torch.manual_seed(0)
+    dyn = TrackedDoubleIntegrator(dt=0.2, q_std=0.05)
+    mean0 = torch.zeros(4)
+    cov0 = torch.diag(torch.tensor([1e-4, 1e-4, 0.0, 0.0]))
+    controls = (0.5 * torch.randn(60, 2)).clamp(-0.99, 0.99)
+    mean, cov = dyn(torch.atanh(controls), mean0, cov0)
+    generator = torch.Generator().manual_seed(1)
+    paths = sample_trajectories(dyn, mean0, cov0, controls, 20000, generator)
+    for step in (5, 30, 60):
+        torch.testing.assert_close(
+            paths[:, step].mean(0), mean[0, step], atol=5e-3, rtol=0
+        )
+        torch.testing.assert_close(
+            paths[:, step, :2].T.cov(),
+            cov[0, step, :2, :2],
+            atol=5e-4,
+            rtol=0.05,
+        )

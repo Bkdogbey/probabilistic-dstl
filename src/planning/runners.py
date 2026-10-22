@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import torch
 from scipy.stats import beta
 
-from models.dynamics import DoubleIntegrator, SingleIntegrator
+from models.dynamics import (
+    DoubleIntegrator,
+    SingleIntegrator,
+    TrackedDoubleIntegrator,
+)
 from models.rollouts import (
     create_gaussian_belief_trajectory,
     gaussian_rollout,
@@ -20,8 +24,12 @@ RESULTS_DIR = Path(__file__).resolve().parents[2] / "outputs"
 
 def build_dynamics(cfg, device):
     common = {key: cfg[key] for key in ("dt", "u_max", "q_std")}
-    if cfg.get("dynamics", "single_integrator") == "double_integrator":
+    kind = cfg.get("dynamics", "single_integrator")
+    if kind == "double_integrator":
         return DoubleIntegrator(**common, device=device)
+    if kind == "tracked_double_integrator":
+        gains = cfg.get("tracking", {})
+        return TrackedDoubleIntegrator(**common, **gains, device=device)
     return SingleIntegrator(**common, device=device)
 
 

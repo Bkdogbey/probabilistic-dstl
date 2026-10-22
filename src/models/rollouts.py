@@ -94,6 +94,9 @@ def gaussian_rollout(dynamics, mean0, cov0):
 def sample_trajectories(dynamics, mean0, cov0, controls, samples, generator):
     """Noisy trajectories x' = A x + B u + w, w ~ N(0, Q), under fixed controls.
 
+    A dynamics with a tracking gain K (TrackedDoubleIntegrator) applies
+    u - K (x - x_bar) instead, x_bar being the planned mean.
+
     Args:
         dynamics: Linear dynamics with A, B, Q.
         mean0, cov0: Gaussian initial state.
@@ -120,9 +123,15 @@ def sample_trajectories(dynamics, mean0, cov0, controls, samples, generator):
 
     state = mean0 + draw(cov0)
     states = [state]
+    gain = getattr(dynamics, "K", None)  # tracker: u = u_ff - K (x - x_bar)
+    planned = mean0
     for control in controls:
+        applied = control
+        if gain is not None:
+            applied = control - (state - planned) @ gain.T
+            planned = dynamics.A @ planned + dynamics.B @ control
         state = (
-            state @ dynamics.A.T + control @ dynamics.B.T + draw(dynamics.Q)
+            state @ dynamics.A.T + applied @ dynamics.B.T + draw(dynamics.Q)
         )
         states.append(state)
     return torch.stack(states, dim=1)

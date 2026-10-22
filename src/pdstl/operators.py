@@ -441,6 +441,38 @@ class Until(STL_Formula):
                 f"child traces have {T}"
             )
 
+        if np.isinf(self._interval[1]):
+            return self._loop(phi, psi, a, b, n_valid, beta)
+        return self._windowed(phi, psi, a, b, n_valid, beta)
+
+    def _windowed(self, phi, psi, a, b, n_valid, beta):
+        """All origins at once; the same values as `_loop` for finite b.
+
+        Origin t has witnesses τ = t + j, j in [a, b]. The prefix min of φ
+        over [t, τ] is a cumulative min along each window (hard), or a
+        cumulative log-sum-exp (smooth: normalized soft-min with the
+        log(n)/β soundness shift of `_reduce_bounds` on the lower bound).
+        """
+        width = b + 1
+        # [B, n_valid, width, 2]: window starting at each origin.
+        phi_w = phi.unfold(1, width, 1)[:, :n_valid].transpose(-1, -2)
+        psi_w = psi.unfold(1, width, 1)[:, :n_valid].transpose(-1, -2)
+        if beta is None:
+            prefix = torch.cummin(phi_w, dim=2).values
+        else:
+            lse = torch.logcumsumexp(-beta * phi_w, dim=2)
+            log_n = torch.log(
+                torch.arange(1, width + 1, dtype=phi.dtype, device=phi.device)
+            )
+            prefix = _pair(-lse[..., 0] / beta, -(lse[..., 1] - log_n) / beta)
+        candidates = _conjunction(prefix[:, :, a:], psi_w[:, :, a:], beta)
+        return _reduce_bounds(
+            self.max_op, candidates, beta, dim=2, keepdim=False
+        )
+
+    def _loop(self, phi, psi, a, b, n_valid, beta):
+        """Reference: one origin and one witness at a time."""
+        T = phi.shape[1]
         results = []
         for t in range(n_valid):
             candidates = []
