@@ -298,7 +298,8 @@ def evaluate(cfg, controls, level):
         ),
     }
     for name, part in s.parts.items():
-        out[f"fail_{name}"] = float((part(beliefs)[:, 0, 0] <= 0.5).mean())
+        failed = part(beliefs)[:, 0, 0] <= 0.5
+        out[f"fail_{name}"] = float(failed.float().mean())
     out["score_eval"] = s.planner.evaluate_controls(
         s.rollout, controls.to(s.dyn.device), spec=s.spec
     ).hard_interval[0]
