@@ -26,9 +26,10 @@ from trajectory import (
 def test_reference_is_the_figure8_feasible_and_through_the_goal(cfg):
     plan = reference_plan(cfg)
     rows = np.asarray(plan["coefficients"])
-    assert np.allclose(plan["start"], [0.5, -1.75]) and cfg.altitude == 0.3
-    assert minsnap.total_duration(rows) == 20.0 == cfg.duration
-    assert cfg.steps == 100 and len(rows) <= minsnap.MAX_PIECES
+    assert np.allclose(plan["start"], [0.56, -1.73]) and cfg.altitude == 0.3
+    assert minsnap.total_duration(rows) == 22.0 == cfg.duration
+    assert cfg.steps == 110 and len(rows) <= minsnap.MAX_PIECES
+    assert len(cfg.obstacles) == 3
     task = Task(cfg)
     assert check_plan(cfg, task, dict(plan))["problems"] == []
     curve = analysis.curve_xy(rows)
@@ -51,7 +52,7 @@ def test_reference_ignores_optimizer_tuning_but_not_the_arena(cfg):
 @pytest.mark.parametrize(
     "change, message",
     [
-        ({"waypoints": [[0.5, -1.75]] * 21}, "miss the waypoints"),
+        ({"waypoints": [[0.56, -1.73]] * 23}, "miss the waypoints"),
         ({"dt": 0.35}, "whole number"),
         ({"durations": [2.0] * 8}, "plan needs"),
     ],
@@ -158,7 +159,7 @@ def test_evaluate_scores_each_requirement(cfg):
     result = analysis.evaluate(recorded(cfg, reference_path(cfg)), task)
     assert result["success"] and result["min_clearance"] > 0
 
-    bad = np.linspace([0.5, -1.75], [1.2, -1.75], 440)  # leaves, no goal
+    bad = np.linspace([0.5, -1.75], [1.2, -1.75], 480)  # leaves, no goal
     result = analysis.evaluate(recorded(cfg, bad), task)
     assert not result["success"] and not result["requirements"]["workspace"]
     assert not result["requirements"]["goal"] and result["min_clearance"] < 0
