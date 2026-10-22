@@ -37,7 +37,7 @@ times:            # seconds; converted to steps with dt
 # Uncertainty levels: the robot's steady 1-sigma tracking error; the process
 # noise q (Q = q^2 I) for each is computed in inspection_dock.load.
 uncertainty:
-  tracking_std_m: {low: 0.05, medium: 0.10, high: 0.20}
+  tracking_std_m: {low: 0.05, medium: 0.125, high: 0.20}
 
 routes:           # one start per plan: legs of (waypoints, dwell seconds)
   shortcut:
