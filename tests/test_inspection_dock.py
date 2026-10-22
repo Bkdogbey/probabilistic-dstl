@@ -93,3 +93,19 @@ def test_each_initial_guess_takes_its_route(cfg, route, expected):
     mean = result.rollout.aux["mean_trace"][0].numpy()
     assert m.describe(cfg, mean) == expected
     assert result.hard_interval[0] == pytest.approx(1.0)
+
+
+def test_report_builds_table_and_figure_from_saved_results(
+    cfg, tmp_path, monkeypatch
+):
+    import shutil
+
+    saved = m.OUTPUTS
+    if not (saved / "selected.csv").exists():
+        pytest.skip("no saved results; run `inspection_dock run` first")
+    for name in ("selected.csv", "plans.pt"):
+        shutil.copy(saved / name, tmp_path / name)
+    monkeypatch.setattr(m, "OUTPUTS", tmp_path)
+    m.report(cfg)
+    for name in ("table.csv", "table.md", "figure.png", "figure.pdf"):
+        assert (tmp_path / name).stat().st_size > 0

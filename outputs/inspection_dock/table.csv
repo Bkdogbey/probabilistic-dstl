@@ -1,0 +1,7 @@
+uncertainty,tracking_std_cm,method,plan,success_pct,ci_pct,fail_safe_pct,fail_visit_pct,fail_rule_pct,fail_dock_pct,pdstl_score,effort
+low,5,STLCG,"shortcut, A, inspect",100.0,"[99.9, 100.0]",0.0,0.0,0.0,0.0,1.0,17.7
+low,5,pdSTL,"shortcut, A, inspect",99.2,"[98.9, 99.4]",0.0,0.0,0.8,0.0,0.99,6.3
+medium,12.5,STLCG,"shortcut, A, inspect",96.7,"[96.1, 97.2]",3.3,0.0,0.0,0.0,0.979,17.7
+medium,12.5,pdSTL,"detour, B",100.0,"[99.9, 100.0]",0.0,0.0,0.0,0.0,0.996,20.3
+high,20,STLCG,"shortcut, A, inspect",75.4,"[74.1, 76.5]",24.1,0.2,0.0,0.5,0.752,17.7
+high,20,pdSTL,"detour, B",98.7,"[98.4, 99.0]",1.1,0.2,0.0,0.0,0.921,20.8

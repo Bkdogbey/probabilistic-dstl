@@ -377,7 +377,7 @@ def table(cfg):
         rows.append(
             {
                 "uncertainty": r["noise"],
-                "tracking_std_cm": round(100 * sigma[r["noise"]]),
+                "tracking_std_cm": f"{100 * sigma[r['noise']]:g}",
                 "method": LABELS[r["method"]],
                 "plan": (
                     f"{r['gap']}, {r['target']}"
@@ -543,17 +543,18 @@ def figure(cfg, methods=("stlcg", "pdstl")):
                 for m in reversed(methods)
             )
             ax.text(
-                0.25,
                 9.75,
+                0.25,
                 success,
-                va="top",
+                ha="right",
+                va="bottom",
                 fontsize=7.5,
                 linespacing=1.35,
                 bbox={"fc": "white", "ec": "none", "alpha": 0.8, "pad": 1.5},
             )
             ax.set_title(
-                f"({'abc'[i]}) {level} uncertainty: "
-                f"{100 * sigma[level]:.0f} cm tracking error",
+                f"({'abc'[i]}) {level}: {100 * sigma[level]:g} cm "
+                "tracking error",
                 fontsize=8,
                 pad=3,
             )
