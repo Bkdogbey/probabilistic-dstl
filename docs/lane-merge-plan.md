@@ -2,6 +2,12 @@
 
 Branch: `lane-merge`, from `opt-planning` at `a503854d9fab1794b138dec353e18d901e0a16ca`.
 
+Current phase: use the existing run/skip blocks for one selected scenario,
+with its figure and a compact results table. Batch execution, smoke campaigns,
+persistent trace logging, and formal reporting below are deferred until the
+interactive examples have been tested. Earlier generated reports are archived
+locally under the ignored `outputs/lane-merge-archive/` directory.
+
 ## Goal
 
 Use the existing closed-loop merge to demonstrate multiple STL specifications, including nested temporal tasks, and measure online replanning time. No method comparison.

@@ -31,6 +31,7 @@ class PlanResult:
     initial_hard_lower: float | None = None
     initial_smooth_lower: float | None = None
     monte_carlo: tuple[float, float, float] | None = None
+    replanning_time: float = 0.0
 
     def alpha_status(self):
         """Whether the lower robustness meets alpha, in words."""
@@ -59,6 +60,7 @@ class MPCResult:
     window_plans: list[PlanResult]
     stopped_reason: str
     failure_detail: str | None = None
+    failed_replanning_time: float | None = None
 
 
 class Planner:
@@ -78,7 +80,7 @@ class Planner:
         if unknown:
             raise ValueError(f"unknown planner settings: {sorted(unknown)}")
         self.dyn, self.horizon = dynamics, horizon
-        self.device = dynamics.device
+        self.device = torch.device(dynamics.device)
         self.cfg = {**defaults, **config}
         self.cfg["smoothing"] = {
             **defaults["smoothing"],
@@ -355,11 +357,15 @@ class Planner:
         """
         states, applied, plans = [state], [], []
         failure_detail = None
+        failed_replanning_time = None
         guess = init_guess
         reason = is_done(state, 0)
         for step in range(max_steps):
             if reason:
                 break
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            replanning_started = perf_counter()
             try:
                 plan = self.optimize_window(
                     make_rollout(state, step),
@@ -377,11 +383,15 @@ class Planner:
                     ),
                     callback_every=callback_every,
                 )
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                plan.replanning_time = perf_counter() - replanning_started
             except (RuntimeError, ValueError) as error:
                 if not capture_planning_failures:
                     raise
                 reason = "planning_failure"
                 failure_detail = f"{type(error).__name__}: {error}"
+                failed_replanning_time = perf_counter() - replanning_started
                 break
             control = plan.controls[0].clone()
             state = execute(state, control, step)
@@ -407,4 +417,5 @@ class Planner:
             if reason
             else "max_steps",
             failure_detail,
+            failed_replanning_time,
         )

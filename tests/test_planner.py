@@ -328,6 +328,7 @@ def test_mpc_first_control_execution_local_spec_and_warm_start(steps):
     assert result.stopped_reason == "max_steps"
     assert [k for _, k in specifications] == list(range(steps))
     for k, plan in enumerate(result.window_plans):
+        assert plan.replanning_time >= plan.planning_time > 0
         torch.testing.assert_close(
             result.applied_controls[k], plan.controls[0]
         )

@@ -3,8 +3,8 @@
 import heapq
 from dataclasses import dataclass
 from functools import cache, reduce
-from itertools import permutations, product
-from math import ceil, floor, hypot, isfinite
+from itertools import pairwise, permutations, product
+from math import ceil, floor, hypot, isclose, isfinite
 
 import numpy as np
 
@@ -286,7 +286,7 @@ def shortest_route(environment, start, clearance=0.05, resolution=0.05):
     ]
 
     def length(cells):
-        return sum(search(a)[0][b] for a, b in zip(cells, cells[1:]))
+        return sum(search(a)[0][b] for a, b in pairwise(cells))
 
     best = min(stops, key=length)
     if not isfinite(length(best)):
@@ -295,7 +295,7 @@ def shortest_route(environment, start, clearance=0.05, resolution=0.05):
             "lower route.clearance or move the obstacles"
         )
     route = []
-    for a, b in zip(best, best[1:]):
+    for a, b in pairwise(best):
         route += grid.shortcut(grid.trace(search(a)[1], a, b))
     return route
 
@@ -394,7 +394,7 @@ class LaneMergeEnvironment(Environment):
 
 
 def lane_merge_specification(environment, horizon):
-    """Road and three relative collision checks, then timed target dwell."""
+    """The selected timed lane task under shared road/traffic safety."""
     return lane_subformulas(environment, horizon)["overall"]
 
 
@@ -415,6 +415,22 @@ def lane_subformulas(environment, horizon):
         safety[name] = ~(longitudinal & lateral)
     safe_atom = reduce(And, [road_atom, *safety.values()])
     all_safe = Always(safe_atom, [0, horizon])
+    headway = None
+    if task["spec"] == "headway":
+        low, high = lane_headway_overlap(metadata)
+        overlap = AxisInterval(
+            low, high, dim=1, name="Target footprint overlap"
+        )
+        lead, separation = lane_headway_parameters(metadata)
+        gap = RelativeAxisInterval(
+            lead["name"],
+            separation,
+            float("inf"),
+            dim=0,
+            name="Lead bumper gap",
+        )
+        headway = Always(~overlap | gap, [0, horizon])
+        all_safe = all_safe & headway
     target = AxisInterval(
         task["target_center"] - task["target_tolerance"],
         task["target_center"] + task["target_tolerance"],
@@ -423,6 +439,65 @@ def lane_subformulas(environment, horizon):
     )
     speed = task["settle_lateral_speed"]
     settled = AxisInterval(-speed, speed, dim=3, name="Lateral speed settled")
+    parts = {
+        "road": road_atom,
+        **{f"safety_{name}": predicate for name, predicate in safety.items()},
+        "safe": all_safe,
+    }
+    if headway is not None:
+        parts["headway"] = headway
+    if task["spec"] != "merge_or_yield":
+        merge = _lane_merge_task(metadata, horizon, target, settled)
+        return {**parts, **merge, "overall": all_safe & merge["branch"]}
+
+    # Completed estimated branches retain their own task. No deadline resets.
+    if metadata.get("yield_completed"):
+        atom = lane_yield_predicate(metadata)
+        stay = Always(atom, [0, horizon])
+        return {
+            **parts,
+            "yield_complete": stay,
+            "complete": stay,
+            "stay": stay,
+            "overall": all_safe & stay,
+        }
+    merge = None
+    if metadata.get("completed") or (
+        not metadata.get("merge_unavailable")
+        and _dwell_possible(task, step, streak)
+    ):
+        merge = _lane_merge_task(metadata, horizon, target, settled)
+    if metadata.get("completed"):
+        return {**parts, **merge, "overall": all_safe & merge["branch"]}
+    yielding = _lane_yield_task(metadata, horizon)
+    if merge is None and yielding is None:
+        raise ValueError("neither merge nor yield has a remaining dwell start")
+    branches = []
+    completions = []
+    stays = []
+    if merge is not None:
+        parts["merge_complete"] = merge["complete"]
+        branches.append(merge["branch"])
+        completions.append(merge["complete"])
+        stays.append(merge["stay"])
+    if yielding is not None:
+        parts["yield_complete"] = yielding["complete"]
+        branches.append(yielding["branch"])
+        completions.append(yielding["complete"])
+        stays.append(yielding["stay"])
+    return {
+        **parts,
+        "complete": reduce(Or, completions),
+        "stay": reduce(Or, stays),
+        "overall": all_safe & reduce(Or, branches),
+    }
+
+
+def _lane_merge_task(metadata, horizon, target, settled):
+    """Existing merge/dwell/retention branch, also used unchanged by C."""
+    task = metadata["task"]
+    step = metadata.get("step", 0)
+    streak = metadata.get("streak", 0)
     dwell = task["dwell_steps"]  # number of elapsed transitions
     absolute_start, absolute_end = task["start_end_steps"]
     credit = lane_dwell_credit(metadata, step, streak)
@@ -434,17 +509,7 @@ def lane_subformulas(environment, horizon):
     if metadata.get("completed"):
         # Dwell is done: no timing or ramp-end check, just stay and settle.
         stay = stay_from(0)
-        return {
-            "road": road_atom,
-            **{
-                f"safety_{name}": predicate
-                for name, predicate in safety.items()
-            },
-            "safe": all_safe,
-            "complete": stay,
-            "stay": stay,
-            "overall": all_safe & stay,
-        }
+        return {"complete": stay, "stay": stay, "branch": stay}
 
     def completion_from_start(start, duration):
         finish = start + duration
@@ -460,6 +525,8 @@ def lane_subformulas(environment, horizon):
 
     if credit:
         remaining = dwell - (credit - 1)
+        if step + remaining > absolute_end:
+            raise ValueError("lane task has no remaining feasible dwell start")
         candidates = [completion_from_start(0, remaining)]
     else:
         start = max(0, absolute_start - step)
@@ -474,17 +541,105 @@ def lane_subformulas(environment, horizon):
     stay = reduce(Or, [stay_from(finish) for _formula, finish in candidates])
     # Safety covers the whole window, not just up to the dwell finish, so
     # the plan cannot drift off the road or into traffic after completing.
-    overall = all_safe & reduce(
+    branch = reduce(
         Or,
         [formula & stay_from(finish) for formula, finish in candidates],
     )
+    return {"complete": completion, "stay": stay, "branch": branch}
+
+
+def _dwell_credit(task, step, streak):
+    start, _ = task["start_end_steps"]
+    return (
+        min(streak, step - start + 1, task["dwell_steps"] + 1)
+        if step >= start
+        else 0
+    )
+
+
+def _dwell_possible(task, step, streak):
+    start, end = task["start_end_steps"]
+    credit = _dwell_credit(task, step, streak)
+    remaining = (
+        task["dwell_steps"] - (credit - 1) if credit else task["dwell_steps"]
+    )
+    return max(step, start) + remaining <= end
+
+
+def lane_yield_predicate(metadata):
+    """Full footprint in the yield rectangle and bounded vx AND vy."""
+    task = metadata["task"]["yield"]
+    vehicle = metadata["ego_vehicle"]
+    xmin, xmax = task["x_range"]
+    ymin, ymax = task["y_range"]
+    region = InsideRectangle(
+        [xmin + vehicle["width"] / 2, xmax - vehicle["width"] / 2],
+        [ymin + vehicle["height"] / 2, ymax - vehicle["height"] / 2],
+        name="Yield footprint containment",
+    )
+    vx, vy = task["stopped_speed"]
+    return region & AxisInterval(-vx, vx, dim=2) & AxisInterval(-vy, vy, dim=3)
+
+
+def lane_yield_contains(environment, state):
+    task = environment.metadata["task"]["yield"]
+    vehicle = environment.metadata["ego_vehicle"]
+    xmin, xmax = task["x_range"]
+    ymin, ymax = task["y_range"]
+    vx, vy = task["stopped_speed"]
+    return bool(
+        (state[0] >= xmin + vehicle["width"] / 2)
+        & (state[0] <= xmax - vehicle["width"] / 2)
+        & (state[1] >= ymin + vehicle["height"] / 2)
+        & (state[1] <= ymax - vehicle["height"] / 2)
+        & (state[2].abs() <= vx)
+        & (state[3].abs() <= vy)
+    )
+
+
+def lane_yield_reached(environment, state, step, streak):
+    task = environment.metadata["task"]["yield"]
+    start, end = task["start_end_steps"]
+    return (
+        start + task["dwell_steps"] <= step <= end
+        and _dwell_credit(task, step, streak) >= task["dwell_steps"] + 1
+        and lane_yield_contains(environment, state)
+    )
+
+
+def lane_yield_possible(environment, step, streak):
+    return _dwell_possible(environment.metadata["task"]["yield"], step, streak)
+
+
+def _lane_yield_task(metadata, horizon):
+    task = metadata["task"]["yield"]
+    step = metadata.get("step", 0)
+    streak = metadata.get("yield_streak", 0)
+    if not _dwell_possible(task, step, streak):
+        return None
+    atom = lane_yield_predicate(metadata)
+    credit = _dwell_credit(task, step, streak)
+    dwell = task["dwell_steps"]
+    if credit:
+        duration = dwell - (credit - 1)
+        starts = [0]
+    else:
+        duration = dwell
+        first = max(0, task["start_end_steps"][0] - step)
+        last = task["start_end_steps"][1] - dwell - step
+        starts = list(range(first, last + 1))
+    # The upper yield endpoint is also a completed-dwell deadline.
+    complete = Eventually(Always(atom, [0, duration]), [starts[0], starts[-1]])
+    branches = [
+        Eventually(Always(atom, [0, duration]), [start, start])
+        & Always(atom, [start + duration, horizon])
+        for start in starts
+    ]
+    stays = [Always(atom, [start + duration, horizon]) for start in starts]
     return {
-        "road": road_atom,
-        **{f"safety_{name}": predicate for name, predicate in safety.items()},
-        "safe": all_safe,
-        "complete": completion,
-        "stay": stay,
-        "overall": overall,
+        "complete": complete,
+        "stay": reduce(Or, stays),
+        "branch": reduce(Or, branches),
     }
 
 
@@ -580,12 +735,51 @@ def lane_target_contains(metadata, mean):
     )
 
 
+def lane_headway_overlap(metadata):
+    """Closed center-y interval where the ego footprint touches target lane."""
+    half_height = metadata["ego_vehicle"]["height"] / 2
+    road = metadata["road"]
+    return road["lane_divider"] - half_height, road["y_max"] + half_height
+
+
+def lane_headway_parameters(metadata):
+    headway = metadata["task"]["headway"]
+    lead = next(
+        car
+        for car in metadata["traffic"]
+        if car["name"] == headway["lead_vehicle"]
+    )
+    separation = (
+        headway["min_gap"]
+        + (metadata["ego_vehicle"]["width"] + lead["width"]) / 2
+    )
+    return lead, separation
+
+
+def lane_lead_gap(environment, ego, traffic):
+    """Physical bumper gap to the designated lead, independent of activation."""
+    metadata = environment.metadata
+    lead, separation = lane_headway_parameters(metadata)
+    index = [car["name"] for car in metadata["traffic"]].index(lead["name"])
+    lengths = separation - metadata["task"]["headway"]["min_gap"]
+    return float(traffic[index, 0] - ego[0]) - lengths
+
+
+def lane_headway_violated(environment, ego, traffic):
+    metadata = environment.metadata
+    if metadata["task"]["spec"] != "headway":
+        return False
+    low, high = lane_headway_overlap(metadata)
+    # Compare in the state's dtype, as the probability predicate does.
+    overlap = bool((ego[1] >= low) & (ego[1] <= high))
+    lead, separation = lane_headway_parameters(metadata)
+    index = [car["name"] for car in metadata["traffic"]].index(lead["name"])
+    return overlap and bool(traffic[index, 0] - ego[0] < separation)
+
+
 def lane_dwell_credit(metadata, step, streak):
     """Number of consecutive in-window target samples available at this step."""
-    start, _ = metadata["task"]["start_end_steps"]
-    if not streak or step < start:
-        return 0
-    return min(streak, step - start + 1)
+    return _dwell_credit(metadata["task"], step, streak)
 
 
 def lane_goal_reached(environment, mean, step, streak):
@@ -633,6 +827,57 @@ def _lane_rectangle(name, role, block):
     )
 
 
+def _lane_steps(seconds, dt, *, end=False):
+    """Convert seconds to a sample index without floating-point off-by-ones."""
+    steps = seconds / dt
+    nearest = round(steps)
+    if isclose(steps, nearest, rel_tol=0, abs_tol=1e-9):
+        steps = nearest
+    return floor(steps) if end else ceil(steps)
+
+
+def _lane_duration(seconds, dt):
+    """Positive durations require at least one elapsed transition."""
+    return max(int(seconds > 0), _lane_steps(seconds, dt))
+
+
+def _lane_yield_config(config):
+    """Validate a full-footprint stop region and discretize absolute times."""
+    yielding = dict(config["task"].get("yield", {}))
+    try:
+        xmin, xmax = yielding["x_range"]
+        ymin, ymax = yielding["y_range"]
+        vx, vy = yielding["stopped_speed"]
+        begin, finish = yielding["window_seconds"]
+        dwell = yielding["dwell_seconds"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "yield needs region, window, dwell and stopped_speed [vx, vy]"
+        ) from error
+    numbers = (xmin, xmax, ymin, ymax, vx, vy, begin, finish, dwell)
+    if not all(isfinite(v) for v in numbers) or min(vx, vy, dwell) <= 0:
+        raise ValueError(
+            "yield values must be finite; dwell and speeds positive"
+        )
+    ego, road, ramp = config["ego_vehicle"], config["road"], config.get("ramp")
+    if xmax - xmin <= ego["width"] or ymax - ymin <= ego["height"]:
+        raise ValueError("yield region must fit the full ego footprint")
+    if ymin < road["y_min"] or ymax > road["y_max"]:
+        raise ValueError("yield region must be inside the road")
+    if ramp is not None and xmax > ramp["start_x"]:
+        raise ValueError("yield region must be upstream of the taper")
+    dt = config["dt"]
+    yielding["dwell_steps"] = _lane_duration(dwell, dt)
+    yielding["start_end_steps"] = (
+        _lane_steps(begin, dt),
+        _lane_steps(finish, dt, end=True),
+    )
+    ys, ye = yielding["start_end_steps"]
+    if ys < 0 or ys + yielding["dwell_steps"] > ye or config["H"] < ye:
+        raise ValueError("lane horizon must cover the yield window and dwell")
+    return yielding
+
+
 def build_lane_merge_environment(config, device="cpu"):
     """Road, target lane, and three constant-velocity traffic beliefs."""
     road = config["road"]
@@ -643,19 +888,33 @@ def build_lane_merge_environment(config, device="cpu"):
     if len(traffic) != 3 or len({car["name"] for car in traffic}) != 3:
         raise ValueError("lane traffic needs three uniquely named vehicles")
     task = dict(config["task"])
+    task.setdefault("spec", "merge")
+    if task["spec"] not in ("merge", "headway", "merge_or_yield"):
+        raise ValueError(f"unknown lane task spec: {task['spec']!r}")
+    if task["spec"] == "headway":
+        headway = task.get("headway", {})
+        if headway.get("lead_vehicle") not in {car["name"] for car in traffic}:
+            raise ValueError(
+                "headway.lead_vehicle must name a traffic vehicle"
+            )
+        gap = headway.get("min_gap", -1)
+        if not isfinite(gap) or gap < 0:
+            raise ValueError("headway.min_gap must be finite and non-negative")
     dt = config["dt"]
-    task["dwell_steps"] = ceil(task["dwell_seconds"] / dt)
-    task["settle_steps"] = ceil(task.get("settle_seconds", 1.0) / dt)
+    task["dwell_steps"] = _lane_duration(task["dwell_seconds"], dt)
+    task["settle_steps"] = _lane_duration(task.get("settle_seconds", 1.0), dt)
     task.setdefault("settle_lateral_speed", 0.3)
     task["start_end_steps"] = (
-        ceil(task["start_window_seconds"][0] / dt),
-        floor(task["start_window_seconds"][1] / dt),
+        _lane_steps(task["start_window_seconds"][0], dt),
+        _lane_steps(task["start_window_seconds"][1], dt, end=True),
     )
     start, end = task["start_end_steps"]
     if start < 0 or end < start + task["dwell_steps"] or config["H"] < end:
         raise ValueError(
             "lane horizon must cover the completion window and dwell time"
         )
+    if task["spec"] == "merge_or_yield":
+        task["yield"] = _lane_yield_config(config)
     environment = LaneMergeEnvironment(
         metadata={
             "road": dict(road),
@@ -674,13 +933,26 @@ def build_lane_merge_environment(config, device="cpu"):
         },
     )
     environment.add_region(_lane_rectangle("goal", "goal", config["goal"]))
+    if task["spec"] == "merge_or_yield":
+        environment.add_region(
+            _lane_rectangle("yield", "target", task["yield"])
+        )
     return environment
 
 
-def lane_local_window(environment, step, streak=0, completed=False):
+def lane_local_window(
+    environment,
+    step,
+    streak=0,
+    completed=False,
+    *,
+    yield_streak=0,
+    yield_completed=False,
+    merge_unavailable=False,
+):
     """Give a planning window its absolute time and observed dwell progress.
 
-    `completed` switches to the post-dwell task: stay in lane and settle.
+    Completion switches to lane retention or stopped-region retention.
     """
     window = LaneMergeEnvironment(
         metadata={
@@ -688,6 +960,9 @@ def lane_local_window(environment, step, streak=0, completed=False):
             "step": step,
             "streak": streak,
             "completed": completed,
+            "yield_streak": yield_streak,
+            "yield_completed": yield_completed,
+            "merge_unavailable": merge_unavailable,
         }
     )
     window.regions = environment.regions

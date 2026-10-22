@@ -4,10 +4,12 @@ from math import log, sqrt
 from pathlib import Path
 
 import matplotlib
-import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib import patches
+
+from planning.environment import lane_headway_overlap, lane_lead_gap
 
 COLORS = {
     "mean": "tab:blue",
@@ -264,6 +266,19 @@ def _draw_environment(ax, env, *, lane=False):
                 label="Goal lane",
             )
         )
+        if "yield" in env.regions:
+            region = env.region("yield")
+            ax.add_patch(
+                patches.Rectangle(
+                    (region.xmin, region.ymin),
+                    region.xmax - region.xmin,
+                    region.ymax - region.ymin,
+                    facecolor=COLORS["target"],
+                    edgecolor=COLORS["target"],
+                    alpha=0.25,
+                    label="Yield region",
+                )
+            )
         moving = {}
         for index, vehicle in enumerate(env.metadata["traffic"]):
             name = vehicle["name"]
@@ -506,22 +521,33 @@ def plot_reach_avoid(
 
 def _mark_lane_task_window(ax, env, dt):
     task = env.metadata["task"]
-    start, end = task["start_end_steps"]
-    latest_start = end - task["dwell_steps"]
-    ax.axvspan(
-        start * dt,
-        latest_start * dt,
-        color=COLORS["goal"],
-        alpha=0.10,
-        label="Dwell-start window",
-    )
-    ax.axvline(
-        end * dt,
-        color=COLORS["obstacle"],
-        linestyle="--",
-        linewidth=1,
-        label="Completion deadline",
-    )
+    windows = [(task, "Dwell-start window", "Completion deadline", "goal")]
+    if task["spec"] == "merge_or_yield":
+        windows.append(
+            (
+                task["yield"],
+                "Yield dwell-start window",
+                "Yield completion deadline",
+                "target",
+            )
+        )
+    for window, label, deadline, color in windows:
+        start, end = window["start_end_steps"]
+        latest_start = end - window["dwell_steps"]
+        ax.axvspan(
+            start * dt,
+            latest_start * dt,
+            color=COLORS[color],
+            alpha=0.10,
+            label=label,
+        )
+        ax.axvline(
+            end * dt,
+            color=COLORS[color],
+            linestyle="--",
+            linewidth=1,
+            label=deadline,
+        )
 
 
 def _plot_execution(result, env, *, dt, save_path, show):
@@ -573,6 +599,23 @@ def _plot_execution(result, env, *, dt, save_path, show):
         )
     _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
     ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
+    if "yield" in env.regions:
+        ax_map.set_xlim(
+            right=max(ax_map.get_xlim()[1], env.region("yield").xmax + 2)
+        )
+    elapsed = dt * np.arange(len(means))
+    used = set()
+    for second in range(int(np.floor(elapsed[-1])) + 1):
+        index = int(np.argmin(np.abs(elapsed - second)))
+        if index not in used:
+            ax_map.annotate(
+                f"t={second} s",
+                means[index],
+                xytext=(4, 8),
+                textcoords="offset points",
+                fontsize=8,
+            )
+            used.add(index)
     reason = result.stopped_reason.replace("_", " ")
     ax_map.text(
         0.98,
@@ -642,108 +685,101 @@ def _plot_execution(result, env, *, dt, save_path, show):
     return fig, (ax_map, ax_score, ax_control)
 
 
-def plot_lane_merge(result, env, *, dt, save_path=None, show=False):
-    """Save one combined result and one local-scale lane trajectory view."""
+def _lane_summary(result, env, dt):
+    """Compute the selected run's physical outcomes and observed timings."""
+    ego = np.asarray([_np(state.ego_true)[:2] for state in result.states])
+    traffic = np.asarray(
+        [_np(state.traffic_true)[:, :2] for state in result.states]
+    )
+    vehicle = env.metadata["ego_vehicle"]
+    half_extents = np.asarray(
+        [
+            [
+                (vehicle["width"] + car["width"]) / 2,
+                (vehicle["height"] + car["height"]) / 2,
+            ]
+            for car in env.metadata["traffic"]
+        ]
+    )
+    separation = np.abs(traffic - ego[:, None, :]) - half_extents
+    clearance = np.linalg.norm(np.maximum(separation, 0), axis=-1)
+    clearance += np.minimum(separation.max(axis=-1), 0)
+    final = result.states[-1]
+    completion, branch = min(
+        [
+            (step, name)
+            for step, name in [
+                (final.true_completed, "merge"),
+                (final.true_yield_completed, "yield"),
+            ]
+            if step is not None
+        ],
+        default=(None, None),
+    )
+    optimizer = [plan.planning_time * 1000 for plan in result.window_plans]
+    replanning = [plan.replanning_time * 1000 for plan in result.window_plans]
+    if result.failed_replanning_time is not None:
+        replanning.append(result.failed_replanning_time * 1000)
+    later = replanning[1:]
+    rows = {
+        "Outcome": result.stopped_reason.replace("_", " "),
+        "Realized branch": branch,
+        "Completion time [s]": None if completion is None else completion * dt,
+        "Minimum traffic clearance [m]": float(clearance.min()),
+    }
+    if env.metadata["task"]["spec"] == "headway":
+        low, high = lane_headway_overlap(env.metadata)
+        gaps = [
+            lane_lead_gap(env, state.ego_true, state.traffic_true)
+            for state in result.states
+            if low <= state.ego_true[1] <= high
+        ]
+        rows["Minimum active lead gap [m]"] = min(gaps) if gaps else None
+    rows.update(
+        {
+            "Optimizer median [ms]": float(np.median(optimizer))
+            if optimizer
+            else None,
+            "First replan [ms]": replanning[0] if replanning else None,
+            "Later replans median [ms]": float(np.median(later))
+            if later
+            else None,
+            "Later replans p95 [ms]": float(np.percentile(later, 95))
+            if later
+            else None,
+            "Later replans maximum [ms]": max(later) if later else None,
+        }
+    )
+    return rows
 
+
+def plot_lane_merge(result, env, *, dt, save_path=None, show=False):
+    """Show the combined lane figure and a compact table for this run."""
     combined = _plot_execution(
         result, env, dt=dt, save_path=save_path, show=show
     )
-
-    def output(kind):
-        if save_path is None:
-            return None
+    rows = []
+    for label, value in _lane_summary(result, env, dt).items():
+        if value is None:
+            value = "N/A"
+        elif isinstance(value, float):
+            value = f"{value:.3f}"
+        rows.append((label, value))
+    fig, ax = plt.subplots(figsize=(7, 5), layout="constrained")
+    ax.set_axis_off()
+    ax.set_title(env.metadata["task"]["spec"].replace("_", " ").capitalize())
+    table = ax.table(
+        cellText=rows,
+        colLabels=["Metric", "Value"],
+        cellLoc="left",
+        colWidths=[0.7, 0.3],
+        bbox=[0, 0, 1, 0.95],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table_path = None
+    if save_path is not None:
         stem = Path(save_path).with_suffix("")
-        return stem.with_name(f"{stem.name}_{kind}.png")
-
-    means = np.asarray([_np(_ego_truth(state))[:2] for state in result.states])
-
-    trajectory_fig, ax_map = plt.subplots(
-        figsize=(12, 4.2), layout="constrained"
-    )
-    moving = _draw_environment(ax_map, env, lane=True)
-    ax_map.plot(
-        means[:, 0],
-        means[:, 1],
-        color=COLORS["executed"],
-        linewidth=2,
-        label="Executed",
-        zorder=5,
-    )
-    ax_map.scatter(
-        means[0, 0],
-        means[0, 1],
-        color=COLORS["executed"],
-        s=25,
-        label="Start",
-        zorder=6,
-    )
-    for index in _selected_windows(len(result.window_plans)):
-        plan = _np(result.window_plans[index].rollout.aux["mean_trace"])[0]
-        ax_map.plot(
-            plan[:, 0],
-            plan[:, 1],
-            color=COLORS["planned"],
-            linewidth=1.1,
-            alpha=0.55,
-            label="Plan",
-        )
-    for index, _vehicle in enumerate(env.metadata["traffic"]):
-        positions = np.asarray(
-            [_np(_traffic_truth(state)[index])[:2] for state in result.states]
-        )
-        ax_map.plot(
-            positions[:, 0],
-            positions[:, 1],
-            color=COLORS["traffic"],
-            linestyle=":",
-            linewidth=1.2,
-            label="Traffic path" if index == 0 else "_nolegend_",
-        )
-    _move_obstacle(moving, env, len(result.states) - 1, result.states[-1])
-    _draw_ego_vehicle(ax_map, env, means[-1])
-    ax_map.set_xlim(means[:, 0].min() - 2, means[:, 0].max() + 18)
-
-    elapsed = dt * np.arange(len(means))
-    used = set()
-    for second in range(int(np.floor(elapsed[-1])) + 1):
-        index = int(np.argmin(np.abs(elapsed - second)))
-        if index in used:
-            continue
-        used.add(index)
-        ax_map.annotate(
-            f"t={second} s",
-            means[index],
-            xytext=(4, 8 if second % 2 == 0 else -15),
-            textcoords="offset points",
-            fontsize=8,
-            color=COLORS["executed"],
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.72,
-                "pad": 1,
-            },
-        )
-    ax_map.text(
-        0.99,
-        0.04,
-        (
-            f"Outcome: {result.stopped_reason.replace('_', ' ')}\n"
-            f"last window {RHO_INTERVAL} = "
-            f"[{result.window_plans[-1].hard_interval[0]:.3f}, "
-            f"{result.window_plans[-1].hard_interval[1]:.3f}]"
-            if result.window_plans
-            else f"Outcome: {result.stopped_reason.replace('_', ' ')}"
-        ),
-        transform=ax_map.transAxes,
-        ha="right",
-        fontsize=9,
-    )
-    _unique_legend(
-        ax_map, loc="lower center", bbox_to_anchor=(0.5, 1.12), ncol=7
-    )
-    _finish(trajectory_fig, output("trajectory"), show)
-    return {
-        "combined": combined,
-        "trajectory": (trajectory_fig, ax_map),
-    }
+        table_path = stem.with_name(f"{stem.name}_table.png")
+    _finish(fig, table_path, show)
+    return {"combined": combined, "table": (fig, ax)}

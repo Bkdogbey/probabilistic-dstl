@@ -10,7 +10,6 @@ REACH_AVOID = "configs/scenarios/reach_avoid"
 LANE = "configs/scenarios/lane"
 LIVE = {"live": True, "optimization_every": 1}  # plot and print each iterate
 
-
 # 1. Reach-avoid: one obstacle
 with skip_run("skip", "ReachAvoid") as check, check():
     reach_avoid.run(f"{REACH_AVOID}/obstacle.yaml", **LIVE)
@@ -34,3 +33,13 @@ with skip_run("skip", "LaneChange") as check, check():
 # 5. On-ramp merge into the main lane
 with skip_run("skip", "LaneMerge") as check, check():
     lane.run(f"{LANE}/lane_merge.yaml", live_optimization=True)
+
+
+# 6. Merge with a minimum gap behind the lead vehicle
+with skip_run("skip", "LaneHeadway") as check, check():
+    lane.run(f"{LANE}/lane_headway.yaml", live_optimization=True)
+
+
+# 7. Merge or stop in the yield region
+with skip_run("skip", "LaneMergeOrYield") as check, check():
+    lane.run(f"{LANE}/lane_merge_or_yield.yaml", live_optimization=True)

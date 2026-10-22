@@ -1,35 +1,41 @@
 """Lane change and merge: semantics, planning, and figures."""
 
-import matplotlib.colors as colors
+from types import SimpleNamespace
+
 import matplotlib.pyplot as plt
 import pytest
 import torch
 import yaml
-from PIL import Image
+from matplotlib import colors
 
+from experiments import lane
 from models.beliefs import GaussianBeliefTrajectory
 from models.rollouts import LaneBeliefTrajectory, lane_rollout
 from pdstl.predicates import AxisInterval, RelativeAxisInterval
-from experiments import lane
 from planning.environment import (
     build_lane_merge_environment,
     lane_contains_footprint,
     lane_goal_reached,
     lane_has_collision,
+    lane_headway_violated,
+    lane_lead_gap,
     lane_local_window,
     lane_subformulas,
+    lane_yield_contains,
+    lane_yield_reached,
 )
-from planning.planner import IterationRecord
+from planning.planner import IterationRecord, MPCResult
 from utils import load_config
 from visualization.animation import animate_mpc
-from visualization.live_plots import create_live_view
 from visualization.figures import (
     COLORS,
     RHO_INTERVAL,
     RHO_LOWER,
     _draw_environment,
+    _lane_summary,
     plot_lane_merge,
 )
+from visualization.live_plots import create_live_view
 
 
 def test_collision_uses_footprints_and_margins():
@@ -41,6 +47,387 @@ def test_collision_uses_footprints_and_margins():
     assert lane_has_collision(env, ego, traffic)
     traffic[0, 0] += 0.001
     assert not lane_has_collision(env, ego, traffic)
+
+
+def test_spec_selection_and_paired_scenarios():
+    a = load_config("configs/scenarios/lane/lane_merge.yaml")
+    b = load_config("configs/scenarios/lane/lane_headway.yaml")
+    assert {k: v for k, v in a.items() if k != "task"} == {
+        k: v for k, v in b.items() if k != "task"
+    }
+    assert {k: v for k, v in a["task"].items() if k != "spec"} == {
+        k: v for k, v in b["task"].items() if k not in ("spec", "headway")
+    }
+    del a["task"]["spec"]
+    assert build_lane_merge_environment(a).metadata["task"]["spec"] == "merge"
+    a["task"]["spec"] = "typo"
+    with pytest.raises(ValueError, match="unknown lane task spec"):
+        build_lane_merge_environment(a)
+    b["task"]["headway"]["lead_vehicle"] = "missing"
+    with pytest.raises(ValueError, match="lead_vehicle"):
+        build_lane_merge_environment(b)
+
+
+def test_paired_ab_initial_truth_and_noise_draws():
+    states = []
+    for name in ("merge", "headway"):
+        s = lane.build(
+            load_config(f"configs/scenarios/lane/lane_{name}.yaml"),
+            device="cpu",
+        )
+        generator = lane._generator(s)
+        state = lane.initial_state_of(s, generator=generator)
+        execute = lane._executor(
+            s,
+            s.cfg["traffic_q_std"] ** 2 * torch.eye(4),
+            None,
+            None,
+            False,
+            generator=generator,
+        )
+        trace = [state]
+        for step in range(3):
+            state = execute(state, torch.tensor([0.5, 0.1]), step)
+            trace.append(state)
+        states.append(trace)
+    for a, b in zip(*states):
+        for field in (
+            "ego_mean",
+            "ego_cov",
+            "ego_true",
+            "traffic_mean",
+            "traffic_cov",
+            "traffic_true",
+        ):
+            torch.testing.assert_close(
+                getattr(a, field), getattr(b, field), rtol=0, atol=0
+            )
+
+
+def _deterministic_lane_beliefs(env, ego, traffic):
+    return LaneBeliefTrajectory(
+        ego,
+        torch.zeros(*ego.shape, 4),
+        traffic,
+        torch.zeros(*traffic.shape, 4),
+        [car["name"] for car in env.metadata["traffic"]],
+    )
+
+
+@pytest.mark.parametrize(
+    "y,violated", [(0.899, False), (0.9, True), (2.4, True), (3.6, True)]
+)
+def test_headway_activation_formula_and_truth(y, violated):
+    cfg = load_config("configs/scenarios/lane/lane_headway.yaml")
+    env = build_lane_merge_environment(cfg)
+    ego = torch.tensor([[[0.0, y, 0.0, 0.0]]]).expand(1, 2, 4).clone()
+    traffic = torch.zeros(1, 2, 3, 4)
+    traffic[..., 0] = 44.49  # 39.99 m bumper gap, including both lengths.
+    formula = lane_subformulas(lane_local_window(env, 30, completed=True), 1)[
+        "headway"
+    ]
+    exact = formula.probability_interval(
+        _deterministic_lane_beliefs(env, ego, traffic)
+    )
+    assert exact[0].item() == float(not violated)
+    assert lane_headway_violated(env, ego[0, 0], traffic[0, 0]) == violated
+    assert lane_lead_gap(env, ego[0, 0], traffic[0, 0]) == pytest.approx(39.99)
+    traffic[..., 0] = 44.5
+    assert not lane_headway_violated(env, ego[0, 0], traffic[0, 0])
+
+
+def test_physical_post_merge_retention_and_headway():
+    cfg = load_config("configs/scenarios/lane/lane_headway.yaml")
+    s = lane.build(cfg, device="cpu")
+    state = lane.initial_state_of(s)
+    true = torch.tensor([0.0, 3.6, 18.0, 0.0])
+    state = state._replace(ego_true=true, true_completed=20)
+    assert lane._outcome(s)(state, 21) == "headway_violation"
+    true = true.clone()
+    true[1] = 0.8
+    assert lane._outcome(s)(state._replace(ego_true=true), 21) == (
+        "lane_retention_violation"
+    )
+    traffic = state.traffic_true.clone()
+    traffic[:, 0] = 100
+    drifting = torch.tensor([0.0, 3.6, 18.0, 0.4])
+    assert (
+        lane._outcome(s)(
+            state._replace(ego_true=drifting, traffic_true=traffic), 21
+        )
+        == "settling_violation"
+    )
+
+
+def _c_environment():
+    return build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_merge_or_yield.yaml")
+    )
+
+
+@pytest.mark.parametrize(
+    "window,steps", [([2.4, 4.8], (12, 24)), ([2.41, 4.79], (13, 23))]
+)
+def test_merge_and_yield_use_the_same_time_conversion(window, steps):
+    cfg = load_config("configs/scenarios/lane/lane_merge_or_yield.yaml")
+    cfg["task"]["start_window_seconds"] = window
+    cfg["task"]["yield"]["window_seconds"] = window
+    task = build_lane_merge_environment(cfg).metadata["task"]
+    assert task["start_end_steps"] == task["yield"]["start_end_steps"] == steps
+
+
+def test_positive_dwell_requires_a_transition():
+    cfg = load_config("configs/scenarios/lane/lane_merge_or_yield.yaml")
+    cfg["task"]["dwell_seconds"] = 1e-12
+    cfg["task"]["yield"]["dwell_seconds"] = 1e-12
+    task = build_lane_merge_environment(cfg).metadata["task"]
+    assert task["dwell_steps"] == task["yield"]["dwell_steps"] == 1
+    cfg["task"]["dwell_seconds"] = 0
+    assert (
+        build_lane_merge_environment(cfg).metadata["task"]["dwell_steps"] == 0
+    )
+
+
+def test_credited_merge_dwell_must_finish_by_deadline():
+    env = build_lane_merge_environment(
+        load_config("configs/scenarios/lane/lane_merge.yaml")
+    )
+    end = env.metadata["task"]["start_end_steps"][1]
+    window = lane_local_window(env, end - 2, streak=4)
+    ego = torch.zeros(1, 7, 4)
+    ego[..., 1] = env.metadata["task"]["target_center"]
+    ego[0, 3:, 1] = 0
+    traffic = torch.zeros(1, 7, 3, 4)
+    beliefs = _deterministic_lane_beliefs(env, ego, traffic)
+    assert (
+        lane_subformulas(window, 6)["complete"].probability_interval(beliefs)[
+            0
+        ]
+        == 1
+    )
+    with pytest.raises(ValueError, match="no remaining feasible dwell start"):
+        lane_subformulas(lane_local_window(env, end - 1, streak=4), 6)
+
+
+@pytest.mark.parametrize("spec", ["merge", "headway"])
+def test_run_table_uses_truth_and_separates_first_timing(spec):
+    cfg = load_config(f"configs/scenarios/lane/lane_{spec}.yaml")
+    s = lane.build(cfg, device="cpu")
+    base = lane.initial_state_of(s, generator=lane._generator(s))
+    traffic = torch.tensor(
+        [
+            [50.0, 3.6, 0.0, 0.0],
+            [100.0, 3.6, 0.0, 0.0],
+            [-100.0, 3.6, 0.0, 0.0],
+        ]
+    )
+    states = [
+        base._replace(
+            ego_true=torch.tensor([float(step), 3.6, 0.0, 0.0]),
+            traffic_true=traffic,
+            completed=2,
+            true_completed=1,
+        )
+        for step in range(4)
+    ]
+    plans = [
+        SimpleNamespace(planning_time=optimizer, replanning_time=replan)
+        for optimizer, replan in [(0.01, 2.0), (0.02, 0.1), (0.03, 0.3)]
+    ]
+    result = MPCResult(states, torch.zeros(3, 2), plans, "success")
+    rows = _lane_summary(result, s.env, cfg["dt"])
+    assert rows["Realized branch"] == "merge"
+    assert rows["Completion time [s]"] == pytest.approx(0.2)
+    assert rows["Minimum traffic clearance [m]"] == pytest.approx(42.5)
+    assert rows["Optimizer median [ms]"] == pytest.approx(20)
+    assert rows["First replan [ms]"] == 2000
+    assert rows["Later replans median [ms]"] == pytest.approx(200)
+    assert rows["Later replans p95 [ms]"] == pytest.approx(290)
+    assert rows["Later replans maximum [ms]"] == 300
+    if spec == "headway":
+        assert rows["Minimum active lead gap [m]"] == pytest.approx(42.5)
+
+
+@pytest.mark.parametrize("outcome", ["step_limit", "planning_failure"])
+def test_incomplete_run_figure_and_table(outcome, tmp_path):
+    s = lane.build(
+        load_config("configs/scenarios/lane/lane_merge_or_yield.yaml"),
+        device="cpu",
+    )
+    result = lane.trial(s, max_steps=0)
+    result.stopped_reason = outcome
+    if outcome == "planning_failure":
+        result.failed_replanning_time = 0.05
+    rows = _lane_summary(result, s.env, s.cfg["dt"])
+    assert rows["Completion time [s]"] is None
+    assert rows["Realized branch"] is None
+    assert rows["Later replans median [ms]"] is None
+    if outcome == "planning_failure":
+        assert rows["First replan [ms]"] == 50
+    figures = plot_lane_merge(
+        result, s.env, dt=s.cfg["dt"], save_path=tmp_path / "yield.png"
+    )
+    map_ax, score_ax, _ = figures["combined"][1]
+    assert "Yield region" in {patch.get_label() for patch in map_ax.patches}
+    assert map_ax.get_xlim()[1] >= s.env.region("yield").xmax
+    assert "Yield completion deadline" in {
+        text.get_text() for text in score_ax.get_legend().get_texts()
+    }
+    cells = figures["table"][1].tables[0].get_celld()
+    assert outcome.replace("_", " ") in {
+        cell.get_text().get_text() for cell in cells.values()
+    }
+    assert {file.name for file in tmp_path.iterdir()} == {
+        "yield.png",
+        "yield.pdf",
+        "yield_table.png",
+        "yield_table.pdf",
+    }
+
+
+def test_yield_geometry_speed_and_validation():
+    env = _c_environment()
+    stopped = torch.tensor([10.0, 0.0, 0.0, 0.0])
+    assert lane_yield_contains(env, stopped)
+    for dim, value in [(0, 5.0), (1, 1.0), (2, 0.401), (3, 0.301)]:
+        outside = stopped.clone()
+        outside[dim] = value
+        assert not lane_yield_contains(env, outside)
+    cfg = load_config("configs/scenarios/lane/lane_merge_or_yield.yaml")
+    cfg["task"]["yield"]["x_range"] = [10.0, 29.0]
+    with pytest.raises(ValueError, match="upstream"):
+        build_lane_merge_environment(cfg)
+
+
+@pytest.mark.parametrize(
+    "branch,y,expected",
+    [
+        ("merge", 3.6, 1),
+        ("yield", 0.0, 1),
+        ("neither", 1.0, 0),
+    ],
+)
+def test_c_or_branches_share_safety(branch, y, expected):
+    env = _c_environment()
+    ego = torch.zeros(1, 31, 4)
+    ego[..., 0] = 10
+    ego[..., 1] = y
+    traffic = torch.zeros(1, 31, 3, 4)
+    traffic[..., 0] = 100
+    formula = lane_subformulas(env, 30)
+    assert {"merge_complete", "yield_complete"} <= formula.keys()
+    beliefs = _deterministic_lane_beliefs(env, ego, traffic)
+    assert formula["overall"].probability_interval(beliefs)[0] == expected
+    if expected:
+        assert (
+            formula[f"{branch}_complete"].probability_interval(beliefs)[0] == 1
+        )
+    ego[0, 0, 1] = -1.0
+    unsafe = _deterministic_lane_beliefs(env, ego, traffic)
+    assert formula["overall"].probability_interval(unsafe)[0] == 0
+
+
+def test_c_absolute_yield_deadline_and_accumulated_dwell():
+    env = _c_environment()
+    task = env.metadata["task"]["yield"]
+    end = task["start_end_steps"][1]
+    dwell = task["dwell_steps"]
+    ego = torch.zeros(1, 7, 4)
+    ego[..., 0] = 10
+    traffic = torch.zeros(1, 7, 3, 4)
+    traffic[..., 0] = 100
+    # Three credited samples leave two transitions in a four-transition dwell.
+    window = lane_local_window(env, end - 2, yield_streak=dwell - 1)
+    parts = lane_subformulas(window, 6)
+    assert "merge_complete" not in parts
+    ego[0, 3:, 2] = 1.0
+    beliefs = _deterministic_lane_beliefs(env, ego, traffic)
+    assert parts["yield_complete"].probability_interval(beliefs)[0] == 1
+    assert lane_yield_reached(env, ego[0, 0], end, dwell + 1)
+    assert not lane_yield_reached(env, ego[0, 0], end + 1, dwell + 2)
+    with pytest.raises(ValueError, match="neither merge nor yield"):
+        lane_subformulas(
+            lane_local_window(env, end - 1, yield_streak=dwell - 1), 6
+        )
+
+
+def test_c_truth_outcomes_deadlines_and_yield_retention():
+    cfg = load_config("configs/scenarios/lane/lane_merge_or_yield.yaml")
+    s = lane.build(cfg, device="cpu")
+    state = lane.initial_state_of(s)
+    truth = torch.tensor([10.0, 0.0, 0.0, 0.0])
+    traffic = state.traffic_true.clone()
+    traffic[:, 0] = 100
+    state = state._replace(ego_true=truth, traffic_true=traffic)
+    end = s.env.metadata["task"]["start_end_steps"][1]
+    assert lane._outcome(s)(state, end) is None  # merge expired, yield lives
+    # Estimated success must not produce a physical outcome.
+    estimated = state._replace(yield_completed=end, yield_streak=100)
+    assert lane._outcome(s)(estimated, end) is None
+    yield_end = s.env.metadata["task"]["yield"]["start_end_steps"][1]
+    assert lane._outcome(s)(estimated, yield_end) == "deadline_missed"
+    yielded = state._replace(true_yield_completed=end)
+    assert lane._outcome(s)(yielded, end + 1) is None
+    assert lane._outcome(s)(yielded, end + 5) == "yielded"
+    drift = truth.clone()
+    drift[3] = 0.4
+    assert lane._outcome(s)(yielded._replace(ego_true=drift), end + 1) == (
+        "yield_retention_violation"
+    )
+
+
+def test_c_estimated_and_true_progress_are_separate():
+    cfg = load_config("configs/scenarios/lane/lane_merge_or_yield.yaml")
+    s = lane.build(cfg, device="cpu")
+    state = lane.initial_state_of(s)
+    estimate = torch.tensor([10.0, 0.0, 0.0, 0.0])
+    truth = estimate.clone()
+    truth[1] = 1.0
+    state = state._replace(
+        ego_mean=estimate, ego_true=truth, yield_streak=0, true_yield_streak=0
+    )
+    steps = cfg["T_SIM"]
+    observation = torch.zeros(steps, 4)
+    observation[:, 1] = -1.0
+    executor = lane._executor(
+        s,
+        cfg["traffic_q_std"] ** 2 * torch.eye(4),
+        torch.zeros(steps, 4),
+        torch.zeros(steps, 3, 4),
+        False,
+        ego_observation_noise=observation,
+        traffic_observation_noise=torch.zeros(steps, 3, 4),
+    )
+    start = s.env.metadata["task"]["yield"]["start_end_steps"][0]
+    dwell = s.env.metadata["task"]["yield"]["dwell_steps"]
+    for step in range(start - 1, start + dwell):
+        state = executor(state, torch.zeros(2), step)
+    assert state.yield_completed == start + dwell
+    assert state.true_yield_completed is None
+    assert state.true_yield_streak == 0
+
+
+def test_c_completed_yield_formula_maintains_stop_after_deadlines():
+    env = _c_environment()
+    window = lane_local_window(env, 40, yield_completed=True)
+    ego = torch.zeros(1, 5, 4)
+    ego[..., 0] = 10
+    traffic = torch.zeros(1, 5, 3, 4)
+    traffic[..., 0] = 100
+    formula = lane_subformulas(window, 4)["overall"]
+    assert (
+        formula.probability_interval(
+            _deterministic_lane_beliefs(env, ego, traffic)
+        )[0]
+        == 1
+    )
+    ego[0, -1, 2] = 0.401
+    assert (
+        formula.probability_interval(
+            _deterministic_lane_beliefs(env, ego, traffic)
+        )[0]
+        == 0
+    )
 
 
 def test_road_contains_the_whole_vehicle_and_taper_front_corner():
@@ -217,23 +604,19 @@ def test_relative_beliefs_and_separate_formulae(lane_config):
 def test_lane_save_and_live_observer(
     lane_config, tmp_path, monkeypatch, capsys
 ):
-    import planning.runners as runners
+    from planning import runners
 
     cfg, path = lane_config
     monkeypatch.setattr(runners, "RESULTS_DIR", tmp_path)
     result = lane.run(str(path), max_steps=1, show=False, save=True)
-    assert (tmp_path / "lane_change.pt").exists()
-    assert (tmp_path / "lane_change.gif").exists()
-    for stem in ("lane_change", "lane_change_trajectory"):
+    for stem in ("lane_change", "lane_change_table"):
         for suffix in (".png", ".pdf"):
             assert (tmp_path / f"{stem}{suffix}").exists()
-    assert not (tmp_path / "lane_change_controls.png").exists()
-    assert not (tmp_path / "lane_change_scores.png").exists()
-    with Image.open(tmp_path / "lane_change.gif") as movie:
-        assert movie.n_frames >= 2
-        first = movie.convert("RGB").tobytes()
-        movie.seek(movie.n_frames - 1)
-        assert movie.convert("RGB").tobytes() != first
+    assert {file.suffix for file in tmp_path.iterdir()} == {
+        ".yaml",
+        ".png",
+        ".pdf",
+    }
 
     setup = lane.build(cfg)
     fig, axes, observe = create_live_view(
@@ -313,6 +696,7 @@ def test_lane_save_and_live_observer(
     plt.close("all")
 
 
+@pytest.mark.slow
 def test_default_lane_completes_with_physical_controls():
     cfg = load_config("configs/scenarios/lane/lane_change.yaml")
     result = lane.run(
@@ -374,6 +758,7 @@ def test_deadline_missed_is_reported(lane_config):
     assert len(result.window_plans) <= 2
 
 
+@pytest.mark.slow
 def test_on_ramp_merge_tapers_and_completes():
     cfg = load_config("configs/scenarios/lane/lane_merge.yaml")
     env = build_lane_merge_environment(cfg)
@@ -390,6 +775,21 @@ def test_on_ramp_merge_tapers_and_completes():
     lower, upper = result.window_plans[-1].hard_interval
     assert 0 <= lower <= upper + 1e-6 <= 1 + 1e-6
     _assert_settled_in_lane(result, env.metadata["task"], cfg)
+
+
+@pytest.mark.slow
+def test_c_open_traffic_completes_merge_branch():
+    cfg = load_config("configs/scenarios/lane/lane_merge.yaml")
+    cfg["task"]["spec"] = "merge_or_yield"
+    cfg["task"]["yield"] = load_config(
+        "configs/scenarios/lane/lane_merge_or_yield.yaml"
+    )["task"]["yield"]
+    s = lane.build(cfg, device="cpu")
+    result = lane.trial(s)
+    assert result.stopped_reason == "success"
+    assert result.states[-1].true_completed is not None
+    assert result.states[-1].true_yield_completed is None
+    _assert_settled_in_lane(result, s.env.metadata["task"], cfg)
 
 
 def _assert_settled_in_lane(result, task, cfg):
@@ -421,10 +821,9 @@ def test_lane_figures_have_time_labels_red_traffic_and_final_score(
     result = lane.run(str(path), max_steps=1, show=False, save=False)
     problem = lane.build(config, device="cpu")
     figures = plot_lane_merge(result, problem.env, dt=config["dt"])
-    trajectory = figures["trajectory"][1]
+    trajectory = figures["combined"][1][0]
     trajectory_text = {text.get_text() for text in trajectory.texts}
     assert "t=0 s" in trajectory_text
-    assert any("last window" in text for text in trajectory_text)
     assert -3.0 < trajectory.get_xlim()[0] <= 0.0
     traffic = [
         patch

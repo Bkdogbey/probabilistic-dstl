@@ -18,10 +18,14 @@ from planning.environment import (
     lane_deadline_missed,
     lane_goal_reached,
     lane_has_collision,
+    lane_headway_violated,
     lane_local_window,
     lane_target_contains,
+    lane_yield_contains,
+    lane_yield_possible,
+    lane_yield_reached,
 )
-from planning.runners import output_path, save_result, setup_problem
+from planning.runners import output_path, setup_problem
 from utils import load_config
 
 logger = logging.getLogger(__name__)
@@ -32,7 +36,7 @@ class LaneState(NamedTuple):
 
     The first six fields retain the previous state tuple's belief interface.
     Physical outcomes use the separate true states and true task progress.
-    `completed`/`true_completed` latch the step the dwell task finished.
+    Merge and yield have separate estimated and true dwell/completion fields.
     """
 
     ego_mean: torch.Tensor
@@ -47,6 +51,10 @@ class LaneState(NamedTuple):
     true_entry: int | None
     completed: int | None = None
     true_completed: int | None = None
+    yield_streak: int = 0
+    true_yield_streak: int = 0
+    yield_completed: int | None = None
+    true_yield_completed: int | None = None
 
 
 def _observation_covariance(cfg, key, reference):
@@ -90,11 +98,11 @@ def run(
     verbose=False,
     max_steps=None,
 ):
-    """Execute one lane scenario closed loop, then plot and save it.
+    """Execute one lane scenario and show its figure and results table.
 
     Args:
         config_path: Lane YAML; outputs are named after its file stem.
-        show, save: Display and/or save the figures and animation.
+        show, save: Display and/or save the figure and table images.
         live, live_optimization, optimization_every: Live execution view.
         verbose: Log progress.
         max_steps: Override the configured number of executed steps.
@@ -137,7 +145,6 @@ def run(
     stem = Path(config_path).stem
     if show or save:
         _present(result, s, stem=stem, show=show, save=save)
-    save_result(result, stem, save)
     return result
 
 
@@ -170,7 +177,7 @@ def trial(
         else initial_state
     )
     if not isinstance(initial_state, LaneState):
-        raise ValueError(
+        raise TypeError(
             "initial_state must be a LaneState with separate truth"
         )
     traffic_q = s.cfg["traffic_q_std"] ** 2 * torch.eye(
@@ -243,11 +250,13 @@ def initial_state_of(s, *, generator=None):
         traffic_true,
         true_streak,
         0 if true_streak else None,
+        yield_streak=_yield_counter(s, s.state[0], 0),
+        true_yield_streak=_yield_counter(s, ego_true, 0),
     )
 
 
 def initial_controls(s):
-    """The configured first-window guess: accelerate and steer into the lane."""
+    """The scenario's configured first-window control guess."""
     warm = s.cfg["warm_start"]
     controls = torch.zeros(
         s.cfg["H"], 2, dtype=s.dyn.B.dtype, device=s.dyn.device
@@ -263,6 +272,12 @@ def success_counter(environment, mean, counter):
     """Consecutive executed steps inside the target lane."""
     inside = lane_target_contains(environment.metadata, mean)
     return counter + 1 if inside else 0
+
+
+def _yield_counter(s, state, counter):
+    if s.env.metadata["task"]["spec"] != "merge_or_yield":
+        return 0
+    return counter + 1 if lane_yield_contains(s.env, state) else 0
 
 
 def _observers(s, *, label, live, optimization_every, initial_state):
@@ -288,7 +303,7 @@ def _observers(s, *, label, live, optimization_every, initial_state):
 
 
 def _present(result, s, *, stem, show, save):
-    from visualization.animation import animate_mpc
+    """Display or save the selected run's figure and table."""
     from visualization.figures import plot_lane_merge
 
     plot_lane_merge(
@@ -296,13 +311,6 @@ def _present(result, s, *, stem, show, save):
         s.env,
         dt=s.cfg["dt"],
         save_path=output_path(stem, ".png") if save else None,
-        show=show,
-    )
-    animate_mpc(
-        result,
-        s.env,
-        dt=s.cfg["dt"],
-        filename=output_path(stem, ".gif") if save else None,
         show=show,
     )
 
@@ -368,6 +376,20 @@ def _executor(
         true_completed = _latch(
             s, state.true_completed, ego_true, step, true_counter
         )
+        yield_counter = _yield_counter(s, mean, state.yield_streak)
+        true_yield_counter = _yield_counter(
+            s, ego_true, state.true_yield_streak
+        )
+        yield_completed = _yield_latch(
+            s, state.yield_completed, mean, step + 1, yield_counter
+        )
+        true_yield_completed = _yield_latch(
+            s,
+            state.true_yield_completed,
+            ego_true,
+            step + 1,
+            true_yield_counter,
+        )
         if verbose and step % 5 == 0:
             logger.info(
                 "Lane step %d: true position %s", step, ego_true[:2].tolist()
@@ -385,6 +407,10 @@ def _executor(
             true_entry,
             completed,
             true_completed,
+            yield_counter,
+            true_yield_counter,
+            yield_completed,
+            true_yield_completed,
         )
 
     return execute
@@ -399,33 +425,74 @@ def _latch(s, completed, mean, step, counter):
     )
 
 
+def _yield_latch(s, completed, state, step, counter):
+    if (
+        completed is not None
+        or s.env.metadata["task"]["spec"] != "merge_or_yield"
+    ):
+        return completed
+    return step if lane_yield_reached(s.env, state, step, counter) else None
+
+
+def _physical_violation(s, state):
+    if lane_has_collision(
+        s.env, state.ego_true[:2], state.traffic_true[:, :2]
+    ):
+        return "collision"
+    if not lane_contains_footprint(
+        s.env, float(state.ego_true[0]), float(state.ego_true[1])
+    ):
+        return "road_violation"
+    if (
+        not s.cfg["speed_bounds"][0]
+        <= float(state.ego_true[2])
+        <= s.cfg["speed_bounds"][1]
+    ):
+        return "speed_violation"
+    if lane_headway_violated(s.env, state.ego_true, state.traffic_true):
+        return "headway_violation"
+    return None
+
+
 def _outcome(s):
+    task = s.env.metadata["task"]
+
     def is_done(state, step):
-        if lane_has_collision(
-            s.env, state.ego_true[:2], state.traffic_true[:, :2]
-        ):
-            return "collision"
-        if not lane_contains_footprint(
-            s.env, float(state.ego_true[0]), float(state.ego_true[1])
-        ):
-            return "road_violation"
-        if (
-            not s.cfg["speed_bounds"][0]
-            <= float(state.ego_true[2])
-            <= s.cfg["speed_bounds"][1]
-        ):
-            return "speed_violation"
-        if state.true_completed is not None:
-            # Keep monitoring truth while the ego settles in the target lane.
-            settle = s.env.metadata["task"]["settle_steps"]
-            return "success" if step >= state.true_completed + settle else None
+        violation = _physical_violation(s, state)
+        if violation:
+            return violation
+        yielded = state.true_yield_completed
+        merged = state.true_completed
+        if yielded is not None and (merged is None or yielded < merged):
+            if not lane_yield_contains(s.env, state.ego_true):
+                return "yield_retention_violation"
+            settle = task["settle_steps"]
+            return "yielded" if step >= yielded + settle else None
+        if merged is not None:
+            return _merged_outcome(s, state, step)
         if lane_deadline_missed(
             s.env, state.ego_true, step, state.true_streak
         ):
+            if task["spec"] == "merge_or_yield" and lane_yield_possible(
+                s.env, step, state.true_yield_streak
+            ):
+                return None
             return "deadline_missed"
         return None
 
     return is_done
+
+
+def _merged_outcome(s, state, step):
+    """Keep monitoring truth throughout the post-merge settling interval."""
+    task = s.env.metadata["task"]
+    if not lane_target_contains(s.env.metadata, state.ego_true):
+        return "lane_retention_violation"
+    if bool(state.ego_true[3].abs() > task["settle_lateral_speed"]):
+        return "settling_violation"
+    if step < state.true_completed + task["settle_steps"]:
+        return None
+    return "success"
 
 
 def _specification(s, factory, state, step):
@@ -433,14 +500,26 @@ def _specification(s, factory, state, step):
     # zero-remaining-dwell formula while the physical monitor keeps running.
     credit = min(state.streak, s.env.metadata["task"]["dwell_steps"] + 1)
     completed = state.completed is not None
-    if not completed and lane_deadline_missed(
+    missed = not completed and lane_deadline_missed(
         s.env, state.ego_mean, step, credit
-    ):
-        # Truth completed but the estimate did not: nothing left to time, so
-        # plan to stay and settle while the physical monitor finishes.
+    )
+    yielded = False
+    if s.env.metadata["task"]["spec"] == "merge_or_yield":
+        yielded = state.yield_completed is not None and (
+            state.completed is None or state.yield_completed < state.completed
+        )
+    elif missed:
+        # An expired estimated window leaves only lane retention to plan;
+        # the separate physical monitor still decides success or failure.
         completed = True
     environment = lane_local_window(
-        s.env, step, streak=credit, completed=completed
+        s.env,
+        step,
+        streak=credit,
+        completed=completed and not yielded,
+        yield_streak=state.yield_streak,
+        yield_completed=yielded,
+        merge_unavailable=missed,
     )
     return (
         factory(environment, state, step)

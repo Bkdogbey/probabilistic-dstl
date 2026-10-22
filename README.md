@@ -156,8 +156,7 @@ updates; task-progress estimates are not a probabilistic history filter.
 `lane.trial` uses a local generator seeded from the scenario, and accepts
 explicit initial states, process disturbances, observation noise, or a
 `torch.Generator` for reproducible trials without changing global RNG state.
-Custom initial states must be `LaneState` records with truth and beliefs;
-older saved state tuples remain plottable.
+Custom initial states must be `LaneState` records with truth and beliefs.
 
 ## Scope: what the numbers mean
 
@@ -201,9 +200,11 @@ pip install -r requirements.txt
 python src/main.py
 ```
 
-Set each block in `src/main.py` to `"run"` or `"skip"`. Figures are shown,
-then saved to `outputs/` (git-ignored) when closed: PNG, PDF, a GIF, and a
-`.pt` result (`torch.load(path, weights_only=False)`).
+Set the desired block in `src/main.py` to `"run"` and the others to `"skip"`.
+The lane examples are `LaneMerge`, `LaneHeadway`, and `LaneMergeOrYield`.
+Each runs one fixed specification and shows its figure and a compact results
+table. When saving is enabled, only those images (PNG/PDF) go to `outputs/`.
+Timing values describe the selected run; they are not benchmark results.
 
 ## Development checks
 

@@ -26,6 +26,7 @@ traffic_q_std: 0.005
 traffic_cov_scale: 0.01
 safety_margin: {longitudinal: 0.5, lateral: 0.2}
 task:
+  spec: merge
   target_center: 3.6
   target_tolerance: 1.2
   start_window_seconds: [2.5, 5.0]
