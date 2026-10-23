@@ -1,4 +1,4 @@
-# irobot spline_waypoint arc: x = 0.69 - 0.64 sin(pi t), y = -1.97 + 1.75 t, t in [0, 1]
+# reference waypoints, from irobot's spline_waypoint sine arc: x = 0.69 - 0.64 sin(pi t), y = -1.97 + 1.75 t, t in [0, 1]
 # length 2.232 m; one waypoint per 1.0 s; cruise 0.223 m/s; 3.0 s cosine speed ramps
 # waypoints 2-5 moved 0.035/0.07/0.07/0.035 m along (-1, -1)/sqrt(2), away from obs_4
 # then the interior waypoints optimised around obs_1, obs_3 and obs_4: min snap, clearance toward 0.10 m, speed <= 0.25 m/s

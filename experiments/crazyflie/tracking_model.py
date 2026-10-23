@@ -190,10 +190,16 @@ def errors_at(flight, delay):
 
 
 def fit_delay(flights):
-    """The delay [s] that minimizes the squared errors of all flights."""
+    """The delay [s] that minimizes the spread of the errors of all flights.
+
+    The spread, not the squared errors: the bias is fitted next, and on a
+    straight stretch flown at a steady speed a delay and a bias along it
+    look alike, so squared errors would trade part of the bias for delay.
+    """
 
     def cost(delay):
-        return sum(np.sum(errors_at(f, delay) ** 2) for f in flights)
+        e = np.concatenate([errors_at(f, delay) for f in flights])
+        return np.sum((e - e.mean(0)) ** 2)
 
     return float(min(DELAYS, key=cost))
 

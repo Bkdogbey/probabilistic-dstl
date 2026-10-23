@@ -6,14 +6,23 @@ minimum-snap polynomial with fixed segment times goes through them. The
 pieces are uploaded to the drone, and the onboard controller flies them
 (`start_trajectory`).
 
-The reference, `plans/reference.json`, is the **figure-8**: a vertical
-lemniscate centred at (0.56, −0.98), 0.68 m wide and 1.5 m tall, at 0.30 m
-altitude. It starts at the bottom tip, passes the goal at the top tip and
-returns: 22 pieces of 1.0 s (22 s), max speed 0.241 m/s. The arena is in
-`config.yml`: x [0, 1], y [−2, 0], with three measured boxes (obs_2,
-obs_3, obs_4), all taller than the flight height. The figure-8 was sized
-to clear them: about 2.5 cm beyond the 7 cm airframe radius at the
-closest point (obs_2).
+The reference, `plans/reference.json`, is the **arc**: it starts from the
+sine path of irobot's `spline_waypoint` example, x = 0.69 − 0.64 sin(πt),
+y = −1.97 + 1.75 t (one 0.64 m bulge over 1.75 m), from the start
+(0.69, −1.97) to the goal at (0.69, −0.22). `plans/reference.csv` holds its
+waypoints: the sine sampled one waypoint per 1.0 s with 3.0 s cosine speed
+ramps, then the interior waypoints moved around the boxes (least snap,
+clearance pushed toward 10 cm beyond the airframe, speed under 0.25 m/s).
+The curve is 13 pieces of 1.0 s (13 s), max speed 0.258 m/s, at 0.30 m
+altitude.
+
+The arena is in `config.yml`: workspace x [−0.5, 1.5], y [−2.5, 0.0]
+(it must stay inside the net, and y ≤ 0 keeps (0, 0), where the estimate
+settles without Lighthouse fixes, outside it) and three measured boxes, all taller than
+the flight height. obs_4 sits inside the arc next to the start; the arc
+then passes between obs_1 and obs_3, where the gap leaves about 14 cm
+after the 7 cm airframe radius. Clearance beyond the airframe: obs_3
+5.3 cm, obs_1 5.9 cm, obs_4 9.4 cm.
 
 The task is: stay in the workspace, avoid obstacles, and reach the goal at
 some step.
@@ -32,7 +41,9 @@ some step.
 4. **The onboard controller flies the curve.** The host only monitors it:
    state freshness, the radio link, the geofence and a trailing 0.25 s
    altitude mean.
-5. **Land in place.** Ctrl-C during the flight also lands.
+5. **Return and land.** The drone climbs to `flight.return_height`
+   (0.5 m, above the boxes), flies back over the start and lands there,
+   ready for the next flight. Ctrl-C during the flight lands in place.
 
 The host time of the `start_trajectory` call is not the firmware's start
 time. The drone also logs the setpoint it is tracking (`ctrltarget`), and
@@ -81,8 +92,8 @@ hand before each `fly`; `--fan` only labels the record.
 | Evaluation | low, medium, high | **20 per condition per level** (120) | compare the two conditions |
 
 `off` is the baseline: identification only, no plans and no evaluation.
-The identification flights also show how the unadjusted figure-8 does
-under each level.
+The identification flights also show how the unadjusted arc does under
+each level.
 
 ### Before every session
 
@@ -122,7 +133,7 @@ python run.py fly --fan low --purpose identification
 python run.py fit
 ```
 
-Fly until the level has **12 flights that reached the figure-8**: attempts
+Fly until the level has **12 flights that reached the curve**: attempts
 that never started (no connection, start gate, positioning) do not count,
 so just fly again. Run `fit` after each level and read its line: the
 delay, the bias `b`, the stationary spread and the held-out coverage (near
@@ -176,7 +187,9 @@ refits the model.
 Identification flights that completed are used, and so are flights that
 aborted on a `TaskViolation` (up to the abort): dropping large deviations
 would understate the noise. Data faults, errors and interruptions are
-excluded.
+excluded. Only flights of the configured reference count, and the return
+after the curve is never part of the mission: the fit and the scores end
+with the curve, and a fault on the way back leaves the mission completed.
 
 **Falls** are reported, not fitted: a flight whose height dropped below
 half the flight altitude during the curve (lost lift, a crash) is left out
@@ -223,37 +236,6 @@ flies only with `--allow-below-threshold`.
 points, only the dense geometric check covers the path. That check samples
 at 100 Hz plus every piece boundary, so it is not a proof of clearance
 between samples.
-
-## The arc scenario
-
-The arc starts from the sine path of irobot's `spline_waypoint` example:
-the same shape (one 0.64 m bulge over 1.75 m), x = 0.69 − 0.64 sin(πt),
-y = −1.97 + 1.75 t, from (0.69, −1.97) to (0.69, −0.22), with obs_4 inside
-it next to the start. `plans/arc.csv` samples it the way the figure-8 is
-sampled (one waypoint per 1.0 s, 3.0 s cosine speed ramps), then moves the
-interior waypoints around the three boxes: least snap, clearance pushed
-toward 10 cm beyond the airframe, speed under 0.25 m/s. The path passes
-between obs_1 and obs_3, where the gap leaves about 14 cm after the
-airframe; it clears obs_3 by 5.3 cm, obs_1 by 5.9 cm and obs_4 by 9.4 cm.
-The reference `plans/arc.json` is 13 pieces of 1.0 s (13 s), max speed
-0.258 m/s, at 0.30 m altitude, flown as an uploaded min-snap curve.
-
-`config.arc.example.yml` has a wider workspace than the figure-8 arena,
-x [−0.5, 1.5], y [−2.5, 0.5]; it must stay inside the net. After the curve the drone climbs to
-`flight.return_height` (0.5 m, above the boxes), flies back over the
-start and lands there, ready for the next flight. The return is not part
-of the mission: the fit and the scores end with the curve, and a fault on
-the way back leaves the mission completed.
-
-```bash
-cp config.arc.example.yml config.arc.yml  # set measured: true when ready
-python run.py --config config.arc.yml fly --fan low --purpose identification
-python run.py --config config.arc.yml fit
-```
-
-Pass `--config config.arc.yml` to every command. `fit` and `analyze` use
-only the trials flown under the configured reference, so the scenarios
-never mix.
 
 ## Other commands
 

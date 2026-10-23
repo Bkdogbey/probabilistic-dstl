@@ -25,7 +25,7 @@ def fly_sim(cfg, tmp_path, short_plan, drone=None, stop=None, connect_fn=None):
     return meta, load_trial(log.dir), drone
 
 
-def test_dry_flight_uploads_before_arming_flies_once_and_lands_in_place(
+def test_dry_flight_uploads_before_arming_flies_once_and_returns_to_land(
     cfg, tmp_path, short_plan
 ):
     meta, trial, drone = fly_sim(cfg, tmp_path, short_plan)
@@ -66,8 +66,9 @@ def test_dry_flight_uploads_before_arming_flies_once_and_lands_in_place(
     _, _, e = aligned_states(trial)
     assert len(e) == 7 and np.abs(e).max() < 0.05
 
-    # Only the move to the start; afterwards it lands where it is.
-    assert calls.count("go_to") == 1
+    # To the start, then the return: climb and back over the start.
+    assert calls.count("go_to") == 3
+    assert np.allclose(drone.pos[:2], short_plan[1]["start"], atol=0.05)
     assert calls[-3:] == ["hl_stop", "disarm", "disconnect"]
 
 
@@ -210,14 +211,15 @@ def test_landing_error_is_separate_from_completed_mission(
     assert drone.calls[-1] == "disconnect" and "stop_setpoint" in drone.calls
 
 
-def test_return_climbs_flies_back_and_lands_at_the_start(
+def test_without_a_return_height_it_lands_where_the_curve_ends(
     cfg, tmp_path, short_plan
 ):
-    cfg = replace(cfg, flight=replace(cfg.flight, return_height=0.5))
+    cfg = replace(cfg, flight=replace(cfg.flight, return_height=None))
     meta, _, drone = fly_sim(cfg, tmp_path, short_plan)
     assert meta["outcome"] == meta["mission_outcome"] == "completed"
-    assert drone.calls.count("go_to") == 3  # to the start, climb, back
-    assert np.allclose(drone.pos[:2], short_plan[1]["start"], atol=0.05)
+    assert drone.calls.count("go_to") == 1  # only to the start
+    end = short_plan[1]["waypoints"][-1]
+    assert np.allclose(drone.pos[:2], end, atol=0.05)
 
 
 def test_a_fault_on_the_way_back_keeps_the_mission_completed(
@@ -229,7 +231,6 @@ def test_a_fault_on_the_way_back_keeps_the_mission_completed(
                 self.is_connected = False
             super().go_to(x, y, z, yaw, duration)
 
-    cfg = replace(cfg, flight=replace(cfg.flight, return_height=0.5))
     meta, _, _ = fly_sim(cfg, tmp_path, short_plan, Lost((*cfg.start, 0.0)))
     assert meta["outcome"] == "aborted" and meta["abort_phase"] == "return"
     assert meta["mission_outcome"] == "completed"

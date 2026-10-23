@@ -17,7 +17,7 @@ class Task:
 
     Obstacles grow and the workspace shrinks by the airframe radius, so
     every check is on the drone's centre. The goal must be reached at some
-    step 1..H (the figure-8 passes its top tip and returns to the start).
+    step 1..H (the arc ends in it).
     """
 
     def __init__(self, cfg):

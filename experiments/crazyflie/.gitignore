@@ -6,11 +6,6 @@ results/
 
 # Keep the frozen reference and its preview in version control.
 plans/*
+!plans/reference.csv
 !plans/reference.json
 !plans/reference.png
-!plans/arc.csv
-!plans/arc.json
-!plans/arc.png
-
-# Local copy of the arc scenario template.
-config.arc.yml

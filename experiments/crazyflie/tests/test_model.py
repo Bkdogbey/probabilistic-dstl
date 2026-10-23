@@ -33,8 +33,9 @@ def errors(rng, steps, p=TRUE):
     return np.array(e)
 
 
-def synthetic_flights(cfg, count, rng, steps=90):
+def synthetic_flights(cfg, count, rng):
     """Flights of the reference, DELAY behind it, errors drawn from TRUE."""
+    steps = cfg.steps
     rows = np.asarray(reference_plan(cfg)["coefficients"])
     t = cfg.dt * np.arange(steps + 1) - DELAY
     behind = minsnap.evaluate(rows, t)[:, :2]
@@ -81,7 +82,7 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
     assert fan["b_poorly_determined"] == [False, False]
     assert report["warnings"] == []
     validation = report["validation"]["off"]
-    assert validation["flights_by_step"] == [20] * 91
+    assert validation["flights_by_step"] == [20] * (cfg.steps + 1)
     for (name, (estimate, *_)), nominal in zip(
         validation["coverage"].items(), (0.393, 0.865, 0.95)
     ):
