@@ -171,20 +171,11 @@ def cmd_fly(cfg, args):
     print(f"Trial {meta['trial_id']}: {meta['outcome']}")
 
 
-def scenario_trials(cfg):
-    """Trials flown under this config's reference: one scenario's data."""
-    return [
-        t
-        for t in all_trials()
-        if t["meta"]["config"]["reference"] == cfg.reference
-    ]
-
-
 def cmd_fit(cfg, args):
     from tracking_model import fit, save_report
 
     try:
-        report = fit(cfg, scenario_trials(cfg))
+        report = fit(cfg, all_trials())
     except ValueError as exc:
         sys.exit(
             f"cannot fit yet: {exc} (identification flights that completed "
@@ -225,7 +216,7 @@ def cmd_analyze(cfg, args):
     if args.trial:
         print(analysis.check_trial(find_trial(args.trial), task, cfg))
         return
-    trials = scenario_trials(cfg)
+    trials = all_trials()
     analysis.summarize(trials, task)
     print((analysis.RESULTS / "summary.md").read_text())
 

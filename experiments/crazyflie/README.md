@@ -224,27 +224,6 @@ points, only the dense geometric check covers the path. That check samples
 at 100 Hz plus every piece boundary, so it is not a proof of clearance
 between samples.
 
-## The IROS scenario
-
-The first IROS draft flew a sine path past three boxes (irobot commit
-`a2e4fc0`). `config.iros.example.yml` sets it up for this pipeline, with the same
-model, planner and limits as the figure-8. `plans/iros_sine.json` is the
-reference: the IROS waypoints, 9 pieces of 3.0 s (27 s), max speed
-0.224 m/s, at 0.30 m altitude. The boxes keep their IROS sizes. obs_2 is
-moved 0.255 m left, because the sine curve cut 3.9 cm into it at its
-IROS position; the curve now clears the airframe by 2.6 cm, as the
-figure-8 does.
-
-```bash
-cp config.iros.example.yml config.iros.yml  # place and measure the boxes
-python run.py --config config.iros.yml fly --fan low --purpose identification
-python run.py --config config.iros.yml fit
-```
-
-Pass `--config config.iros.yml` to every command. `fit` and `analyze` use
-only the trials flown under the configured reference, so the two
-scenarios never mix.
-
 ## Other commands
 
 ```bash
