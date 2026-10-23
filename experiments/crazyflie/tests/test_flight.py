@@ -210,6 +210,31 @@ def test_landing_error_is_separate_from_completed_mission(
     assert drone.calls[-1] == "disconnect" and "stop_setpoint" in drone.calls
 
 
+def test_return_climbs_flies_back_and_lands_at_the_start(
+    cfg, tmp_path, short_plan
+):
+    cfg = replace(cfg, flight=replace(cfg.flight, return_height=0.5))
+    meta, _, drone = fly_sim(cfg, tmp_path, short_plan)
+    assert meta["outcome"] == meta["mission_outcome"] == "completed"
+    assert drone.calls.count("go_to") == 3  # to the start, climb, back
+    assert np.allclose(drone.pos[:2], short_plan[1]["start"], atol=0.05)
+
+
+def test_a_fault_on_the_way_back_keeps_the_mission_completed(
+    cfg, tmp_path, short_plan
+):
+    class Lost(SimDrone):
+        def go_to(self, x, y, z, yaw, duration):
+            if z == 0.5:
+                self.is_connected = False
+            super().go_to(x, y, z, yaw, duration)
+
+    cfg = replace(cfg, flight=replace(cfg.flight, return_height=0.5))
+    meta, _, _ = fly_sim(cfg, tmp_path, short_plan, Lost((*cfg.start, 0.0)))
+    assert meta["outcome"] == "aborted" and meta["abort_phase"] == "return"
+    assert meta["mission_outcome"] == "completed"
+
+
 # State feed, start gate and altitude
 
 

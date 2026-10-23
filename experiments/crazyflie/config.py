@@ -64,6 +64,9 @@ class Flight:
     geofence_margin: float = 0.10
     position_spread: float = 0.05
     position_timeout: float = 15.0
+    # After the curve: climb to this height, fly back over the start and
+    # land there. None lands where the curve ends.
+    return_height: float | None = None
     # Onboard controller: 1 = PID; 2 = Mellinger (hovered 10 cm low on
     # 2026-10-20: its thrust assumes a lighter drone than ours).
     controller: int = 1

@@ -3,7 +3,8 @@
 `drone` is an irobot `CrazyflieBase` (radio link, arming) or a `SimDrone`.
 The plan's polynomial pieces are uploaded on the ground, before arming.
 The high-level commander takes off, reaches the start, flies the uploaded
-curve (`start_trajectory`) and lands in place. The host only monitors the
+curve (`start_trajectory`) and lands in place, or first flies back to the
+start at `flight.return_height` when that is set. The host only monitors the
 mission; every safety decision uses a fresh state packet.
 
 Abort kinds: `TaskViolation` (left the workspace or altitude band: a task
@@ -355,6 +356,17 @@ def fly(drone, feed, plan, cfg, log, stop, status):
 
     log.set_phase("mission")
     mission(drone, feed, cfg, log, stop, sum(plan["durations"]))
+    log.meta["mission_outcome"] = "completed"  # whatever the return does
+
+    if f.return_height is not None:
+        # Climb above the boxes where the curve ended, then fly back.
+        log.set_phase("return")
+        end = plan["waypoints"][-1]
+        _go_to(drone, feed, cfg, stop, [*end, f.return_height], f.takeoff_speed)
+        _go_to(
+            drone, feed, cfg, stop,
+            [*plan["start"], f.return_height], f.transit_speed,
+        )  # fmt: skip
 
     # Landing and disconnect belong to run_flight's single cleanup path.
 
@@ -472,8 +484,9 @@ def run_flight(cfg, plan, log, stop=None, connect_fn=None):
         phase = log.phase
         if "mission_t0" in log.meta:
             log.meta.setdefault("mission_t_end", time.monotonic())
-        log.meta["mission_outcome"] = (
-            outcome if "mission_t0" in log.meta else "not_started"
+        log.meta.setdefault(
+            "mission_outcome",
+            outcome if "mission_t0" in log.meta else "not_started",
         )
         if status["airborne"]:
             log.set_phase("land" if outcome == "completed" else "cleanup_land")

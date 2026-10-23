@@ -239,7 +239,11 @@ as an uploaded min-snap curve.
 
 `config.arc.example.yml` has a wider workspace than the figure-8 arena,
 x [−0.5, 1.5], y [−2.5, 0.5]; it must stay inside the net. Boxes 1 and 3
-go in once they are measured.
+go in once they are measured. After the curve the drone climbs to
+`flight.return_height` (0.5 m, above the boxes), flies back over the
+start and lands there, ready for the next flight. The return is not part
+of the mission: the fit and the scores end with the curve, and a fault on
+the way back leaves the mission completed.
 
 ```bash
 cp config.arc.example.yml config.arc.yml  # set measured: true when ready

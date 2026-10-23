@@ -20,3 +20,6 @@ model_report: null  # set to the report printed by `python run.py --config confi
 
 # Set the physical fan manually; this setting labels the flight.
 fan: "off"  # "off" (baseline), low, medium, high; quoted: YAML reads off as false
+
+# After the curve, climb above the boxes, fly back over the start, land there.
+flight: {return_height: 0.5}
