@@ -229,11 +229,12 @@ between samples.
 The arc is the sine path of irobot's `spline_waypoint` example, the same
 shape (one 0.64 m bulge over 1.75 m), placed so that obs_4 sits inside it
 next to the start: x = 0.69 − 0.64 sin(πt), y = −1.97 + 1.75 t, from
-(0.69, −1.97) to (0.69, −0.22). The curve clears obs_4 by 2.7 cm beyond
-the airframe, as the figure-8 clears its boxes (2.5 cm). `plans/arc.csv`
-samples it the way the figure-8 is sampled: one waypoint per 1.0 s,
-3.0 s cosine speed ramps at both ends. The reference `plans/arc.json` is
-13 pieces of 1.0 s (13 s), max speed 0.225 m/s, at 0.30 m altitude, flown
+(0.69, −1.97) to (0.69, −0.22). `plans/arc.csv` samples it the way the
+figure-8 is sampled: one waypoint per 1.0 s, 3.0 s cosine speed ramps at
+both ends. Waypoints 2–5, next to obs_4, are then moved diagonally away
+from the box (3.5, 7, 7 and 3.5 cm), so the curve clears it by 10 cm
+beyond the airframe instead of 2.7 cm. The reference `plans/arc.json` is
+13 pieces of 1.0 s (13 s), max speed 0.240 m/s, at 0.30 m altitude, flown
 as an uploaded min-snap curve.
 
 `config.arc.example.yml` has a wider workspace than the figure-8 arena,
