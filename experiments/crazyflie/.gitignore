@@ -8,9 +8,9 @@ results/
 plans/*
 !plans/reference.json
 !plans/reference.png
-!plans/iros_sine.csv
-!plans/iros_sine.json
-!plans/iros_sine.png
+!plans/arc.csv
+!plans/arc.json
+!plans/arc.png
 
-# Local copy of the IROS scenario template.
-config.iros.yml
+# Local copy of the arc scenario template.
+config.arc.yml

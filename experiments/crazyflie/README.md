@@ -224,26 +224,27 @@ points, only the dense geometric check covers the path. That check samples
 at 100 Hz plus every piece boundary, so it is not a proof of clearance
 between samples.
 
-## The IROS scenario
+## The arc scenario
 
-The first IROS draft flew a sine path past three boxes (irobot commit
-`a2e4fc0`). `config.iros.example.yml` sets it up for this pipeline, with the same
-model, planner and limits as the figure-8. `plans/iros_sine.json` is the
-reference: the IROS waypoints, 9 pieces of 3.0 s (27 s), max speed
-0.224 m/s, at 0.30 m altitude. The boxes keep their IROS sizes. obs_2 is
-moved 0.255 m left, because the sine curve cut 3.9 cm into it at its
-IROS position; the curve now clears the airframe by 2.6 cm, as the
-figure-8 does.
+The arc is the sine path of irobot's `spline_waypoint` example:
+x = 0.90 − 0.64 sin(πt), y = −1.875 + 1.75 t, a single bulge from the start
+(0.90, −1.875) to (0.90, −0.125). irobot's version ran from (1, −1.75) to
+(1, 0), on the walls; it is moved 0.10 m in x and 0.125 m in y to fit inside
+them. `plans/arc.csv` samples it the way the figure-8 is sampled: one
+waypoint per 1.0 s, 3.0 s cosine speed ramps at both ends. The reference
+`plans/arc.json` is 13 pieces of 1.0 s (13 s), max speed 0.225 m/s, at
+0.30 m altitude, 3 cm from the walls. `config.arc.example.yml` has no
+obstacles yet; boxes 1, 3 and 4 go in once they are measured.
 
 ```bash
-cp config.iros.example.yml config.iros.yml  # place and measure the boxes
-python run.py --config config.iros.yml fly --fan low --purpose identification
-python run.py --config config.iros.yml fit
+cp config.arc.example.yml config.arc.yml  # set measured: true when ready
+python run.py --config config.arc.yml fly --fan low --purpose identification
+python run.py --config config.arc.yml fit
 ```
 
-Pass `--config config.iros.yml` to every command. `fit` and `analyze` use
-only the trials flown under the configured reference, so the two
-scenarios never mix.
+Pass `--config config.arc.yml` to every command. `fit` and `analyze` use
+only the trials flown under the configured reference, so the scenarios
+never mix.
 
 ## Other commands
 

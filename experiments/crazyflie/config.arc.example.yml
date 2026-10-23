@@ -1,0 +1,20 @@
+# Arc scenario: the irobot spline_waypoint sine arc (no obstacles yet).
+# Metres, seconds, m/s; world frame (Lighthouse). Figure-8 arena.
+measured: false
+radio_uri: radio://0/87/2M/E7E7E7E787
+
+altitude_tolerance: 0.20  # mission limit on the 0.25 s mean height
+airframe_radius: 0.07  # obstacles grow and walls move in by this
+workspace: {x: [0.0, 1.0], y: [-2.0, 0.0]}
+obstacles: []  # add boxes 1, 3 and 4 once measured
+goal: {x: [0.70, 1.00], y: [-0.30, 0.00]}  # around the arc's end
+
+# The reference curve owns the start, altitude and timing.
+reference: plans/arc.json
+v_max: 0.30  # speed norm limit on the curve [m/s]
+a_max: 0.30  # acceleration norm limit on the curve [m/s^2]
+clearance_margin: 0.01  # sampled airframe clearance must stay above this [m]
+model_report: null  # set to the report printed by `python run.py --config config.arc.yml fit`
+
+# Set the physical fan manually; this setting labels the flight.
+fan: "off"  # "off" (baseline), low, medium, high; quoted: YAML reads off as false
