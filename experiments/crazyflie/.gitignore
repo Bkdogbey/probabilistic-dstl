@@ -8,3 +8,9 @@ results/
 plans/*
 !plans/reference.json
 !plans/reference.png
+!plans/iros_sine.csv
+!plans/iros_sine.json
+!plans/iros_sine.png
+
+# Local copy of the IROS scenario template.
+config.iros.yml
