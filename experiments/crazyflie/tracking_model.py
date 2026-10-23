@@ -103,18 +103,42 @@ class TrackingModel:
 # Which flights count
 
 
-def usable(trial):
-    """Identification flights that completed or aborted on a task violation.
-
-    Task-violation aborts count up to the abort: dropping large deviations
-    would understate the noise. Data faults, errors and interruptions do not.
-    """
+def identification(trial):
     meta = trial["meta"]
-    mission = meta.get("mission_outcome")
     return (
         meta["purpose"] == "identification"
         and not meta.get("dry_run")
         and not meta.get("data_readiness")
+    )
+
+
+def fell(trial):
+    """Did the drone drop below half its flight height during the curve?
+
+    A fall (lost lift, a crash) is reported as its own outcome: a Gaussian
+    tracking-error model cannot describe it, and its last samples, often an
+    estimate thrown off by the impact, would only inflate the spread.
+    """
+    meta, s = trial["meta"], trial.get("state")
+    if meta.get("mission_outcome") != "aborted" or s is None:
+        return False
+    t = s["t_host"]
+    during = (t >= meta["mission_t0"]) & (t <= meta["mission_t_end"])
+    return bool((s["z"][during] < meta["altitude"] / 2).any())
+
+
+def usable(trial):
+    """Identification flights that completed or aborted on a task violation.
+
+    Task-violation aborts (leaving the workspace or the altitude band) count
+    up to the abort: dropping large deviations would understate the noise.
+    Falls, data faults, errors and interruptions do not.
+    """
+    meta = trial["meta"]
+    mission = meta.get("mission_outcome")
+    return (
+        identification(trial)
+        and not fell(trial)
         and (
             mission == "completed"
             or (
@@ -123,6 +147,15 @@ def usable(trial):
             )
         )
     )
+
+
+def falls_by_fan(trials):
+    """Trial ids of the identification flights that fell, per fan."""
+    falls = defaultdict(list)
+    for t in trials:
+        if identification(t) and fell(t):
+            falls[fan_setting(t["meta"]["fan"])].append(t["meta"]["trial_id"])
+    return falls
 
 
 def by_fan(trials):
@@ -248,6 +281,7 @@ def fit(cfg, trials):
     rng = np.random.default_rng(cfg.model["seed"])
     report = {"dt": cfg.dt, "config_hash": cfg.hash, "fans": {}}
     warnings, data = [], {}
+    falls = falls_by_fan(trials)
     for fan, fs in flights.items():
         delay = fit_delay(fs)
         errors = data[fan] = [errors_at(f, delay) for f in fs]
@@ -260,6 +294,9 @@ def fit(cfg, trials):
         report["fans"][fan] = {
             **{k: np.asarray(v).tolist() for k, v in params.items()},
             "fit_flights": len(errors),
+            "falls": falls[fan],
+            "fall_rate": len(falls[fan])
+            / (len(falls[fan]) + len(errors) + len(held[fan])),
             "fit_trials": [t["meta"]["trial_id"] for t in fit_trials[fan]],
             "held_out_trials": [t["meta"]["trial_id"] for t in held[fan]],
         }

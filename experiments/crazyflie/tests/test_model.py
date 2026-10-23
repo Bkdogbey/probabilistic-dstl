@@ -128,15 +128,32 @@ def test_tick_rate_process_subsampled_reproduces_q(rho):
     assert not np.allclose(Q_h, Q / TICKS)  # dividing by 20 is wrong
 
 
-def test_task_violations_count_up_to_the_abort_and_faults_do_not(cfg):
-    def trial(**meta):
+def test_task_violations_count_up_to_the_abort_but_falls_and_faults_do_not(
+    cfg,
+):
+    def trial(z=0.30, **meta):
         base = {
             "purpose": "identification",
             "outcome": "completed",
             "mission_outcome": "completed",
             "fan": 0,
+            "altitude": 0.30,
+            "mission_t0": 0.0,
+            "mission_t_end": 1.0,
+            "trial_id": "t",
         }
-        return {"meta": {**base, **meta}}
+        t = np.linspace(-1.0, 2.0, 61)
+        heights = np.where(t > 0.8, z, 0.30)  # ends at height z
+        return {"meta": {**base, **meta}, "state": {"t_host": t, "z": heights}}
+
+    fall = trial(
+        z=0.05,
+        outcome="aborted",
+        mission_outcome="aborted",
+        abort_kind="TaskViolation",
+    )
+    assert tracking_model.fell(fall)
+    assert tracking_model.falls_by_fan([fall, trial()]) == {"off": ["t"]}
 
     kept = [
         trial(),
@@ -147,6 +164,7 @@ def test_task_violations_count_up_to_the_abort_and_faults_do_not(cfg):
         ),
     ]
     dropped = [
+        fall,
         trial(
             outcome="aborted",
             mission_outcome="aborted",

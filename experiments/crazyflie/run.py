@@ -171,11 +171,20 @@ def cmd_fly(cfg, args):
     print(f"Trial {meta['trial_id']}: {meta['outcome']}")
 
 
+def scenario_trials(cfg):
+    """Trials flown under this config's reference: one scenario's data."""
+    return [
+        t
+        for t in all_trials()
+        if t["meta"]["config"]["reference"] == cfg.reference
+    ]
+
+
 def cmd_fit(cfg, args):
     from tracking_model import fit, save_report
 
     try:
-        report = fit(cfg, all_trials())
+        report = fit(cfg, scenario_trials(cfg))
     except ValueError as exc:
         sys.exit(
             f"cannot fit yet: {exc} (identification flights that completed "
@@ -192,6 +201,10 @@ def cmd_fit(cfg, args):
             f"rho {np.round(f['rho'], 3).tolist()}, "
             f"b {np.round(f['b'], 4).tolist()} m, "
             f"stationary spread {np.round(f['stationary_spread'], 4).tolist()} m"
+        )
+        print(
+            f"    falls: {len(f['falls'])} "
+            f"({100 * f['fall_rate']:.0f}% of flights that reached the curve)"
         )
         if any(f["b_poorly_determined"]):
             print("    b is poorly determined: rho is close to 1")
@@ -212,7 +225,7 @@ def cmd_analyze(cfg, args):
     if args.trial:
         print(analysis.check_trial(find_trial(args.trial), task, cfg))
         return
-    trials = all_trials()
+    trials = scenario_trials(cfg)
     analysis.summarize(trials, task)
     print((analysis.RESULTS / "summary.md").read_text())
 
