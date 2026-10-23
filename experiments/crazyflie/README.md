@@ -226,20 +226,20 @@ between samples.
 
 ## The arc scenario
 
-The arc is the sine path of irobot's `spline_waypoint` example, the same
-shape (one 0.64 m bulge over 1.75 m), placed so that obs_4 sits inside it
-next to the start: x = 0.69 − 0.64 sin(πt), y = −1.97 + 1.75 t, from
-(0.69, −1.97) to (0.69, −0.22). `plans/arc.csv` samples it the way the
-figure-8 is sampled: one waypoint per 1.0 s, 3.0 s cosine speed ramps at
-both ends. Waypoints 2–5, next to obs_4, are then moved diagonally away
-from the box (3.5, 7, 7 and 3.5 cm), so the curve clears it by 10 cm
-beyond the airframe instead of 2.7 cm. The reference `plans/arc.json` is
-13 pieces of 1.0 s (13 s), max speed 0.240 m/s, at 0.30 m altitude, flown
-as an uploaded min-snap curve.
+The arc starts from the sine path of irobot's `spline_waypoint` example:
+the same shape (one 0.64 m bulge over 1.75 m), x = 0.69 − 0.64 sin(πt),
+y = −1.97 + 1.75 t, from (0.69, −1.97) to (0.69, −0.22), with obs_4 inside
+it next to the start. `plans/arc.csv` samples it the way the figure-8 is
+sampled (one waypoint per 1.0 s, 3.0 s cosine speed ramps), then moves the
+interior waypoints around the three boxes: least snap, clearance pushed
+toward 10 cm beyond the airframe, speed under 0.25 m/s. The path passes
+between obs_1 and obs_3, where the gap leaves about 14 cm after the
+airframe; it clears obs_3 by 5.3 cm, obs_1 by 5.9 cm and obs_4 by 9.4 cm.
+The reference `plans/arc.json` is 13 pieces of 1.0 s (13 s), max speed
+0.258 m/s, at 0.30 m altitude, flown as an uploaded min-snap curve.
 
 `config.arc.example.yml` has a wider workspace than the figure-8 arena,
-x [−0.5, 1.5], y [−2.5, 0.5]; it must stay inside the net. Boxes 1 and 3
-go in once they are measured. After the curve the drone climbs to
+x [−0.5, 1.5], y [−2.5, 0.5]; it must stay inside the net. After the curve the drone climbs to
 `flight.return_height` (0.5 m, above the boxes), flies back over the
 start and lands there, ready for the next flight. The return is not part
 of the mission: the fit and the scores end with the curve, and a fault on
