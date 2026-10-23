@@ -226,15 +226,19 @@ between samples.
 
 ## The arc scenario
 
-The arc is the sine path of irobot's `spline_waypoint` example:
-x = 0.90 − 0.64 sin(πt), y = −1.875 + 1.75 t, a single bulge from the start
-(0.90, −1.875) to (0.90, −0.125). irobot's version ran from (1, −1.75) to
-(1, 0), on the walls; it is moved 0.10 m in x and 0.125 m in y to fit inside
-them. `plans/arc.csv` samples it the way the figure-8 is sampled: one
-waypoint per 1.0 s, 3.0 s cosine speed ramps at both ends. The reference
-`plans/arc.json` is 13 pieces of 1.0 s (13 s), max speed 0.225 m/s, at
-0.30 m altitude, 3 cm from the walls. `config.arc.example.yml` has no
-obstacles yet; boxes 1, 3 and 4 go in once they are measured.
+The arc is the sine path of irobot's `spline_waypoint` example, the same
+shape (one 0.64 m bulge over 1.75 m), placed so that obs_4 sits inside it
+next to the start: x = 0.69 − 0.64 sin(πt), y = −1.97 + 1.75 t, from
+(0.69, −1.97) to (0.69, −0.22). The curve clears obs_4 by 2.7 cm beyond
+the airframe, as the figure-8 clears its boxes (2.5 cm). `plans/arc.csv`
+samples it the way the figure-8 is sampled: one waypoint per 1.0 s,
+3.0 s cosine speed ramps at both ends. The reference `plans/arc.json` is
+13 pieces of 1.0 s (13 s), max speed 0.225 m/s, at 0.30 m altitude, flown
+as an uploaded min-snap curve.
+
+`config.arc.example.yml` has a wider workspace than the figure-8 arena,
+x [−0.5, 1.5], y [−2.5, 0.5]; it must stay inside the net. Boxes 1 and 3
+go in once they are measured.
 
 ```bash
 cp config.arc.example.yml config.arc.yml  # set measured: true when ready
