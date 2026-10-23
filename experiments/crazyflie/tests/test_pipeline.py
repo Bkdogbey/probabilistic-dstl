@@ -87,12 +87,12 @@ def test_import_rebuilds_the_reference_and_export_round_trips(cfg, tmp_path):
 
 
 def test_explicit_selection_never_chooses_newest(cfg, tmp_path):
-    args = SimpleNamespace(plan=None, fan=0, allow_below_threshold=False)
+    args = SimpleNamespace(plan=None, fan="off", allow_below_threshold=False)
     selected, _ = run.select_plan(cfg, args)
     assert str(selected) == cfg.reference
     plan = json.loads(Path(cfg.reference).read_text())
-    plan["fan"] = 6
-    other = tmp_path / "fan6.json"
+    plan["fan"] = "low"
+    other = tmp_path / "low.json"
     other.write_text(json.dumps(plan))
     args.plan = str(other)
     with pytest.raises(SystemExit, match="for fan"):
@@ -188,8 +188,8 @@ def test_altitude_scoring_uses_the_same_average_as_execution(cfg):
     assert not analysis.evaluate(trial, Task(cfg))["requirements"]["altitude"]
 
 
-@pytest.mark.parametrize("setting", [0, 6, 12, 18])
-def test_numeric_fan_setting_is_recorded(cfg, tmp_path, setting):
+@pytest.mark.parametrize("setting", ["off", "low", "medium", "high"])
+def test_fan_setting_is_recorded(cfg, tmp_path, setting):
     measured = replace(cfg, fan=setting)
     assert measured.ready_for_data(setting) is None
     log = TrialLog.for_flight(
@@ -200,9 +200,17 @@ def test_numeric_fan_setting_is_recorded(cfg, tmp_path, setting):
         fan=setting,
         root=tmp_path,
     )
-    assert f"fan{setting:02d}" in log.id and log.meta["fan"] == setting
+    assert f"fan-{setting}" in log.id and log.meta["fan"] == setting
     assert log.meta["coefficients"] == reference_plan(cfg)["coefficients"]
 
 
 def test_unmeasured_config_marks_flights_as_not_fit_data(cfg):
-    assert replace(cfg, measured=False).ready_for_data(0)
+    assert replace(cfg, measured=False).ready_for_data("off")
+
+
+def test_old_numeric_baseline_reads_as_off():
+    import config
+
+    assert config.fan_setting(0) == config.fan_setting(False) == "off"
+    with pytest.raises(ValueError):
+        config.fan_setting(6)

@@ -18,7 +18,7 @@ def fly_sim(cfg, tmp_path, short_plan, drone=None, stop=None, connect_fn=None):
     path, plan = short_plan
     cfg = cfg.for_plan(plan)
     log = TrialLog.for_flight(
-        cfg, plan, path, purpose="pilot", fan=0, root=tmp_path / "logs"
+        cfg, plan, path, purpose="pilot", fan="off", root=tmp_path / "logs"
     )
     drone = drone or SimDrone((*cfg.start, 0.0))
     meta = run_flight(cfg, plan, log, stop, connect_fn or (lambda _: drone))
@@ -163,7 +163,7 @@ def test_failed_start_move_lands_and_disconnects(cfg, tmp_path, short_plan):
 def test_drone_away_from_the_start_flies_there_before_the_mission(
     cfg, tmp_path, short_plan
 ):
-    home = (cfg.start[0] - 0.5, cfg.start[1] + 0.3, 0.0)
+    home = (cfg.start[0] - 0.3, cfg.start[1] + 0.3, 0.0)
     meta, _, drone = fly_sim(cfg, tmp_path, short_plan, SimDrone(home))
     assert meta["outcome"] == "completed"
     assert np.allclose(meta["home"][:2], home[:2], atol=0.01)
@@ -171,6 +171,17 @@ def test_drone_away_from_the_start_flies_there_before_the_mission(
     assert calls.index("takeoff") < calls.index("go_to")
     assert calls.index("go_to") < calls.index("start_trajectory")
     assert np.allclose(meta["start_state"][:2], cfg.start, atol=0.05)
+
+
+def test_no_lighthouse_fix_is_refused_before_upload(cfg, tmp_path, short_plan):
+    """Without fixes the estimate settles near (0, 0), outside the arena."""
+    meta, _, drone = fly_sim(
+        cfg, tmp_path, short_plan, SimDrone((0.0, 0.0, 0.0))
+    )
+    assert (meta["outcome"], meta["abort_kind"]) == ("aborted", "DataFault")
+    assert meta["abort_phase"] == "positioning"
+    assert "Lighthouse" in meta["abort_reason"]
+    assert not any(c in drone.calls for c in ("write_data_sync", "arm"))
 
 
 def test_connect_failure_still_records_the_attempt(cfg, tmp_path, short_plan):

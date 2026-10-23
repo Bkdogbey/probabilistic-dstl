@@ -20,7 +20,7 @@ clearance_margin: 0.01  # sampled airframe clearance must stay above this [m]
 model_report: null  # set to the report printed by `python run.py fit`
 
 # Set the physical fan manually; this setting labels the flight.
-fan: 0  # 0 = off; active settings: 6, 12, 18
+fan: "off"  # "off" (baseline), low, medium, high; quoted: YAML reads off as false
 
 # Routine defaults are in config.py. Override only what is needed,
 # e.g. flight: {start_speed: 0.10}.

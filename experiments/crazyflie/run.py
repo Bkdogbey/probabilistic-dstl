@@ -1,9 +1,9 @@
 """Crazyflie experiment: fly an uploaded min-snap curve, fit, plan, analyze.
 
-python run.py fly --fan 0
+python run.py fly --fan off
 python run.py analyze --trial latest
 python run.py fit
-python run.py plan --condition pdstl --fan 0 --output plans/pdstl_fan0.json
+python run.py plan --condition pdstl --fan low --output plans/pdstl_low.json
 python run.py export plans/reference.json --csv /tmp/reference.csv
 
 The configured reference is already registered. Use import only for a new
@@ -241,7 +241,6 @@ def main(argv=None):
     )
     p.add_argument(
         "--fan",
-        type=int,
         choices=config.FAN_SETTINGS,
         help="default: fan in config.yml",
     )
@@ -256,7 +255,6 @@ def main(argv=None):
     )
     f.add_argument(
         "--fan",
-        type=int,
         choices=config.FAN_SETTINGS,
         help="physical setting; default: fan in config.yml",
     )

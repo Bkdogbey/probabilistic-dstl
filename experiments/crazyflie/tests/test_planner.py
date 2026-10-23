@@ -61,7 +61,7 @@ def test_stored_score_is_recomputed_from_the_saved_rows(
 ):
     task = Task(small)
     record = planner.plan(
-        small, task, model, reference_plan(small), condition, 0
+        small, task, model, reference_plan(small), condition, "low"
     )
     path = save_plan(record, tmp_path / f"{condition}.json")
     saved = read_plan(path)
@@ -143,9 +143,9 @@ def test_both_conditions_get_the_same_budget(small, model):
     task, reference = Task(small), reference_plan(small)
     budgets = []
     for condition in planner.CONDITIONS:
-        objective = planner.plan(small, task, model, reference, condition, 0)[
-            "objective"
-        ]
+        objective = planner.plan(
+            small, task, model, reference, condition, "low"
+        )["objective"]
         budgets.append(
             (
                 objective["iterations"],
@@ -176,7 +176,9 @@ def test_below_threshold_plans_load_only_when_allowed(cfg, tmp_path):
     with pytest.raises(ValueError, match="allow-below-threshold"):
         load_plan(path, cfg)
     assert load_plan(path, cfg, allow_below_threshold=True)["feasible"]
-    args = SimpleNamespace(plan=str(path), fan=0, allow_below_threshold=False)
+    args = SimpleNamespace(
+        plan=str(path), fan="off", allow_below_threshold=False
+    )
     with pytest.raises(SystemExit, match="allow-below-threshold"):
         run.select_plan(cfg, args)
     args.allow_below_threshold = True

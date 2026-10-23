@@ -17,12 +17,12 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "src"))  # the pdSTL core (models, planning, ...)
 
 
-FAN_SETTINGS = (0, 6, 12, 18)  # old experiment: off plus three active settings
+FAN_SETTINGS = ("off", "low", "medium", "high")  # off is the baseline
 
 
 def fan_setting(value):
-    """Numeric physical setting; 'off' is readable in older trial metadata."""
-    setting = 0 if value == "off" else int(value)
+    """A fan level; older records stored the baseline as 0."""
+    setting = "off" if value in (0, "0") else str(value)  # YAML off is False
     if setting not in FAN_SETTINGS:
         raise ValueError(f"fan must be one of {FAN_SETTINGS}")
     return setting
@@ -122,7 +122,7 @@ class Config:
     planner: dict
     mean_model: dict
     model_report: str | None = None
-    fan: int = 0
+    fan: str = "off"
 
     @property
     def steps(self):
@@ -180,7 +180,7 @@ def load(path=HERE / "config.yml"):
             f"  cd {HERE} && cp config.example.yml {path.name}"
         )
     raw = {**deepcopy(DEFAULTS), **yaml.safe_load(path.read_text())}
-    raw["fan"] = fan_setting(raw.get("fan", 0))
+    raw["fan"] = fan_setting(raw.get("fan", "off"))
     if not isinstance(raw["reference"], str):
         raise TypeError(
             "reference must name the supplied trajectory file, e.g. reference: plans/reference.json"

@@ -67,7 +67,7 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
     report = tracking_model.fit(
         cfg, synthetic_flights(cfg, 60, np.random.default_rng(0))
     )
-    fan = report["fans"]["0"]
+    fan = report["fans"]["off"]  # metadata fan 0 reads as off
     assert fan["fit_flights"] == 40 and len(fan["held_out_trials"]) == 20
     assert not set(fan["held_out_trials"]) & set(fan["fit_trials"])
     assert fan["delay"] == pytest.approx(DELAY, abs=0.011)
@@ -80,7 +80,7 @@ def test_fit_recovers_the_model_and_held_out_coverage_is_nominal(
     assert (lo <= fan["rho"]).all() and (fan["rho"] <= hi).all()
     assert fan["b_poorly_determined"] == [False, False]
     assert report["warnings"] == []
-    validation = report["validation"]["0"]
+    validation = report["validation"]["off"]
     assert validation["flights_by_step"] == [20] * 91
     for (name, (estimate, *_)), nominal in zip(
         validation["coverage"].items(), (0.393, 0.865, 0.95)
@@ -93,7 +93,7 @@ def test_few_flights_warn_and_a_single_flight_is_refused(cfg, synthetic):
     report = tracking_model.fit(
         cfg, synthetic_flights(cfg, 3, np.random.default_rng(1))
     )
-    assert report["fans"]["0"]["fit_flights"] == 2
+    assert report["fans"]["off"]["fit_flights"] == 2
     assert "2 fit flights" in report["warnings"][0]
     with pytest.raises(ValueError, match="at least two"):
         tracking_model.fit(
@@ -223,16 +223,17 @@ def test_model_prediction_approaches_the_stationary_covariance():
     )
 
 
-@pytest.mark.parametrize("setting", [0, 6, 12, 18])
-def test_model_report_loads_by_numeric_fan_setting(cfg, tmp_path, setting):
+@pytest.mark.parametrize("setting", ["off", "low", "medium", "high"])
+def test_model_report_loads_by_fan_setting(cfg, tmp_path, setting):
+    push = ("off", "low", "medium", "high").index(setting) / 1000
     report = {
-        "id": "numeric-fan-model",
+        "id": "fan-model",
         "hash": "test",
         "dt": cfg.dt,
         "fans": {
-            str(setting): {
+            setting: {
                 "rho": [0.5, 0.5],
-                "b": [setting / 1000] * 2,
+                "b": [push] * 2,
                 "Q": (1e-4 * np.eye(2)).tolist(),
                 "m0": [0, 0],
                 "P0": (1e-4 * np.eye(2)).tolist(),
@@ -242,6 +243,7 @@ def test_model_report_loads_by_numeric_fan_setting(cfg, tmp_path, setting):
     path = tmp_path / "model.json"
     path.write_text(json.dumps(report))
     loaded = tracking_model.load_model(path, setting, cfg)
-    assert np.allclose(loaded.b.numpy(), setting / 1000)
+    assert np.allclose(loaded.b.numpy(), push)
+    other = "low" if setting != "low" else "high"
     with pytest.raises(ValueError, match="no fan"):
-        tracking_model.load_model(path, 6 if setting != 6 else 12, cfg)
+        tracking_model.load_model(path, other, cfg)

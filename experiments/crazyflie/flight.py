@@ -314,6 +314,18 @@ def fly(drone, feed, plan, cfg, log, stop, status):
     log.set_phase("positioning")
     home = wait_for_positioning(drone, feed, cfg, stop)
     log.meta["home"] = home.tolist()
+    # Without Lighthouse fixes the estimate settles near (0, 0) after the
+    # reset, outside the arena: never take off from there.
+    ws, r = cfg.workspace, cfg.airframe_radius
+    inside = (
+        ws.x[0] + r <= home[0] <= ws.x[1] - r
+        and ws.y[0] + r <= home[1] <= ws.y[1] - r
+    )
+    if not inside:
+        raise DataFault(
+            f"drone at ({home[0]:.2f}, {home[1]:.2f}) is not inside the "
+            "workspace; check that Lighthouse is tracking"
+        )
     start = np.array([*plan["start"], cfg.altitude])
 
     log.set_phase("upload")

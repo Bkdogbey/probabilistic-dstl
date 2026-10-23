@@ -33,7 +33,7 @@ from pathlib import Path
 import minsnap
 import numpy as np
 import torch
-from config import HERE, fan_setting
+from config import FAN_SETTINGS, HERE, fan_setting
 from logger import aligned_states
 
 REPORTS = HERE / "reports"
@@ -129,8 +129,9 @@ def by_fan(trials):
     groups = defaultdict(list)
     for t in trials:
         if usable(t):
-            groups[str(fan_setting(t["meta"]["fan"]))].append(t)
-    return dict(sorted(groups.items(), key=lambda item: int(item[0])))
+            groups[fan_setting(t["meta"]["fan"])].append(t)
+    order = sorted(groups, key=FAN_SETTINGS.index)
+    return {fan: groups[fan] for fan in order}
 
 
 def split(trials, holdout_every):
@@ -298,7 +299,7 @@ def save_report(report):
 
 
 def model_from(report, fan, cfg):
-    key = str(fan_setting(fan))
+    key = fan_setting(fan)
     if key not in report["fans"]:
         raise ValueError(f"model {report['id']} has no fan {fan!r}")
     return make_model(

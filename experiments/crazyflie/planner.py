@@ -261,7 +261,7 @@ def make_plan(cfg, task, problem, condition, fan, best, objective):
         best["waypoints"],
         problem.durations,
         condition,
-        f"{condition}_fan{fan}_{stamp}",
+        f"{condition}_{fan}_{stamp}",
     )
     rows = np.asarray(record["coefficients"])
     exact = problem.exact_score(condition, problem.rows_mean(rows))

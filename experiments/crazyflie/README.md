@@ -21,7 +21,8 @@ some step.
 ## How a flight works
 
 1. **Positioning.** The Kalman filter is reset and the position estimate
-   must settle. The drone can sit anywhere in the workspace.
+   must settle. The drone can sit anywhere in the workspace; a settled
+   position outside it (as without Lighthouse fixes) refuses takeoff.
 2. **Upload, on the ground.** The onboard controller is set
    (`flight.controller`: 1 = PID, the default; 2 = Mellinger, which hovered
    10 cm low on our drone). The pieces are written to trajectory
@@ -64,81 +65,111 @@ The simulator generates data from this same model. Simulated flights
 therefore test plumbing and parameter recovery only, never whether the
 model suits the hardware.
 
-## Pipeline
+## Running the experiment
 
-Run these from this directory. Copy `config.example.yml` to `config.yml`
-for a new checkout.
+Run everything from this directory. For a new checkout, copy
+`config.example.yml` to `config.yml`.
 
-1. **Measure the geometry.** Enter the workspace, any obstacles and the
-   airframe radius in `config.yml`, then set `measured: true`.
-2. **First hardware step:** one slow fan-off pilot flight.
+**Fan levels:** `off` (baseline), `low`, `medium`, `high`. Set the fan by
+hand before each `fly`; `--fan` only labels the record.
 
-   ```bash
-   python run.py fly --fan 0 --purpose pilot
-   python run.py analyze --trial latest
-   ```
+| Phase | Fan levels | Flights | Purpose |
+| --- | --- | --- | --- |
+| Pilots | each level, before its data | 1–3 | check the drone and the airflow |
+| Identification | off, low, medium, high | **12 completed per level** (48) | fit one model per level |
+| Planning (offline) | low, medium, high | 2 plans per level | deterministic (`mean_model`) and `pdstl` |
+| Evaluation | low, medium, high | **20 per condition per level** (120) | compare the two conditions |
 
-   Before any identification flights, check the alignment (the offset of
-   `t_play` and whether it was identifiable), the `ctrltarget`-vs-`r(t)`
-   residual (well under 1 cm), and the time-aligned and cross-track errors.
-3. **Identification flights** of the reference figure-8: 12 completed
-   flights at each fan setting. Fan 0 is the baseline (identification
-   only); fans 6, 12 and 18 are also planned and evaluated. These flights
-   also show how the unadjusted figure-8 does under each fan.
+`off` is the baseline: identification only, no plans and no evaluation.
+The identification flights also show how the unadjusted figure-8 does
+under each level.
 
-   ```bash
-   python run.py fly --purpose identification --fan 6
-   ```
+### Before every session
 
-4. **Fit.**
+1. `config.yml` has `measured: true`, and **every box inside the net is
+   listed** under `obstacles` at its measured position. Boxes and fan stay
+   where they are for the whole data collection.
+2. Write down where the fan stands and where it points.
+3. Lighthouse deck firmly seated, propellers undamaged, battery charged.
+   Swap the battery when its **resting** voltage at the start of a flight
+   is below 3.7 V.
+4. In cfclient, hold the drone still: x/y steady to a few mm.
 
-   ```bash
-   python run.py fit
-   ```
+### 1. Pilot at each level (go / no-go)
 
-   Every third flight per fan is held out. In the report (`reports/`),
-   check:
-   - coverage near 39 / 86 / 95 %;
-   - `flights_by_step`: flights that aborted early drop out of later
-     steps;
-   - the residual lag-1 correlation (near 0 if the model fits);
-   - the stationary spread per fan.
+```bash
+python run.py fly --fan low --purpose pilot
+python run.py analyze --trial latest
+```
 
-   Set `model_report` in `config.yml` to the report.
-5. **Plan** both conditions at fans 6, 12 and 18: deterministic
-   (`mean_model`, the predicted average path only) and `pdstl` (average and
-   spread):
+Start a level's identification flights only when its pilots show:
 
-   ```bash
-   python run.py plan --condition mean_model --fan 6 --output plans/mean_fan6.json
-   python run.py plan --condition pdstl --fan 6 --output plans/pdstl_fan6.json
-   ```
+- the drone hovers steadily at the start before the curve (no bouncing of
+  more than a few cm), and **does not fall** during the curve;
+- cross-track error around 15–25 mm RMS, wobble under about 15 mm;
+- every box at least about 10 cm from the drone's centre;
+- `ctrltarget` vs `r(t)` under 1 cm (the alignment is right).
 
-   Report how much the plans differ: waypoint distance, min clearance and
-   exact scores. This is a **diagnostic, not a gate**. Similar plans can
-   mean the uncertainty is too small to change the decision, the task is
-   easy, or the bound or the optimizer is uninformative. Investigate which
-   one it is, and report it.
-6. **Evaluation flights**: 20 per condition at each of fans 6, 12 and 18
-   (120 in total), alternating the two conditions:
+If the drone falls or bounces at a level, the airflow is too strong or
+too turbulent there (for example in a box's wake): move or aim the fan,
+or lower that level, before collecting data. A drone knocked out of the
+air is not data the model can use.
 
-   ```bash
-   python run.py fly --plan plans/mean_fan6.json --purpose evaluation --fan 6
-   python run.py fly --plan plans/pdstl_fan6.json --purpose evaluation --fan 6
-   ```
+### 2. Identification: 12 completed flights per level
 
-7. **Analyze.** `python run.py analyze` writes `results/summary.md`.
-   Success rates (with Clopper–Pearson intervals) are kept apart from the
-   model scores.
+```bash
+python run.py fly --fan low --purpose identification
+python run.py fit
+```
 
-**Flight counts.** Two fit flights per fan is the software minimum, not
-enough calibration. Plan for at least `model.min_flights_warning` (8) per
-fan before trusting a fit.
+Fly until the level has **12 flights that reached the figure-8**: attempts
+that never started (no connection, start gate, positioning) do not count,
+so just fly again. Run `fit` after each level and read its line: the
+delay, the bias `b`, the stationary spread and the held-out coverage (near
+39 / 86 / 95 %). Every third flight per level is held out. `fit` warns
+below 8 fit flights per level; two is only the software minimum.
 
-Set the physical fan before running `fly`: **0** is off; **6, 12 and 18**
-are the active settings. `--fan` labels the record; it does not operate the
-fan. Pilots, dry runs and unmeasured trials are never fitted. Evaluation
-data never refits the model.
+A flight ruined by the hardware (for example a Lighthouse-deck drop-out)
+can be excluded by writing a reason into its `metadata.json` as
+`"data_readiness"`.
+
+### 3. Plan (offline)
+
+Set `model_report` in `config.yml` to the newest report, then per level:
+
+```bash
+python run.py plan --condition mean_model --fan low --output plans/mean_low.json
+python run.py plan --condition pdstl --fan low --output plans/pdstl_low.json
+```
+
+Check each plan: feasible, threshold met, and how far the waypoints moved
+from the reference. How much the two plans differ is a **diagnostic, not
+a gate**: similar plans can mean the uncertainty is too small to change
+the decision, the task is easy, or the bound or the optimizer is
+uninformative. Investigate which, and report it.
+
+### 4. Evaluation: start only when
+
+- all four levels have their 12 identification flights and `fit` shows
+  coverage near nominal at every level;
+- the six plans (low, medium, high × two conditions) are feasible and
+  reviewed;
+- the arena, boxes and fan placement are unchanged since identification.
+
+Then fly **20 per condition per level**, alternating the two conditions
+(deterministic, pdstl, deterministic, …), with the purpose `evaluation`:
+
+```bash
+python run.py fly --plan plans/mean_low.json --purpose evaluation --fan low
+python run.py fly --plan plans/pdstl_low.json --purpose evaluation --fan low
+```
+
+### 5. Analyze
+
+`python run.py analyze` writes `results/summary.md`: success rates with
+Clopper–Pearson intervals, kept apart from the model scores. Pilots, dry
+runs and unmeasured trials are never fitted, and evaluation data never
+refits the model.
 
 ## Which flights the fit uses
 
@@ -190,7 +221,7 @@ between samples.
 ## Other commands
 
 ```bash
-python run.py fly --fan 0 --dry-run                     # simulated drone
+python run.py fly --fan off --dry-run                   # simulated drone
 python run.py import waypoints.csv --segment 2.0 --output plans/slow.json
 python run.py export plans/reference.json --csv /tmp/reference.csv
 ```

@@ -34,9 +34,7 @@ class TrialLog:
     def __init__(self, metadata, root=LOGS):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         fan_tag = (
-            f"_fan{fan_setting(metadata['fan']):02d}"
-            if "fan" in metadata
-            else ""
+            f"_fan-{fan_setting(metadata['fan'])}" if "fan" in metadata else ""
         )
         self.id = (
             f"{stamp}_{metadata['condition']}{fan_tag}_{metadata['purpose']}"
