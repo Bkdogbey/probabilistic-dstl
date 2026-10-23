@@ -81,8 +81,10 @@ for a new checkout.
    Before any identification flights, check the alignment (the offset of
    `t_play` and whether it was identifiable), the `ctrltarget`-vs-`r(t)`
    residual (well under 1 cm), and the time-aligned and cross-track errors.
-3. **Identification flights** of the reference at fan settings 0, 6, 12
-   and 18.
+3. **Identification flights** of the reference figure-8: 12 completed
+   flights at each fan setting. Fan 0 is the baseline (identification
+   only); fans 6, 12 and 18 are also planned and evaluated. These flights
+   also show how the unadjusted figure-8 does under each fan.
 
    ```bash
    python run.py fly --purpose identification --fan 6
@@ -103,7 +105,9 @@ for a new checkout.
    - the stationary spread per fan.
 
    Set `model_report` in `config.yml` to the report.
-5. **Plan** both conditions per fan:
+5. **Plan** both conditions at fans 6, 12 and 18: deterministic
+   (`mean_model`, the predicted average path only) and `pdstl` (average and
+   spread):
 
    ```bash
    python run.py plan --condition mean_model --fan 6 --output plans/mean_fan6.json
@@ -115,10 +119,10 @@ for a new checkout.
    mean the uncertainty is too small to change the decision, the task is
    easy, or the bound or the optimizer is uninformative. Investigate which
    one it is, and report it.
-6. **Evaluation flights**, in a balanced order with a fixed count:
+6. **Evaluation flights**: 20 per condition at each of fans 6, 12 and 18
+   (120 in total), alternating the two conditions:
 
    ```bash
-   python run.py fly --purpose evaluation --fan 6
    python run.py fly --plan plans/mean_fan6.json --purpose evaluation --fan 6
    python run.py fly --plan plans/pdstl_fan6.json --purpose evaluation --fan 6
    ```
