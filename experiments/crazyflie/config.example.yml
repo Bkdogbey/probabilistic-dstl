@@ -24,4 +24,4 @@ fan: "off"  # "off" (baseline), low, medium, high; quoted: YAML reads off as fal
 
 # Routine defaults are in config.py. Override only what is needed.
 # After the curve: climb above the boxes, fly back over the start, land there.
-flight: {return_height: 0.8}
+flight: {return_height: 0.6}

@@ -226,7 +226,7 @@ def test_a_fault_on_the_way_back_keeps_the_mission_completed(
 ):
     class Lost(SimDrone):
         def go_to(self, x, y, z, yaw, duration):
-            if z == 0.5:
+            if z == cfg.flight.return_height:
                 self.is_connected = False
             super().go_to(x, y, z, yaw, duration)
 
