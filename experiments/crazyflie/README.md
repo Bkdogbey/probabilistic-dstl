@@ -43,7 +43,7 @@ some step.
    not checked in flight: a drone pushed into a box or down by the wind
    keeps flying the curve, and `analyze` scores the failure afterwards.
 5. **Return and land.** The drone climbs to `flight.return_height`
-   (0.5 m, above the boxes), flies back over the start and lands there,
+   (0.8 m, above the boxes and the fan's wake), flies back over the start and lands there,
    ready for the next flight. Ctrl-C during the flight lands in place.
 
 The host time of the `start_trajectory` call is not the firmware's start
