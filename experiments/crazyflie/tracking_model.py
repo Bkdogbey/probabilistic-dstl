@@ -281,12 +281,19 @@ def fit(cfg, trials):
         fan: [flight_positions(t) for t in ts]
         for fan, ts in fit_trials.items()
     }
-    if not flights or min(len(f) for f in flights.values()) < 2:
+    # A level without enough flights yet is skipped, not a reason to stop.
+    warnings = [
+        f"fan {fan}: {len(fs)} fit flights; skipped (needs at least 2)"
+        for fan, fs in flights.items()
+        if len(fs) < 2
+    ]
+    flights = {fan: fs for fan, fs in flights.items() if len(fs) >= 2}
+    if not flights:
         raise ValueError("need at least two fitting flights per fan")
     samples = cfg.model["bootstrap"]
     rng = np.random.default_rng(cfg.model["seed"])
     report = {"dt": cfg.dt, "config_hash": cfg.hash, "fans": {}}
-    warnings, data = [], {}
+    data = {}
     falls = falls_by_fan(trials)
     for fan, fs in flights.items():
         delay = fit_delay(fs)

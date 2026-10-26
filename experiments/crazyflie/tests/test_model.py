@@ -102,6 +102,16 @@ def test_few_flights_warn_and_a_single_flight_is_refused(cfg, synthetic):
         )
 
 
+def test_a_level_with_too_few_flights_is_skipped(cfg, synthetic):
+    cfg = replace(cfg, model={**cfg.model, "bootstrap": 5})
+    flights = synthetic_flights(cfg, 3, np.random.default_rng(1))
+    lone = synthetic_flights(cfg, 1, np.random.default_rng(2))[0]
+    lone["meta"]["fan"] = "high"
+    report = tracking_model.fit(cfg, flights + [lone])
+    assert list(report["fans"]) == ["off"]
+    assert any("fan high" in w and "skipped" in w for w in report["warnings"])
+
+
 def test_clipped_rho_refits_the_intercept_and_the_residuals():
     k = np.arange(40.0)
     # x grows (slope 1.01 > 0.999); y alternates (slope < 0).
