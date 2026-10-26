@@ -40,6 +40,7 @@ REPORTS = HERE / "reports"
 RHO_RANGE = (0.0, 0.999)
 RHO_NEAR_ONE = 0.95  # above this, b = c / (1 - rho) is poorly determined
 P0_FLOOR = 0.01**2  # m^2, on the initial variances
+FLOOR = 0.05  # m, below this the drone is on the floor: a fall
 DELAYS = np.arange(0.0, 1.0 + 1e-9, 0.01)  # s, searched for the delay
 COVERAGE = {
     "d2<=1 (39.3%)": 1.0,
@@ -113,7 +114,7 @@ def identification(trial):
 
 
 def fell(trial):
-    """Did the drone drop below half its flight height during the curve?
+    """Did the drone reach the floor during the curve?
 
     A fall (lost lift, a crash) is reported as its own outcome: a Gaussian
     tracking-error model cannot describe it, and its last samples, often an
@@ -124,7 +125,7 @@ def fell(trial):
         return False
     t = s["t_host"]
     during = (t >= meta["mission_t0"]) & (t <= meta["mission_t_end"])
-    return bool((s["z"][during] < meta["altitude"] / 2).any())
+    return bool((s["z"][during] < FLOOR).any())
 
 
 def usable(trial):

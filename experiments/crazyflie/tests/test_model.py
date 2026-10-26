@@ -158,12 +158,13 @@ def test_task_violations_count_up_to_the_abort_but_falls_and_faults_do_not(
         return {"meta": {**base, **meta}, "state": {"t_host": t, "z": heights}}
 
     fall = trial(
-        z=0.05,
+        z=0.0,
         outcome="aborted",
         mission_outcome="aborted",
         abort_kind="TaskViolation",
     )
     assert tracking_model.fell(fall)
+    assert not tracking_model.fell(trial(z=0.12))  # a sag, not a fall
     assert tracking_model.falls_by_fan([fall, trial()]) == {"off": ["t"]}
 
     kept = [

@@ -158,8 +158,8 @@ excluded. Only flights of the configured reference count, and the return
 after the curve is never part of the mission: the fit and the scores end
 with the curve, and a fault on the way back leaves the mission completed.
 
-**Falls** are reported, not fitted: a flight whose height dropped below
-half the flight altitude during the curve (lost lift, a crash) is left out
+**Falls** are reported, not fitted: a flight that reached the floor (below
+0.05 m) during the curve (lost lift, a crash) is left out
 of the error model, which is Gaussian and cannot describe it. `fit` lists
 the falls per level and the fall rate (falls / flights that reached the
 curve); report the fall rate as its own result.
