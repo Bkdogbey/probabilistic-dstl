@@ -146,7 +146,7 @@ two conditions (deterministic, pdstl, deterministic, …):
 
 ```bash
 python run.py fly --plan plans/reference.json --fan low
-python run.py fly --plan plans/pdstl_low.json --fan low --allow-below-threshold
+python run.py fly --plan plans/pdstl_low.json --fan low
 ```
 
 ### 4. Analyze
