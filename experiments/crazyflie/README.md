@@ -53,25 +53,32 @@ the curve.
 
 ## The model, in plain words
 
-drone position = curve, delayed + bias + a random error.
+drone position = curve, delayed + push + a random error.
 
 With the PID controller the drone trails the uploaded curve by a steady
 delay (about 0.5 s on our drone). The delay is fitted per fan first; the
 error is then measured behind the delayed curve, `e_k = p_k − r(t_k − d)`.
 
-Under the model, the spread of that error settles to a fixed (stationary)
-value instead of growing without limit. Per fan setting, on the 0.2 s grid:
+The **push** `mu_k` is the mean of that error over the fit flights at each
+0.2 s step: the wind's repeatable effect at each place along the arc (at
+high it shoves the drone toward obs_1 and then onto obs_3 on every flight).
+The rest, `x_k = e_k − mu_k`, varies from flight to flight.
+
+Under the model, the spread of the random part settles to a fixed
+(stationary) value instead of growing without limit. Per fan setting, on
+the 0.2 s grid:
 
 ```text
-e[k+1] = R e[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),   w ~ N(0, Q)
+x[k+1] = R x[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),   w ~ N(0, Q)
 ```
 
 This is what the model **assumes**. The held-out coverage checks show
 whether real flights behave this way. `Q` is an *effective* covariance: it
 also absorbs state-estimation error and model mismatch, so it is not pure
-fan noise. The model also assumes that, at a given fan setting, the error
-statistics are the same for every path, so a plan only moves the curve.
-Only flights of other paths can test this.
+fan noise. The model also assumes that, at a given fan setting, the push
+and the random part are the same for every path, so a plan only moves the
+curve. That is reasonable for plans that stay a few centimetres from the
+arc; only flights of other paths can test it.
 
 The simulator generates data from this same model. Simulated flights
 therefore test plumbing and parameter recovery only, never whether the
@@ -90,8 +97,8 @@ with `--plan` is an evaluation flight.
 | Phase | Fan levels | Flights | Purpose |
 | --- | --- | --- | --- |
 | Identification | off, low, medium, high | **12 completed per level** (48) | fit one model per level |
-| Planning (offline) | low, medium, high | 2 plans per level | deterministic (`mean_model`) and `pdstl` |
-| Evaluation | low, medium, high | **20 per condition per level** (120) | compare the two conditions |
+| Planning (offline) | low, medium, high | 1 plan per level | `pdstl` |
+| Evaluation | low, medium, high | **20 per condition per level** (120) | deterministic (the nominal arc, unchanged) vs `pdstl` |
 
 `off` is the baseline: identification only, no plans and no evaluation.
 The identification flights also show how the unadjusted arc does under
@@ -117,7 +124,7 @@ python run.py fit
 Fly until the level has **12 flights that reached the curve**: attempts
 that never started (no connection, start gate, positioning) do not count,
 so just fly again. Run `fit` after each level and read its line: the
-delay, the bias `b`, the stationary spread and the held-out coverage (near
+delay, the largest push, the stationary spread and the held-out coverage (near
 39 / 86 / 95 %). Every third flight per level is held out.
 
 A flight ruined by the hardware (for example a Lighthouse-deck drop-out)
@@ -129,17 +136,17 @@ can be excluded by writing a reason into its `metadata.json` as
 Set `model_report` in `config.yml` to the newest report, then per level:
 
 ```bash
-python run.py plan --condition mean_model --fan low --output plans/mean_low.json
 python run.py plan --condition pdstl --fan low --output plans/pdstl_low.json
 ```
 
 ### 3. Evaluation: 20 per condition per level
 
-Alternate the two conditions (deterministic, pdstl, deterministic, …):
+The deterministic condition flies the nominal arc unchanged. Alternate the
+two conditions (deterministic, pdstl, deterministic, …):
 
 ```bash
-python run.py fly --plan plans/mean_low.json --fan low
-python run.py fly --plan plans/pdstl_low.json --fan low
+python run.py fly --plan plans/reference.json --fan low
+python run.py fly --plan plans/pdstl_low.json --fan low --allow-below-threshold
 ```
 
 ### 4. Analyze

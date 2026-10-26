@@ -205,6 +205,11 @@ def cmd_fit(cfg, args):
             f"b {np.round(f['b'], 4).tolist()} m, "
             f"stationary spread {np.round(f['stationary_spread'], 4).tolist()} m"
         )
+        push = np.linalg.norm(f["push"], axis=1)
+        print(
+            f"    push along the curve: up to {100 * push.max():.1f} cm "
+            f"(at {cfg.dt * push.argmax():.1f} s)"
+        )
         print(
             f"    falls: {len(f['falls'])} "
             f"({100 * f['fall_rate']:.0f}% of flights that reached the curve)"

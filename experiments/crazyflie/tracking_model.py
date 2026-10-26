@@ -4,10 +4,15 @@ The onboard controller flies the uploaded curve r(t), and with PID it
 trails the curve by a steady delay (about 0.5 s). Per fan setting the
 delay d is fitted first, by least squares over the fit flights; on the
 planning grid t_k = t_play + k dt the tracking error behind the delayed
-curve, e_k = p_k - r(t_k - d), is then modelled as
+curve, e_k = p_k - r(t_k - d), is then modelled as a push mu_k, the mean
+error of the fit flights at step k, plus a random part x_k:
 
-    e[k+1] = R e[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),
-    w ~ N(0, Q) (full 2x2),   e[0] ~ N(m0, P0).
+    e_k = mu_k + x_k,
+    x[k+1] = R x[k] + (I - R) b + w[k],   R = diag(rho_x, rho_y),
+    w ~ N(0, Q) (full 2x2),   x[0] ~ N(m0, P0).
+
+The push is the wind's repeatable effect at each place along the curve
+(the same on every flight); x is what varies from flight to flight.
 
 This is an empirical error model, not a physical model of the drone. Q is
 the effective innovation covariance: it also absorbs state-estimation error
@@ -17,9 +22,10 @@ solves P_inf = R P_inf R^T + Q. A Gaussian error still has unbounded
 support. Whether real flights behave this way is what the held-out
 coverage checks test.
 
-Assumption: at a given fan setting the error statistics are the same for
-every candidate path, so a plan only moves r. This is a strong assumption
-that only flights of other paths can test.
+Assumption: at a given fan setting the push at step k and the random part
+are the same for every candidate path, so a plan only moves r. This holds
+for plans that stay a few centimetres from the flown reference; only
+flights of other paths can test it.
 """
 
 from __future__ import annotations
@@ -52,7 +58,7 @@ COVERAGE = {
 class TrackingModel:
     """The error model of one fan setting.
 
-    Beliefs are r(t_k - delay) + m_k with covariance P_k.
+    Beliefs are r(t_k - delay) + mu_k + m_k with covariance P_k.
     """
 
     def __init__(
@@ -66,6 +72,7 @@ class TrackingModel:
         report_id=None,
         report_hash=None,
         delay=0.0,
+        push=None,
     ):
         def tensor(x):
             return torch.as_tensor(np.asarray(x, float), dtype=torch.float64)
@@ -74,9 +81,17 @@ class TrackingModel:
         self.rho, self.b, self.Q = tensor(rho), tensor(b), tensor(Q)
         self.m0, self.P0 = tensor(m0), tensor(P0)
         self.report_id, self.report_hash = report_id, report_hash
+        self.push = None if push is None else tensor(push)
+
+    def push_at(self, n):
+        """The push mu_k [n, 2] of the first n steps; past its end it holds."""
+        if self.push is None:
+            return torch.zeros(n, 2, dtype=torch.float64)
+        last = self.push[-1:].expand(max(n - len(self.push), 0), 2)
+        return torch.cat([self.push, last])[:n]
 
     def error_moments(self, steps):
-        """Error mean m_k [steps+1, 2] and covariance P_k [steps+1, 2, 2]."""
+        """Error mean mu_k + m_k [steps+1, 2] and covariance P_k."""
         R = torch.diag(self.rho)
         m, P = self.m0, self.P0
         means, covs = [m], [P]
@@ -85,7 +100,7 @@ class TrackingModel:
             P = R @ P @ R.T + self.Q
             means.append(m)
             covs.append(P)
-        return torch.stack(means), torch.stack(covs)
+        return torch.stack(means) + self.push_at(steps + 1), torch.stack(covs)
 
     def predict(self, reference):
         """Belief mean r_k + m_k [N, 2] and covariance P_k.
@@ -190,6 +205,14 @@ def errors_at(flight, delay):
     return flight["p"] - minsnap.evaluate(flight["rows"], t)[:, :2]
 
 
+def mean_by_step(errors):
+    """Mean error [K, 2] at each step over the flights that reached it."""
+    steps = max(len(e) for e in errors)
+    return np.array(
+        [np.mean([e[k] for e in errors if k < len(e)], 0) for k in range(steps)]
+    )
+
+
 def fit_delay(flights):
     """The delay [s] that minimizes the spread of the errors of all flights.
 
@@ -272,6 +295,7 @@ def make_model(dt, params, report_id=None, report_hash=None):
         report_id,
         report_hash,
         params.get("delay", 0.0),
+        params.get("push"),
     )
 
 
@@ -298,8 +322,10 @@ def fit(cfg, trials):
     falls = falls_by_fan(trials)
     for fan, fs in flights.items():
         delay = fit_delay(fs)
-        errors = data[fan] = [errors_at(f, delay) for f in fs]
-        params = {**fit_errors(errors), "delay": delay}
+        raw = [errors_at(f, delay) for f in fs]
+        push = mean_by_step(raw)
+        errors = data[fan] = [e - push[: len(e)] for e in raw]
+        params = {**fit_errors(errors), "delay": delay, "push": push}
         if len(errors) < cfg.model["min_flights_warning"]:
             warnings.append(
                 f"fan {fan}: {len(errors)} fit flights; plan for at least "
@@ -393,7 +419,9 @@ def validate(model, errors, samples, rng):
         return [float(value), *map(float, np.percentile(draws, [2.5, 97.5]))]
 
     params = {"rho": model.rho.numpy(), "b": model.b.numpy()}
-    residual = [residuals(params, e) for e in errors]
+    residual = [
+        residuals(params, e - model.push_at(len(e)).numpy()) for e in errors
+    ]
     pooled = np.concatenate(residual)
     centred = [r - pooled.mean(0) for r in residual]
     lag1 = sum((r[:-1] * r[1:]).sum(0) for r in centred) / sum(
