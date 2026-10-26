@@ -7,9 +7,11 @@ curve (`start_trajectory`) and lands in place, or first flies back to the
 start at `flight.return_height` when that is set. The host only monitors the
 mission; every safety decision uses a fresh state packet.
 
-Abort kinds: `TaskViolation` (left the workspace or altitude band: a task
-failure) and `DataFault` (stale state, lost link, failed upload: not a task
-outcome). Either one lands through the high-level commander.
+Abort kinds: `TaskViolation` (left the workspace: a task failure) and
+`DataFault` (stale state, lost link, failed upload: not a task outcome).
+Either one lands through the high-level commander. During the curve the
+height and the boxes are not checked: a drone pushed into a box or down by
+the wind keeps flying, and the analysis scores the failure afterwards.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from minsnap import MAX_PIECES, PIECE_BYTES
 
 logger = logging.getLogger(__name__)
 
-ALTITUDE_AVG_S = 0.25  # s of state averaged for the altitude limit
+ALTITUDE_AVG_S = 0.25  # s, the start gate's recent window
 MONITOR_S = 0.05  # mission check period
 START_HEIGHT_DRIFT = 0.02  # m between the 0.25 s and 1 s mean heights
 # Monitoring continues this long after the curve ends, while the drone holds
@@ -362,19 +364,15 @@ def fly(drone, feed, plan, cfg, log, stop, status):
         # Climb above the boxes where the curve ended, then fly back.
         log.set_phase("return")
         end = plan["waypoints"][-1]
-        _go_to(drone, feed, cfg, stop, [*end, f.return_height], f.takeoff_speed)
+        _go_to(
+            drone, feed, cfg, stop, [*end, f.return_height], f.takeoff_speed
+        )
         _go_to(
             drone, feed, cfg, stop,
             [*plan["start"], f.return_height], f.transit_speed,
         )  # fmt: skip
 
     # Landing and disconnect belong to run_flight's single cleanup path.
-
-
-def mean_altitude(feed, cfg, s):
-    """Altitude averaged over the last ALTITUDE_AVG_S; one reading can spike."""
-    window = feed.window(ALTITUDE_AVG_S, cfg.flight.stale_s)
-    return float(np.mean(window[:, 2])) if window is not None else float(s[2])
 
 
 def mission(drone, feed, cfg, log, stop, duration):
@@ -396,10 +394,7 @@ def mission(drone, feed, cfg, log, stop, duration):
     log.mission_start(t0, state)
     end = t0 + duration + END_HOLD_S
     while time.monotonic() < end:
-        s = _check(drone, feed, cfg)
-        z = mean_altitude(feed, cfg, s)
-        if abs(z - cfg.altitude) > cfg.altitude_tolerance:
-            raise TaskViolation(f"altitude {z:.2f} m")
+        _check(drone, feed, cfg)  # link, fresh state, geofence
         _wait(stop, min(MONITOR_S, end - time.monotonic()))
     log.mission_end(time.monotonic())
 

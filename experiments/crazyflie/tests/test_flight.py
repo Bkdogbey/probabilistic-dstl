@@ -114,24 +114,23 @@ def test_stale_state_mid_trajectory_aborts_and_lands(
     assert "land" in drone.calls and drone.calls[-1] == "disconnect"
 
 
-def test_sustained_altitude_error_is_a_task_violation(
+def test_a_sinking_drone_keeps_flying_and_is_scored_afterwards(
     cfg, tmp_path, short_plan
 ):
+    import tracking_model
+
     class Sinking(SimDrone):
         def _step(self):
             super()._step()
             if self.playback_tick is not None:
                 self.pos[2] -= 0.3
 
-    meta, _, drone = fly_sim(
+    meta, trial, drone = fly_sim(
         cfg, tmp_path, short_plan, Sinking((*cfg.start, 0.0))
     )
-    assert (meta["outcome"], meta["abort_kind"]) == (
-        "aborted",
-        "TaskViolation",
-    )
-    assert "altitude" in meta["abort_reason"] and meta["landing"] == "landed"
-    assert "land" in drone.calls
+    assert meta["outcome"] == meta["mission_outcome"] == "completed"
+    assert drone.calls.count("start_trajectory") == 1
+    assert tracking_model.fell(trial)  # reported as a fall, not fitted
 
 
 def test_stop_request_interrupts_and_lands(cfg, tmp_path, short_plan):
@@ -257,24 +256,6 @@ def gate_verdicts(cfg, position, velocity, seconds=8, seed=0):
         if now[0] > 2:
             out.append(at_start(feed, np.array(cfg.start), cfg))
     return np.array(out)
-
-
-def test_one_altitude_spike_is_ignored_but_a_sustained_error_is_not(cfg):
-    now = [0.0]
-    feed = quiet_feed(now)
-
-    def run(z_at):
-        for k in range(60):
-            now[0] = k / cfg.log_hz
-            z = z_at(k)
-            feed.on_state(k * 50, dict(zip(STATE_VARS, [1, -2, z, 0, 0, 0])))
-        return flight.mean_altitude(feed, cfg, feed.snapshot(1.0))
-
-    tol = cfg.altitude_tolerance
-    spike = run(lambda k: cfg.altitude + (0.35 if k == 59 else 0.0))
-    assert abs(spike - cfg.altitude) < tol  # one bad reading: no abort
-    high = run(lambda k: cfg.altitude + 2 * tol)
-    assert abs(high - cfg.altitude) > tol  # sustained: abort
 
 
 def test_positioning_waits_for_the_first_fresh_state(cfg):
@@ -483,7 +464,9 @@ def test_ros_component_executes_once_without_a_mission_thread(
 
     class Launcher:
         def __init__(self):
-            self.ls = SimpleNamespace(shutdown=lambda: calls.append("shutdown"))
+            self.ls = SimpleNamespace(
+                shutdown=lambda: calls.append("shutdown")
+            )
 
         def add_pkg(self, *, components, activate_all_components_on_start):
             self.component = components[0]

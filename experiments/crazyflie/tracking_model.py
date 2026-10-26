@@ -120,7 +120,7 @@ def fell(trial):
     estimate thrown off by the impact, would only inflate the spread.
     """
     meta, s = trial["meta"], trial.get("state")
-    if meta.get("mission_outcome") != "aborted" or s is None:
+    if "mission_t0" not in meta or s is None:
         return False
     t = s["t_host"]
     during = (t >= meta["mission_t0"]) & (t <= meta["mission_t_end"])

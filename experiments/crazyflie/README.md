@@ -39,8 +39,9 @@ some step.
 3. **Takeoff** where it sits, a straight move to the start, then the
    **start gate** (averaged position, speed and height).
 4. **The onboard controller flies the curve.** The host only monitors it:
-   state freshness, the radio link, the geofence and a trailing 0.25 s
-   altitude mean.
+   state freshness, the radio link and the geofence. Height and boxes are
+   not checked in flight: a drone pushed into a box or down by the wind
+   keeps flying the curve, and `analyze` scores the failure afterwards.
 5. **Return and land.** The drone climbs to `flight.return_height`
    (0.5 m, above the boxes), flies back over the start and lands there,
    ready for the next flight. Ctrl-C during the flight lands in place.
@@ -151,7 +152,7 @@ refits the model.
 ## Which flights the fit uses
 
 Identification flights that completed are used, and so are flights that
-aborted on a `TaskViolation` (up to the abort): dropping large deviations
+aborted on a `TaskViolation` (the geofence, up to the abort): dropping large deviations
 would understate the noise. Data faults, errors and interruptions are
 excluded. Only flights of the configured reference count, and the return
 after the curve is never part of the mission: the fit and the scores end
