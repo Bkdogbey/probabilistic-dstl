@@ -82,11 +82,12 @@ Run everything from this directory. For a new checkout, copy
 `config.example.yml` to `config.yml`.
 
 **Fan levels:** `off` (baseline), `low`, `medium`, `high`. Set the fan by
-hand before each `fly`; `--fan` only labels the record.
+hand before each `fly`; `--fan` only labels the record. A `fly` without
+`--plan` flies the reference and is an identification flight; a `fly`
+with `--plan` is an evaluation flight.
 
 | Phase | Fan levels | Flights | Purpose |
 | --- | --- | --- | --- |
-| Pilots | each level, before its data | 1–3 | check the drone and the airflow |
 | Identification | off, low, medium, high | **12 completed per level** (48) | fit one model per level |
 | Planning (offline) | low, medium, high | 2 plans per level | deterministic (`mean_model`) and `pdstl` |
 | Evaluation | low, medium, high | **20 per condition per level** (120) | compare the two conditions |
@@ -95,41 +96,20 @@ hand before each `fly`; `--fan` only labels the record.
 The identification flights also show how the unadjusted arc does under
 each level.
 
-### Before every session
-
-1. `config.yml` has `measured: true`, and **every box inside the net is
-   listed** under `obstacles` at its measured position. Boxes and fan stay
-   where they are for the whole data collection.
-2. Write down where the fan stands and where it points.
-3. Lighthouse deck firmly seated, propellers undamaged, battery charged.
-   Swap the battery when its **resting** voltage at the start of a flight
-   is below 3.7 V.
-4. In cfclient, hold the drone still: x/y steady to a few mm.
-
-### 1. Pilot at each level (go / no-go)
+Flights run from the ROS environment:
 
 ```bash
-python run.py fly --fan low --purpose pilot
-python run.py analyze --trial latest
+conda activate ros_env && source ~/sugar_ws/install/setup.bash
 ```
 
-Start a level's identification flights only when its pilots show:
+Each `fly` exits by itself after landing. Boxes and fan stay where they
+are for the whole data collection; swap the battery when its resting
+voltage at the start of a flight is below 3.7 V.
 
-- the drone hovers steadily at the start before the curve (no bouncing of
-  more than a few cm), and **does not fall** during the curve;
-- cross-track error around 15–25 mm RMS, wobble under about 15 mm;
-- every box at least about 10 cm from the drone's centre;
-- `ctrltarget` vs `r(t)` under 1 cm (the alignment is right).
-
-If the drone falls or bounces at a level, the airflow is too strong or
-too turbulent there (for example in a box's wake): move or aim the fan,
-or lower that level, before collecting data. A drone knocked out of the
-air is not data the model can use.
-
-### 2. Identification: 12 completed flights per level
+### 1. Identification: 12 completed flights per level
 
 ```bash
-python run.py fly --fan low --purpose identification
+python run.py fly --fan low
 python run.py fit
 ```
 
@@ -137,14 +117,13 @@ Fly until the level has **12 flights that reached the curve**: attempts
 that never started (no connection, start gate, positioning) do not count,
 so just fly again. Run `fit` after each level and read its line: the
 delay, the bias `b`, the stationary spread and the held-out coverage (near
-39 / 86 / 95 %). Every third flight per level is held out. `fit` warns
-below 8 fit flights per level; two is only the software minimum.
+39 / 86 / 95 %). Every third flight per level is held out.
 
 A flight ruined by the hardware (for example a Lighthouse-deck drop-out)
 can be excluded by writing a reason into its `metadata.json` as
 `"data_readiness"`.
 
-### 3. Plan (offline)
+### 2. Plan (offline)
 
 Set `model_report` in `config.yml` to the newest report, then per level:
 
@@ -153,32 +132,19 @@ python run.py plan --condition mean_model --fan low --output plans/mean_low.json
 python run.py plan --condition pdstl --fan low --output plans/pdstl_low.json
 ```
 
-Check each plan: feasible, threshold met, and how far the waypoints moved
-from the reference. How much the two plans differ is a **diagnostic, not
-a gate**: similar plans can mean the uncertainty is too small to change
-the decision, the task is easy, or the bound or the optimizer is
-uninformative. Investigate which, and report it.
+### 3. Evaluation: 20 per condition per level
 
-### 4. Evaluation: start only when
-
-- all four levels have their 12 identification flights and `fit` shows
-  coverage near nominal at every level;
-- the six plans (low, medium, high × two conditions) are feasible and
-  reviewed;
-- the arena, boxes and fan placement are unchanged since identification.
-
-Then fly **20 per condition per level**, alternating the two conditions
-(deterministic, pdstl, deterministic, …), with the purpose `evaluation`:
+Alternate the two conditions (deterministic, pdstl, deterministic, …):
 
 ```bash
-python run.py fly --plan plans/mean_low.json --purpose evaluation --fan low
-python run.py fly --plan plans/pdstl_low.json --purpose evaluation --fan low
+python run.py fly --plan plans/mean_low.json --fan low
+python run.py fly --plan plans/pdstl_low.json --fan low
 ```
 
-### 5. Analyze
+### 4. Analyze
 
 `python run.py analyze` writes `results/summary.md`: success rates with
-Clopper–Pearson intervals, kept apart from the model scores. Pilots, dry
+Clopper–Pearson intervals, kept apart from the model scores. Dry
 runs and unmeasured trials are never fitted, and evaluation data never
 refits the model.
 

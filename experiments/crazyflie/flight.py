@@ -497,7 +497,7 @@ def run_flight(cfg, plan, log, stop=None, connect_fn=None):
 
 
 def launch(cfg, plan, log, connect_fn=None):
-    """Execute one mission in ROS Sugar, then idle until Ctrl-C."""
+    """Execute one mission in ROS Sugar, then shut the launcher down."""
     from ros_sugar import Launcher
     from ros_sugar.core import BaseComponent
 
@@ -517,11 +517,11 @@ def launch(cfg, plan, log, connect_fn=None):
                 self.result = run_flight(cfg, plan, log, self.stop, connect_fn)
                 print(
                     f"Flight {self.result['outcome']}; cleanup finished "
-                    f"(landing: {self.result.get('landing', 'not airborne')}). "
-                    "Ctrl-C to exit."
+                    f"(landing: {self.result.get('landing', 'not airborne')})."
                 )
             finally:
                 self.finished.set()
+                launcher.ls.shutdown()
 
         def _execution_step(self):
             pass

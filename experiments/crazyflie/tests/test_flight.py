@@ -482,6 +482,9 @@ def test_ros_component_executes_once_without_a_mission_thread(
             pass
 
     class Launcher:
+        def __init__(self):
+            self.ls = SimpleNamespace(shutdown=lambda: calls.append("shutdown"))
+
         def add_pkg(self, *, components, activate_all_components_on_start):
             self.component = components[0]
 
@@ -508,4 +511,4 @@ def test_ros_component_executes_once_without_a_mission_thread(
 
     monkeypatch.setattr(flight.threading, "Thread", no_worker)
     assert flight.launch(cfg, {}, None)["outcome"] == "completed"
-    assert len(calls) == 1
+    assert len(calls) == 2 and calls[1] == "shutdown"  # exits after one flight

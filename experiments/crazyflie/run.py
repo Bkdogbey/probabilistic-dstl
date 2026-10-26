@@ -1,9 +1,10 @@
 """Crazyflie experiment: fly an uploaded min-snap curve, fit, plan, analyze.
 
-python run.py fly --fan off
-python run.py analyze --trial latest
+python run.py fly --fan low                                  # identification
 python run.py fit
 python run.py plan --condition pdstl --fan low --output plans/pdstl_low.json
+python run.py fly --plan plans/pdstl_low.json --fan low      # evaluation
+python run.py analyze
 python run.py export plans/reference.json --csv /tmp/reference.csv
 
 The configured reference is already registered. Use import only for a new
@@ -140,6 +141,8 @@ def cmd_fly(cfg, args):
     from flight import launch, run_flight
 
     path, plan = select_plan(cfg, args)
+    # The reference is flown for identification, a model plan for evaluation.
+    purpose = "evaluation" if args.plan else "identification"
     cfg = cfg.for_plan(plan)
     if not args.dry_run and (missing := missing_flight_stack()):
         print("Cannot fly from this Python environment; missing:")
@@ -148,7 +151,7 @@ def cmd_fly(cfg, args):
 
     dry = " [DRY RUN]" if args.dry_run else ""
     print(
-        f"{plan['id']} ({plan['condition']}), purpose {args.purpose}, "
+        f"{plan['id']} ({plan['condition']}), purpose {purpose}, "
         f"fan {args.fan}{dry}"
     )
     print(describe(plan, path))
@@ -156,7 +159,7 @@ def cmd_fly(cfg, args):
         cfg,
         plan,
         path,
-        purpose=args.purpose,
+        purpose=purpose,
         fan=args.fan,
         dry_run=args.dry_run,
         note=args.note,
@@ -261,11 +264,6 @@ def main(argv=None):
     p.add_argument("--output", help="optional saved plan filename")
     f = sub.add_parser("fly", help="upload and fly a saved curve")
     f.add_argument("--plan", help="saved file; default: configured reference")
-    f.add_argument(
-        "--purpose",
-        choices=("pilot", "identification", "evaluation"),
-        default="pilot",
-    )
     f.add_argument(
         "--fan",
         choices=config.FAN_SETTINGS,
