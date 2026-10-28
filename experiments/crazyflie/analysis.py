@@ -21,6 +21,7 @@ from flight import MONITOR_S
 from logger import logged_time, playback_time, state_times
 from matplotlib.patches import Ellipse, Rectangle
 from scipy.stats import beta
+from tracking_model import fell
 from trajectory import PLANS, condition_name, file_hash
 
 RESULTS = HERE / "results"
@@ -55,6 +56,10 @@ def evaluate(trial, task):
 
     Completed flights and aborts for a task violation count; data faults,
     errors, interruptions and preflight aborts are excluded with a reason.
+    Success is the planned task: the curve completed, inside the workspace,
+    clear of every box by the airframe radius, the goal reached. Height is
+    not planned, so it is reported beside success (`height_held`, `fell`),
+    as is the centre's distance to the measured boxes (`box_distance`).
     """
     meta = trial["meta"]
     if meta.get("purpose") in ("identification", "evaluation") and meta.get(
@@ -79,13 +84,15 @@ def evaluate(trial, task):
     windows = [(s["t_host"] >= t - window) & (s["t_host"] <= t) for t in ticks]
     altitude = np.array([s["z"][w].mean() for w in windows if w.any()])
     error = np.abs(altitude - meta["altitude"])
-    met["altitude"] = bool(
-        len(altitude) and np.all(error <= meta["altitude_tolerance"])
-    )
     return {
         "success": outcome == "completed" and all(met.values()),
         "requirements": met,
+        "height_held": bool(
+            len(altitude) and np.all(error <= meta["altitude_tolerance"])
+        ),
+        "fell": fell(trial),
         "min_clearance": float(task.clearance(xyz[:, :2]).min()),
+        "box_distance": float(task.box_distance(xyz[:, :2]).min()),
     }
 
 
@@ -111,9 +118,10 @@ def summarize(trials, task):
             groups[key].append(trial)
     header = (
         "| condition | fan | success | 95% CI | failed requirements "
+        "| height held | falls | centre outside the boxes "
         "| planned exact score (model) | excluded |"
     )
-    lines = [header, "|" + "---|" * 7]
+    lines = [header, "|" + "---|" * 10]
     for (condition, fan), group in sorted(groups.items()):
         results = [evaluate(t, task) for t in group]
         counted = [r for r in results if "excluded" not in r]
@@ -128,7 +136,11 @@ def summarize(trials, task):
         score = "-" if score is None else f"{score:.3f}"
         lines.append(
             f"| {condition} | {fan} | {k}/{n} | [{low:.2f}, {high:.2f}] "
-            f"| {failed or '-'} | {score} | {len(results) - n} |"
+            f"| {failed or '-'} "
+            f"| {sum(r['height_held'] for r in counted)}/{n} "
+            f"| {sum(r['fell'] for r in counted)}/{n} "
+            f"| {sum(r['box_distance'] > 0 for r in counted)}/{n} "
+            f"| {score} | {len(results) - n} |"
         )
     RESULTS.mkdir(exist_ok=True)
     (RESULTS / "summary.md").write_text("\n".join(lines) + "\n")
@@ -256,7 +268,9 @@ def check_trial(trial, task, cfg):
     if "excluded" not in result:
         print(
             f"  requirements {result['requirements']}, "
-            f"min clearance {result['min_clearance']:.3f} m"
+            f"min clearance {result['min_clearance']:.3f} m\n"
+            f"  height held {result['height_held']}, fell {result['fell']}, "
+            f"centre to the nearest box {result['box_distance']:.3f} m"
         )
 
     # Height from takeoff to landing only: the estimator reset on the ground

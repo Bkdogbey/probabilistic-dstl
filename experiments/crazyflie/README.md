@@ -152,7 +152,14 @@ python run.py fly --plan plans/pdstl_low.json --fan low
 ### 4. Analyze
 
 `python run.py analyze` writes `results/summary.md`: success rates with
-Clopper–Pearson intervals, kept apart from the model scores. Dry
+Clopper–Pearson intervals, kept apart from the model scores.
+
+**Success** is the planned task: the curve flown to its end, the drone's
+centre at least 7 cm (the airframe radius) inside the workspace and away
+from every box, and the goal reached. Height is not planned, so it is
+reported beside success, not in it: *height held* (the 0.25 s mean within
+0.30 ± 0.20 m throughout), *falls* (below 0.05 m) and *centre outside the
+boxes* (the measured boxes, no margin: no physical overlap). Dry
 runs and unmeasured trials are never fitted, and evaluation data never
 refits the model.
 

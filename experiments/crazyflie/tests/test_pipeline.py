@@ -158,6 +158,7 @@ def test_evaluate_scores_each_requirement(cfg):
     task = Task(cfg)
     result = analysis.evaluate(recorded(cfg, reference_path(cfg)), task)
     assert result["success"] and result["min_clearance"] > 0
+    assert result["box_distance"] > result["min_clearance"]  # no margin
 
     bad = np.linspace([0.5, -1.75], [2.5, -1.75], 480)  # leaves, no goal
     result = analysis.evaluate(recorded(cfg, bad), task)
@@ -177,15 +178,17 @@ def test_abort_boundary_excludes_landing_from_mission_metrics(cfg):
     trial["state"]["z"][after] = 0.0
     result = analysis.evaluate(trial, Task(cfg))
     assert not result["success"] and not result["requirements"]["goal"]
-    assert result["min_clearance"] > 0 and result["requirements"]["altitude"]
+    assert result["min_clearance"] > 0 and result["height_held"]
 
 
-def test_altitude_scoring_uses_the_same_average_as_execution(cfg):
+def test_height_is_reported_beside_success_not_in_it(cfg):
     trial = recorded(cfg, reference_path(cfg))
     trial["state"]["z"][40] = cfg.altitude + 0.35
-    assert analysis.evaluate(trial, Task(cfg))["success"]
-    trial["state"]["z"][40:60] = cfg.altitude + 0.35
-    assert not analysis.evaluate(trial, Task(cfg))["requirements"]["altitude"]
+    assert analysis.evaluate(trial, Task(cfg))["height_held"]
+    trial["state"]["z"][40:60] = 0.0  # a dip to the floor, then regained
+    result = analysis.evaluate(trial, Task(cfg))
+    assert not result["height_held"] and result["fell"]
+    assert result["success"]
 
 
 @pytest.mark.parametrize("setting", ["off", "low", "medium", "high"])

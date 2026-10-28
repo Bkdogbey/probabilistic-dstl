@@ -23,6 +23,7 @@ class Task:
     def __init__(self, cfg):
         r = cfg.airframe_radius
         self.workspace = cfg.workspace.grown(-r)
+        self.boxes = cfg.obstacles  # as measured, for contact
         self.obstacles = [box.grown(r) for box in cfg.obstacles]
         self.goal = cfg.goal
         self.steps = cfg.steps
@@ -54,6 +55,11 @@ class Task:
             [walls, *(_box_distance(xy, box) for box in self.obstacles)],
             axis=0,
         )
+
+    def box_distance(self, xy):
+        """Centre distance [m] to the nearest measured box; < 0 inside one."""
+        xy = np.asarray(xy, dtype=float)
+        return np.min([_box_distance(xy, box) for box in self.boxes], axis=0)
 
     def requirements(self, path):
         """Each requirement on a path [N, 2] from its start: met or not."""
