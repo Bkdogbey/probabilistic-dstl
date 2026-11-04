@@ -546,8 +546,8 @@
  "model_hash": null,
  "problems": [],
  "feasible": true,
- "min_clearance": 0.053235922404117716,
- "execution_hash": "ba20e6e2787a",
+ "min_clearance": 0.058897807332055886,
+ "execution_hash": "d7ee00ff4480",
  "source": "/home/bennett/Research/probabilistic-dstl/experiments/crazyflie/plans/reference.csv",
  "source_hash": "649da1162fd9",
  "method": "min-snap, degree 7, through the supplied waypoints"

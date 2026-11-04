@@ -8,7 +8,7 @@ airframe_radius: 0.07  # obstacles grow and walls move in by this
 workspace: {x: [-0.5, 1.5], y: [-2.5, 0.0]}  # inside the net; y <= 0 keeps (0, 0) out
 obstacles:  # measured boxes, all taller than the flight height
   - {name: obs_4, x: [0.46, 0.60], y: [-1.59, -1.30], height: 0.31}
-  - {name: obs_3, x: [0.0, 0.29], y: [-0.508, -0.305], height: 0.4191}  # y 12-20 in
+  - {name: obs_3, x: [-0.03, 0.26], y: [-0.508, -0.305], height: 0.4191}  # y 12-20 in; x remeasured 2026-11-04
   - {name: obs_1, x: [0.572, 0.876], y: [-0.892, -0.635], height: 0.41}  # x 22.5-34.5 in, y 25-35 1/8 in
 goal: {x: [0.54, 0.84], y: [-0.37, -0.07]}  # around the arc's end
 
