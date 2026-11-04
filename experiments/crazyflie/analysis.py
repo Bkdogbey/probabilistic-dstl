@@ -22,7 +22,7 @@ from logger import logged_time, playback_time, state_times
 from matplotlib.patches import Ellipse, Rectangle
 from scipy.stats import beta
 from tracking_model import fell
-from trajectory import PLANS, condition_name, file_hash
+from trajectory import PLANS, condition_name
 
 RESULTS = HERE / "results"
 ALIGNMENT_FLAG_M = 0.01  # max ctrltarget-vs-r residual worth investigating
@@ -97,15 +97,21 @@ def evaluate(trial, task):
 
 
 def _plan(meta):
+    """The saved plan whose curve this flight flew, or None.
+
+    Matched by the curve, not the file: re-checking a plan against a
+    corrected arena rewrites its file but not its curve.
+    """
     path = Path(meta.get("plan_path", PLANS / f"{meta['plan_id']}.json"))
     if not path.exists():
         # Recorded files can be moved to another machine.
         path = PLANS / f"{meta['plan_id']}.json"
-    if not path.exists() or (
-        meta.get("plan_hash") and file_hash(path) != meta["plan_hash"]
-    ):
+    if not path.exists():
         return None
-    return json.loads(path.read_text())
+    plan = json.loads(path.read_text())
+    if plan["coefficients"] != meta["coefficients"]:
+        return None
+    return plan
 
 
 def summarize(trials, task):

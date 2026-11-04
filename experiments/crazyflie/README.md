@@ -20,9 +20,9 @@ The arena is in `config.yml`: workspace x [−0.5, 1.5], y [−2.5, 0.0]
 (it must stay inside the net, and y ≤ 0 keeps (0, 0), where the estimate
 settles without Lighthouse fixes, outside it) and three measured boxes, all taller than
 the flight height. obs_4 sits inside the arc next to the start; the arc
-then passes between obs_1 and obs_3, where the gap leaves about 14 cm
-after the 7 cm airframe radius. Clearance beyond the airframe: obs_3
-5.3 cm, obs_1 5.9 cm, obs_4 9.4 cm.
+then passes between obs_1 and obs_3, where the gap leaves about 18 cm
+after the 6.5 cm airframe radius (the measured prop-tip radius).
+Clearance beyond the airframe: obs_3 8.5 cm, obs_1 6.6 cm, obs_4 10.1 cm.
 
 The task is: stay in the workspace, avoid obstacles, and reach the goal at
 some step.
@@ -155,7 +155,7 @@ python run.py fly --plan plans/pdstl_low.json --fan low
 Clopper–Pearson intervals, kept apart from the model scores.
 
 **Success** is the planned task: the curve flown to its end, the drone's
-centre at least 7 cm (the airframe radius) inside the workspace and away
+centre at least 6.5 cm (the airframe radius) inside the workspace and away
 from every box, and the goal reached. Height is not planned, so it is
 reported beside success, not in it: *height held* (the 0.25 s mean within
 0.30 ± 0.20 m throughout), *falls* (below 0.05 m) and *centre outside the

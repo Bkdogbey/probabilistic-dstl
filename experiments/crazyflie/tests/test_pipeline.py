@@ -99,7 +99,7 @@ def test_explicit_selection_never_chooses_newest(cfg, tmp_path):
         run.select_plan(cfg, args)
 
 
-def test_recorded_plan_is_portable_and_hash_checked(
+def test_recorded_plan_is_portable_and_matched_by_its_curve(
     cfg, tmp_path, monkeypatch
 ):
     path = tmp_path / "reference.json"
@@ -108,13 +108,14 @@ def test_recorded_plan_is_portable_and_hash_checked(
     meta = {
         "plan_id": "reference",
         "plan_path": "/missing/reference.json",
-        "plan_hash": file_hash(path),
+        "coefficients": reference_plan(cfg)["coefficients"],
     }
     assert (
         analysis._plan(meta)["coefficients"]
         == reference_plan(cfg)["coefficients"]
     )
-    assert analysis._plan({**meta, "plan_hash": "different"}) is None
+    moved = np.asarray(meta["coefficients"]) + 0.01
+    assert analysis._plan({**meta, "coefficients": moved.tolist()}) is None
 
 
 def recorded(cfg, path, outcome="completed"):
