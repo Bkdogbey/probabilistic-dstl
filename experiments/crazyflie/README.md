@@ -20,8 +20,8 @@ The arena is in `config.yml`: workspace x [−0.5, 1.5], y [−2.5, 0.0]
 (it must stay inside the net, and y ≤ 0 keeps (0, 0), where the estimate
 settles without Lighthouse fixes, outside it) and three measured boxes, all taller than
 the flight height. obs_4 sits inside the arc next to the start; the arc
-then passes between obs_1 and obs_3, where the gap leaves about 18 cm
-after the 6.5 cm airframe radius (the measured prop-tip radius).
+then passes between obs_1 and obs_3, where the gap leaves about 21 cm
+(corner to corner) after the 6.5 cm airframe radius (the measured prop-tip radius).
 Clearance beyond the airframe: obs_3 8.5 cm, obs_1 6.6 cm, obs_4 10.1 cm.
 
 The task is: stay in the workspace, avoid obstacles, and reach the goal at
