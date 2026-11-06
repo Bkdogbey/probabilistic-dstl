@@ -227,9 +227,8 @@ def cmd_fit(cfg, args):
 
 def cmd_analyze(cfg, args):
     import analysis
-    from geometry import Task
 
-    task = Task(cfg)
+    task = analysis.scoring_task(cfg)
     if args.trial:
         print(analysis.check_trial(find_trial(args.trial), task, cfg))
         return

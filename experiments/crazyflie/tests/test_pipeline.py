@@ -159,7 +159,6 @@ def test_evaluate_scores_each_requirement(cfg):
     task = Task(cfg)
     result = analysis.evaluate(recorded(cfg, reference_path(cfg)), task)
     assert result["success"] and result["min_clearance"] > 0
-    assert result["box_distance"] > result["min_clearance"]  # no margin
 
     bad = np.linspace([0.5, -1.75], [2.5, -1.75], 480)  # leaves, no goal
     result = analysis.evaluate(recorded(cfg, bad), task)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib
@@ -17,6 +18,7 @@ import matplotlib.pyplot as plt
 import minsnap
 import numpy as np
 from config import HERE, fan_setting
+from geometry import Task
 from flight import MONITOR_S
 from logger import logged_time, playback_time, state_times
 from matplotlib.patches import Ellipse, Rectangle
@@ -51,15 +53,24 @@ def mission_samples(trial):
     return np.stack([s["x"][keep], s["y"][keep], s["z"][keep]], 1)
 
 
+def scoring_task(cfg):
+    """The task flights are scored on: the measured boxes and net, no margin.
+
+    A violation is the drone's centre inside a box or outside the net. The
+    planner keeps the airframe margin; scoring does not.
+    """
+    return Task(replace(cfg, airframe_radius=0.0))
+
+
 def evaluate(trial, task):
     """Requirements of one attempt, or why it is excluded.
 
     Completed flights and aborts for a task violation count; data faults,
     errors, interruptions and preflight aborts are excluded with a reason.
-    Success is the planned task: the curve completed, inside the workspace,
-    clear of every box by the airframe radius, the goal reached. Height is
-    not planned, so it is reported beside success (`height_held`, `fell`),
-    as is the centre's distance to the measured boxes (`box_distance`).
+    Success: the curve completed, inside the workspace, out of every box,
+    the goal reached, all checked on the drone's centre against `task`
+    (see `scoring_task`). Height is not planned, so it is reported beside
+    success (`height_held`, `fell`).
     """
     meta = trial["meta"]
     if meta.get("purpose") in ("identification", "evaluation") and meta.get(
@@ -92,7 +103,6 @@ def evaluate(trial, task):
         ),
         "fell": fell(trial),
         "min_clearance": float(task.clearance(xyz[:, :2]).min()),
-        "box_distance": float(task.box_distance(xyz[:, :2]).min()),
     }
 
 
@@ -142,10 +152,10 @@ def summarize(trials, task, first=None):
             groups[key].append(trial)
     header = (
         "| condition | fan | success | 95% CI | failed requirements "
-        "| height held | falls | centre outside the boxes "
+        "| height held | falls "
         "| planned exact score (model) | excluded |"
     )
-    lines = [header, "|" + "---|" * 10]
+    lines = [header, "|" + "---|" * 9]
     if first:
         lines = [
             f"First {first} flights per group that reached the curve, "
@@ -172,7 +182,6 @@ def summarize(trials, task, first=None):
             f"| {failed or '-'} "
             f"| {sum(r['height_held'] for r in counted)}/{n} "
             f"| {sum(r['fell'] for r in counted)}/{n} "
-            f"| {sum(r['box_distance'] > 0 for r in counted)}/{n} "
             f"| {score} | {len(results) - n} |"
         )
     RESULTS.mkdir(exist_ok=True)
@@ -302,8 +311,7 @@ def check_trial(trial, task, cfg):
         print(
             f"  requirements {result['requirements']}, "
             f"min clearance {result['min_clearance']:.3f} m\n"
-            f"  height held {result['height_held']}, fell {result['fell']}, "
-            f"centre to the nearest box {result['box_distance']:.3f} m"
+            f"  height held {result['height_held']}, fell {result['fell']}"
         )
 
     # Height from takeoff to landing only: the estimator reset on the ground

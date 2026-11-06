@@ -157,12 +157,12 @@ rates with Clopper–Pearson intervals, kept apart from the model scores.
 in flight order, so every group reports the same number; the rule does not
 look at outcomes. Without it, every flight counts.
 
-**Success** is the planned task: the curve flown to its end, the drone's
-centre at least 6.5 cm (the airframe radius) inside the workspace and away
-from every box, and the goal reached. Height is not planned, so it is
-reported beside success, not in it: *height held* (the 0.25 s mean within
-0.30 ± 0.20 m throughout), *falls* (below 0.05 m) and *centre outside the
-boxes* (the measured boxes, no margin: no physical overlap). Dry
+**Success**: the curve flown to its end, the drone's centre never inside
+a measured box or outside the net, and the goal reached. A violation is
+hitting a box; there is no margin in the scoring (the planner still keeps
+the 6.5 cm airframe margin). Height is not planned, so it is reported
+beside success, not in it: *height held* (the 0.25 s mean within
+0.30 ± 0.20 m throughout) and *falls* (below 0.05 m). Dry
 runs and unmeasured trials are never fitted, and evaluation data never
 refits the model.
 

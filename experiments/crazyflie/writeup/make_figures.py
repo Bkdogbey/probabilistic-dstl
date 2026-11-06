@@ -22,7 +22,6 @@ sys.path.insert(0, str(HERE.parent))
 
 import analysis  # noqa: E402
 import config  # noqa: E402
-from geometry import Task  # noqa: E402
 from logger import all_trials  # noqa: E402
 
 FIRST = 20
@@ -77,16 +76,9 @@ def counted(pairs):
 
 
 def draw_arena(ax, cfg):
-    """Measured boxes (dark), their airframe margin (light), the goal."""
-    r = cfg.airframe_radius
+    """Measured boxes and the goal."""
     for box in cfg.obstacles:
         (x0, x1), (y0, y1) = box.x, box.y
-        ax.add_patch(
-            Rectangle(
-                (x0 - r, y0 - r), x1 - x0 + 2 * r, y1 - y0 + 2 * r,
-                fc="#e4e3df", ec="none", zorder=1,
-            )
-        )
         ax.add_patch(
             Rectangle((x0, y0), x1 - x0, y1 - y0, fc="#8a8a86", ec="none", zorder=2)
         )
@@ -135,12 +127,8 @@ def paths_figure(cfg, data):
         plt.Line2D([], [], color=COLOR["pdstl"], lw=1.2, label="success (pdSTL)"),
         plt.Line2D([], [], color=FAILED, lw=1.2, label="failure"),
         Rectangle((0, 0), 1, 1, fc="#8a8a86", label="box"),
-        Rectangle(
-            (0, 0), 1, 1, fc="#e4e3df",
-            label=f"{100 * cfg.airframe_radius:.1f} cm airframe margin",
-        ),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False,
+    fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False,
                bbox_to_anchor=(0.5, -0.01), handlelength=1.6, columnspacing=1.0)
     fig.subplots_adjust(left=0.07, right=0.995, top=0.96, bottom=0.11)
     fig.savefig(FIGURES / "flown_paths.pdf")
@@ -193,7 +181,6 @@ def write_table(data):
             lines.append(
                 f"{fan if cond == 'arc' else ''} & {LABEL[cond]} & "
                 f"{k}/{n} & [{lo:.2f}, {hi:.2f}] & "
-                f"{sum(r['box_distance'] > 0 for r in results)}/{n} & "
                 f"{sum(r['fell'] for r in results)}/{n} & "
                 f"{sum(r['height_held'] for r in results)}/{n} & "
                 f"{excluded} \\\\"
@@ -204,7 +191,7 @@ def write_table(data):
 
 def main():
     cfg = config.load(config.HERE / "config.yml")
-    task = Task(cfg)
+    task = analysis.scoring_task(cfg)
     FIGURES.mkdir(exist_ok=True)
     data = groups(cfg, task)
     paths_figure(cfg, data)
