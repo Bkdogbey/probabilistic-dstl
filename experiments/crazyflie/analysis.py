@@ -114,8 +114,26 @@ def _plan(meta):
     return plan
 
 
-def summarize(trials, task):
-    """Evaluation flights per condition x fan -> results/summary.md."""
+def first_counted(results, first):
+    """Results in flight order up to the `first`-th counted one.
+
+    Attempts excluded before it stay in, so the excluded count matches.
+    """
+    kept, counted = [], 0
+    for r in results:
+        if counted == first:
+            break
+        kept.append(r)
+        counted += "excluded" not in r
+    return kept
+
+
+def summarize(trials, task, first=None):
+    """Evaluation flights per condition x fan -> results/summary.md.
+
+    With `first`, each group keeps its first `first` flights that reached
+    the curve, in flight order: a rule fixed before looking at outcomes.
+    """
     groups = defaultdict(list)
     for trial in trials:
         meta = trial["meta"]
@@ -128,8 +146,17 @@ def summarize(trials, task):
         "| planned exact score (model) | excluded |"
     )
     lines = [header, "|" + "---|" * 10]
+    if first:
+        lines = [
+            f"First {first} flights per group that reached the curve, "
+            "in flight order.",
+            "",
+            *lines,
+        ]
     for (condition, fan), group in sorted(groups.items()):
         results = [evaluate(t, task) for t in group]
+        if first:
+            results = first_counted(results, first)
         counted = [r for r in results if "excluded" not in r]
         k, n = sum(r["success"] for r in counted), len(counted)
         low, high = clopper_pearson(k, n) if n else (np.nan, np.nan)

@@ -171,6 +171,17 @@ def test_evaluate_scores_each_requirement(cfg):
     assert analysis.evaluate(excluded, task) == {"excluded": "state stale"}
 
 
+def test_first_counted_keeps_flight_order_and_earlier_exclusions():
+    results = [
+        {"success": True},
+        {"excluded": "no connection"},
+        {"success": False},
+        {"success": True},
+    ]
+    assert analysis.first_counted(results, 2) == results[:3]
+    assert analysis.first_counted(results, 9) == results
+
+
 def test_abort_boundary_excludes_landing_from_mission_metrics(cfg):
     trial = recorded(cfg, reference_path(cfg), outcome="aborted")
     trial["meta"].update(abort_kind="TaskViolation", mission_t_end=1.0)

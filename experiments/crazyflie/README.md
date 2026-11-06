@@ -151,8 +151,11 @@ python run.py fly --plan plans/pdstl_low.json --fan low
 
 ### 4. Analyze
 
-`python run.py analyze` writes `results/summary.md`: success rates with
-Clopper–Pearson intervals, kept apart from the model scores.
+`python run.py analyze --first 20` writes `results/summary.md`: success
+rates with Clopper–Pearson intervals, kept apart from the model scores.
+`--first 20` keeps each group's first 20 flights that reached the curve,
+in flight order, so every group reports the same number; the rule does not
+look at outcomes. Without it, every flight counts.
 
 **Success** is the planned task: the curve flown to its end, the drone's
 centre at least 6.5 cm (the airframe radius) inside the workspace and away

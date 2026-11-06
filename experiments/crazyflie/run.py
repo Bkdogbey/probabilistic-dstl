@@ -4,7 +4,7 @@ python run.py fly --fan low                                  # identification
 python run.py fit
 python run.py plan --condition pdstl --fan low --output plans/pdstl_low.json
 python run.py fly --plan plans/pdstl_low.json --fan low      # evaluation
-python run.py analyze
+python run.py analyze --first 20
 python run.py export plans/reference.json --csv /tmp/reference.csv
 
 The configured reference is already registered. Use import only for a new
@@ -234,7 +234,7 @@ def cmd_analyze(cfg, args):
         print(analysis.check_trial(find_trial(args.trial), task, cfg))
         return
     trials = scenario_trials(cfg)
-    analysis.summarize(trials, task)
+    analysis.summarize(trials, task, args.first)
     print((analysis.RESULTS / "summary.md").read_text())
 
 
@@ -281,6 +281,11 @@ def main(argv=None):
     a = sub.add_parser("analyze", help="score and plot recorded flights")
     a.add_argument(
         "--trial", help='trial id, a unique part of it, or "latest"'
+    )
+    a.add_argument(
+        "--first",
+        type=int,
+        help="keep each group's first N flights that reached the curve",
     )
     args = parser.parse_args(argv)
 
