@@ -208,13 +208,32 @@ def _top(cfg, beliefs, margin=0.45):
     return min(room, max(highest, goal) + margin)
 
 
+def _even_ticks(limits, step=2):
+    """Ticks every `step` metres, on multiples of `step`, inside `limits`."""
+    lo = step * np.ceil(limits[0] / step)
+    return np.arange(lo, limits[1] + 1e-9, step)
+
+
+def _bottom(cfg, beliefs, margin=0.35):
+    """Lower y limit: the lowest drawn mark minus `margin`, inside the room.
+
+    Below the plans only the floor block remains, so it can be cut too.
+    """
+    radius = np.sqrt(-2 * np.log(1 - CONFIDENCE))
+    lowest = min(
+        float(np.min(mean[:, 1] - radius * np.sqrt(cov[:, 1, 1])))
+        for mean, cov in beliefs.values()
+    )
+    return max(cfg["bounds"]["y_range"][0], lowest - margin)
+
+
 def _style_axes(ax, xlim, ylim, first, last):
     """Ticks every 2 m; only the last panel labels the right wall, so the
     labels of neighbouring panels do not meet."""
     ax.set(xlim=xlim, ylim=ylim, aspect="equal")
-    xticks = np.arange(xlim[0], xlim[1] + 1e-9, 2)
+    xticks = _even_ticks(xlim)
     ax.set_xticks(xticks if last else xticks[xticks < xlim[1]])
-    ax.set_yticks(np.arange(ylim[0], ylim[1] + 1e-9, 2))
+    ax.set_yticks(_even_ticks(ylim))
     for spine in ax.spines.values():
         spine.set_visible(False)
     ax.tick_params(labelsize=PAPER_FONT, length=2, pad=1, color="0.4")
@@ -223,6 +242,15 @@ def _style_axes(ax, xlim, ylim, first, last):
         ax.set_ylabel("y (m)", fontsize=PAPER_FONT, labelpad=1)
     else:
         ax.tick_params(labelleft=False)
+
+
+def _legend_handles():
+    return [
+        Line2D([], [], lw=1.4, label="pdSTL", **METHOD_STYLE["pdstl"]),
+        Patch(fc=METHOD_STYLE["pdstl"]["color"], alpha=0.25, label="95% CI"),
+        Line2D([], [], lw=1.4, label="STLCG", **METHOD_STYLE["stlcg"]),
+        *_region_handles(),
+    ]
 
 
 def _region_handles():
@@ -289,16 +317,7 @@ def plot_risk_aversion(
                 fontsize=PAPER_FONT,
                 pad=1.5,
             )
-        handles = [
-            Line2D([], [], lw=1.4, label="pdSTL", **METHOD_STYLE["pdstl"]),
-            Patch(
-                fc=METHOD_STYLE["pdstl"]["color"],
-                alpha=0.25,
-                label="95% CI",
-            ),
-            Line2D([], [], lw=1.4, label="STLCG", **METHOD_STYLE["stlcg"]),
-            *_region_handles(),
-        ]
+        handles = _legend_handles()
         fig.legend(
             handles=handles,
             loc="upper center",
@@ -310,6 +329,88 @@ def plot_risk_aversion(
             columnspacing=1.0,
             borderaxespad=0.0,
             borderpad=0.1,
+        )
+        fig.savefig(out_dir / f"{stem}.pdf")
+        fig.savefig(out_dir / f"{stem}.png", dpi=300)
+        plt.close(fig)
+    return out_dir / f"{stem}.png"
+
+
+# Backup for one IEEE column: the same panels in a 2 x 2 grid
+
+COLUMN_WIDTH = 3.5  # in, IEEE column width
+
+
+def plot_risk_aversion_column(
+    cfg, beliefs, out_dir, methods=("stlcg", "pdstl"), stem="figure_column"
+):
+    """The three panels in a 2 x 2 grid, the legend in the fourth cell.
+
+    Fits one IEEE column (3.5 in); the empty room above and below the plans
+    is cut (`_top`, `_bottom`). Writes `<stem>.png/.pdf`, returns the png.
+    """
+    levels = list(cfg["noise"])
+    every = cfg["figure"]["ellipse_every"]
+    xlim = tuple(cfg["bounds"]["x_range"])
+    ylim = (_bottom(cfg, beliefs), _top(cfg, beliefs))
+    left, right, bottom, gap_x, gap_y, title = (
+        0.27,
+        0.10,
+        0.24,
+        0.16,
+        0.16,
+        0.13,
+    )
+    panel_w = (COLUMN_WIDTH - left - right - gap_x) / 2
+    panel_h = panel_w * (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
+    height = bottom + 2 * panel_h + gap_y + title
+    # (column, row from the bottom) for (a), (b), (c); legend in (1, 0)
+    cells = [(0, 1), (1, 1), (0, 0)]
+    with plt.rc_context(STYLE):
+        fig = plt.figure(figsize=(COLUMN_WIDTH, height))
+        for i, (noise, (col, row)) in enumerate(zip(levels, cells)):
+            ax = fig.add_axes(
+                [
+                    (left + col * (panel_w + gap_x)) / COLUMN_WIDTH,
+                    (bottom + row * (panel_h + gap_y)) / height,
+                    panel_w / COLUMN_WIDTH,
+                    panel_h / height,
+                ]
+            )
+            _draw_room(ax, cfg, ylim)
+            for method in methods:
+                mean, cov = beliefs[(method, noise)]
+                _draw_plan(ax, mean, cov, method, every)
+                _draw_times(ax, cfg, mean, method)
+            _style_axes(ax, xlim, ylim, first=col == 0, last=True)
+            if row == 1:  # x labels only under the bottom row
+                ax.tick_params(labelbottom=False)
+                ax.set_xlabel("")
+            ax.set_title(
+                f"({'abc'[i]}) {noise.capitalize()} noise, "
+                f"$q = {cfg['noise'][noise]:.4f}$",
+                loc="left",
+                fontsize=PAPER_FONT,
+                pad=1.5,
+            )
+        legend_ax = fig.add_axes(
+            [
+                (left + panel_w + gap_x) / COLUMN_WIDTH,
+                bottom / height,
+                panel_w / COLUMN_WIDTH,
+                panel_h / height,
+            ]
+        )
+        legend_ax.axis("off")
+        legend_ax.legend(
+            handles=_legend_handles(),
+            loc="center",
+            ncol=2,
+            fontsize=PAPER_FONT - 1,
+            frameon=False,
+            handlelength=1.4,
+            columnspacing=1.0,
+            labelspacing=0.5,
         )
         fig.savefig(out_dir / f"{stem}.pdf")
         fig.savefig(out_dir / f"{stem}.png", dpi=300)

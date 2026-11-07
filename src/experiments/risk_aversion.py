@@ -39,7 +39,11 @@ from planning.runners import (
     setup_problem,
 )
 from utils import load_config
-from visualization.risk_aversion import LABELS, plot_risk_aversion
+from visualization.risk_aversion import (
+    LABELS,
+    plot_risk_aversion,
+    plot_risk_aversion_column,
+)
 
 CONFIG = "configs/scenarios/reach_avoid/risk_aversion.yaml"
 OUTPUTS = RESULTS_DIR / "risk_aversion"
@@ -462,3 +466,5 @@ def figure(cfg, *saved, methods=("stlcg", "pdstl")):
             cfg, beliefs, OUTPUTS, methods, width=width, stem=stem
         )
         print(f"wrote {path}", flush=True)
+    path = plot_risk_aversion_column(cfg, beliefs, OUTPUTS, methods)
+    print(f"wrote {path}", flush=True)
