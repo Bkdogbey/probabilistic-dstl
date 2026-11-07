@@ -6,7 +6,7 @@ Carlo success rates; nothing here loads results or runs a planner.
 Styled like the lane paper figure (visualization.figures.plot_lane_paper):
 7 pt DejaVu Sans, obstacles in the light-fill / dark-edge red of the ramp
 end, the goal in the light green of the target lane, pdSTL in blue with its
-belief, STLCG as the orange dashed plan.
+belief, STLCG as the solid orange plan.
 """
 
 import matplotlib.pyplot as plt
@@ -33,7 +33,7 @@ GOAL_FILL, GOAL_EDGE = "#98df8a", "#2ca02c"
 WALL = "0.2"
 METHOD_STYLE = {
     "pdstl": {"color": COLORS["mean"], "ls": "-"},
-    "stlcg": {"color": COLORS["planned"], "ls": "--"},
+    "stlcg": {"color": COLORS["planned"], "ls": "-"},
 }
 CONFIDENCE = 0.95
 
