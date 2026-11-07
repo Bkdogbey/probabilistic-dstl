@@ -235,7 +235,7 @@ def plot_risk_aversion(
             Patch(
                 fc=METHOD_STYLE["pdstl"]["color"],
                 alpha=0.25,
-                label="pdSTL 95% belief",
+                label="95% CI",
             ),
             Line2D([], [], lw=1.4, label="STLCG", **METHOD_STYLE["stlcg"]),
             *_region_handles(),
