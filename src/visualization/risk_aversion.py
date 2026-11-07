@@ -2,6 +2,11 @@
 
 Pure plotting: the caller supplies the planned belief paths and the Monte
 Carlo success rates; nothing here loads results or runs a planner.
+
+Styled like the lane paper figure (visualization.figures.plot_lane_paper):
+7 pt DejaVu Sans, obstacles in the light-fill / dark-edge red of the ramp
+end, the goal in the light green of the target lane, pdSTL in blue with its
+belief, STLCG as the orange dashed plan.
 """
 
 import matplotlib.pyplot as plt
@@ -12,23 +17,45 @@ from matplotlib.patches import Ellipse, Patch, Rectangle
 from visualization.figures import COLORS, _ellipse_parameters
 
 LABELS = {"stlcg": "STLCG", "pdstl": "pdSTL"}
-# The repo's figure palette (visualization.figures.COLORS): pdSTL in the
-# belief blue, the deterministic plan in the planned orange.
-METHOD_COLOR = {"pdstl": COLORS["mean"], "stlcg": COLORS["planned"]}
+
+PAPER_WIDTH = 7.16  # in, IEEE two-column text width
+PAPER_FONT = 7  # pt
+STYLE = {
+    "mathtext.fontset": "dejavusans",
+    "font.family": "DejaVu Sans",
+    "font.size": PAPER_FONT,
+    # Embed TrueType, not Type 3, fonts (IEEE PDF checks reject Type 3).
+    "pdf.fonttype": 42,
+}
+# The lane figure's region colours.
+OBSTACLE_FILL, OBSTACLE_EDGE = "#ff9896", "#d62728"
+GOAL_FILL, GOAL_EDGE = "#98df8a", "#2ca02c"
+WALL = "0.2"
+METHOD_STYLE = {
+    "pdstl": {"color": COLORS["mean"], "ls": "-"},
+    "stlcg": {"color": COLORS["planned"], "ls": "--"},
+}
+CONFIDENCE = 0.95
+
+# Layout, in inches.
+LEFT, RIGHT, GAP = 0.30, 0.08, 0.07  # y labels, right margin, between panels
+BOTTOM, TITLE, LEGEND = 0.27, 0.13, 0.15  # x labels, panel title, legend row
 
 
-def _draw_room(ax, cfg):
-    """Walls, obstacles and goal in the repo's style; start marked S."""
+def _draw_room(ax, cfg, top):
+    """Walls, obstacles and goal; start marked S."""
     (x0, x1), (y0, y1) = cfg["bounds"]["x_range"], cfg["bounds"]["y_range"]
-    ax.add_patch(
-        Rectangle(
-            (x0, y0),
-            x1 - x0,
-            y1 - y0,
-            fill=False,
-            ec=COLORS["workspace"],
-            lw=1.3,
-        )
+    # The walls are the axes, drawn unclipped over the hidden spines, up to
+    # the top of the view (`top`), so a cut room stays open above.
+    wall = min(y1, top)
+    ax.plot(
+        [x0, x0, x1, x1] + ([x0] if wall == y1 else []),
+        [wall, y0, y0, wall] + ([wall] if wall == y1 else []),
+        color=WALL,
+        lw=1.1,
+        zorder=2,
+        clip_on=False,
+        solid_capstyle="butt",
     )
     for block in cfg["obstacles"]:
         (bx0, bx1), (by0, by1) = block["x_range"], block["y_range"]
@@ -37,10 +64,11 @@ def _draw_room(ax, cfg):
                 (bx0, by0),
                 bx1 - bx0,
                 by1 - by0,
-                fc=COLORS["obstacle"],
-                ec=COLORS["obstacle"],
-                alpha=0.45,
+                fc=OBSTACLE_FILL,
+                ec=OBSTACLE_EDGE,
                 hatch="//",
+                alpha=0.9,
+                lw=0.8,
             )
         )
     (gx0, gx1), (gy0, gy1) = cfg["goal"]["x_range"], cfg["goal"]["y_range"]
@@ -49,23 +77,24 @@ def _draw_room(ax, cfg):
             (gx0, gy0),
             gx1 - gx0,
             gy1 - gy0,
-            fc=COLORS["goal"],
-            ec=COLORS["goal"],
-            alpha=0.35,
+            fc=GOAL_FILL,
+            ec=GOAL_EDGE,
+            alpha=0.6,
+            lw=0.8,
         )
     )
     ax.text(
         (gx0 + gx1) / 2,
-        gy1 + 0.15,
+        gy1 + 0.12,
         "G",
-        color=COLORS["goal"],
+        color=GOAL_EDGE,
         fontweight="bold",
         ha="center",
         va="bottom",
     )
     sx, sy = cfg["x0_mean"][:2]
-    ax.plot(sx, sy, "o", color="k", ms=3.5, zorder=5)
-    ax.text(sx, sy + 0.25, "S", fontweight="bold", ha="center", va="bottom")
+    ax.plot(sx, sy, "o", color="k", ms=3, zorder=5)
+    ax.text(sx, sy + 0.2, "S", fontweight="bold", ha="center", va="bottom")
 
 
 def _draw_plan(ax, mean, cov, method, every):
@@ -74,33 +103,71 @@ def _draw_plan(ax, mean, cov, method, every):
     STLCG plans the noise-free mean, so it has no belief to draw; its
     executed spread shows in its Monte Carlo success instead.
     """
-    color = METHOD_COLOR[method]
-    ax.plot(*mean.T, color=color, lw=1.6, zorder=4)
+    style = METHOD_STYLE[method]
+    ax.plot(*mean.T, lw=1.4, zorder=4, **style)
     if method != "pdstl":
         return
     for k in [*range(every, len(mean) - 1, every), len(mean) - 1]:
-        width, height, angle = _ellipse_parameters(cov[k], 0.95)
+        width, height, angle = _ellipse_parameters(cov[k], CONFIDENCE)
         ax.add_patch(
             Ellipse(
                 mean[k],
                 width,
                 height,
                 angle=angle,
-                fc=color,
-                ec=color,
-                alpha=0.22,
-                lw=0.6,
+                fc=style["color"],
+                ec="none",
+                alpha=0.18,
                 zorder=3,
             )
         )
 
 
-def _ticks(limits, step=2, last=True):
-    """Ticks every `step` metres across `limits`; drop the upper end unless
-    `last`."""
-    lo, hi = limits
-    ticks = np.arange(lo, hi + 1e-9, step)
-    return ticks if last else ticks[ticks < hi]
+def _top(cfg, beliefs, margin=0.45):
+    """Upper y limit: the highest drawn mark plus `margin`, inside the room.
+
+    The room above the plans is empty, so it is cut to save space.
+    """
+    radius = np.sqrt(-2 * np.log(1 - CONFIDENCE))
+    highest = max(
+        float(np.max(mean[:, 1] + radius * np.sqrt(cov[:, 1, 1])))
+        for mean, cov in beliefs.values()
+    )
+    goal = cfg["goal"]["y_range"][1] + 0.5  # the G label
+    room = cfg["bounds"]["y_range"][1]
+    return min(room, max(highest, goal) + margin)
+
+
+def _style_axes(ax, xlim, ylim, first, last):
+    """Ticks every 2 m; only the last panel labels the right wall, so the
+    labels of neighbouring panels do not meet."""
+    ax.set(xlim=xlim, ylim=ylim, aspect="equal")
+    xticks = np.arange(xlim[0], xlim[1] + 1e-9, 2)
+    ax.set_xticks(xticks if last else xticks[xticks < xlim[1]])
+    ax.set_yticks(np.arange(ylim[0], ylim[1] + 1e-9, 2))
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(labelsize=PAPER_FONT, length=2, pad=1, color="0.4")
+    ax.set_xlabel("x (m)", fontsize=PAPER_FONT, labelpad=0)
+    if first:
+        ax.set_ylabel("y (m)", fontsize=PAPER_FONT, labelpad=1)
+    else:
+        ax.tick_params(labelleft=False)
+
+
+def _success_text(ax, success, noise, methods):
+    """Monte Carlo success per method, bottom right, in the method colour."""
+    for row, method in enumerate(reversed(methods)):
+        ax.text(
+            0.97,
+            0.03 + 0.085 * row,
+            f"{LABELS[method]} {100 * success[(method, noise)]:.1f}%",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            color=METHOD_STYLE[method]["color"],
+            fontweight="bold",
+        )
 
 
 def plot_risk_aversion(
@@ -112,100 +179,74 @@ def plot_risk_aversion(
     `success[(method, noise)]` is the Monte Carlo success rate in [0, 1].
     Writes figure.png and figure.pdf to `out_dir` and returns the png path.
 
-    Sized for a two-column IEEE figure (7.16 in) with the panels filling
-    the width; the explanation of the marks belongs in the caption.
+    Two-column IEEE width; the panels share one metres-per-inch scale and
+    the empty room above the plans is cut (see `_top`).
     """
     levels = list(cfg["noise"])
     every = cfg["figure"]["ellipse_every"]
-    sigma = cfg["uncertainty"]["position_std_m"]
-    after = cfg["uncertainty"]["after_s"]
-    with plt.rc_context({"font.size": 8}):
-        fig, axes = plt.subplots(
-            1,
-            len(levels),
-            figsize=(7.16, 2.95),
-            sharey=True,
-            gridspec_kw={"wspace": 0.05},
-        )
-        for i, (ax, noise) in enumerate(zip(axes, levels)):
-            _draw_room(ax, cfg)
+    xlim = tuple(cfg["bounds"]["x_range"])
+    ylim = (cfg["bounds"]["y_range"][0], _top(cfg, beliefs))
+    panel_w = (PAPER_WIDTH - LEFT - RIGHT - GAP * (len(levels) - 1)) / len(
+        levels
+    )
+    panel_h = panel_w * (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
+    height = BOTTOM + panel_h + TITLE + LEGEND
+    with plt.rc_context(STYLE):
+        fig = plt.figure(figsize=(PAPER_WIDTH, height))
+        for i, noise in enumerate(levels):
+            left = LEFT + i * (panel_w + GAP)
+            ax = fig.add_axes(
+                [
+                    left / PAPER_WIDTH,
+                    BOTTOM / height,
+                    panel_w / PAPER_WIDTH,
+                    panel_h / height,
+                ]
+            )
+            _draw_room(ax, cfg, ylim[1])
             for method in methods:
                 mean, cov = beliefs[(method, noise)]
                 _draw_plan(ax, mean, cov, method, every)
-            text = "\n".join(
-                f"{LABELS[m]}: {100 * success[(m, noise)]:.1f}%"
-                for m in reversed(methods)
-            )
-            ax.text(
-                0.025,
-                0.975,
-                text,
-                transform=ax.transAxes,
-                va="top",
-                fontsize=7.5,
-                linespacing=1.35,
-                bbox={"fc": "white", "ec": "none", "alpha": 0.8, "pad": 1.5},
-            )
+            _success_text(ax, success, noise, methods)
+            _style_axes(ax, xlim, ylim, i == 0, i == len(levels) - 1)
             ax.set_title(
-                f"({'abc'[i]}) {noise} uncertainty: "
-                f"{100 * sigma[noise]:.0f} cm after {after:g} s",
-                fontsize=8,
-                pad=3,
+                f"({'abc'[i]}) {noise.capitalize()} noise, "
+                f"$q = {cfg['noise'][noise]:.4f}$",
+                loc="left",
+                fontsize=PAPER_FONT,
+                pad=1.5,
             )
-            ax.set(
-                xlim=cfg["bounds"]["x_range"],
-                ylim=cfg["bounds"]["y_range"],
-                aspect="equal",
-                # the last panel alone shows the right wall's tick, so
-                # labels of neighbouring panels do not meet
-                xticks=_ticks(
-                    cfg["bounds"]["x_range"], last=i == len(levels) - 1
-                ),
-                yticks=_ticks(cfg["bounds"]["y_range"]),
-            )
-            ax.set_xlabel("x [m]", labelpad=1)
-            ax.grid(color=COLORS["workspace"], alpha=0.16, lw=0.6)
-            ax.set_axisbelow(True)
-            ax.tick_params(labelsize=7, length=2, pad=1.5)
-        axes[0].set_ylabel("y [m]", labelpad=1)
         handles = [
-            Line2D([], [], color=METHOD_COLOR["pdstl"], lw=1.6, label="pdSTL"),
+            Line2D([], [], lw=1.4, label="pdSTL", **METHOD_STYLE["pdstl"]),
             Patch(
-                fc=METHOD_COLOR["pdstl"],
-                ec=METHOD_COLOR["pdstl"],
-                alpha=0.3,
+                fc=METHOD_STYLE["pdstl"]["color"],
+                alpha=0.25,
                 label="pdSTL 95% belief",
             ),
-            Line2D([], [], color=METHOD_COLOR["stlcg"], lw=1.6, label="STLCG"),
+            Line2D([], [], lw=1.4, label="STLCG", **METHOD_STYLE["stlcg"]),
             Patch(
-                fc=COLORS["obstacle"],
-                ec=COLORS["obstacle"],
-                alpha=0.45,
+                fc=OBSTACLE_FILL,
+                ec=OBSTACLE_EDGE,
                 hatch="//",
+                alpha=0.9,
+                lw=0.8,
                 label="Obstacle",
             ),
-            Patch(
-                fc=COLORS["goal"], ec=COLORS["goal"], alpha=0.35, label="Goal"
-            ),
+            Patch(fc=GOAL_FILL, ec=GOAL_EDGE, alpha=0.6, lw=0.8, label="Goal"),
         ]
         fig.legend(
             handles=handles,
             loc="upper center",
             bbox_to_anchor=(0.5, 1.0),
-            ncol=5,
-            fontsize=7.5,
+            ncol=len(handles),
+            fontsize=PAPER_FONT - 1,
             frameon=False,
-            handlelength=2.0,
-            columnspacing=1.4,
-            borderaxespad=0.1,
+            handlelength=1.4,
+            columnspacing=1.0,
+            borderaxespad=0.0,
+            borderpad=0.1,
         )
-        fig.subplots_adjust(left=0.05, right=0.998, bottom=0.1, top=0.88)
-        for suffix in (".png", ".pdf"):
-            fig.savefig(
-                out_dir / f"figure{suffix}",
-                dpi=300,
-                bbox_inches="tight",
-                pad_inches=0.02,
-            )
+        fig.savefig(out_dir / "figure.pdf")
+        fig.savefig(out_dir / "figure.png", dpi=300)
         plt.close(fig)
     return out_dir / "figure.png"
