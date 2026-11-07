@@ -172,7 +172,14 @@ def test_table_and_figure_build_from_saved_results(cfg, tmp_path, monkeypatch):
     saved = [risk_aversion.load_outputs(m) for m in cfg["methods"]]
     risk_aversion.table(cfg, *saved)
     risk_aversion.figure(cfg, *saved)
-    for name in ("table.csv", "table.md", "figure.png", "figure.pdf"):
+    for name in (
+        "table.csv",
+        "table.md",
+        "figure.png",
+        "figure.pdf",
+        "figure_compact.png",
+        "figure_compact.pdf",
+    ):
         assert (tmp_path / name).stat().st_size > 0
     assert len((tmp_path / "table.md").read_text().splitlines()) == 2 + 6
 

@@ -39,7 +39,11 @@ from planning.runners import (
     setup_problem,
 )
 from utils import load_config
-from visualization.risk_aversion import LABELS, plot_risk_aversion
+from visualization.risk_aversion import (
+    LABELS,
+    plot_risk_aversion,
+    plot_risk_aversion_compact,
+)
 
 CONFIG = "configs/scenarios/reach_avoid/risk_aversion.yaml"
 OUTPUTS = RESULTS_DIR / "risk_aversion"
@@ -452,12 +456,13 @@ def first_arrival(cfg, mean):
 def figure(cfg, *saved, methods=("stlcg", "pdstl")):
     """Plot both plans per noise level from the saved results."""
     plans = {k: v for _, p in saved for k, v in p.items()}
-    picked = {(r["method"], r["noise"]): r for rows, _ in saved for r in rows}
     beliefs = {
         (m, n): belief(cfg, plans[f"{m}/{n}"], n)
         for m in methods
         for n in cfg["noise"]
     }
-    success = {k: float(r["success"]) for k, r in picked.items()}
-    path = plot_risk_aversion(cfg, beliefs, success, OUTPUTS, methods)
-    print(f"wrote {path}", flush=True)
+    for path in (
+        plot_risk_aversion(cfg, beliefs, OUTPUTS, methods),
+        plot_risk_aversion_compact(cfg, beliefs, OUTPUTS),
+    ):
+        print(f"wrote {path}", flush=True)
