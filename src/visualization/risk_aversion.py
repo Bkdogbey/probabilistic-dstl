@@ -181,33 +181,40 @@ def _region_handles():
     ]
 
 
-def plot_risk_aversion(cfg, beliefs, out_dir, methods=("stlcg", "pdstl")):
+def plot_risk_aversion(
+    cfg,
+    beliefs,
+    out_dir,
+    methods=("stlcg", "pdstl"),
+    width=PAPER_WIDTH,
+    stem="figure",
+):
     """One panel per noise level, both plans in each (two-column width).
 
     `beliefs[(method, noise)]` is (mean [T, 2], cov [T, 2, 2]). Writes
-    figure.png and figure.pdf to `out_dir` and returns the png path.
+    `<stem>.png` and `<stem>.pdf` to `out_dir` and returns the png path.
 
-    Two-column IEEE width; the panels share one metres-per-inch scale and
-    the empty room above the plans is cut (see `_top`).
+    `width` is in inches: the IEEE two-column width by default, less to
+    leave room beside the figure. Fonts stay 7 pt; the panels shrink. The
+    panels share one metres-per-inch scale and the empty room above the
+    plans is cut (see `_top`).
     """
     levels = list(cfg["noise"])
     every = cfg["figure"]["ellipse_every"]
     xlim = tuple(cfg["bounds"]["x_range"])
     ylim = (cfg["bounds"]["y_range"][0], _top(cfg, beliefs))
-    panel_w = (PAPER_WIDTH - LEFT - RIGHT - GAP * (len(levels) - 1)) / len(
-        levels
-    )
+    panel_w = (width - LEFT - RIGHT - GAP * (len(levels) - 1)) / len(levels)
     panel_h = panel_w * (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
     height = BOTTOM + panel_h + TITLE + LEGEND
     with plt.rc_context(STYLE):
-        fig = plt.figure(figsize=(PAPER_WIDTH, height))
+        fig = plt.figure(figsize=(width, height))
         for i, noise in enumerate(levels):
             left = LEFT + i * (panel_w + GAP)
             ax = fig.add_axes(
                 [
-                    left / PAPER_WIDTH,
+                    left / width,
                     BOTTOM / height,
-                    panel_w / PAPER_WIDTH,
+                    panel_w / width,
                     panel_h / height,
                 ]
             )
@@ -245,111 +252,7 @@ def plot_risk_aversion(cfg, beliefs, out_dir, methods=("stlcg", "pdstl")):
             borderaxespad=0.0,
             borderpad=0.1,
         )
-        fig.savefig(out_dir / "figure.pdf")
-        fig.savefig(out_dir / "figure.png", dpi=300)
+        fig.savefig(out_dir / f"{stem}.pdf")
+        fig.savefig(out_dir / f"{stem}.png", dpi=300)
         plt.close(fig)
-    return out_dir / "figure.png"
-
-
-# Compact, single-column version: every level in one panel
-
-COLUMN_WIDTH = 3.5  # in, IEEE column width
-LEVEL_BLUES = ("#9ecae1", "#4292c6", "#08306b")  # low -> high noise
-
-
-def _bottom(cfg, beliefs, margin=0.35):
-    """Lower y limit: the lowest drawn mark minus `margin`, inside the room.
-
-    Below the plans only the floor block remains, so it is cut too.
-    """
-    radius = np.sqrt(-2 * np.log(1 - CONFIDENCE))
-    lowest = min(
-        float(np.min(mean[:, 1] - radius * np.sqrt(cov[:, 1, 1])))
-        for mean, cov in beliefs.values()
-    )
-    return max(cfg["bounds"]["y_range"][0], lowest - margin)
-
-
-def plot_risk_aversion_compact(cfg, beliefs, out_dir):
-    """All noise levels in one single-column panel.
-
-    STLCG plans the noise-free mean once, so one orange path serves every
-    level; pdSTL's plan per level is drawn in a darker blue as noise grows,
-    each with its 95% belief ellipse outlined once per second. The empty room above and below the
-    plans is cut. Writes figure_compact.png/.pdf and returns the png path.
-    """
-    levels = list(cfg["noise"])
-    outline = round(1.0 / cfg["dt"])  # one ellipse per second
-    xlim = tuple(cfg["bounds"]["x_range"])
-    ylim = (_bottom(cfg, beliefs), _top(cfg, beliefs))
-    left, right, bottom, legend = 0.30, 0.10, 0.27, 0.27
-    panel_w = COLUMN_WIDTH - left - right
-    panel_h = panel_w * (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
-    height = bottom + panel_h + legend
-    with plt.rc_context(STYLE):
-        fig = plt.figure(figsize=(COLUMN_WIDTH, height))
-        ax = fig.add_axes(
-            [
-                left / COLUMN_WIDTH,
-                bottom / height,
-                panel_w / COLUMN_WIDTH,
-                panel_h / height,
-            ]
-        )
-        _draw_room(ax, cfg, ylim)
-        mean, _ = beliefs[("stlcg", levels[0])]
-        ax.plot(*mean.T, lw=1.3, zorder=4, **METHOD_STYLE["stlcg"])
-        for noise, colour in zip(levels, LEVEL_BLUES):
-            mean, cov = beliefs[("pdstl", noise)]
-            ax.plot(*mean.T, color=colour, lw=1.3, zorder=5)
-            # Outlines, not fills: the levels' ellipses overlap.
-            for k in [*range(outline, len(mean) - 1, outline), len(mean) - 1]:
-                width, height_k, angle = _ellipse_parameters(
-                    cov[k], CONFIDENCE
-                )
-                ax.add_patch(
-                    Ellipse(
-                        mean[k],
-                        width,
-                        height_k,
-                        angle=angle,
-                        fill=False,
-                        ec=colour,
-                        lw=0.5,
-                        alpha=0.8,
-                        zorder=3,
-                    )
-                )
-        _style_axes(ax, xlim, ylim, first=True, last=True)
-        ax.set_yticks(np.arange(np.ceil(ylim[0]), ylim[1] + 1e-9, 2))
-        handles = [
-            Line2D(
-                [],
-                [],
-                color=colour,
-                lw=1.3,
-                label=f"pdSTL, {noise} ($q = {cfg['noise'][noise]:.4f}$)",
-            )
-            for noise, colour in zip(levels, LEVEL_BLUES)
-        ]
-        handles += [
-            Line2D([], [], lw=1.3, label="STLCG", **METHOD_STYLE["stlcg"]),
-            *_region_handles(),
-        ]
-        fig.legend(
-            handles=handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.0),
-            ncol=3,
-            fontsize=PAPER_FONT - 1,
-            frameon=False,
-            handlelength=1.4,
-            columnspacing=0.8,
-            borderaxespad=0.0,
-            borderpad=0.1,
-            labelspacing=0.25,
-        )
-        fig.savefig(out_dir / "figure_compact.pdf")
-        fig.savefig(out_dir / "figure_compact.png", dpi=300)
-        plt.close(fig)
-    return out_dir / "figure_compact.png"
+    return out_dir / f"{stem}.png"

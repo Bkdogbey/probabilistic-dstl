@@ -177,8 +177,8 @@ def test_table_and_figure_build_from_saved_results(cfg, tmp_path, monkeypatch):
         "table.md",
         "figure.png",
         "figure.pdf",
-        "figure_compact.png",
-        "figure_compact.pdf",
+        "figure_narrow.png",
+        "figure_narrow.pdf",
     ):
         assert (tmp_path / name).stat().st_size > 0
     assert len((tmp_path / "table.md").read_text().splitlines()) == 2 + 6

@@ -39,11 +39,7 @@ from planning.runners import (
     setup_problem,
 )
 from utils import load_config
-from visualization.risk_aversion import (
-    LABELS,
-    plot_risk_aversion,
-    plot_risk_aversion_compact,
-)
+from visualization.risk_aversion import LABELS, plot_risk_aversion
 
 CONFIG = "configs/scenarios/reach_avoid/risk_aversion.yaml"
 OUTPUTS = RESULTS_DIR / "risk_aversion"
@@ -461,8 +457,8 @@ def figure(cfg, *saved, methods=("stlcg", "pdstl")):
         for m in methods
         for n in cfg["noise"]
     }
-    for path in (
-        plot_risk_aversion(cfg, beliefs, OUTPUTS, methods),
-        plot_risk_aversion_compact(cfg, beliefs, OUTPUTS),
-    ):
+    for stem, width in cfg["figure"]["widths_in"].items():
+        path = plot_risk_aversion(
+            cfg, beliefs, OUTPUTS, methods, width=width, stem=stem
+        )
         print(f"wrote {path}", flush=True)
