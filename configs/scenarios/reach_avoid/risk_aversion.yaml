@@ -48,4 +48,5 @@ methods:
 monte_carlo: {samples: 5000, seed: 7}
 figure:
   ellipse_every: 2  # one 95% ellipse every 0.4 s
+  time_marks_s: [4, 8]  # labelled on each path, with the goal arrival
   widths_in: {figure: 7.16, figure_narrow: 6.0}  # one file per width (in)

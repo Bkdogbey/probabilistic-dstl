@@ -109,6 +109,64 @@ def _draw_room(ax, cfg, ylim):
     ax.text(sx, sy + 0.2, "S", fontweight="bold", ha="center", va="bottom")
 
 
+def _arrival(cfg, mean):
+    """First step at which the path `mean` [T, 2] is inside the goal."""
+    (gx0, gx1), (gy0, gy1) = cfg["goal"]["x_range"], cfg["goal"]["y_range"]
+    inside = (
+        (mean[:, 0] >= gx0)
+        & (mean[:, 0] <= gx1)
+        & (mean[:, 1] >= gy0)
+        & (mean[:, 1] <= gy1)
+    )
+    hits = np.flatnonzero(inside)
+    return int(hits[0]) if len(hits) else None
+
+
+def _draw_times(ax, cfg, mean, method):
+    """Dots on the mean path at the configured times and at goal arrival,
+    each labelled with its time: pdSTL's above the path, STLCG's below.
+    """
+    dt = cfg["dt"]
+    steps = {round(t / dt) for t in cfg["figure"]["time_marks_s"]}
+    steps = {k for k in steps if 0 < k < len(mean)}
+    arrival = _arrival(cfg, mean)
+    if arrival is not None:
+        # an arrival close to a configured mark replaces it
+        steps = {k for k in steps if abs(k - arrival) * dt >= 1.0}
+        steps.add(arrival)
+    colour = METHOD_STYLE[method]["color"]
+    above = method == "pdstl"
+    for k in sorted(steps):
+        ax.plot(
+            *mean[k], "o", ms=2.6, mfc=colour, mec="white", mew=0.5, zorder=6
+        )
+        if k == arrival:
+            # beside the goal, not over it: pdSTL left, STLCG below
+            offset, ha, va = (
+                ((-4, 1), "right", "bottom")
+                if above
+                else (
+                    (1, -4),
+                    "left",
+                    "top",
+                )
+            )
+        else:
+            offset, ha = (0, 3 if above else -3), "center"
+            va = "bottom" if above else "top"
+        ax.annotate(
+            f"{k * dt:g} s",
+            mean[k],
+            xytext=offset,
+            textcoords="offset points",
+            ha=ha,
+            va=va,
+            color=colour,
+            fontsize=PAPER_FONT - 1,
+            zorder=6,
+        )
+
+
 def _draw_plan(ax, mean, cov, method, every):
     """Mean path; pdSTL also gets its 95% belief ellipses every `every`.
 
@@ -222,6 +280,7 @@ def plot_risk_aversion(
             for method in methods:
                 mean, cov = beliefs[(method, noise)]
                 _draw_plan(ax, mean, cov, method, every)
+                _draw_times(ax, cfg, mean, method)
             _style_axes(ax, xlim, ylim, i == 0, i == len(levels) - 1)
             ax.set_title(
                 f"({'abc'[i]}) {noise.capitalize()} noise, "
