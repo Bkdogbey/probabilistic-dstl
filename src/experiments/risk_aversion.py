@@ -2,7 +2,8 @@
 
 A floor block and an upper block leave two gaps to the goal: a narrow slit
 between them (short) and the open room above the upper block (around,
-longer). STLCG requires a fixed margin on the mean path; pdSTL requires an
+longer). The robot must reach the goal and stay in it for the goal's
+dwell. STLCG requires a fixed margin on the mean path; pdSTL requires an
 exact score. Both then spend the least effort. Each method plans from both
 gaps, keeps one plan by its own rule, and the plan is executed open loop under
 noise (Monte Carlo, the same draws for every plan).
@@ -416,8 +417,9 @@ def table(cfg, *saved):
 def belief(cfg, controls, noise):
     """Mean and covariance of the open-loop plan at one noise level.
 
-    Cut at arrival, the first step the mean is inside the goal: the formula
-    asks only to reach the goal, so the plan is free to move on afterwards.
+    Cut once the goal is held: the first step the mean is inside the goal
+    plus the goal's dwell. The formula asks nothing after that, so the plan
+    is free to move on.
     """
     s = evaluation_problem(cfg, noise)
     mean, cov = s.state
@@ -429,7 +431,8 @@ def belief(cfg, controls, noise):
     mean = torch.stack(means).cpu().numpy()[:, :2]
     cov = torch.stack(covs).cpu().numpy()[:, :2, :2]
     arrival = first_arrival(cfg, mean)
-    end = len(mean) if arrival is None else arrival + 1
+    dwell = cfg["goal"].get("dwell", 0)
+    end = len(mean) if arrival is None else arrival + dwell + 1
     return mean[:end], cov[:end]
 
 

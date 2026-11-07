@@ -126,6 +126,34 @@ def test_builder_reads_bounds_obstacles_goal_and_visit_regions():
     assert environment.visits == [(None, 2, ["t1", "t2"])]
 
 
+def test_goal_dwell_requires_holding_the_goal():
+    environment = Environment()
+    environment.set_bounds([0, 10], [0, 10])
+    environment.set_goal([8, 9], [8, 9], dwell=3)
+    assert environment.goal_dwell == 3
+    spec = environment.get_specification(10)
+    assert "♢_[1, 7](□_[0, 3](goal))" in str(spec)
+    # A path that touches the goal once fails; one that stays holds.
+    touch = torch.full((11, 2), 5.0)
+    touch[6] = 8.5
+    stay = touch.clone()
+    stay[6:10] = 8.5
+    for path, holds in ((touch, False), (stay, True)):
+        state = torch.cat([path, torch.zeros(11, 2)], dim=1)[None]
+        beliefs = create_gaussian_belief_trajectory(
+            state, torch.zeros_like(state)
+        )
+        assert bool(spec(beliefs)[0, 0, 0] > 0.5) == holds
+
+
+def test_goal_without_dwell_is_plain_reach():
+    environment = Environment()
+    environment.set_bounds([0, 10], [0, 10])
+    environment.set_goal([8, 9], [8, 9])
+    assert environment.goal_dwell == 0
+    assert "♢_[1, 10](goal)" in str(environment.get_specification(10))
+
+
 def test_unnamed_regions_get_default_names():
     environment = Environment()
     environment.set_bounds([0, 10], [0, 10])

@@ -60,11 +60,13 @@ class Environment:
 
     `goal` is (interval, names) and `visits` is [(interval, dwell, names)];
     several names are alternatives, any one of which satisfies the task.
+    `goal_dwell` is how many steps the goal must be held once reached.
     """
 
     def __init__(self):
         self.regions = {}
         self.goal = None
+        self.goal_dwell = 0
         self.visits = []
 
     def set_bounds(self, x_range, y_range):
@@ -79,11 +81,19 @@ class Environment:
         )
 
     def set_goal(
-        self, x_range=None, y_range=None, any_of=None, interval=None, name=None
+        self,
+        x_range=None,
+        y_range=None,
+        any_of=None,
+        interval=None,
+        name=None,
+        dwell=0,
     ):
-        """A region to reach within `interval`, or one of `any_of`."""
+        """A region to reach within `interval`, or one of `any_of`, and
+        stay in for `dwell` more steps (0: reaching it is enough)."""
         names = self._alternatives("goal", name, x_range, y_range, any_of)
         self.goal = (interval, names)
+        self.goal_dwell = int(dwell)
 
     def add_visit_region(
         self,
@@ -189,15 +199,18 @@ def reach_avoid_specification(environment, horizon):
         horizon: Last prediction step H; step 0 is the known initial belief.
 
     Returns:
-        G[1,H] safe & F[goal interval] goal
+        G[1,H] safe & F[goal interval] G[0,goal dwell] goal
         & F[visit interval] G[0,dwell] visit, for every visit region.
     """
     if environment.goal is None:
         raise ValueError("reach-avoid needs a goal")
     interval, names = environment.goal
+    dwell = environment.goal_dwell
     parts = [
         Always(safety_event(environment), [1, horizon]),
-        Eventually(_any(environment, names, 0), _window(interval, horizon, 0)),
+        Eventually(
+            _any(environment, names, dwell), _window(interval, horizon, dwell)
+        ),
     ]
     for interval, dwell, names in environment.visits:
         parts.append(
