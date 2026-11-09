@@ -8,9 +8,10 @@ from math import ceil, floor, hypot, isclose, isfinite
 
 import numpy as np
 
-from pdstl.operators import Always, And, Eventually, Or
+from pdstl.operators import END, Always, And, Eventually, Or, Until
 from pdstl.predicates import (
     AxisInterval,
+    GreaterThan,
     HalfSpace,
     InsideRectangle,
     LessThan,
@@ -494,7 +495,25 @@ def lane_subformulas(environment, horizon):
 
 
 def _lane_merge_task(metadata, horizon, target, settled):
-    """Existing merge/dwell/retention branch, also used unchanged by C."""
+    """The merge/dwell/retention branch, also used unchanged by C.
+
+    Before any dwell credit the branch is
+    F[start, latest] (G[0,d] lane AND G[d,d] before_end
+                      AND G[d,end] (lane AND settled)).
+    Once in the lane it is
+    lane U[remaining, latest] (before_end AND G[0,end] (lane AND settled)).
+    "end" is the plan end: the stay window runs from the dwell finish to the
+    horizon, so its length depends on the start the F (or U) picks.
+
+    Args:
+        metadata: Lane metadata of the local window (step, streak, task).
+        horizon: Last step of the planning window.
+        target: Target-lane occupancy predicate.
+        settled: Lateral-speed predicate.
+
+    Returns:
+        Dict with "complete", "stay" and "branch" formulas.
+    """
     task = metadata["task"]
     step = metadata.get("step", 0)
     streak = metadata.get("streak", 0)
@@ -502,13 +521,14 @@ def _lane_merge_task(metadata, horizon, target, settled):
     absolute_start, absolute_end = task["start_end_steps"]
     credit = lane_dwell_credit(metadata, step, streak)
 
-    def stay_from(start):
-        """Remain in the target lane with settled lateral speed afterwards."""
-        return Always(target & settled, [start, horizon])
-
     if metadata.get("completed"):
-        # Dwell is done: no timing or ramp-end check, just stay and settle.
-        stay = stay_from(0)
+        # Dwell is done: no timing or ramp-end check. Stay in the lane, and be
+        # settled from the merge deadline on (the latest finish the window
+        # allows; the truth monitor uses the same rule), or from now if late.
+        settle_from = min(max(0, absolute_end - step), horizon)
+        stay = Always(target, [0, horizon]) & Always(
+            settled, [settle_from, horizon]
+        )
         return {"complete": stay, "stay": stay, "branch": stay}
 
     def completion_from_start(start, duration):
@@ -523,29 +543,49 @@ def _lane_merge_task(metadata, horizon, target, settled):
             formula = formula & Always(before_end, [finish, finish])
         return formula, finish
 
-    if credit:
-        remaining = dwell - (credit - 1)
-        if step + remaining > absolute_end:
-            raise ValueError("lane task has no remaining feasible dwell start")
-        candidates = [completion_from_start(0, remaining)]
-    else:
+    if not credit:
+        # Not in the lane yet: one Eventually over the dwell start s, with
+        # the same conjunction grouping as one candidate per s, so the exact
+        # lower bound is the same max over starts. G[d, END] runs to the
+        # trace end, which is the horizon end.
         start = max(0, absolute_start - step)
         latest_start = absolute_end - dwell - step
         if latest_start < start:
             raise ValueError("lane task has no remaining feasible dwell start")
-        candidates = [
-            completion_from_start(candidate, dwell)
-            for candidate in range(start, latest_start + 1)
-        ]
-    completion = reduce(Or, [formula for formula, _finish in candidates])
-    stay = reduce(Or, [stay_from(finish) for _formula, finish in candidates])
+        starts = [start, latest_start]
+        completion, _finish = completion_from_start(0, dwell)
+        stay = Always(target & settled, [dwell, END])
+        return {
+            "complete": Eventually(completion, starts),
+            "stay": Eventually(stay, starts),
+            "branch": Eventually(completion & stay, starts),
+        }
+    remaining = dwell - (credit - 1)
+    if step + remaining > absolute_end:
+        raise ValueError("lane task has no remaining feasible dwell start")
+    # Already in the lane: the dwell may finish at any step f from its
+    # earliest one to the deadline, with the lane held from now through f.
+    # That is target U[remaining, latest] (finish check), one Until instead
+    # of an Or over f. The Frechet And lower is max(0, sum - (n - 1)) for any
+    # grouping, so the lower bound equals the Or over finishes.
+    finishes = [remaining, min(absolute_end - step, horizon)]
+    stay = Always(target & settled, [0, END])
+    ramp = metadata.get("ramp")
+    if ramp is None:
+        return {
+            "complete": Always(target, [0, remaining]),
+            "stay": Eventually(stay, finishes),
+            "branch": Until(target, stay, finishes),
+        }
+    front_limit = ramp["end_x"] - metadata["ego_vehicle"]["width"] / 2
+    before_end = LessThan(front_limit, dim=0, name="Front before ramp end")
     # Safety covers the whole window, not just up to the dwell finish, so
     # the plan cannot drift off the road or into traffic after completing.
-    branch = reduce(
-        Or,
-        [formula & stay_from(finish) for formula, finish in candidates],
-    )
-    return {"complete": completion, "stay": stay, "branch": branch}
+    return {
+        "complete": Until(target, before_end, finishes),
+        "stay": Eventually(stay, finishes),
+        "branch": Until(target, before_end & stay, finishes),
+    }
 
 
 def _dwell_credit(task, step, streak):
@@ -630,21 +670,23 @@ def _lane_yield_task(metadata, horizon):
         starts = list(range(first, last + 1))
     # The upper yield endpoint is also a completed-dwell deadline.
     complete = Eventually(Always(atom, [0, duration]), [starts[0], starts[-1]])
-    branches = [
-        Eventually(Always(atom, [0, duration]), [start, start])
-        & Always(atom, [start + duration, horizon])
-        for start in starts
-    ]
-    stays = [Always(atom, [start + duration, horizon]) for start in starts]
+    # "Stopped from some start s <= last until the end" is the same event as
+    # "stopped from `last` on", so one Always replaces an Or over every start:
+    # the same yes/no answer, never a lower score, and far cheaper to solve.
+    last = starts[-1]
     return {
         "complete": complete,
-        "stay": reduce(Or, stays),
-        "branch": reduce(Or, branches),
+        "stay": Always(atom, [last + duration, horizon]),
+        "branch": Always(atom, [last, horizon]),
     }
 
 
 def lane_road_predicate(metadata):
-    """Contain the complete axis-aligned ego footprint inside the road."""
+    """Contain the complete axis-aligned ego footprint inside the road.
+
+    With a ramp: the ramp lane tapers from start_x to end_x, and with
+    `gore_x` the footprint may not reach the main lane upstream of the gore.
+    """
     road = metadata["road"]
     ramp = metadata.get("ramp")
     ego = metadata["ego_vehicle"]
@@ -676,7 +718,18 @@ def lane_road_predicate(metadata):
         slope * start - road["y_min"] - half_height - slope * half_width,
         name="Above ramp edge",
     )
-    return outer & (after_taper | above_taper)
+    road_atom = outer & (after_taper | above_taper)
+    if ramp.get("gore_x") is None:
+        return road_atom
+    # Upstream of the gore the ramp is a separate road: the footprint may
+    # reach into the main lane only once all of it is past the gore.
+    in_ramp_lane = LessThan(
+        road["lane_divider"] - half_height, dim=1, name="Ramp lane"
+    )
+    past_gore = GreaterThan(
+        ramp["gore_x"] + half_width, dim=0, name="Past the gore"
+    )
+    return road_atom & (in_ramp_lane | past_gore)
 
 
 def lane_collision_extents(metadata, vehicle):
@@ -716,6 +769,13 @@ def lane_contains_footprint(environment, x, y):
     ):
         return False
     ramp = metadata.get("ramp")
+    gore = None if ramp is None else ramp.get("gore_x")
+    if (
+        gore is not None
+        and y + half_height > road["lane_divider"]
+        and x - half_width < gore
+    ):
+        return False  # reaches into the main lane before the gore
     if ramp is None or y - half_height >= road["lane_divider"]:
         return True
     slope = (road["lane_divider"] - road["y_min"]) / (
@@ -878,20 +938,57 @@ def _lane_yield_config(config):
     return yielding
 
 
+def _check_brake(car):
+    """Optional scripted braking: {at, duration} in s, decel in m/s^2."""
+    brake = car.get("brake")
+    if brake is None:
+        return
+    try:
+        values = (brake["at"], brake["duration"], brake["decel"])
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            f"{car['name']}.brake needs at, duration and decel"
+        ) from error
+    if not all(isfinite(v) for v in values) or min(values) < 0:
+        raise ValueError(f"{car['name']}.brake values must be non-negative")
+
+
+def lane_traffic_acceleration(traffic, time):
+    """True longitudinal acceleration of each car at `time` (scripted brakes).
+
+    The planner never sees this: it predicts constant traffic velocity, so a
+    braking car is a surprise that only the measurements reveal.
+    """
+    accelerations = []
+    for car in traffic:
+        brake = car.get("brake")
+        active = (
+            brake is not None
+            and brake["at"] <= time < brake["at"] + brake["duration"]
+        )
+        accelerations.append(-brake["decel"] if active else 0.0)
+    return accelerations
+
+
 def build_lane_merge_environment(config, device="cpu"):
-    """Road, target lane, and three constant-velocity traffic beliefs."""
+    """Road, target lane, and constant-velocity traffic beliefs."""
     road = config["road"]
     ramp = config.get("ramp")
     if ramp is not None and not ramp["start_x"] < ramp["end_x"]:
         raise ValueError("ramp needs start_x < end_x")
+    if ramp is not None and ramp.get("gore_x", -np.inf) > ramp["start_x"]:
+        raise ValueError("ramp needs gore_x <= start_x")
     traffic = config["traffic"]
-    if len(traffic) != 3 or len({car["name"] for car in traffic}) != 3:
-        raise ValueError("lane traffic needs three uniquely named vehicles")
+    names = [car["name"] for car in traffic]
+    if not names or len(set(names)) != len(names):
+        raise ValueError("lane traffic needs uniquely named vehicles")
+    for car in traffic:
+        _check_brake(car)
     task = dict(config["task"])
     task.setdefault("spec", "merge")
     if task["spec"] not in ("merge", "headway", "merge_or_yield"):
         raise ValueError(f"unknown lane task spec: {task['spec']!r}")
-    if task["spec"] == "headway":
+    if task["spec"] == "headway" or "headway" in task:
         headway = task.get("headway", {})
         if headway.get("lead_vehicle") not in {car["name"] for car in traffic}:
             raise ValueError(
